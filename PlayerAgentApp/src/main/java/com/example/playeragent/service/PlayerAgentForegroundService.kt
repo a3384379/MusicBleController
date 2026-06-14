@@ -17,6 +17,8 @@ import android.util.Log
 import com.example.playeragent.MainActivity
 import com.example.playeragent.ble.BleAdvertiserManager
 import com.example.playeragent.ble.BleGattServerManager
+import com.example.playeragent.logging.LogConfig
+import com.example.playeragent.logging.LogBuffer
 
 class PlayerAgentForegroundService : Service() {
 
@@ -78,12 +80,22 @@ class PlayerAgentForegroundService : Service() {
         val advertisingSupported = adapter.isMultipleAdvertisementSupported
         log("BLE advertising supported: $advertisingSupported")
 
-        gattServerManager = BleGattServerManager(
-            context = this,
-            bluetoothManager = bluetoothManager,
-            logger = ::log
-        ).also {
-            it.start()
+        val existingGattServerManager = gattServerManager
+        if (existingGattServerManager == null) {
+            val manager = BleGattServerManager(
+                context = this,
+                bluetoothManager = bluetoothManager,
+                logger = ::log,
+                transientLogger = ::logLocalOnly,
+                verboseLogger = ::logVerbose
+            )
+            if (manager.start()) {
+                gattServerManager = manager
+            }
+        } else if (!existingGattServerManager.isStarted()) {
+            existingGattServerManager.start()
+        } else {
+            logVerbose("GATT server already running; initialization skipped")
         }
 
         if (!advertisingSupported) {
@@ -91,12 +103,19 @@ class PlayerAgentForegroundService : Service() {
             return
         }
 
-        advertiserManager = BleAdvertiserManager(
-            context = this,
-            bluetoothAdapter = adapter,
-            logger = ::log
-        ).also {
-            it.startAdvertising()
+        val existingAdvertiserManager = advertiserManager
+        if (existingAdvertiserManager == null) {
+            advertiserManager = BleAdvertiserManager(
+                context = this,
+                bluetoothAdapter = adapter,
+                logger = ::log
+            ).also {
+                it.startAdvertising()
+            }
+        } else if (!existingAdvertiserManager.isAdvertising()) {
+            existingAdvertiserManager.startAdvertising()
+        } else {
+            logVerbose("BLE advertising already running; initialization skipped")
         }
     }
 
@@ -154,6 +173,21 @@ class PlayerAgentForegroundService : Service() {
 
     private fun log(message: String) {
         val fullMessage = "[PlayerAgent] $message"
+        LogBuffer.append(fullMessage)
+        publishLog(fullMessage)
+    }
+
+    private fun logVerbose(message: String) {
+        if (LogConfig.DEBUG_VERBOSE_LOG) {
+            log(message)
+        }
+    }
+
+    private fun logLocalOnly(message: String) {
+        publishLog("[PlayerAgent] $message")
+    }
+
+    private fun publishLog(fullMessage: String) {
         Log.i(TAG, fullMessage)
         sendBroadcast(
             Intent(ACTION_LOG)

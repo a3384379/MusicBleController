@@ -2,6 +2,7 @@ package com.example.playeragent.media
 
 import android.content.Context
 import android.os.Environment
+import com.example.playeragent.logging.LogConfig
 import java.io.File
 import java.nio.charset.Charset
 import java.util.Locale
@@ -114,7 +115,6 @@ class LyricManager(
         val safePosition = positionMs.coerceAtLeast(0L)
         val lines = cachedLines
         if (lines.isEmpty()) {
-            logger("[Lyric] current line empty because no parsed lyrics")
             return ""
         }
 
@@ -128,7 +128,9 @@ class LyricManager(
         }
 
         if (currentLine != lastLoggedLine) {
-            logger("[Lyric] current line=$currentLine")
+            if (LogConfig.DEBUG_VERBOSE_LOG) {
+                logger("[Lyric] current line=$currentLine")
+            }
             lastLoggedLine = currentLine
         }
 

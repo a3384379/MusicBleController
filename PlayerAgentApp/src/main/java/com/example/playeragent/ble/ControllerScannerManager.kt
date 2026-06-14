@@ -6,10 +6,13 @@ import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelUuid
 
 class ControllerScannerManager(
+    private val context: Context,
     private val bluetoothAdapter: BluetoothAdapter,
     private val logger: (String) -> Unit
 ) {
@@ -26,24 +29,24 @@ class ControllerScannerManager(
         }
 
         override fun onBatchScanResults(results: MutableList<ScanResult>) {
-            logger("onBatchScanResults: count=${results.size}")
+            logger("[BLE-B] onBatchScanResults count=${results.size}")
             results.forEach { handleScanResult(it) }
         }
 
         override fun onScanFailed(errorCode: Int) {
             scanning = false
-            logger("Controller scan failed: errorCode=$errorCode reason=${errorCodeToString(errorCode)}")
+            logger("[BLE-B] scan failed: errorCode=$errorCode reason=${errorCodeToString(errorCode)}")
         }
     }
 
     fun startScan() {
         if (scanning) {
-            logger("Controller scan already running")
+            logger("[BLE-B] controller scan already running")
             return
         }
 
         if (!bluetoothAdapter.isEnabled) {
-            logger("Bluetooth disabled")
+            logger("[BLE-B] Bluetooth disabled")
             return
         }
 
@@ -66,11 +69,11 @@ class ControllerScannerManager(
 
         try {
             scanner?.stopScan(scanCallback)
-            logger("Controller scan stopped")
+            logger("[BLE-B] controller scan stopped")
         } catch (securityException: SecurityException) {
-            logger("Controller scan stop failed: missing permission")
+            logger("[BLE-B] controller scan stop failed: missing permission")
         } catch (exception: Exception) {
-            logger("Controller scan stop failed: ${exception.message}")
+            logger("[BLE-B] controller scan stop failed: ${exception.message}")
         } finally {
             scanning = false
         }
@@ -79,7 +82,7 @@ class ControllerScannerManager(
     @SuppressLint("MissingPermission")
     private fun createScannerAndStartScan() {
         if (!bluetoothAdapter.isEnabled) {
-            logger("Bluetooth disabled")
+            logger("[BLE-B] Bluetooth disabled")
             return
         }
 
@@ -88,7 +91,7 @@ class ControllerScannerManager(
         if (scanner == null) {
             if (retryIndex < MAX_RETRY_COUNT) {
                 retryIndex += 1
-                logger("Retry create scanner: index=$retryIndex")
+                logger("[BLE-B] retry create scanner index=$retryIndex")
                 mainHandler.postDelayed(
                     {
                         createScannerAndStartScan()
@@ -96,12 +99,12 @@ class ControllerScannerManager(
                     RETRY_SCANNER_DELAY_MS
                 )
             } else {
-                logger("bluetoothLeScanner still null after retries")
+                logger("[BLE-B] bluetoothLeScanner still null after retries")
             }
             return
         }
 
-        logger("bluetoothLeScanner created")
+        logger("[BLE-B] bluetoothLeScanner created")
         startScanWithCreatedScanner()
     }
 
@@ -109,7 +112,7 @@ class ControllerScannerManager(
     private fun startScanWithCreatedScanner() {
         val createdScanner = scanner
         if (createdScanner == null) {
-            logger("bluetoothLeScanner still null after retries")
+            logger("[BLE-B] bluetoothLeScanner unavailable")
             return
         }
 
@@ -120,13 +123,13 @@ class ControllerScannerManager(
         try {
             createdScanner.startScan(null, settings, scanCallback)
             scanning = true
-            logger("Controller scan started")
+            logger("[BLE-B] controller scan started")
         } catch (securityException: SecurityException) {
             scanning = false
-            logger("Controller scan failed: missing permission")
+            logger("[BLE-B] controller scan failed: missing permission")
         } catch (exception: Exception) {
             scanning = false
-            logger("Controller scan failed: ${exception.message}")
+            logger("[BLE-B] controller scan failed: ${exception.message}")
         }
     }
 
@@ -135,15 +138,34 @@ class ControllerScannerManager(
         val device = result.device ?: return
         val name = result.scanRecord?.deviceName ?: device.name ?: "Unknown"
         val address = device.address ?: "Unknown"
+        val serviceUuids = result.scanRecord?.serviceUuids.orEmpty()
 
-        logger("Scan result:\nname=$name\naddress=$address\nrssi=${result.rssi}")
+        logger(
+            "[BLE-B] scan result:\n" +
+                "name=$name\n" +
+                "address=$address\n" +
+                "rssi=${result.rssi}\n" +
+                "serviceUuids=${serviceUuids.joinToString()}"
+        )
 
-        if (device.name?.contains(CONTROLLER_DEVICE_NAME) == true) {
-            logger("Controller matched by device name")
+        val serviceMatched = serviceUuids.contains(ParcelUuid(PlayerAgentUuids.SERVICE_UUID))
+        val nameMatched = name.contains(
+            PlayerAgentUuids.IOS_CONTROLLER_NAME,
+            ignoreCase = true
+        )
+
+        if (serviceMatched || nameMatched) {
+            logger(
+                "[BLE-B] controller matched: " +
+                    "serviceUuid=$serviceMatched name=$nameMatched"
+            )
             stopScan()
 
             gattClientManager?.close()
-            gattClientManager = ControllerGattClientManager(logger)
+            gattClientManager = ControllerGattClientManager(
+                context = context.applicationContext,
+                logger = logger
+            )
             gattClientManager?.connect(device)
         }
     }
@@ -151,17 +173,19 @@ class ControllerScannerManager(
     private fun errorCodeToString(errorCode: Int): String {
         return when (errorCode) {
             ScanCallback.SCAN_FAILED_ALREADY_STARTED -> "SCAN_FAILED_ALREADY_STARTED"
-            ScanCallback.SCAN_FAILED_APPLICATION_REGISTRATION_FAILED -> "SCAN_FAILED_APPLICATION_REGISTRATION_FAILED"
+            ScanCallback.SCAN_FAILED_APPLICATION_REGISTRATION_FAILED ->
+                "SCAN_FAILED_APPLICATION_REGISTRATION_FAILED"
             ScanCallback.SCAN_FAILED_FEATURE_UNSUPPORTED -> "SCAN_FAILED_FEATURE_UNSUPPORTED"
             ScanCallback.SCAN_FAILED_INTERNAL_ERROR -> "SCAN_FAILED_INTERNAL_ERROR"
-            ScanCallback.SCAN_FAILED_OUT_OF_HARDWARE_RESOURCES -> "SCAN_FAILED_OUT_OF_HARDWARE_RESOURCES"
-            ScanCallback.SCAN_FAILED_SCANNING_TOO_FREQUENTLY -> "SCAN_FAILED_SCANNING_TOO_FREQUENTLY"
+            ScanCallback.SCAN_FAILED_OUT_OF_HARDWARE_RESOURCES ->
+                "SCAN_FAILED_OUT_OF_HARDWARE_RESOURCES"
+            ScanCallback.SCAN_FAILED_SCANNING_TOO_FREQUENTLY ->
+                "SCAN_FAILED_SCANNING_TOO_FREQUENTLY"
             else -> "UNKNOWN_$errorCode"
         }
     }
 
     companion object {
-        private const val CONTROLLER_DEVICE_NAME = "MusicController"
         private const val INITIAL_SCANNER_DELAY_MS = 1500L
         private const val RETRY_SCANNER_DELAY_MS = 2000L
         private const val MAX_RETRY_COUNT = 3

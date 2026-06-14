@@ -62,6 +62,19 @@ class MediaCommandExecutor(
         )
     }
 
+    fun setVolume(requestedVolume: Int): JSONObject {
+        val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val clampedVolume = requestedVolume.coerceIn(0, maxVolume)
+
+        audioManager.setStreamVolume(
+            AudioManager.STREAM_MUSIC,
+            clampedVolume,
+            AudioManager.FLAG_SHOW_UI
+        )
+
+        return createVolumeState()
+    }
+
     fun seekTo(positionMs: Long) {
         logger("[Seek]\nreceived position=$positionMs")
 

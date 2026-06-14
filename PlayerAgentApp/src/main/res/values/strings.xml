@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_service_description">Detect visible QQ Music lyric text for diagnostics.</string>
+</resources>
