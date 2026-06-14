@@ -15,19 +15,28 @@ class BleAdvertiserManager(
 ) {
 
     private val advertiser = bluetoothAdapter.bluetoothLeAdvertiser
+    @Volatile
+    private var advertisingStartedOrRequested = false
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+            advertisingStartedOrRequested = true
             logger("BLE advertising started with scan response")
         }
 
         override fun onStartFailure(errorCode: Int) {
+            advertisingStartedOrRequested = false
             logger("BLE advertising start failed: code=$errorCode reason=${errorCodeToString(errorCode)}")
         }
     }
 
     @SuppressLint("MissingPermission")
+    @Synchronized
     fun startAdvertising() {
+        if (advertisingStartedOrRequested) {
+            logger("BLE advertising already running; skip initialization")
+            return
+        }
         if (advertiser == null) {
             logger("BLE advertiser unavailable")
             return
@@ -64,17 +73,24 @@ class BleAdvertiserManager(
             .build()
 
         try {
+            advertisingStartedOrRequested = true
             advertiser.startAdvertising(settings, advertiseData, scanResponse, advertiseCallback)
             logger("BLE advertising start requested")
         } catch (securityException: SecurityException) {
+            advertisingStartedOrRequested = false
             logger("BLE advertising start failed: missing permission")
         } catch (exception: Exception) {
+            advertisingStartedOrRequested = false
             logger("BLE advertising start failed: ${exception.message}")
         }
     }
 
     @SuppressLint("MissingPermission")
+    @Synchronized
     fun stopAdvertising() {
+        if (!advertisingStartedOrRequested) {
+            return
+        }
         try {
             advertiser?.stopAdvertising(advertiseCallback)
             logger("BLE advertising stopped")
@@ -82,8 +98,12 @@ class BleAdvertiserManager(
             logger("BLE advertising stop failed: missing permission")
         } catch (exception: Exception) {
             logger("BLE advertising stop failed: ${exception.message}")
+        } finally {
+            advertisingStartedOrRequested = false
         }
     }
+
+    fun isAdvertising(): Boolean = advertisingStartedOrRequested
 
     private fun errorCodeToString(errorCode: Int): String {
         return when (errorCode) {

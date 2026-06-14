@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="background" x1="120" y1="76" x2="914" y2="946" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#672407"/>
+      <stop offset="0.52" stop-color="#C6480A"/>
+      <stop offset="1" stop-color="#2C160E"/>
+    </linearGradient>
+    <linearGradient id="player" x1="304" y1="220" x2="680" y2="820" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFF7ED"/>
+      <stop offset="1" stop-color="#FFD1A8"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="26" stdDeviation="32" flood-color="#1C0902" flood-opacity="0.48"/>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#background)"/>
+  <circle cx="880" cy="154" r="210" fill="#FF9D3D" opacity="0.15"/>
+  <circle cx="132" cy="900" r="270" fill="#1C0803" opacity="0.26"/>
+  <path d="M164 750C286 861 474 894 632 823C747 771 830 675 863 559" fill="none" stroke="#FFB56E" stroke-width="20" stroke-linecap="round" opacity="0.24"/>
+  <g filter="url(#shadow)">
+    <rect x="260" y="174" width="430" height="676" rx="90" fill="url(#player)"/>
+    <rect x="308" y="242" width="334" height="380" rx="42" fill="#52200B"/>
+    <circle cx="475" cy="722" r="72" fill="#B53E08"/>
+    <path d="M452 679L521 722L452 765Z" fill="#FFFFFF"/>
+    <rect x="410" y="203" width="130" height="14" rx="7" fill="#B45B31" opacity="0.55"/>
+  </g>
+  <g fill="#FFFFFF">
+    <circle cx="393" cy="508" r="43"/>
+    <circle cx="511" cy="468" r="43"/>
+    <path d="M425 326H462V508H425Z"/>
+    <path d="M425 326L552 292V352L425 386Z"/>
+    <path d="M515 316H552V468H515Z"/>
+  </g>
+  <g fill="none" stroke="#FFFFFF" stroke-width="32" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M788 308V558"/>
+    <path d="M788 308L870 390L788 458L870 540L788 622"/>
+    <path d="M788 308L730 366"/>
+    <path d="M788 622L730 564"/>
+  </g>
+  <circle cx="731" cy="465" r="16" fill="#FFFFFF"/>
+</svg>

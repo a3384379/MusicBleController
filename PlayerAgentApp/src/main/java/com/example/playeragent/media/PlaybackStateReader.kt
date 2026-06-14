@@ -7,6 +7,7 @@ import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.SystemClock
+import com.example.playeragent.logging.LogConfig
 import com.example.playeragent.service.PlayerNotificationListenerService
 import org.json.JSONObject
 
@@ -22,9 +23,11 @@ class PlaybackStateReader(
         context = appContext,
         logger = logger
     )
+    private var metadataMissingLogged = false
+    private var durationMissingLogged = false
 
     fun readPlaybackState(): JSONObject {
-        logger("[PlaybackState] GET_PLAYBACK_STATE received")
+        verbose("[PlaybackState] GET_PLAYBACK_STATE received")
 
         if (mediaSessionManager == null) {
             logger("[PlaybackState] MediaSessionManager unavailable")
@@ -49,15 +52,17 @@ class PlaybackStateReader(
             return emptyResponse("getActiveSessions failed")
         }
 
-        logger("[PlaybackState] activeSessions count=${controllers.size}")
+        verbose("[PlaybackState] activeSessions count=${controllers.size}")
 
         if (controllers.isEmpty()) {
             logger("[PlaybackState] no active media sessions")
             return emptyResponse("No active media sessions")
         }
 
-        controllers.forEachIndexed { index, controller ->
-            logController(index, controller)
+        if (LogConfig.DEBUG_VERBOSE_LOG) {
+            controllers.forEachIndexed { index, controller ->
+                logController(index, controller)
+            }
         }
 
         val selected = controllers.firstOrNull {
@@ -65,6 +70,12 @@ class PlaybackStateReader(
         } ?: controllers.first()
 
         val metadata = selected.metadata
+        if (metadata == null && !metadataMissingLogged) {
+            metadataMissingLogged = true
+            logger("[PlaybackState] metadata null package=${selected.packageName}")
+        } else if (metadata != null) {
+            metadataMissingLogged = false
+        }
         val playbackState = selected.playbackState
         val playing = playbackState?.state == PlaybackState.STATE_PLAYING
         val position = calculatePosition(playbackState)
@@ -73,10 +84,16 @@ class PlaybackStateReader(
         val artist = metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty()
         val album = metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM).orEmpty()
         val duration = metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
+        if (duration <= 0L && !durationMissingLogged) {
+            durationMissingLogged = true
+            logger("[PlaybackState] duration missing title=$title")
+        } else if (duration > 0L) {
+            durationMissingLogged = false
+        }
         lyricManager.loadLyric(title, artist)
         val lyric = lyricManager.getCurrentLine(position)
 
-        logger(
+        verbose(
             "[PlaybackState] selected package=${selected.packageName}\n" +
                 "playing=$playing\n" +
                 "title=$title\n" +
@@ -113,6 +130,12 @@ class PlaybackStateReader(
                 "artist=$artist\n" +
                 "album=$album"
         )
+    }
+
+    private fun verbose(message: String) {
+        if (LogConfig.DEBUG_VERBOSE_LOG) {
+            logger(message)
+        }
     }
 
     private fun emptyResponse(reason: String): JSONObject {
