@@ -16,6 +16,10 @@ class LyricManager(
     private var cachedKey: String? = null
     private var cachedLines: List<LyricLine> = emptyList()
     private var lastLoggedLine: String? = null
+    private val qrcLyricManager = QrcLyricManager(
+        context = appContext,
+        logger = logger
+    )
 
     fun scanLrcFiles(title: String, artist: String, album: String) {
         logger("[LyricScan] start")
@@ -75,11 +79,13 @@ class LyricManager(
         }
     }
 
-    fun loadLyric(title: String, artist: String) {
-        val key = lyricKey(title, artist)
+    fun loadLyric(title: String, artist: String, album: String = "") {
+        val key = lyricKey(title, artist, album)
         if (key == cachedKey) {
             if (cachedLines.isEmpty()) {
-                applyScannedCacheIfAvailable(title, artist)
+                if (applyScannedCacheIfAvailable(title, artist)) {
+                    cachedKey = key
+                }
             }
             return
         }
@@ -89,6 +95,7 @@ class LyricManager(
         lastLoggedLine = null
 
         if (applyScannedCacheIfAvailable(title, artist)) {
+            cachedKey = key
             return
         }
 
@@ -103,6 +110,7 @@ class LyricManager(
         val matchedFile = findMatchedFile(directory, title, artist)
         if (matchedFile == null) {
             logger("[Lyric] no lyric file matched")
+            qrcLyricManager.load(title, artist, album)
             return
         }
 
@@ -115,7 +123,7 @@ class LyricManager(
         val safePosition = positionMs.coerceAtLeast(0L)
         val lines = cachedLines
         if (lines.isEmpty()) {
-            return ""
+            return qrcLyricManager.getCurrentLine(safePosition)
         }
 
         var currentLine = ""
@@ -445,8 +453,12 @@ class LyricManager(
             .trim()
     }
 
-    private fun lyricKey(title: String, artist: String): String {
-        return "${title.trim()}|${artist.trim()}"
+    private fun lyricKey(
+        title: String,
+        artist: String,
+        album: String = ""
+    ): String {
+        return "${title.trim()}|${artist.trim()}|${album.trim()}"
     }
 
     data class LyricLine(

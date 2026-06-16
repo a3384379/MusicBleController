@@ -3,6 +3,7 @@ package com.example.playeragent.media
 import android.content.Context
 import android.os.Environment
 import android.util.Base64
+import io.github.proify.qrckit.decrypt.QrcDecrypter
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -84,17 +85,21 @@ class QrcDumpManager(
         val type = detectType(fileBytes, decodedTexts.values)
         output.log("[QrcDump] type=${type.label}")
 
-        decodedTexts.forEach { (charsetName, text) ->
-            logTextBlock(
-                charsetName = charsetName,
-                source = "file",
-                text = text
-            )
+        if (type != FileType.ENCRYPTED_QRC_HEX) {
+            decodedTexts.forEach { (charsetName, text) ->
+                logTextBlock(
+                    charsetName = charsetName,
+                    source = "file",
+                    text = text
+                )
+            }
         }
 
         val decodedType = when (type) {
             FileType.ZIP -> inspectZip(fileBytes, source = "file")
             FileType.ZLIB -> inspectZlib(fileBytes, source = "file")
+            FileType.ENCRYPTED_QRC_HEX ->
+                inspectEncryptedQrc(fileBytes, selected.name)
             FileType.POSSIBLE_BASE64 ->
                 inspectBase64(fileBytes, source = "file")
 
@@ -242,6 +247,9 @@ class QrcDumpManager(
         if (isZlib(bytes)) {
             return FileType.ZLIB
         }
+        if (isEncryptedQrcHex(bytes)) {
+            return FileType.ENCRYPTED_QRC_HEX
+        }
 
         val combinedText = texts.joinToString("\n")
         if (XML_MARKERS.any {
@@ -257,6 +265,77 @@ class QrcDumpManager(
             return FileType.POSSIBLE_BASE64
         }
         return FileType.UNKNOWN_OR_ENCRYPTED
+    }
+
+    private fun inspectEncryptedQrc(
+        fileBytes: ByteArray,
+        fileName: String
+    ): String {
+        val encrypted = String(fileBytes, Charsets.US_ASCII)
+            .filterNot(Char::isWhitespace)
+        output.log(
+            "[QrcDump] encrypted qrc hex characters=${encrypted.length}"
+        )
+
+        val decrypted = QrcDecrypter.decrypt(encrypted)
+        if (decrypted.isNullOrBlank()) {
+            output.log("[QrcDump] qrc decrypt failed")
+            return "QRC_DECRYPT_FAILED"
+        }
+
+        val metadata = QRC_METADATA_REGEX.findAll(decrypted)
+            .associate { match ->
+                match.groupValues[1] to unescapeXml(match.groupValues[2])
+            }
+        val lyricContent = QRC_LYRIC_CONTENT_REGEX.find(decrypted)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.let(::unescapeXml)
+        val lines = lyricContent
+            ?.let { content ->
+                QRC_LINE_REGEX.findAll(content).map { match ->
+                    val start = match.groupValues[1].toLongOrNull() ?: 0L
+                    val duration = match.groupValues[2].toLongOrNull() ?: 0L
+                    val bodyStart = match.range.last + 1
+                    QrcLineMarker(start, duration, bodyStart)
+                }.toList()
+            }
+            .orEmpty()
+
+        output.log(
+            "[QrcDump] qrc decrypt success xmlChars=${decrypted.length}"
+        )
+        output.log(
+            "[QrcDump] metadata title=${metadata["ti"].orEmpty()} " +
+                "artist=${metadata["ar"].orEmpty()} " +
+                "album=${metadata["al"].orEmpty()}"
+        )
+        output.log("[QrcDump] parsed lyric lines=${lines.size}")
+        output.log("[QrcDump] ===== QRC XML START =====")
+        output.log(decrypted.take(TEXT_PREVIEW_CHARACTER_LIMIT))
+        output.log("[QrcDump] ===== QRC XML END =====")
+
+        if (lyricContent != null) {
+            lines.take(QRC_LINE_PREVIEW_LIMIT).forEachIndexed { index, line ->
+                val bodyEnd = lines.getOrNull(index + 1)?.bodyStart
+                    ?: lyricContent.length
+                val body = lyricContent
+                    .substring(line.bodyStart, bodyEnd)
+                    .trim()
+                val text = body.replace(QRC_WORD_TIME_REGEX, "")
+                output.log(
+                    "[QrcDump] line start=${line.startMs} " +
+                        "duration=${line.durationMs} text=$text"
+                )
+            }
+        }
+
+        summaryLogger(
+            "[QrcDump] decrypt success file=$fileName " +
+                "title=${metadata["ti"].orEmpty()} " +
+                "artist=${metadata["ar"].orEmpty()} lines=${lines.size}"
+        )
+        return "QRC_XML"
     }
 
     private fun inspectZlib(bytes: ByteArray, source: String): String {
@@ -468,6 +547,25 @@ class QrcDumpManager(
             }
     }
 
+    private fun isEncryptedQrcHex(bytes: ByteArray): Boolean {
+        val compact = String(bytes, Charsets.US_ASCII)
+            .filterNot(Char::isWhitespace)
+        return compact.length >= MIN_HEX_QRC_LENGTH &&
+            compact.length % 16 == 0 &&
+            HEX_REGEX.matches(compact)
+    }
+
+    private fun unescapeXml(value: String): String {
+        return value
+            .replace("&#10;", "\n")
+            .replace("&#13;", "\r")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+    }
+
     private fun isZip(bytes: ByteArray): Boolean {
         return bytes.size >= 4 &&
             bytes[0] == 0x50.toByte() &&
@@ -504,11 +602,18 @@ class QrcDumpManager(
         val charset: Charset
     )
 
+    private data class QrcLineMarker(
+        val startMs: Long,
+        val durationMs: Long,
+        val bodyStart: Int
+    )
+
     private enum class FileType(val label: String) {
         ZIP("ZIP"),
         ZLIB("ZLIB"),
         XML_OR_QRC_XML("XML_OR_QRC_XML"),
         LRC_TEXT("LRC_TEXT"),
+        ENCRYPTED_QRC_HEX("ENCRYPTED_QRC_HEX"),
         POSSIBLE_BASE64("POSSIBLE_BASE64"),
         UNKNOWN_OR_ENCRYPTED("UNKNOWN_OR_ENCRYPTED")
     }
@@ -556,6 +661,8 @@ class QrcDumpManager(
         private const val MAX_EXPANDED_BYTES = 64 * 1024
         private const val MAX_TOTAL_OUTPUT_CHARACTERS = 30_000
         private const val MIN_BASE64_LENGTH = 128
+        private const val MIN_HEX_QRC_LENGTH = 128
+        private const val QRC_LINE_PREVIEW_LIMIT = 12
 
         private val SUPPORTED_EXTENSIONS = setOf(
             "qrc",
@@ -602,5 +709,14 @@ class QrcDumpManager(
         )
         private val BASE64_REGEX =
             Regex("""[A-Za-z0-9+/]+={0,2}""")
+        private val HEX_REGEX = Regex("""[0-9A-Fa-f]+""")
+        private val QRC_LYRIC_CONTENT_REGEX =
+            Regex("""LyricContent\s*=\s*"([\s\S]*?)"""")
+        private val QRC_METADATA_REGEX =
+            Regex("""\[(\w+)\s*:\s*([^]]*)]""")
+        private val QRC_LINE_REGEX =
+            Regex("""\[(\d+)\s*,\s*(\d+)]""")
+        private val QRC_WORD_TIME_REGEX =
+            Regex("""\(\d+\s*,\s*\d+\)""")
     }
 }

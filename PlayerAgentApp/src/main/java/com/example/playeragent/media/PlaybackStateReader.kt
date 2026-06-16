@@ -90,7 +90,7 @@ class PlaybackStateReader(
         } else if (duration > 0L) {
             durationMissingLogged = false
         }
-        lyricManager.loadLyric(title, artist)
+        lyricManager.loadLyric(title, artist, album)
         val lyric = lyricManager.getCurrentLine(position)
 
         verbose(

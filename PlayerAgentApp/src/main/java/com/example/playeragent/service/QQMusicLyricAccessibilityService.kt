@@ -115,6 +115,7 @@ class QQMusicLyricAccessibilityService : AccessibilityService() {
             }
             val currentMedia = readCurrentMedia()
             val traversal = collectTextViewTexts(root)
+            latestTexts = traversal.texts
             logDiagnostic(
                 "[AccessibilityLyric] node count=${traversal.nodeCount} " +
                     "text count=${traversal.texts.size}"
@@ -430,7 +431,12 @@ class QQMusicLyricAccessibilityService : AccessibilityService() {
         @Volatile
         private var lastLoggedCandidate = ""
 
+        @Volatile
+        private var latestTexts: List<String> = emptyList()
+
         fun isConnected(): Boolean = serviceConnected
+
+        fun latestTextsSnapshot(): List<String> = latestTexts.toList()
 
         fun requestTreeDump(): Boolean {
             val service = activeInstance ?: return false

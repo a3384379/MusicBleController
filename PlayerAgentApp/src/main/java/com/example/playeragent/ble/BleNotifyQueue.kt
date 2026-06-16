@@ -164,9 +164,14 @@ class BleNotifyQueue(
                 } else {
                     when (job.type) {
                         "albumArt" -> logger(
-                            "[AlbumArt][BLE] send end id=${job.albumArtId}"
+                            "[AlbumArt] send end id=${job.albumArtId} " +
+                                "quality=${job.albumArtQuality}"
                         )
                         "remoteLog" -> logger("[RemoteLog] send end")
+                        "mediaFieldDump" ->
+                            logger("[MediaFieldDump] send end")
+                        "trackInfo" ->
+                            logger("[TrackInfo] send end")
                         else -> logger("[BleNotifyQueue] job end type=${job.type}")
                     }
                     job.onComplete?.invoke()
@@ -194,6 +199,14 @@ class BleNotifyQueue(
         val requested = notify(server, characteristic, job.device, packet.value)
         val sendLog = "[BleNotifyQueue] send type=${packet.type} bytes=${packet.value.size}"
         when {
+            packet.type == "mediaFieldDumpChunk" -> {
+                // The dump contents are intentionally kept out of normal logs.
+            }
+            packet.type == "trackInfoChunk" -> {
+                if (LogConfig.DEBUG_VERBOSE_LOG) {
+                    verboseLogger(sendLog)
+                }
+            }
             packet.type == "logChunk" || packet.type == "albumArtChunk" -> {
                 if (activePacketIndex % CHUNK_PROGRESS_INTERVAL == 0) {
                     localOnlyLogger(
@@ -238,6 +251,10 @@ class BleNotifyQueue(
                 logger("[AlbumArt][BLE] failed reason=$reason")
             "remoteLog" ->
                 logger("[RemoteLog] send failed reason=$reason")
+            "mediaFieldDump" ->
+                logger("[MediaFieldDump] send failed reason=$reason")
+            "trackInfo" ->
+                logger("[TrackInfo] send failed reason=$reason")
         }
     }
 
@@ -292,20 +309,27 @@ class BleNotifyQueue(
         val chunkCount: Int
             get() = packets.count {
                 it.type == "albumArtChunk" || it.type == "logChunk"
+                    || it.type == "mediaFieldDumpChunk"
+                    || it.type == "trackInfoChunk"
             }
 
         val albumArtId: String
-            get() {
-                val endPacket = packets.lastOrNull {
-                    it.type == "albumArtEnd"
-                } ?: return ""
-                return try {
-                    JSONObject(endPacket.value.toString(Charsets.UTF_8))
-                        .optString("id")
-                } catch (_: Exception) {
-                    ""
-                }
+            get() = albumArtEndField("id")
+
+        val albumArtQuality: String
+            get() = albumArtEndField("quality")
+
+        private fun albumArtEndField(name: String): String {
+            val endPacket = packets.lastOrNull {
+                it.type == "albumArtEnd"
+            } ?: return ""
+            return try {
+                JSONObject(endPacket.value.toString(Charsets.UTF_8))
+                    .optString(name)
+            } catch (_: Exception) {
+                ""
             }
+        }
     }
 
     companion object {

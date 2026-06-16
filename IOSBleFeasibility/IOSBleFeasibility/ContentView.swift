@@ -4,6 +4,8 @@ struct ContentView: View {
     @StateObject private var bleManager = BLETestManager()
     @State private var showLogs = false
     @State private var showSonyLogs = false
+    @State private var showDebugTools = false
+    @State private var showMediaFieldDump = false
 
     var body: some View {
         NavigationStack {
@@ -17,7 +19,7 @@ struct ContentView: View {
                     Divider()
                     volumeSection
                     refreshControls
-                    remoteLogSection
+                    debugToolsSection
                     logSection
                 }
                 .padding()
@@ -279,6 +281,104 @@ struct ContentView: View {
                     .onChange(of: bleManager.logs.count) { _, count in
                         guard count > 0 else { return }
                         proxy.scrollTo(count - 1, anchor: .bottom)
+                    }
+                }
+            }
+        }
+    }
+
+    private var debugToolsSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Button {
+                showDebugTools.toggle()
+            } label: {
+                HStack {
+                    Label("Debug Tools", systemImage: "wrench.and.screwdriver")
+                    Spacer()
+                    Image(systemName: showDebugTools ? "chevron.up" : "chevron.down")
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+
+            if showDebugTools {
+                remoteLogSection
+                Divider()
+                mediaFieldDumpSection
+            }
+        }
+    }
+
+    private var mediaFieldDumpSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Media Field Dump")
+                    .font(.headline)
+                Spacer()
+                Button(action: bleManager.sendDumpMediaFields) {
+                    Label("Dump Media Fields", systemImage: "list.bullet.clipboard")
+                }
+                .buttonStyle(.bordered)
+                .disabled(
+                    bleManager.connectionStatus != "已连接" ||
+                        bleManager.isMediaFieldDumpReceiving
+                )
+            }
+
+            if bleManager.isMediaFieldDumpReceiving ||
+                !bleManager.mediaFieldDumpProgressText.isEmpty {
+                HStack(spacing: 8) {
+                    if bleManager.isMediaFieldDumpReceiving {
+                        ProgressView()
+                    }
+                    Text(bleManager.mediaFieldDumpProgressText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Button {
+                showMediaFieldDump.toggle()
+            } label: {
+                Label(
+                    showMediaFieldDump
+                        ? "Hide Media Field Dump"
+                        : "Show Media Field Dump",
+                    systemImage: showMediaFieldDump
+                        ? "chevron.up"
+                        : "chevron.down"
+                )
+            }
+            .buttonStyle(.bordered)
+
+            if showMediaFieldDump {
+                if bleManager.mediaFieldDumpText.isEmpty {
+                    Text("尚未获取")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ScrollView {
+                        Text(bleManager.mediaFieldDumpText)
+                            .font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                    }
+                    .frame(height: 260)
+                    .background(Color(uiColor: .secondarySystemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                    HStack {
+                        Button(action: bleManager.copyMediaFieldDump) {
+                            Label("Copy Media Dump", systemImage: "doc.on.doc")
+                        }
+                        .buttonStyle(.bordered)
+
+                        if !bleManager.mediaFieldDumpCopyStatus.isEmpty {
+                            Text(bleManager.mediaFieldDumpCopyStatus)
+                                .font(.caption)
+                                .foregroundStyle(.green)
+                        }
                     }
                 }
             }

@@ -1,4 +1,5 @@
 import CoreBluetooth
+import CryptoKit
 import Foundation
 import UIKit
 
@@ -23,6 +24,10 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var remoteLogText = ""
     @Published private(set) var remoteLogCopyStatus = ""
     @Published private(set) var isRemoteLogTransferInProgress = false
+    @Published private(set) var mediaFieldDumpText = ""
+    @Published private(set) var mediaFieldDumpCopyStatus = ""
+    @Published private(set) var isMediaFieldDumpReceiving = false
+    @Published private(set) var mediaFieldDumpProgressText = ""
 
     private lazy var centralManager = CBCentralManager(delegate: self, queue: nil)
     private lazy var peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
@@ -32,12 +37,23 @@ final class BLETestManager: NSObject, ObservableObject {
     private var sonyStatusCharacteristic: CBCharacteristic?
     private var pendingWriteCommand = ""
     private var albumArtID = ""
+    private var albumArtQuality = ""
     private var albumArtExpectedSize = 0
     private var albumArtExpectedChunks = 0
     private var albumArtChunks: [Int: Data] = [:]
+    private var currentAlbumArtID = ""
+    private var currentCachedAlbumArtQuality = ""
+    private var requestedAlbumArtKeys: Set<String> = []
+    private var albumArtPreviewRetryCount = 0
     private var remoteLogExpectedChunks = 0
     private var remoteLogExpectedLines = 0
     private var remoteLogChunks: [Int: Data] = [:]
+    private var mediaFieldDumpExpectedSize = 0
+    private var mediaFieldDumpExpectedChunks = 0
+    private var mediaFieldDumpChunks: [Int: Data] = [:]
+    private var trackInfoExpectedSize = 0
+    private var trackInfoExpectedChunks = 0
+    private var trackInfoChunks: [Int: Data] = [:]
 
     private var commandCharacteristic: CBMutableCharacteristic?
     private var statusCharacteristic: CBMutableCharacteristic?
@@ -116,6 +132,21 @@ final class BLETestManager: NSObject, ObservableObject {
         guard !remoteLogText.isEmpty else { return }
         UIPasteboard.general.string = remoteLogText
         remoteLogCopyStatus = "已复制 Sony 日志"
+    }
+
+    func sendDumpMediaFields() {
+        resetMediaFieldDumpTransfer()
+        mediaFieldDumpText = ""
+        mediaFieldDumpCopyStatus = ""
+        isMediaFieldDumpReceiving = true
+        mediaFieldDumpProgressText = "Media dump receiving..."
+        sendCommand(cmd: "DUMP_MEDIA_FIELDS")
+    }
+
+    func copyMediaFieldDump() {
+        guard !mediaFieldDumpText.isEmpty else { return }
+        UIPasteboard.general.string = mediaFieldDumpText
+        mediaFieldDumpCopyStatus = "已复制 Media Field Dump"
     }
 
     func sendCommand(cmd: String, extra: [String: Any] = [:]) {
@@ -208,8 +239,13 @@ final class BLETestManager: NSObject, ObservableObject {
         sonyCommandCharacteristic = nil
         sonyStatusCharacteristic = nil
         resetAlbumArtTransfer()
+        requestedAlbumArtKeys.removeAll()
         resetRemoteLogTransfer()
+        resetMediaFieldDumpTransfer()
+        resetTrackInfoTransfer()
         isRemoteLogTransferInProgress = false
+        isMediaFieldDumpReceiving = false
+        mediaFieldDumpProgressText = ""
         scanTimeoutWorkItem?.cancel()
         centralManager.stopScan()
         centralManager.scanForPeripherals(
@@ -367,7 +403,9 @@ extension BLETestManager: CBCentralManagerDelegate {
         sonyCommandCharacteristic = nil
         sonyStatusCharacteristic = nil
         resetAlbumArtTransfer()
+        requestedAlbumArtKeys.removeAll()
         resetRemoteLogTransfer()
+        resetTrackInfoTransfer()
         isRemoteLogTransferInProgress = false
     }
 }
@@ -478,7 +516,10 @@ extension BLETestManager: CBPeripheralDelegate {
 
         if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let type = object["type"] as? String,
-           type == "logChunk" || type == "albumArtChunk" {
+           type == "logChunk" ||
+               type == "albumArtChunk" ||
+               type == "trackInfoChunk" ||
+               type == "mediaFieldDumpChunk" {
             log("[BLE] status notify received type=\(type)")
         } else {
             log("[BLE] status notify received: \(text)")
@@ -496,20 +537,50 @@ extension BLETestManager: CBPeripheralDelegate {
         DispatchQueue.main.async {
             switch type {
             case "playbackState":
-                self.title = object["title"] as? String ?? "-"
-                self.artist = object["artist"] as? String ?? "-"
-                self.album = object["album"] as? String ?? "-"
-                self.lyric = object["lyric"] as? String ?? ""
                 self.isPlaying = object["playing"] as? Bool ?? false
                 self.durationMs = Self.int64Value(object["duration"])
+                if let lyric = object["lyric"] as? String {
+                    self.lyric = lyric
+                }
                 if !self.isSeeking {
                     self.positionMs = Self.int64Value(object["position"])
                     self.seekPositionMs = self.positionMs
                 }
                 self.log(
-                    "[iOS][Status] playbackState title=\(self.title) " +
+                    "[iOS][Status] playbackState " +
                         "position=\(self.positionMs) duration=\(self.durationMs)"
                 )
+
+            case "trackInfo":
+                self.applyTrackInfo(object)
+
+            case "trackInfoStart":
+                let size = Self.intValue(object["size"])
+                let chunks = Self.intValue(object["chunks"])
+                guard size > 0, chunks > 0 else {
+                    self.resetTrackInfoTransfer()
+                    self.log("[TrackInfo] invalid start")
+                    return
+                }
+                self.resetTrackInfoTransfer()
+                self.trackInfoExpectedSize = size
+                self.trackInfoExpectedChunks = chunks
+                self.log("[TrackInfo] start chunks=\(chunks) size=\(size)")
+
+            case "trackInfoChunk":
+                let index = Self.intValue(object["index"])
+                guard self.trackInfoExpectedChunks > 0,
+                      index >= 0,
+                      index < self.trackInfoExpectedChunks,
+                      let base64 = object["data"] as? String,
+                      let chunk = Data(base64Encoded: base64) else {
+                    self.log("[TrackInfo] invalid chunk index=\(index)")
+                    return
+                }
+                self.trackInfoChunks[index] = chunk
+
+            case "trackInfoEnd":
+                self.finishTrackInfoTransfer()
 
             case "volumeState":
                 self.volumeMax = Self.intValue(object["max"])
@@ -522,29 +593,60 @@ extension BLETestManager: CBPeripheralDelegate {
                         "max=\(self.volumeMax)"
                 )
 
+            case "albumArtOffer":
+                let id = object["id"] as? String ?? ""
+                guard !id.isEmpty else {
+                    self.log("[AlbumArt] invalid offer")
+                    return
+                }
+                self.log("[AlbumArt] offer id=\(id)")
+                self.handleAlbumArtIdentity(id)
+                if self.currentCachedAlbumArtQuality == "full" {
+                    self.sendCommand(
+                        cmd: "ALBUM_ART_SKIP",
+                        extra: ["id": id]
+                    )
+                } else if self.currentCachedAlbumArtQuality == "preview" {
+                    self.requestAlbumArt(id: id, quality: "full")
+                } else {
+                    self.requestAlbumArt(id: id, quality: "preview")
+                }
+
             case "albumArtStart":
                 let id = object["id"] as? String ?? ""
+                let quality = object["quality"] as? String ?? ""
                 let size = Self.intValue(object["size"])
                 let chunks = Self.intValue(object["chunks"])
-                guard !id.isEmpty, size > 0, chunks > 0 else {
+                guard !id.isEmpty,
+                      quality == "preview" || quality == "full",
+                      size > 0,
+                      chunks > 0 else {
                     self.resetAlbumArtTransfer()
                     self.log(
                         "[AlbumArt] invalid start id=\(id) " +
-                            "size=\(size) chunks=\(chunks)"
+                            "quality=\(quality) size=\(size) chunks=\(chunks)"
                     )
                     return
                 }
+                self.handleAlbumArtIdentity(id)
                 self.resetAlbumArtTransfer()
                 self.albumArtID = id
+                self.albumArtQuality = quality
                 self.albumArtExpectedSize = size
                 self.albumArtExpectedChunks = chunks
-                self.log("[AlbumArt] start chunks=\(chunks) size=\(size)")
+                self.log(
+                    "[AlbumArt] start id=\(id) quality=\(quality) " +
+                        "chunks=\(chunks) size=\(size)"
+                )
 
             case "albumArtChunk":
                 let id = object["id"] as? String ?? ""
+                let quality =
+                    object["quality"] as? String ?? self.albumArtQuality
                 let index = Self.intValue(object["index"])
                 guard self.albumArtExpectedChunks > 0,
                       id == self.albumArtID,
+                      quality == self.albumArtQuality,
                       index >= 0,
                       index < self.albumArtExpectedChunks,
                       let base64 = object["data"] as? String,
@@ -557,25 +659,38 @@ extension BLETestManager: CBPeripheralDelegate {
 
             case "albumArtEnd":
                 let id = object["id"] as? String ?? ""
+                let quality =
+                    object["quality"] as? String ?? self.albumArtQuality
                 self.log(
                     "[AlbumArt] end received=\(self.albumArtChunks.count) " +
                         "expected=\(self.albumArtExpectedChunks)"
                 )
-                guard id == self.albumArtID else {
+                guard id == self.albumArtID,
+                      quality == self.albumArtQuality else {
                     self.log(
-                        "[AlbumArt] decode failed id mismatch " +
-                            "expected=\(self.albumArtID) actual=\(id)"
+                        "[AlbumArt] decode failed transfer mismatch " +
+                            "expected=\(self.albumArtID)/\(self.albumArtQuality) " +
+                            "actual=\(id)/\(quality)"
                     )
                     self.resetAlbumArtTransfer()
                     return
                 }
-                self.finishAlbumArtTransfer(id: id)
+                self.finishAlbumArtTransfer(id: id, quality: quality)
 
             case "albumArtUnavailable":
                 let id = object["id"] as? String ?? ""
+                let quality = object["quality"] as? String ?? "preview"
                 self.resetAlbumArtTransfer()
-                self.albumArtImage = nil
-                self.log("[AlbumArt] unavailable id=\(id)")
+                self.requestedAlbumArtKeys.remove("\(id)|\(quality)")
+                if id == self.currentAlbumArtID,
+                   quality == "preview",
+                   self.albumArtImage == nil {
+                    self.albumArtImage = nil
+                    self.retryAlbumArtPreviewIfNeeded(id: id)
+                }
+                self.log(
+                    "[AlbumArt] unavailable id=\(id) quality=\(quality)"
+                )
 
             case "logStart":
                 let chunks = Self.intValue(object["chunks"])
@@ -619,13 +734,54 @@ extension BLETestManager: CBPeripheralDelegate {
                     self.finishRemoteLogTransfer()
                 }
 
+            case "mediaFieldDumpStart":
+                let size = Self.intValue(object["size"])
+                let chunks = Self.intValue(object["chunks"])
+                guard size > 0, chunks > 0 else {
+                    self.failMediaFieldDump("invalid start")
+                    return
+                }
+                self.resetMediaFieldDumpTransfer()
+                self.mediaFieldDumpExpectedSize = size
+                self.mediaFieldDumpExpectedChunks = chunks
+                self.mediaFieldDumpText = ""
+                self.mediaFieldDumpCopyStatus = ""
+                self.isMediaFieldDumpReceiving = true
+                self.mediaFieldDumpProgressText = "Media dump receiving..."
+                self.log("[MediaDump] start chunks=\(chunks)")
+
+            case "mediaFieldDumpChunk":
+                let index = Self.intValue(object["index"])
+                guard self.mediaFieldDumpExpectedChunks > 0,
+                      index >= 0,
+                      index < self.mediaFieldDumpExpectedChunks,
+                      let base64 = object["data"] as? String,
+                      let chunk = Data(base64Encoded: base64) else {
+                    self.failMediaFieldDump("invalid chunk index=\(index)")
+                    return
+                }
+                self.mediaFieldDumpChunks[index] = chunk
+                self.mediaFieldDumpProgressText =
+                    "Receiving chunk \(self.mediaFieldDumpChunks.count) / " +
+                    "\(self.mediaFieldDumpExpectedChunks)"
+                self.log("[MediaDump] chunk index=\(index)")
+
+            case "mediaFieldDumpEnd":
+                self.log("[MediaDump] end")
+                self.finishMediaFieldDumpTransfer()
+
+            case "mediaFieldDumpError":
+                let message = object["message"] as? String ?? "unknown error"
+                self.mediaFieldDumpText = "Media field dump failed: \(message)"
+                self.failMediaFieldDump(message)
+
             default:
                 self.log("[Status] unsupported type=\(type)")
             }
         }
     }
 
-    private func finishAlbumArtTransfer(id: String) {
+    private func finishAlbumArtTransfer(id: String, quality: String) {
         let missingIndexes = (0..<albumArtExpectedChunks).filter {
             albumArtChunks[$0] == nil
         }
@@ -661,21 +817,199 @@ extension BLETestManager: CBPeripheralDelegate {
             return
         }
 
-        albumArtImage = image
+        saveAlbumArt(jpegData, id: id, quality: quality)
+        if id == currentAlbumArtID {
+            albumArtImage = image
+            currentCachedAlbumArtQuality = quality
+        }
+        requestedAlbumArtKeys.remove("\(id)|\(quality)")
         let pixelWidth = image.cgImage?.width ?? Int(image.size.width)
         let pixelHeight = image.cgImage?.height ?? Int(image.size.height)
-        log(
-            "[AlbumArt] decode success " +
-                "imageSize=\(pixelWidth)x\(pixelHeight)"
-        )
+        log("[AlbumArt] \(quality) decode success")
+        log("[AlbumArt] decode success imageSize=\(pixelWidth)x\(pixelHeight)")
         resetAlbumArtTransfer()
+
+        if id == currentAlbumArtID, quality == "preview" {
+            albumArtPreviewRetryCount = 0
+            requestAlbumArt(id: id, quality: "full")
+        }
     }
 
     private func resetAlbumArtTransfer() {
         albumArtID = ""
+        albumArtQuality = ""
         albumArtExpectedSize = 0
         albumArtExpectedChunks = 0
         albumArtChunks.removeAll()
+    }
+
+    private func applyTrackInfo(_ object: [String: Any]) {
+        let newTitle = object["title"] as? String ?? "-"
+        let newArtist = object["artist"] as? String ?? "-"
+        let newAlbum = object["album"] as? String ?? "-"
+        if newTitle != title || newArtist != artist || newAlbum != album {
+            lyric = ""
+        }
+        title = newTitle
+        artist = newArtist
+        album = newAlbum
+        log("[TrackInfo] updated title=\(title) artist=\(artist)")
+    }
+
+    private func finishTrackInfoTransfer() {
+        guard trackInfoExpectedChunks > 0,
+              trackInfoChunks.count == trackInfoExpectedChunks else {
+            log(
+                "[TrackInfo] decode failed received=\(trackInfoChunks.count) " +
+                    "expected=\(trackInfoExpectedChunks)"
+            )
+            resetTrackInfoTransfer()
+            return
+        }
+
+        var data = Data()
+        data.reserveCapacity(trackInfoExpectedSize)
+        for index in 0..<trackInfoExpectedChunks {
+            guard let chunk = trackInfoChunks[index] else {
+                log("[TrackInfo] decode failed missing index=\(index)")
+                resetTrackInfoTransfer()
+                return
+            }
+            data.append(chunk)
+        }
+
+        guard data.count == trackInfoExpectedSize,
+              let object = try? JSONSerialization.jsonObject(
+                with: data
+              ) as? [String: Any],
+              object["type"] as? String == "trackInfo" else {
+            log("[TrackInfo] decode failed")
+            resetTrackInfoTransfer()
+            return
+        }
+        applyTrackInfo(object)
+        log("[TrackInfo] decode success bytes=\(data.count)")
+        resetTrackInfoTransfer()
+    }
+
+    private func resetTrackInfoTransfer() {
+        trackInfoExpectedSize = 0
+        trackInfoExpectedChunks = 0
+        trackInfoChunks.removeAll()
+    }
+
+    private func handleAlbumArtIdentity(_ id: String) {
+        guard !id.isEmpty, id != currentAlbumArtID else { return }
+
+        currentAlbumArtID = id
+        currentCachedAlbumArtQuality = ""
+        requestedAlbumArtKeys.removeAll()
+        albumArtPreviewRetryCount = 0
+        resetAlbumArtTransfer()
+
+        if let cached = loadCachedAlbumArt(id: id) {
+            albumArtImage = cached.image
+            currentCachedAlbumArtQuality = cached.quality
+            log("[AlbumArtCache] hit id=\(id)")
+        } else {
+            albumArtImage = nil
+            log("[AlbumArtCache] miss id=\(id)")
+        }
+    }
+
+    private func requestAlbumArt(id: String, quality: String) {
+        guard id == currentAlbumArtID else { return }
+        let key = "\(id)|\(quality)"
+        guard requestedAlbumArtKeys.insert(key).inserted else { return }
+        log("[AlbumArt] request \(quality)")
+        sendCommand(
+            cmd: "ALBUM_ART_REQUEST",
+            extra: ["id": id, "quality": quality]
+        )
+    }
+
+    private func retryAlbumArtPreviewIfNeeded(id: String) {
+        guard id == currentAlbumArtID,
+              albumArtPreviewRetryCount < 2 else {
+            return
+        }
+        albumArtPreviewRetryCount += 1
+        log("[AlbumArt] preview retry=\(albumArtPreviewRetryCount)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self,
+                  self.currentAlbumArtID == id,
+                  self.albumArtImage == nil else {
+                return
+            }
+            self.requestAlbumArt(id: id, quality: "preview")
+        }
+    }
+
+    private func loadCachedAlbumArt(
+        id: String
+    ) -> (image: UIImage, quality: String)? {
+        let imageURL = albumArtCacheURL(id: id)
+        guard let data = try? Data(contentsOf: imageURL),
+              let image = UIImage(data: data) else {
+            return nil
+        }
+
+        let qualityURL = albumArtQualityURL(id: id)
+        let quality = (
+            try? String(contentsOf: qualityURL, encoding: .utf8)
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (image, quality == "preview" ? "preview" : "full")
+    }
+
+    private func saveAlbumArt(_ data: Data, id: String, quality: String) {
+        do {
+            let directory = albumArtCacheDirectory()
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+            try data.write(to: albumArtCacheURL(id: id), options: .atomic)
+            try quality.write(
+                to: albumArtQualityURL(id: id),
+                atomically: true,
+                encoding: .utf8
+            )
+            log("[AlbumArtCache] saved id=\(id)")
+        } catch {
+            log(
+                "[AlbumArtCache] save failed id=\(id) " +
+                    "error=\(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func albumArtCacheDirectory() -> URL {
+        let documents = FileManager.default.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        )[0]
+        return documents.appendingPathComponent(
+            "AlbumArtCache",
+            isDirectory: true
+        )
+    }
+
+    private func albumArtCacheURL(id: String) -> URL {
+        albumArtCacheDirectory()
+            .appendingPathComponent(Self.sha256(id))
+            .appendingPathExtension("jpg")
+    }
+
+    private func albumArtQualityURL(id: String) -> URL {
+        albumArtCacheDirectory()
+            .appendingPathComponent(Self.sha256(id))
+            .appendingPathExtension("quality")
+    }
+
+    private static func sha256(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     private func finishRemoteLogTransfer() {
@@ -720,6 +1054,50 @@ extension BLETestManager: CBPeripheralDelegate {
         remoteLogExpectedChunks = 0
         remoteLogExpectedLines = 0
         remoteLogChunks.removeAll()
+    }
+
+    private func finishMediaFieldDumpTransfer() {
+        guard mediaFieldDumpExpectedChunks > 0,
+              mediaFieldDumpChunks.count == mediaFieldDumpExpectedChunks else {
+            failMediaFieldDump("missing chunks")
+            return
+        }
+
+        var textData = Data()
+        textData.reserveCapacity(mediaFieldDumpExpectedSize)
+        for index in 0..<mediaFieldDumpExpectedChunks {
+            guard let chunk = mediaFieldDumpChunks[index] else {
+                failMediaFieldDump("missing chunk index=\(index)")
+                return
+            }
+            textData.append(chunk)
+        }
+
+        guard textData.count == mediaFieldDumpExpectedSize,
+              let text = String(data: textData, encoding: .utf8) else {
+            failMediaFieldDump("invalid size or UTF-8")
+            return
+        }
+
+        mediaFieldDumpText = text
+        mediaFieldDumpCopyStatus = ""
+        isMediaFieldDumpReceiving = false
+        mediaFieldDumpProgressText = ""
+        log("[MediaDump] decode success bytes=\(textData.count)")
+        resetMediaFieldDumpTransfer()
+    }
+
+    private func failMediaFieldDump(_ reason: String) {
+        isMediaFieldDumpReceiving = false
+        mediaFieldDumpProgressText = "Media dump failed"
+        log("[MediaDump] decode failed \(reason)")
+        resetMediaFieldDumpTransfer()
+    }
+
+    private func resetMediaFieldDumpTransfer() {
+        mediaFieldDumpExpectedSize = 0
+        mediaFieldDumpExpectedChunks = 0
+        mediaFieldDumpChunks.removeAll()
     }
 
     private static func int64Value(_ value: Any?) -> Int64 {

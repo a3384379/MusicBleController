@@ -18,13 +18,16 @@ import com.example.playeragent.media.AlbumArtTestManager
 import com.example.playeragent.logging.LogConfig
 import com.example.playeragent.logging.LogBuffer
 import com.example.playeragent.media.MediaCommandExecutor
+import com.example.playeragent.media.MediaFieldDumpManager
 import com.example.playeragent.media.PlaybackStateReader
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 class BleGattServerManager(
     context: Context,
@@ -52,6 +55,12 @@ class BleGattServerManager(
         logger = logger,
         sendLine = { message -> sendStatusMessage(message) }
     )
+    private val mediaFieldDumpManager = MediaFieldDumpManager(appContext)
+    private val mediaFieldDumpExecutor =
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "MediaFieldDumpThread")
+        }
+    private val mediaFieldDumpPreparing = AtomicBoolean(false)
 
     private var gattServer: BluetoothGattServer? = null
     private var statusCharacteristic: BluetoothGattCharacteristic? = null
@@ -66,9 +75,8 @@ class BleGattServerManager(
     @Volatile
     private var lastAlbumArtKey: String? = null
     @Volatile
-    private var lastSentAlbumArtId: String? = null
-    @Volatile
-    private var sendingAlbumArtId: String? = null
+    private var currentAlbumArtId: String? = null
+    private val albumArtRequestsInFlight = ConcurrentHashMap.newKeySet<String>()
     private var lastAutoPushSongKey: String? = null
     private var lastAutoPushPlaying: Boolean? = null
     @Volatile
@@ -100,8 +108,8 @@ class BleGattServerManager(
                 mtuByAddress.remove(address)
                 notifyQueue.removeDevice(address)
                 lastAlbumArtKey = null
-                lastSentAlbumArtId = null
-                sendingAlbumArtId = null
+                currentAlbumArtId = null
+                albumArtRequestsInFlight.clear()
                 lastAutoPushSongKey = null
                 lastAutoPushPlaying = null
                 stopAutoPushIfUnused()
@@ -220,9 +228,9 @@ class BleGattServerManager(
                     subscribedDevices.remove(device.address)
                     notifyQueue.removeDevice(device.address)
                     lastAlbumArtKey = null
-                    lastSentAlbumArtId = null
-                    sendingAlbumArtId = null
-                    lastAutoPushSongKey = null
+                    currentAlbumArtId = null
+                    albumArtRequestsInFlight.clear()
+                        lastAutoPushSongKey = null
                     lastAutoPushPlaying = null
                     logger("[BLE-A] status notify unsubscribed: device=${device.address}")
                     stopAutoPushIfUnused()
@@ -318,8 +326,8 @@ class BleGattServerManager(
         stopAutoPush()
         notifyQueue.clear()
         lastAlbumArtKey = null
-        lastSentAlbumArtId = null
-        sendingAlbumArtId = null
+        currentAlbumArtId = null
+        albumArtRequestsInFlight.clear()
         lastAutoPushSongKey = null
         lastAutoPushPlaying = null
         subscribedDevices.clear()
@@ -327,6 +335,7 @@ class BleGattServerManager(
         recentConnectionCallbacks.clear()
         recentMtuCallbacks.clear()
         statusCharacteristic = null
+        mediaFieldDumpExecutor.shutdownNow()
 
         try {
             gattServer?.close()
@@ -392,15 +401,21 @@ class BleGattServerManager(
                     .coerceIn(0, MAX_LOG_LIMIT)
                 sendRemoteLogs(limit)
             }
+            "ALBUM_ART_SKIP" -> handleAlbumArtSkip(request)
+            "ALBUM_ART_REQUEST" -> handleAlbumArtRequest(request)
+            "DUMP_MEDIA_FIELDS" -> sendMediaFieldDump()
             else -> logger("[BLE-A] unknown command: $command")
         }
     }
 
     private fun sendPlaybackState(includeAlbumArt: Boolean = false) {
-        val state = createCompactPlaybackState()
-        sendStatusMessage(state.toString())
+        val source = playbackStateReader.readPlaybackState()
         if (includeAlbumArt) {
-            sendAlbumArtIfSongChanged(state)
+            sendTrackInfo(source)
+        }
+        sendCompactPlaybackState(source)
+        if (includeAlbumArt) {
+            sendAlbumArtIfSongChanged(source)
         }
     }
 
@@ -483,17 +498,18 @@ class BleGattServerManager(
         }
 
         try {
-            val state = createCompactPlaybackState()
-            logAutoPushStateChanges(state)
+            val source = playbackStateReader.readPlaybackState()
+            val songChanged = logAutoPushStateChanges(source)
             if (LogConfig.DEBUG_VERBOSE_LOG) {
                 verboseLogger(
                     "[BLE-A][AutoPush] playbackState " +
-                        "position=${state.optLong("position")} " +
-                        "duration=${state.optLong("duration")}"
+                        "position=${source.optLong("position")} " +
+                        "duration=${source.optLong("duration")}"
                 )
             }
-            val result = sendStatusMessage(state.toString()).also {
-                sendAlbumArtIfSongChanged(state)
+            val result = sendCompactPlaybackState(source)
+            if (songChanged) {
+                sendAlbumArtIfSongChanged(source)
             }
             if (LogConfig.DEBUG_VERBOSE_LOG) {
                 verboseLogger("[BLE-A][AutoPush] notify result=$result")
@@ -503,12 +519,13 @@ class BleGattServerManager(
         }
     }
 
-    private fun logAutoPushStateChanges(state: JSONObject) {
+    private fun logAutoPushStateChanges(state: JSONObject): Boolean {
         val songKey = buildAlbumArtCacheKey(state)
         val title = state.optString("title")
         val playing = state.optBoolean("playing")
+        val songChanged = songKey != lastAutoPushSongKey
 
-        if (songKey != lastAutoPushSongKey) {
+        if (songChanged) {
             lastAutoPushSongKey = songKey
             logger("[BLE-A][AutoPush] song changed title=$title")
         }
@@ -516,53 +533,230 @@ class BleGattServerManager(
             lastAutoPushPlaying = playing
             logger("[BLE-A][AutoPush] play state changed playing=$playing")
         }
+        return songChanged
     }
 
-    private fun createCompactPlaybackState(): JSONObject {
-        val source = playbackStateReader.readPlaybackState()
-        return JSONObject()
+    private fun sendCompactPlaybackState(source: JSONObject): Boolean {
+        val compactState = JSONObject()
             .put("type", "playbackState")
             .put("playing", source.optBoolean("playing"))
-            .put("title", source.optString("title").take(MAX_STATE_TEXT_LENGTH))
-            .put("artist", source.optString("artist").take(MAX_STATE_TEXT_LENGTH))
-            .put("album", source.optString("album").take(MAX_STATE_TEXT_LENGTH))
             .put("position", source.optLong("position"))
             .put("duration", source.optLong("duration"))
-            .put("lyric", source.optString("lyric").take(MAX_STATE_TEXT_LENGTH))
+        val lyric = source.optString("lyric").take(MAX_LYRIC_TEXT_LENGTH)
+        compactState.put("lyric", lyric)
+        val device = subscribedDevices.values.firstOrNull()
+        if (device != null) {
+            val maximumPayload = maximumPayloadFor(device)
+            var fittedLyric = lyric
+            while (fittedLyric.isNotEmpty() &&
+                compactState.toString().toByteArray(Charsets.UTF_8).size >
+                maximumPayload
+            ) {
+                fittedLyric = fittedLyric.dropLast(1)
+                compactState.put("lyric", fittedLyric)
+            }
+            if (compactState.toString().toByteArray(Charsets.UTF_8).size >
+                maximumPayload
+            ) {
+                compactState.remove("lyric")
+            }
+        }
+        return sendStatusMessage(compactState.toString())
+    }
+
+    private fun sendTrackInfo(source: JSONObject) {
+        val device = subscribedDevices.values.firstOrNull() ?: run {
+            logger("[TrackInfo] send skipped: no iPhone subscriber")
+            return
+        }
+        val trackInfo = JSONObject()
+            .put("type", "trackInfo")
+            .put(
+                "title",
+                source.optString("title").take(MAX_TRACK_INFO_TEXT_LENGTH)
+            )
+            .put(
+                "artist",
+                source.optString("artist").take(MAX_TRACK_INFO_TEXT_LENGTH)
+            )
+            .put(
+                "album",
+                source.optString("album").take(MAX_TRACK_INFO_TEXT_LENGTH)
+            )
+        val trackInfoBytes = trackInfo.toString().toByteArray(Charsets.UTF_8)
+        val maximumPayload = maximumPayloadFor(device)
+        if (trackInfoBytes.size <= maximumPayload) {
+            notifyQueue.enqueueShort(
+                device = device,
+                type = "trackInfo",
+                value = trackInfoBytes,
+                delayAfterMs = SHORT_MESSAGE_DELAY_MS
+            )
+            return
+        }
+
+        logger("[PlaybackState] payload too large, compact mode used")
+        val packets = buildTrackInfoPackets(
+            trackInfoBytes = trackInfoBytes,
+            maximumPayload = maximumPayload
+        )
+        if (packets == null) {
+            logger("[TrackInfo] build failed: MTU too small")
+            return
+        }
+        notifyQueue.enqueueLongJob(
+            type = TRACK_INFO_JOB_TYPE,
+            device = device,
+            packets = packets
+        )
+    }
+
+    private fun buildTrackInfoPackets(
+        trackInfoBytes: ByteArray,
+        maximumPayload: Int
+    ): List<BleNotifyQueue.Packet>? {
+        for (rawChunkSize in MAX_TRACK_INFO_CHUNK_BYTES downTo 1) {
+            val chunkCount =
+                (trackInfoBytes.size + rawChunkSize - 1) / rawChunkSize
+            val start = JSONObject()
+                .put("type", "trackInfoStart")
+                .put("size", trackInfoBytes.size)
+                .put("chunks", chunkCount)
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            val end = JSONObject()
+                .put("type", "trackInfoEnd")
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            if (start.size > maximumPayload || end.size > maximumPayload) {
+                continue
+            }
+
+            val packets = mutableListOf(
+                BleNotifyQueue.Packet(
+                    type = "trackInfoStart",
+                    value = start,
+                    delayAfterMs = SHORT_MESSAGE_DELAY_MS
+                )
+            )
+            var allChunksFit = true
+            for (index in 0 until chunkCount) {
+                val from = index * rawChunkSize
+                val to = minOf(from + rawChunkSize, trackInfoBytes.size)
+                val chunk = JSONObject()
+                    .put("type", "trackInfoChunk")
+                    .put("index", index)
+                    .put(
+                        "data",
+                        Base64.encodeToString(
+                            trackInfoBytes.copyOfRange(from, to),
+                            Base64.NO_WRAP
+                        )
+                    )
+                    .toString()
+                    .toByteArray(Charsets.UTF_8)
+                if (chunk.size > maximumPayload) {
+                    allChunksFit = false
+                    break
+                }
+                packets += BleNotifyQueue.Packet(
+                    type = "trackInfoChunk",
+                    value = chunk,
+                    delayAfterMs = SHORT_MESSAGE_DELAY_MS
+                )
+            }
+            if (!allChunksFit) {
+                continue
+            }
+            packets += BleNotifyQueue.Packet(
+                type = "trackInfoEnd",
+                value = end,
+                delayAfterMs = SHORT_MESSAGE_DELAY_MS
+            )
+            return packets
+        }
+        return null
     }
 
     @Synchronized
     private fun sendAlbumArtIfSongChanged(playbackState: JSONObject) {
         val cacheKey = buildAlbumArtCacheKey(playbackState)
         val protocolId = buildAlbumArtProtocolId(playbackState)
-        if (protocolId == sendingAlbumArtId) {
-            logger("[AlbumArt][BLE] skip duplicate sending id=$protocolId")
-            return
-        }
         if (cacheKey == lastAlbumArtKey) {
             return
         }
-        if (protocolId == lastSentAlbumArtId) {
-            logger("[AlbumArt][BLE] skip already sent id=$protocolId")
-            lastAlbumArtKey = cacheKey
-            return
-        }
-
-        if (notifyQueue.hasJobTypeActiveOrQueued(ALBUM_ART_JOB_TYPE)) {
-            logger("[AlbumArt][BLE] transfer already queued")
-            return
-        }
-
         val device = subscribedDevices.values.firstOrNull() ?: run {
             logger("[AlbumArt][BLE] no iPhone subscriber")
             return
         }
-        sendingAlbumArtId = protocolId
+        currentAlbumArtId = protocolId
+        albumArtRequestsInFlight.removeIf {
+            !it.startsWith("$protocolId|")
+        }
+
+        val offer = JSONObject()
+            .put("type", "albumArtOffer")
+            .put("id", protocolId)
+            .toString()
+            .toByteArray(Charsets.UTF_8)
+        if (offer.size > maximumPayloadFor(device)) {
+            logger("[AlbumArt] offer failed id=$protocolId reason=MTU")
+            return
+        }
+        lastAlbumArtKey = cacheKey
+        logger("[AlbumArt] offer id=$protocolId")
+        notifyQueue.enqueueShort(
+            device = device,
+            type = "albumArtOffer",
+            value = offer,
+            delayAfterMs = SHORT_MESSAGE_DELAY_MS
+        )
+    }
+
+    @Synchronized
+    private fun handleAlbumArtSkip(request: JSONObject) {
+        val protocolId = request.optString("id")
+        if (protocolId.isBlank() || protocolId != currentAlbumArtId) {
+            logger("[AlbumArt] skip ignored stale id=$protocolId")
+            return
+        }
+        logger("[AlbumArt] cache confirmed id=$protocolId")
+    }
+
+    @Synchronized
+    private fun handleAlbumArtRequest(request: JSONObject) {
+        val protocolId = request.optString("id")
+        val quality = AlbumArtQuality.fromWireValue(
+            request.optString("quality")
+        )
+        if (protocolId.isBlank() || protocolId != currentAlbumArtId) {
+            logger("[AlbumArt] request ignored stale id=$protocolId")
+            return
+        }
+        if (quality == null) {
+            logger("[AlbumArt] request ignored invalid quality")
+            return
+        }
+
+        val requestKey = "$protocolId|${quality.wireValue}"
+        if (!albumArtRequestsInFlight.add(requestKey)) {
+            logger("[AlbumArt] skip duplicate sending")
+            return
+        }
+        logger(
+            "[AlbumArt] request id=$protocolId quality=${quality.wireValue}"
+        )
+
+        val device = subscribedDevices.values.firstOrNull()
+        if (device == null) {
+            albumArtRequestsInFlight.remove(requestKey)
+            logger("[AlbumArt] request failed: no iPhone subscriber")
+            return
+        }
         val albumArt = albumArtTestManager.readCurrentNotificationAlbumArt()
         if (albumArt == null) {
-            sendingAlbumArtId = null
-            sendAlbumArtUnavailable(device, protocolId)
-            lastAlbumArtKey = cacheKey
+            albumArtRequestsInFlight.remove(requestKey)
+            sendAlbumArtUnavailable(device, protocolId, quality)
             return
         }
 
@@ -578,15 +772,15 @@ class BleGattServerManager(
         val preparation = prepareAlbumArt(
             bitmap = bitmap,
             deviceMaximumPayload = maximumPayload,
-            protocolId = protocolId
+            protocolId = protocolId,
+            quality = quality
         )
         val preparedAlbumArt = preparation.prepared
         if (preparedAlbumArt == null) {
-            sendingAlbumArtId = null
+            albumArtRequestsInFlight.remove(requestKey)
             if (preparation.compressionFailed) {
                 logger("[AlbumArt][BLE] unavailable")
-                sendAlbumArtUnavailable(device, protocolId)
-                lastAlbumArtKey = cacheKey
+                sendAlbumArtUnavailable(device, protocolId, quality)
             }
             return
         }
@@ -595,65 +789,49 @@ class BleGattServerManager(
         val albumPackets = preparedAlbumArt.packets
         val totalChunks = albumPackets.totalChunks
         logger(
-            "[AlbumArt][BLE] selected scale=${compressedAlbumArt.width} " +
+            "[AlbumArt][BLE] selected quality=${quality.wireValue} " +
+                "scale=${compressedAlbumArt.width} " +
                 "quality=${compressedAlbumArt.quality} " +
                 "bytes=${compressedAlbumArt.bytes.size} chunks=$totalChunks"
         )
 
-        lastAlbumArtKey = cacheKey
         logger(
-            "[AlbumArt][BLE] send start id=$protocolId chunks=$totalChunks"
+            "[AlbumArt] send start id=$protocolId " +
+                "quality=${quality.wireValue} chunks=$totalChunks"
         )
         notifyQueue.enqueueLongJob(
             type = ALBUM_ART_JOB_TYPE,
             device = device,
             packets = albumPackets.packets,
             onComplete = {
-                markAlbumArtSent(
-                    protocolId = protocolId,
-                    cacheKey = cacheKey
-                )
+                albumArtRequestsInFlight.remove(requestKey)
             },
             onFailure = {
-                clearSendingAlbumArt(protocolId)
+                albumArtRequestsInFlight.remove(requestKey)
             }
         )
-    }
-
-    @Synchronized
-    private fun markAlbumArtSent(
-        protocolId: String,
-        cacheKey: String
-    ) {
-        if (sendingAlbumArtId == protocolId) {
-            lastSentAlbumArtId = protocolId
-            lastAlbumArtKey = cacheKey
-            sendingAlbumArtId = null
-        }
-    }
-
-    @Synchronized
-    private fun clearSendingAlbumArt(protocolId: String) {
-        if (sendingAlbumArtId == protocolId) {
-            sendingAlbumArtId = null
-        }
     }
 
     private fun prepareAlbumArt(
         bitmap: Bitmap,
         deviceMaximumPayload: Int,
-        protocolId: String
+        protocolId: String,
+        quality: AlbumArtQuality
     ): AlbumArtPreparation {
-        val attempts = listOf(
-            CompressionAttempt(width = 160, height = 160, quality = 55),
-            CompressionAttempt(width = 144, height = 144, quality = 50),
-            CompressionAttempt(width = 128, height = 128, quality = 45),
-            CompressionAttempt(width = 96, height = 96, quality = 35)
-        )
+        val attempts = when (quality) {
+            AlbumArtQuality.PREVIEW -> listOf(
+                CompressionAttempt(96, 96, 35, PREVIEW_MAX_JPEG_BYTES),
+                CompressionAttempt(80, 80, 30, PREVIEW_MAX_JPEG_BYTES),
+                CompressionAttempt(64, 64, 25, PREVIEW_MAX_JPEG_BYTES)
+            )
+            AlbumArtQuality.FULL -> listOf(
+                CompressionAttempt(220, 220, 70, FULL_PRIMARY_MAX_JPEG_BYTES),
+                CompressionAttempt(180, 180, 60, FULL_FALLBACK_MAX_JPEG_BYTES),
+                CompressionAttempt(160, 160, 55, Int.MAX_VALUE)
+            )
+        }
 
-        var index = 0
-        while (index < attempts.size) {
-            val attempt = attempts[index]
+        attempts.forEachIndexed { index, attempt ->
             if (index > 0) {
                 logger(
                     "[AlbumArt][BLE] fallback scale=${attempt.width} " +
@@ -666,6 +844,7 @@ class BleGattServerManager(
             val packets = buildAlbumArtPackets(
                 deviceMaximumPayload = deviceMaximumPayload,
                 protocolId = protocolId,
+                quality = quality,
                 bytes = compressed.bytes
             )
             if (packets == null) {
@@ -676,11 +855,7 @@ class BleGattServerManager(
                 return AlbumArtPreparation()
             }
 
-            val withinByteLimit =
-                compressed.bytes.size <= MAX_ALBUM_JPEG_BYTES
-            val withinChunkLimit =
-                packets.totalChunks <= MAX_ALBUM_CHUNKS
-            if (withinByteLimit && withinChunkLimit) {
+            if (compressed.bytes.size <= attempt.maximumBytes) {
                 return AlbumArtPreparation(
                     prepared = PreparedAlbumArt(
                         compressed = compressed,
@@ -692,20 +867,9 @@ class BleGattServerManager(
             logger(
                 "[AlbumArt][BLE] candidate scale=${attempt.width} " +
                     "quality=${attempt.quality} bytes=${compressed.bytes.size} " +
-                    "chunks=${packets.totalChunks} exceeds limit"
+                    "chunks=${packets.totalChunks} exceeds " +
+                    "${attempt.maximumBytes} bytes"
             )
-            if (index == attempts.lastIndex) {
-                logger(
-                    "[AlbumArt][BLE] build failed: no quality profile fits " +
-                        "$MAX_ALBUM_JPEG_BYTES bytes/$MAX_ALBUM_CHUNKS chunks"
-                )
-            }
-
-            index = if (index == 0 && !withinChunkLimit) {
-                2
-            } else {
-                index + 1
-            }
         }
         return AlbumArtPreparation()
     }
@@ -748,6 +912,7 @@ class BleGattServerManager(
     private fun buildAlbumArtPackets(
         deviceMaximumPayload: Int,
         protocolId: String,
+        quality: AlbumArtQuality,
         bytes: ByteArray
     ): AlbumArtPackets? {
         val payloadLimit = minOf(
@@ -765,6 +930,7 @@ class BleGattServerManager(
             val start = JSONObject()
                 .put("type", "albumArtStart")
                 .put("id", protocolId)
+                .put("quality", quality.wireValue)
                 .put("size", bytes.size)
                 .put("chunks", totalChunks)
                 .toString()
@@ -782,6 +948,7 @@ class BleGattServerManager(
                 val chunk = JSONObject()
                     .put("type", "albumArtChunk")
                     .put("id", protocolId)
+                    .put("quality", quality.wireValue)
                     .put("index", index)
                     .put(
                         "data",
@@ -802,6 +969,7 @@ class BleGattServerManager(
             val end = JSONObject()
                 .put("type", "albumArtEnd")
                 .put("id", protocolId)
+                .put("quality", quality.wireValue)
                 .toString()
                 .toByteArray(Charsets.UTF_8)
             if (end.size > payloadLimit) {
@@ -829,11 +997,13 @@ class BleGattServerManager(
 
     private fun sendAlbumArtUnavailable(
         device: BluetoothDevice,
-        protocolId: String
+        protocolId: String,
+        quality: AlbumArtQuality
     ) {
         val value = JSONObject()
             .put("type", "albumArtUnavailable")
             .put("id", protocolId)
+            .put("quality", quality.wireValue)
             .toString()
             .toByteArray(Charsets.UTF_8)
         if (value.size > maximumPayloadFor(device)) {
@@ -858,16 +1028,15 @@ class BleGattServerManager(
     }
 
     private fun buildAlbumArtProtocolId(playbackState: JSONObject): String {
-        val parts = listOf(
+        val source = listOf(
             playbackState.optString("title"),
             playbackState.optString("artist"),
             playbackState.optString("album")
-        ).map {
-            it.replace(Regex("[\\r\\n|]"), " ")
-                .trim()
-                .take(MAX_ALBUM_ID_PART_LENGTH)
-        }
-        return parts.joinToString("_").ifBlank { "unknown" }
+        ).joinToString("|").ifBlank { "unknown" }
+        return MessageDigest.getInstance("SHA-256")
+            .digest(source.toByteArray(Charsets.UTF_8))
+            .take(ALBUM_ART_ID_HASH_BYTES)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 
     private fun maximumPayloadFor(device: BluetoothDevice): Int {
@@ -969,6 +1138,161 @@ class BleGattServerManager(
         )
     }
 
+    private fun sendMediaFieldDump() {
+        logger("[MediaFieldDump] requested")
+        if (subscribedDevices.isEmpty()) {
+            logger("[MediaFieldDump] send failed: no iPhone subscriber")
+            return
+        }
+        if (notifyQueue.hasJobTypeActiveOrQueued(MEDIA_FIELD_DUMP_JOB_TYPE) ||
+            !mediaFieldDumpPreparing.compareAndSet(false, true)
+        ) {
+            logger("[MediaFieldDump] request already active")
+            return
+        }
+
+        mediaFieldDumpExecutor.execute {
+            try {
+                val dump = mediaFieldDumpManager.dumpAllFields()
+                val bytes = dump.toByteArray(Charsets.UTF_8)
+                logger("[MediaFieldDump] built bytes=${bytes.size}")
+                enqueueMediaFieldDump(bytes)
+            } catch (throwable: Throwable) {
+                logger(
+                    "[MediaFieldDump] build failed: " +
+                        "${throwable.javaClass.simpleName}: ${throwable.message}"
+                )
+                sendMediaFieldDumpError(
+                    "${throwable.javaClass.simpleName}: ${throwable.message}"
+                )
+            } finally {
+                mediaFieldDumpPreparing.set(false)
+            }
+        }
+    }
+
+    private fun enqueueMediaFieldDump(bytes: ByteArray) {
+        val device = subscribedDevices.values.firstOrNull() ?: run {
+            logger("[MediaFieldDump] send failed: no iPhone subscriber")
+            return
+        }
+        val maximumPayload = maximumPayloadFor(device)
+        val rawChunkSize = chooseMediaFieldDumpChunkSize(maximumPayload)
+        if (rawChunkSize <= 0) {
+            sendMediaFieldDumpError("MTU too small")
+            return
+        }
+
+        val totalChunks =
+            (bytes.size + rawChunkSize - 1) / rawChunkSize
+        val packets = mutableListOf<BleNotifyQueue.Packet>()
+        val start = JSONObject()
+            .put("type", "mediaFieldDumpStart")
+            .put("size", bytes.size)
+            .put("chunks", totalChunks)
+            .toString()
+            .toByteArray(Charsets.UTF_8)
+        if (start.size > maximumPayload) {
+            sendMediaFieldDumpError("start packet exceeds MTU")
+            return
+        }
+        packets += BleNotifyQueue.Packet(
+            type = "mediaFieldDumpStart",
+            value = start,
+            delayAfterMs = MEDIA_FIELD_DUMP_DELAY_MS
+        )
+
+        for (index in 0 until totalChunks) {
+            val from = index * rawChunkSize
+            val to = minOf(from + rawChunkSize, bytes.size)
+            val chunk = JSONObject()
+                .put("type", "mediaFieldDumpChunk")
+                .put("index", index)
+                .put(
+                    "data",
+                    Base64.encodeToString(
+                        bytes.copyOfRange(from, to),
+                        Base64.NO_WRAP
+                    )
+                )
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            if (chunk.size > maximumPayload) {
+                sendMediaFieldDumpError("chunk $index exceeds MTU")
+                return
+            }
+            packets += BleNotifyQueue.Packet(
+                type = "mediaFieldDumpChunk",
+                value = chunk,
+                delayAfterMs = MEDIA_FIELD_DUMP_DELAY_MS
+            )
+        }
+
+        val end = JSONObject()
+            .put("type", "mediaFieldDumpEnd")
+            .toString()
+            .toByteArray(Charsets.UTF_8)
+        if (end.size > maximumPayload) {
+            sendMediaFieldDumpError("end packet exceeds MTU")
+            return
+        }
+        packets += BleNotifyQueue.Packet(
+            type = "mediaFieldDumpEnd",
+            value = end,
+            delayAfterMs = MEDIA_FIELD_DUMP_DELAY_MS
+        )
+
+        logger("[MediaFieldDump] chunks=$totalChunks")
+        logger("[MediaFieldDump] send start")
+        notifyQueue.enqueueLongJob(
+            type = MEDIA_FIELD_DUMP_JOB_TYPE,
+            device = device,
+            packets = packets
+        )
+    }
+
+    private fun chooseMediaFieldDumpChunkSize(maximumPayload: Int): Int {
+        for (candidate in MAX_MEDIA_FIELD_DUMP_CHUNK_BYTES downTo 1) {
+            val sample = JSONObject()
+                .put("type", "mediaFieldDumpChunk")
+                .put("index", 9999)
+                .put(
+                    "data",
+                    Base64.encodeToString(
+                        ByteArray(candidate),
+                        Base64.NO_WRAP
+                    )
+                )
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            if (sample.size <= maximumPayload) {
+                return candidate
+            }
+        }
+        return 0
+    }
+
+    private fun sendMediaFieldDumpError(message: String) {
+        val device = subscribedDevices.values.firstOrNull() ?: return
+        val maximumPayload = maximumPayloadFor(device)
+        val safeMessage = message.take(MAX_MEDIA_FIELD_DUMP_ERROR_CHARS)
+        val value = JSONObject()
+            .put("type", "mediaFieldDumpError")
+            .put("message", safeMessage)
+            .toString()
+            .toByteArray(Charsets.UTF_8)
+        if (value.size > maximumPayload) {
+            logger("[MediaFieldDump] error packet exceeds MTU")
+            return
+        }
+        notifyQueue.enqueueShort(
+            device = device,
+            type = "mediaFieldDumpError",
+            value = value,
+            delayAfterMs = SHORT_MESSAGE_DELAY_MS
+        )
+    }
+
     private fun chooseLogChunkSize(maximumPayload: Int): Int {
         for (candidate in MAX_LOG_CHUNK_RAW_BYTES downTo 1) {
             val sample = JSONObject()
@@ -1023,12 +1347,14 @@ class BleGattServerManager(
         private const val DEFAULT_MTU = 23
         private const val ATT_HEADER_SIZE = 3
         private const val AUTO_PUSH_INTERVAL_MS = 1000L
-        private const val MAX_STATE_TEXT_LENGTH = 30
-        private const val MAX_ALBUM_JPEG_BYTES = 6000
-        private const val MAX_ALBUM_CHUNKS = 120
-        private const val MAX_ALBUM_CHUNK_RAW_BYTES = 48
+        private const val MAX_TRACK_INFO_TEXT_LENGTH = 300
+        private const val MAX_TRACK_INFO_CHUNK_BYTES = 300
+        private const val MAX_ALBUM_CHUNK_RAW_BYTES = 60
         private const val MAX_ALBUM_JSON_BYTES = 180
-        private const val MAX_ALBUM_ID_PART_LENGTH = 3
+        private const val ALBUM_ART_ID_HASH_BYTES = 12
+        private const val PREVIEW_MAX_JPEG_BYTES = 2500
+        private const val FULL_PRIMARY_MAX_JPEG_BYTES = 12000
+        private const val FULL_FALLBACK_MAX_JPEG_BYTES = 9000
         private const val SHORT_MESSAGE_DELAY_MS = 20L
         private const val ALBUM_ART_NOTIFICATION_DELAY_MS = 35L
         private const val LOG_NOTIFICATION_DELAY_MS = 20L
@@ -1036,16 +1362,36 @@ class BleGattServerManager(
         private const val MAX_LOG_JSON_BYTES = 480
         private const val DEFAULT_LOG_LIMIT = 30
         private const val MAX_LOG_LIMIT = 50
+        private const val MAX_MEDIA_FIELD_DUMP_CHUNK_BYTES = 300
+        private const val MAX_MEDIA_FIELD_DUMP_ERROR_CHARS = 80
+        private const val MEDIA_FIELD_DUMP_DELAY_MS = 25L
         private const val ALBUM_ART_JOB_TYPE = "albumArt"
+        private const val TRACK_INFO_JOB_TYPE = "trackInfo"
+        private const val MAX_LYRIC_TEXT_LENGTH = 30
         private const val REMOTE_LOG_JOB_TYPE = "remoteLog"
+        private const val MEDIA_FIELD_DUMP_JOB_TYPE = "mediaFieldDump"
         private const val CALLBACK_LOG_DEDUP_WINDOW_MS = 500L
     }
 
     private data class CompressionAttempt(
         val width: Int,
         val height: Int,
-        val quality: Int
+        val quality: Int,
+        val maximumBytes: Int
     )
+
+    private enum class AlbumArtQuality(val wireValue: String) {
+        PREVIEW("preview"),
+        FULL("full");
+
+        companion object {
+            fun fromWireValue(value: String): AlbumArtQuality? {
+                return entries.firstOrNull {
+                    it.wireValue.equals(value, ignoreCase = true)
+                }
+            }
+        }
+    }
 
     private data class CompressedAlbumArt(
         val bytes: ByteArray,
