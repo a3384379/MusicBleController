@@ -1,5 +1,6 @@
 package com.example.playeragent.logging
 
+import android.util.Log
 import java.text.SimpleDateFormat
 import java.util.ArrayDeque
 import java.util.Date
@@ -20,6 +21,7 @@ object LogBuffer {
             .replace('\r', ' ')
             .replace('\n', ' ')
             .let(::truncateMessage)
+        Log.i(TAG, singleLineMessage)
         entries.addLast(
             "[${timestampFormat.format(Date())}] $singleLineMessage"
         )
@@ -57,4 +59,5 @@ object LogBuffer {
     private const val MAX_REQUEST_LIMIT = 100
     private const val MAX_MESSAGE_LENGTH = 300
     private const val TRUNCATED_SUFFIX = "...<truncated>"
+    private const val TAG = "PlayerAgentLogBuffer"
 }

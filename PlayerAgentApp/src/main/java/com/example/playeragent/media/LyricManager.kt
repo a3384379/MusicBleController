@@ -6,6 +6,7 @@ import com.example.playeragent.logging.LogConfig
 import java.io.File
 import java.nio.charset.Charset
 import java.util.Locale
+import java.util.concurrent.Executors
 
 class LyricManager(
     context: Context,
@@ -14,8 +15,15 @@ class LyricManager(
 
     private val appContext = context.applicationContext
     private var cachedKey: String? = null
+    private var activeSongKey: String? = null
+    private var loadedSongKey: String? = null
+    private var loadingSongKey: String? = null
+    private var pendingRequest: LyricLoadRequest? = null
     private var cachedLines: List<LyricLine> = emptyList()
     private var lastLoggedLine: String? = null
+    private val lyricExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "QrcLyricLoaderThread")
+    }
     private val qrcLyricManager = QrcLyricManager(
         context = appContext,
         logger = logger
@@ -79,24 +87,113 @@ class LyricManager(
         }
     }
 
-    fun loadLyric(title: String, artist: String, album: String = "") {
+    @Synchronized
+    fun requestLyricLoadAsync(title: String, artist: String, album: String = "") {
         val key = lyricKey(title, artist, album)
-        if (key == cachedKey) {
-            if (cachedLines.isEmpty()) {
-                if (applyScannedCacheIfAvailable(title, artist)) {
-                    cachedKey = key
-                }
-            }
+        if (key == activeSongKey && key == loadedSongKey) {
             return
         }
 
-        cachedKey = key
-        cachedLines = emptyList()
+        if (key != activeSongKey) {
+            activeSongKey = key
+            cachedKey = key
+            cachedLines = emptyList()
+            loadedSongKey = null
+            lastLoggedLine = null
+            qrcLyricManager.clearCacheIfSongChanged(title, artist, album)
+        }
+
+        if (title.isBlank() && artist.isBlank()) {
+            loadedSongKey = key
+            return
+        }
+        if (key == loadingSongKey) {
+            return
+        }
+
+        pendingRequest = LyricLoadRequest(
+            key = key,
+            title = title,
+            artist = artist,
+            album = album
+        )
+        startNextLyricLoadLocked()
+    }
+
+    fun loadLyric(title: String, artist: String, album: String = "") {
+        val request = LyricLoadRequest(
+            key = lyricKey(title, artist, album),
+            title = title,
+            artist = artist,
+            album = album
+        )
+        val result = loadLyricBlocking(request)
+        synchronized(this) {
+            applyLoadedLyricLocked(request, result)
+        }
+    }
+
+    private fun startNextLyricLoadLocked() {
+        if (loadingSongKey != null) {
+            return
+        }
+        val request = pendingRequest ?: return
+        pendingRequest = null
+        loadingSongKey = request.key
+        logger(
+            "[LyricAsync] task start title=${request.title} " +
+                "artist=${request.artist}"
+        )
+        lyricExecutor.execute {
+            val startedAt = System.currentTimeMillis()
+            val result = loadLyricBlocking(request)
+            synchronized(this) {
+                val costMs = System.currentTimeMillis() - startedAt
+                if (activeSongKey == request.key) {
+                    applyLoadedLyricLocked(request, result)
+                    if (result.lineCount > 0) {
+                        logger("[LyricAsync] task success count=${result.lineCount}")
+                    } else {
+                        logger("[LyricAsync] task failed")
+                    }
+                    logger(
+                        "[Lyric] async load done title=${request.title} " +
+                            "source=${result.source} lines=${result.lineCount} costMs=$costMs"
+                    )
+                } else {
+                    logger("[Lyric] async load discarded title=${request.title}")
+                }
+                loadingSongKey = null
+                startNextLyricLoadLocked()
+            }
+        }
+    }
+
+    private fun applyLoadedLyricLocked(
+        request: LyricLoadRequest,
+        result: LyricLoadResult
+    ) {
+        cachedKey = request.key
+        if (result.lines.isNotEmpty()) {
+            cachedLines = result.lines
+        } else if (result.source != LyricSource.QRC) {
+            cachedLines = emptyList()
+        }
+        loadedSongKey = request.key
         lastLoggedLine = null
+    }
+
+    private fun loadLyricBlocking(request: LyricLoadRequest): LyricLoadResult {
+        val title = request.title
+        val artist = request.artist
+        val album = request.album
 
         if (applyScannedCacheIfAvailable(title, artist)) {
-            cachedKey = key
-            return
+            return LyricLoadResult(
+                lines = cachedLines,
+                lineCount = cachedLines.size,
+                source = LyricSource.LRC
+            )
         }
 
         logger("[Lyric] load title=$title artist=$artist")
@@ -110,20 +207,39 @@ class LyricManager(
         val matchedFile = findMatchedFile(directory, title, artist)
         if (matchedFile == null) {
             logger("[Lyric] no lyric file matched")
-            qrcLyricManager.load(title, artist, album)
-            return
+            val qrcLoaded = qrcLyricManager.load(title, artist, album)
+            val qrcLineCount = qrcLyricManager.cachedLineCount()
+            return LyricLoadResult(
+                lines = emptyList(),
+                lineCount = qrcLineCount,
+                source = if (qrcLoaded) LyricSource.QRC else LyricSource.NONE
+            )
         }
 
         logger("[Lyric] matched file=${matchedFile.absolutePath}")
-        cachedLines = parseLrc(matchedFile)
-        logger("[Lyric] parsed lines count=${cachedLines.size}")
+        val parsedLines = parseLrc(matchedFile)
+        logger("[Lyric] parsed lines count=${parsedLines.size}")
+        return LyricLoadResult(
+            lines = parsedLines,
+            lineCount = parsedLines.size,
+            source = LyricSource.LRC
+        )
     }
 
+    @Synchronized
     fun getCurrentLine(positionMs: Long): String {
+        if (activeSongKey != loadedSongKey) {
+            return ""
+        }
         val safePosition = positionMs.coerceAtLeast(0L)
         val lines = cachedLines
         if (lines.isEmpty()) {
-            return qrcLyricManager.getCurrentLine(safePosition)
+            val qrcLine = qrcLyricManager.getCurrentLine(safePosition)
+            if (qrcLine.isNotBlank() && qrcLine != lastLoggedLine) {
+                logger("[LyricAsync] current lyric updated")
+                lastLoggedLine = qrcLine
+            }
+            return qrcLine
         }
 
         var currentLine = ""
@@ -138,6 +254,9 @@ class LyricManager(
         if (currentLine != lastLoggedLine) {
             if (LogConfig.DEBUG_VERBOSE_LOG) {
                 logger("[Lyric] current line=$currentLine")
+            }
+            if (currentLine.isNotBlank()) {
+                logger("[LyricAsync] current lyric updated")
             }
             lastLoggedLine = currentLine
         }
@@ -477,6 +596,25 @@ class LyricManager(
         val file: File,
         val lines: List<LyricLine>
     )
+
+    private data class LyricLoadRequest(
+        val key: String,
+        val title: String,
+        val artist: String,
+        val album: String
+    )
+
+    private data class LyricLoadResult(
+        val lines: List<LyricLine>,
+        val lineCount: Int,
+        val source: LyricSource
+    )
+
+    private enum class LyricSource {
+        NONE,
+        LRC,
+        QRC
+    }
 
     private data class DecodeAttempt(
         val name: String,

@@ -2,6 +2,7 @@ package com.example.playeragent.media
 
 import android.content.Context
 import android.os.Environment
+import com.example.playeragent.logging.LogConfig
 import io.github.proify.qrckit.decrypt.QrcDecrypter
 import java.io.File
 import java.util.Locale
@@ -12,52 +13,127 @@ class QrcLyricManager(
 ) {
 
     private val appContext = context.applicationContext
-    private var cachedGroups: List<QrcGroup> = emptyList()
-    private var groupsCachedAt = 0L
+    private val cacheManager = QrcLyricCacheManager(
+        context = appContext,
+        logger = logger
+    )
+    private var indexEntries: List<QrcGroupIndexEntry> = emptyList()
+    private var indexBuiltAt = 0L
+    private var indexDirectoryModifiedAt = 0L
+    private var indexFileCount = 0
     private var cachedSongKey: String? = null
     private var cachedGroupId: String? = null
     private var cachedLines: List<LyricLine> = emptyList()
     private var lastLoggedLine: String? = null
+    private val songGroupCache = mutableMapOf<String, String>()
+    private val songLinesCache = mutableMapOf<String, List<LyricLine>>()
+    private val parsedQrcCache = mutableMapOf<String, ParsedQrc?>()
 
     @Synchronized
-    fun load(title: String, artist: String, album: String) {
-        val songKey = buildSongKey(title, artist, album)
-        if (songKey == cachedSongKey) {
-            return
+    fun load(title: String, artist: String, album: String): Boolean {
+        val normalizedTitle = normalizeForMatch(title)
+        val normalizedArtist = normalizeForMatch(artist)
+        val normalizedAlbum = normalizeForMatch(album)
+        val songKey = buildSongKey(
+            normalizedTitle,
+            normalizedArtist,
+            normalizedAlbum
+        )
+        if (songKey == cachedSongKey && cachedLines.isNotEmpty()) {
+            return true
         }
 
-        clearCacheIfSongChanged(title, artist, album)
-        if (title.isBlank() && artist.isBlank()) {
-            return
+        if (songKey != cachedSongKey) {
+            clearCacheIfSongChanged(title, artist, album)
+        }
+        if (normalizedTitle.isBlank() && normalizedArtist.isBlank()) {
+            return false
         }
 
+        val startedAt = System.currentTimeMillis()
         logger("[QrcLyric] load title=$title artist=$artist album=$album")
-        val groups = scanQrcGroups()
-        logger("[QrcLyric] scan groups count=${groups.size}")
-        if (groups.isEmpty()) {
-            logger("[QrcLyric] best group=none score=0")
-            return
+        logger("[QrcLyric] findBestGroup start title=$title")
+
+        cacheManager.get(title, artist, album)?.let { cached ->
+            cachedLines = cached.lines.map {
+                LyricLine(timeMs = it.timeMs, text = it.text)
+            }
+            cachedGroupId = cached.groupId
+            logger(
+                "[QrcLyric] parsed lines=${cachedLines.size} " +
+                    "totalCostMs=${System.currentTimeMillis() - startedAt}"
+            )
+            return cachedLines.isNotEmpty()
         }
 
-        val best = findBestGroup(groups, title, artist, album)
+        songLinesCache[songKey]?.let { lines ->
+            cachedLines = lines
+            cachedGroupId = songGroupCache[songKey]
+            logger("[QrcLyric] cache hit songKey=$songKey")
+            logger(
+                "[QrcLyric] parsed lines=${lines.size} " +
+                    "totalCostMs=${System.currentTimeMillis() - startedAt}"
+            )
+            return lines.isNotEmpty()
+        }
+
+        val entries = getIndexEntries(forceRefresh = false)
+        logger("[QrcLyric] scan groups count=${entries.size}")
+        if (entries.isEmpty()) {
+            logger("[QrcLyric] best group=none score=0")
+            return false
+        }
+
+        songGroupCache[songKey]?.let { groupId ->
+            entries.firstOrNull { it.groupId == groupId }?.let { entry ->
+                val parsed = decryptAndParseQrc(entry)
+                if (parsed != null &&
+                    parsedMatchesTitle(parsed, normalizedTitle)
+                ) {
+                    applyParsedResult(songKey, entry, parsed)
+                    logger("[QrcLyric] cache hit songKey=$songKey")
+                    logger(
+                        "[QrcLyric] parsed lines=${cachedLines.size} " +
+                            "totalCostMs=${System.currentTimeMillis() - startedAt}"
+                    )
+                    return cachedLines.isNotEmpty()
+                }
+            }
+        }
+
+        val best = findBestGroup(
+            entries = entries,
+            normalizedTitle = normalizedTitle,
+            normalizedArtist = normalizedArtist,
+            normalizedAlbum = normalizedAlbum
+        )
         if (best == null || best.score < MIN_MATCH_SCORE) {
             logger(
-                "[QrcLyric] best group=${best?.group?.groupId ?: "none"} " +
+                "[QrcLyric] best group=${best?.entry?.groupId ?: "none"} " +
                     "score=${best?.score ?: 0}"
             )
-            return
+            return false
         }
 
-        cachedGroupId = best.group.groupId
-        cachedLines = best.parsed?.lines
-            ?: decryptAndParseQrc(best.group)?.lines.orEmpty()
+        val parsed = best.parsed ?: decryptAndParseQrc(best.entry)
+        if (parsed == null || !parsedMatchesTitle(parsed, normalizedTitle)) {
+            logger("[QrcLyric] best group=none score=0")
+            return false
+        }
+
+        applyParsedResult(songKey, best.entry, parsed)
         logger(
-            "[QrcLyric] best group=${best.group.groupId} score=${best.score}"
+            "[QrcLyric] best group=${best.entry.groupId} score=${best.score}"
         )
         logger("[QrcLyric] decrypted lines=${cachedLines.size}")
         cachedLines.firstOrNull()?.let {
             logger("[QrcLyric] first line=${it.text}")
         }
+        logger(
+            "[QrcLyric] parsed lines=${cachedLines.size} " +
+                "totalCostMs=${System.currentTimeMillis() - startedAt}"
+        )
+        return cachedLines.isNotEmpty()
     }
 
     @Synchronized
@@ -91,12 +167,21 @@ class QrcLyricManager(
     }
 
     @Synchronized
+    fun cachedLineCount(): Int {
+        return cachedLines.size
+    }
+
+    @Synchronized
     fun clearCacheIfSongChanged(
         title: String,
         artist: String,
         album: String
     ) {
-        val songKey = buildSongKey(title, artist, album)
+        val songKey = buildSongKey(
+            normalizeForMatch(title),
+            normalizeForMatch(artist),
+            normalizeForMatch(album)
+        )
         if (songKey == cachedSongKey) {
             return
         }
@@ -107,24 +192,51 @@ class QrcLyricManager(
     }
 
     @Synchronized
-    fun scanQrcGroups(): List<QrcGroup> {
-        val now = System.currentTimeMillis()
-        if (cachedGroups.isNotEmpty() &&
-            now - groupsCachedAt < GROUP_CACHE_DURATION_MS
-        ) {
-            return cachedGroups
-        }
+    fun scanQrcGroups(forceRefresh: Boolean = false): List<QrcGroup> {
+        return getIndexEntries(forceRefresh).map(QrcGroupIndexEntry::toGroup)
+    }
 
+    private fun getIndexEntries(forceRefresh: Boolean): List<QrcGroupIndexEntry> {
+        val now = System.currentTimeMillis()
         val directory = File(
             Environment.getExternalStorageDirectory(),
             "QQMusic/qrc"
         )
+        val directoryModifiedAt = directory.lastModified()
         val files = try {
             directory.listFiles()?.filter(File::isFile).orEmpty()
         } catch (exception: Exception) {
-            logger("[QrcLyric] scan failed error=${exception.message}")
+            logger("[QrcIndex] build failed error=${exception.message}")
             emptyList()
         }
+        val fileCount = files.size
+
+        if (!forceRefresh &&
+            indexEntries.isNotEmpty() &&
+            now - indexBuiltAt < INDEX_CACHE_DURATION_MS &&
+            directoryModifiedAt == indexDirectoryModifiedAt &&
+            fileCount == indexFileCount
+        ) {
+            logger("[QrcIndex] cache hit groups=${indexEntries.size}")
+            return indexEntries
+        }
+
+        return buildIndex(
+            files = files,
+            directoryModifiedAt = directoryModifiedAt,
+            fileCount = fileCount
+        )
+    }
+
+    private fun buildIndex(
+        files: List<File>,
+        directoryModifiedAt: Long,
+        fileCount: Int
+    ): List<QrcGroupIndexEntry> {
+        val startedAt = System.currentTimeMillis()
+        logger("[QrcIndex] build start")
+        var normalizedTextBytes = 0
+        var producerCacheLimitLogged = false
 
         val builders = linkedMapOf<String, QrcGroupBuilder>()
         files.forEach { file ->
@@ -137,110 +249,248 @@ class QrcLyricManager(
             builder.add(suffix, file)
         }
 
-        cachedGroups = builders.values
+        val entries = builders.values
             .map(QrcGroupBuilder::build)
             .filter { it.qrcFile != null }
-        groupsCachedAt = now
-        return cachedGroups
+            .map { group ->
+                val rawProducerText = if (normalizedTextBytes < MAX_TOTAL_PRODUCER_TEXT_BYTES) {
+                    readProducerText(group.producerFile)
+                } else {
+                    if (!producerCacheLimitLogged) {
+                        producerCacheLimitLogged = true
+                        logger("[QrcIndex] producer text cache limit reached")
+                    }
+                    ""
+                }
+                val normalizedProducerText = normalizeForMatch(rawProducerText)
+                normalizedTextBytes += normalizedProducerText
+                    .toByteArray(Charsets.UTF_8)
+                    .size
+                QrcGroupIndexEntry(
+                    groupId = group.groupId,
+                    qrcFile = group.qrcFile,
+                    producerFile = group.producerFile,
+                    exFile = group.exFile,
+                    translrcFile = group.translrcFile,
+                    romaqrcFile = group.romaqrcFile,
+                    lastModified = group.lastModified,
+                    normalizedProducerText = normalizedProducerText,
+                    producerTextLoaded = rawProducerText.isNotBlank(),
+                    hasQrc = group.qrcFile != null,
+                    hasProducer = group.producerFile != null,
+                    hasTranslrc = group.translrcFile != null,
+                    hasRomaqrc = group.romaqrcFile != null
+                )
+            }
+
+        indexEntries = entries
+        indexBuiltAt = System.currentTimeMillis()
+        indexDirectoryModifiedAt = directoryModifiedAt
+        indexFileCount = fileCount
+        logger(
+            "[QrcIndex] build end groups=${entries.size} " +
+                "costMs=${indexBuiltAt - startedAt}"
+        )
+        return entries
     }
 
     private fun findBestGroup(
-        groups: List<QrcGroup>,
-        title: String,
-        artist: String,
-        album: String
+        entries: List<QrcGroupIndexEntry>,
+        normalizedTitle: String,
+        normalizedArtist: String,
+        normalizedAlbum: String
     ): ScoredGroup? {
+        val startedAt = System.currentTimeMillis()
         val now = System.currentTimeMillis()
-        val normalizedTitle = normalize(title)
-        val normalizedArtist = normalize(artist)
-        val normalizedAlbum = normalize(album)
+        val producerCandidates = entries.mapNotNull { entry ->
+            val producerText = entry.normalizedProducerText
+            if (!containsNormalized(producerText, normalizedTitle)) {
+                return@mapNotNull null
+            }
 
-        val preliminary = groups.map { group ->
-            var score = 0
-            val producerText = readSmallText(group.producerFile)
-            if (containsNormalized(producerText, normalizedTitle)) score += 80
+            var score = 100
             if (containsNormalized(producerText, normalizedArtist)) score += 50
-            if (containsNormalized(producerText, normalizedAlbum)) score += 30
+            if (containsNormalized(producerText, normalizedAlbum)) score += 20
 
-            val age = (now - group.lastModified).coerceAtLeast(0L)
+            val age = (now - entry.lastModified).coerceAtLeast(0L)
             score += when {
-                age <= FIVE_MINUTES_MS -> 40
-                age <= THIRTY_MINUTES_MS -> 20
+                age <= FIVE_MINUTES_MS -> 30
+                age <= THIRTY_MINUTES_MS -> 15
                 else -> 0
             }
-            if (group.qrcFile != null) score += 10
-            if (group.producerFile != null) score += 5
-            ScoredGroup(group = group, score = score)
-        }
+            if (entry.hasQrc) score += 10
+            if (entry.hasTranslrc) score += 5
+            if (entry.hasRomaqrc) score += 5
+            ScoredGroup(entry = entry, score = score)
+        }.sortedWith(
+            compareByDescending<ScoredGroup> { it.score }
+                .thenByDescending { it.entry.lastModified }
+        )
 
-        val decryptCandidates = preliminary
-            .filter {
-                it.score > BASE_FILE_SCORE ||
-                    it.group.groupId == cachedGroupId
-            }
-            .sortedWith(
-                compareByDescending<ScoredGroup> { it.score }
-                    .thenByDescending { it.group.lastModified }
+        val producerCostMs = System.currentTimeMillis() - startedAt
+        logger(
+            "[QrcLyric] producer match candidates=${producerCandidates.size} " +
+                "costMs=$producerCostMs"
+        )
+
+        val confirmStartedAt = System.currentTimeMillis()
+        val producerConfirmCandidates = producerCandidates
+            .take(DECRYPT_CONFIRM_CANDIDATES)
+        var confirmed = confirmCandidates(
+            candidates = producerConfirmCandidates,
+            normalizedTitle = normalizedTitle,
+            normalizedArtist = normalizedArtist
+        )
+        logger(
+            "[QrcLyric] decrypt confirm candidates=${producerConfirmCandidates.size} " +
+                "costMs=${System.currentTimeMillis() - confirmStartedAt}"
+        )
+
+        if (confirmed == null) {
+            val fallbackStartedAt = System.currentTimeMillis()
+            val attemptedGroupIds = producerConfirmCandidates
+                .map { it.entry.groupId }
+                .toSet()
+            val fallbackCandidates = fallbackRecentCandidates(
+                entries = entries,
+                excludedGroupIds = attemptedGroupIds
             )
-            .take(MAX_DECRYPT_CANDIDATES)
-
-        val scored = decryptCandidates.map { candidate ->
-            val parsed = decryptAndParseQrc(candidate.group)
-            var score = candidate.score
-            if (parsed != null) {
-                val decryptedText = normalize(parsed.rawText)
-                if (containsNormalized(decryptedText, normalizedTitle)) {
-                    score += 80
-                }
-                if (containsNormalized(decryptedText, normalizedArtist)) {
-                    score += 50
-                }
-                if (containsNormalized(parsed.title, normalizedTitle)) {
-                    score += 80
-                }
-                if (containsNormalized(parsed.artist, normalizedArtist)) {
-                    score += 50
-                }
-            }
-            ScoredGroup(candidate.group, score, parsed)
-        }.sortedByDescending(ScoredGroup::score)
-
-        scored.take(CANDIDATE_LOG_LIMIT).forEach {
+            confirmed = confirmCandidates(
+                candidates = fallbackCandidates,
+                normalizedTitle = normalizedTitle,
+                normalizedArtist = normalizedArtist
+            )
             logger(
-                "[QrcLyric] candidate score=${it.score} " +
-                    "groupId=${it.group.groupId}"
+                "[QrcLyric] fallback decrypt candidates=${fallbackCandidates.size} " +
+                    "costMs=${System.currentTimeMillis() - fallbackStartedAt}"
             )
         }
-        return scored.firstOrNull()
+        return confirmed
     }
 
-    private fun decryptAndParseQrc(group: QrcGroup): ParsedQrc? {
-        val file = group.qrcFile ?: return null
+    private fun fallbackRecentCandidates(
+        entries: List<QrcGroupIndexEntry>,
+        excludedGroupIds: Set<String>
+    ): List<ScoredGroup> {
+        return entries
+            .asSequence()
+            .filter { it.groupId !in excludedGroupIds }
+            .sortedByDescending(QrcGroupIndexEntry::lastModified)
+            .take(FALLBACK_DECRYPT_CANDIDATES)
+            .map { entry ->
+                ScoredGroup(entry = entry, score = 100)
+            }
+            .toList()
+    }
+
+    private fun confirmCandidates(
+        candidates: List<ScoredGroup>,
+        normalizedTitle: String,
+        normalizedArtist: String
+    ): ScoredGroup? {
+        candidates.forEach { candidate ->
+            val parsed = decryptAndParseQrc(candidate.entry) ?: return@forEach
+            if (!parsedMatchesTitle(parsed, normalizedTitle)) {
+                return@forEach
+            }
+            val artistBonus = if (
+                normalizedArtist.isBlank() ||
+                parsedMatchesArtist(parsed, normalizedArtist)
+            ) {
+                50
+            } else {
+                0
+            }
+            val confirmed = candidate.copy(
+                score = candidate.score + artistBonus,
+                parsed = parsed
+            )
+            if (LogConfig.DEBUG_VERBOSE_LOG) {
+                logger(
+                    "[QrcLyric] candidate score=${confirmed.score} " +
+                        "groupId=${confirmed.entry.groupId}"
+                )
+            }
+            return confirmed
+        }
+        return null
+    }
+
+    private fun decryptAndParseQrc(entry: QrcGroupIndexEntry): ParsedQrc? {
+        val file = entry.qrcFile ?: return null
+        val cacheKey = "${entry.groupId}:${file.lastModified()}:${file.length()}"
+        if (parsedQrcCache.containsKey(cacheKey)) {
+            return parsedQrcCache[cacheKey]
+        }
         return try {
             val encrypted = file.readText(Charsets.US_ASCII)
                 .filterNot(Char::isWhitespace)
             if (!isEncryptedQrcHex(encrypted)) {
                 logger(
-                    "[QrcLyric] decrypt failed groupId=${group.groupId} " +
+                    "[QrcLyric] decrypt failed groupId=${entry.groupId} " +
                         "error=not encrypted QRC hex"
                 )
+                parsedQrcCache[cacheKey] = null
                 return null
             }
             val decrypted = QrcDecrypter.decrypt(encrypted)
                 ?: run {
                     logger(
-                        "[QrcLyric] decrypt failed groupId=${group.groupId} " +
+                        "[QrcLyric] decrypt failed groupId=${entry.groupId} " +
                             "error=decrypt returned empty"
                     )
+                    parsedQrcCache[cacheKey] = null
                     return null
                 }
-            parseQrc(decrypted)
+            parseQrc(decrypted).also {
+                parsedQrcCache[cacheKey] = it
+                trimParsedQrcCache()
+            }
         } catch (exception: Exception) {
             logger(
-                "[QrcLyric] decrypt failed groupId=${group.groupId} " +
+                "[QrcLyric] decrypt failed groupId=${entry.groupId} " +
                     "error=${exception.message}"
             )
+            parsedQrcCache[cacheKey] = null
             null
+        }
+    }
+
+    private fun applyParsedResult(
+        songKey: String,
+        entry: QrcGroupIndexEntry,
+        parsed: ParsedQrc
+    ) {
+        cachedGroupId = entry.groupId
+        cachedLines = parsed.lines
+        songGroupCache[songKey] = entry.groupId
+        if (parsed.lines.isNotEmpty()) {
+            songLinesCache[songKey] = parsed.lines
+            cacheManager.save(
+                ParsedLyric(
+                    songKey = songKey,
+                    title = parsed.title,
+                    artist = parsed.artist,
+                    album = parsed.album,
+                    groupId = entry.groupId,
+                    qrcLastModified = entry.qrcFile?.lastModified() ?: 0L,
+                    lines = parsed.lines.map {
+                        QrcLyricLine(timeMs = it.timeMs, text = it.text)
+                    }
+                )
+            )
+            trimSongCaches()
+        }
+    }
+
+    private fun trimSongCaches() {
+        if (songLinesCache.size <= MAX_SONG_CACHE_SIZE) {
+            return
+        }
+        val overflow = songLinesCache.size - MAX_SONG_CACHE_SIZE
+        songLinesCache.keys.take(overflow).forEach { key ->
+            songLinesCache.remove(key)
+            songGroupCache.remove(key)
         }
     }
 
@@ -284,7 +534,7 @@ class QrcLyricManager(
         )
     }
 
-    private fun readSmallText(file: File?): String {
+    private fun readProducerText(file: File?): String {
         if (file == null || !file.canRead()) {
             return ""
         }
@@ -299,27 +549,57 @@ class QrcLyricManager(
         }
     }
 
+    private fun trimParsedQrcCache() {
+        if (parsedQrcCache.size <= MAX_PARSED_QRC_CACHE_SIZE) {
+            return
+        }
+        val overflow = parsedQrcCache.size - MAX_PARSED_QRC_CACHE_SIZE
+        parsedQrcCache.keys.take(overflow).forEach(parsedQrcCache::remove)
+    }
+
     private fun isEncryptedQrcHex(value: String): Boolean {
         return value.length >= MIN_HEX_LENGTH &&
             value.length % 16 == 0 &&
             HEX_REGEX.matches(value)
     }
 
-    private fun containsNormalized(value: String, expected: String): Boolean {
-        return expected.isNotBlank() && normalize(value).contains(expected)
+    private fun parsedMatchesTitle(
+        parsed: ParsedQrc,
+        normalizedTitle: String
+    ): Boolean {
+        val normalizedRaw = normalizeForMatch(parsed.rawText)
+        return containsNormalized(normalizedRaw, normalizedTitle) ||
+            containsNormalized(normalizeForMatch(parsed.title), normalizedTitle)
     }
 
-    private fun normalize(value: String): String {
-        return value.lowercase(Locale.ROOT)
-            .replace(NORMALIZE_REGEX, "")
+    private fun parsedMatchesArtist(
+        parsed: ParsedQrc,
+        normalizedArtist: String
+    ): Boolean {
+        val normalizedRaw = normalizeForMatch(parsed.rawText)
+        return containsNormalized(normalizedRaw, normalizedArtist) ||
+            containsNormalized(normalizeForMatch(parsed.artist), normalizedArtist)
+    }
+
+    private fun containsNormalized(value: String, expected: String): Boolean {
+        return expected.isNotBlank() && value.contains(expected)
+    }
+
+    private fun normalizeForMatch(text: String): String {
+        return text
+            .lowercase(Locale.ROOT)
+            .replace(BRACKET_CONTENT_REGEX, "")
+            .replace(MATCH_PUNCTUATION_REGEX, "")
+            .replace(WHITESPACE_REGEX, "")
+            .trim()
     }
 
     private fun buildSongKey(
-        title: String,
-        artist: String,
-        album: String
+        normalizedTitle: String,
+        normalizedArtist: String,
+        normalizedAlbum: String
     ): String {
-        return "${title.trim()}|${artist.trim()}|${album.trim()}"
+        return "$normalizedTitle|$normalizedArtist|$normalizedAlbum"
     }
 
     private fun unescapeXml(value: String): String {
@@ -348,6 +628,34 @@ class QrcLyricManager(
         val text: String
     )
 
+    data class QrcGroupIndexEntry(
+        val groupId: String,
+        val qrcFile: File?,
+        val producerFile: File?,
+        val exFile: File?,
+        val translrcFile: File?,
+        val romaqrcFile: File?,
+        val lastModified: Long,
+        val normalizedProducerText: String,
+        val producerTextLoaded: Boolean,
+        val hasQrc: Boolean,
+        val hasProducer: Boolean,
+        val hasTranslrc: Boolean,
+        val hasRomaqrc: Boolean
+    ) {
+        fun toGroup(): QrcGroup {
+            return QrcGroup(
+                groupId = groupId,
+                qrcFile = qrcFile,
+                producerFile = producerFile,
+                exFile = exFile,
+                translrcFile = translrcFile,
+                romaqrcFile = romaqrcFile,
+                lastModified = lastModified
+            )
+        }
+    }
+
     private data class ParsedQrc(
         val title: String,
         val artist: String,
@@ -357,7 +665,7 @@ class QrcLyricManager(
     )
 
     private data class ScoredGroup(
-        val group: QrcGroup,
+        val entry: QrcGroupIndexEntry,
         val score: Int,
         val parsed: ParsedQrc? = null
     )
@@ -408,14 +716,16 @@ class QrcLyricManager(
     }
 
     companion object {
-        private const val GROUP_CACHE_DURATION_MS = 60_000L
+        private const val INDEX_CACHE_DURATION_MS = 5 * 60_000L
         private const val FIVE_MINUTES_MS = 5 * 60_000L
         private const val THIRTY_MINUTES_MS = 30 * 60_000L
-        private const val MIN_MATCH_SCORE = 50
-        private const val BASE_FILE_SCORE = 15
-        private const val MAX_DECRYPT_CANDIDATES = 12
-        private const val CANDIDATE_LOG_LIMIT = 8
+        private const val MIN_MATCH_SCORE = 100
+        private const val DECRYPT_CONFIRM_CANDIDATES = 3
+        private const val FALLBACK_DECRYPT_CANDIDATES = 3
         private const val MAX_PRODUCER_BYTES = 8 * 1024
+        private const val MAX_TOTAL_PRODUCER_TEXT_BYTES = 3 * 1024 * 1024
+        private const val MAX_PARSED_QRC_CACHE_SIZE = 80
+        private const val MAX_SONG_CACHE_SIZE = 80
         private const val MIN_HEX_LENGTH = 128
 
         private val GROUP_FILE_REGEX =
@@ -429,6 +739,10 @@ class QrcLyricManager(
         private val QRC_WORD_TIME_REGEX =
             Regex("""\(\d+\s*,\s*\d+\)""")
         private val HEX_REGEX = Regex("""[0-9A-Fa-f]+""")
-        private val NORMALIZE_REGEX = Regex("""[\s\p{P}\p{S}]+""")
+        private val BRACKET_CONTENT_REGEX =
+            Regex("""\([^)]*\)|（[^）]*）|\[[^]]*]|\【[^】]*】""")
+        private val MATCH_PUNCTUATION_REGEX =
+            Regex("""[-_.·・/\\:]""")
+        private val WHITESPACE_REGEX = Regex("""\s+""")
     }
 }

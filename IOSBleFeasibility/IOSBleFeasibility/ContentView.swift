@@ -73,7 +73,7 @@ struct ContentView: View {
                     }
                 }
             }
-            .frame(width: 180, height: 180)
+            .frame(width: 160, height: 160)
             .clipShape(RoundedRectangle(cornerRadius: 8))
             .accessibilityLabel("当前歌曲封面")
             .padding(.bottom, 8)

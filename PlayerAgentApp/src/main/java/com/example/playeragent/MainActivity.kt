@@ -32,6 +32,8 @@ import com.example.playeragent.media.LyricManager
 import com.example.playeragent.media.LyricSourceTestManager
 import com.example.playeragent.media.PlaybackStateReader
 import com.example.playeragent.media.QrcDumpManager
+import com.example.playeragent.media.QrcLyricPrebuildManager
+import com.example.playeragent.media.QrcPrebuildProgress
 import com.example.playeragent.service.PlayerAgentForegroundService
 import com.example.playeragent.service.QQMusicLyricAccessibilityService
 
@@ -45,12 +47,14 @@ class MainActivity : Activity() {
     private lateinit var currentAlbumArtTextView: TextView
     private lateinit var debugPanel: LinearLayout
     private lateinit var debugToggleButton: Button
+    private lateinit var qrcCacheBuildTextView: TextView
     private lateinit var logTextView: TextView
     private lateinit var logScrollView: ScrollView
     private lateinit var logToggleButton: Button
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var controllerScannerManager: ControllerScannerManager? = null
     private var rfcommClientManager: RfcommClientManager? = null
+    private var qrcLyricPrebuildManager: QrcLyricPrebuildManager? = null
 
     private val logReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -109,6 +113,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        qrcLyricPrebuildManager?.stop()
         controllerScannerManager?.stopScan()
         rfcommClientManager?.close()
         super.onDestroy()
@@ -217,6 +222,21 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(8), dp(12), dp(8))
             setBackgroundColor(Color.rgb(245, 245, 245))
         }
+        qrcCacheBuildTextView = TextView(this).apply {
+            text = QrcPrebuildProgress(
+                running = false,
+                total = 0,
+                processed = 0,
+                success = 0,
+                failed = 0,
+                skipped = 0
+            ).displayText()
+            textSize = 13f
+            setTextIsSelectable(true)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            setBackgroundColor(Color.WHITE)
+        }
+        debugPanel.addView(qrcCacheBuildTextView)
         addDebugButtons(debugPanel)
         content.addView(debugPanel)
 
@@ -257,6 +277,8 @@ class MainActivity : Activity() {
         panel.addView(actionButton("TEST CURRENT LYRIC", ::testCurrentLyric))
         panel.addView(actionButton("TEST LRC DEBUG", ::testLrcDebug))
         panel.addView(actionButton("DUMP FIRST QRC", ::dumpFirstQrc))
+        panel.addView(actionButton("START QRC CACHE BUILD", ::startQrcCacheBuild))
+        panel.addView(actionButton("STOP QRC CACHE BUILD", ::stopQrcCacheBuild))
         panel.addView(
             actionButton(
                 "DUMP ACCESSIBILITY TREE",
@@ -335,7 +357,8 @@ class MainActivity : Activity() {
             val state = try {
                 PlaybackStateReader(
                     context = this,
-                    logger = ::appendThreadSafeLog
+                    logger = ::appendThreadSafeLog,
+                    includeLyric = false
                 ).readPlaybackState()
             } catch (exception: Exception) {
                 appendThreadSafeLog(
@@ -441,7 +464,8 @@ class MainActivity : Activity() {
                 appendThreadSafeLog("[LyricScan] requested")
                 val playbackState = PlaybackStateReader(
                     context = this,
-                    logger = ::appendThreadSafeLog
+                    logger = ::appendThreadSafeLog,
+                    includeLyric = false
                 ).readPlaybackState()
                 LyricManager(
                     context = this,
@@ -554,6 +578,32 @@ class MainActivity : Activity() {
         }.apply {
             name = "QrcDumpThread"
             start()
+        }
+    }
+
+    private fun startQrcCacheBuild() {
+        if (!ensureLyricStorageAccess()) {
+            return
+        }
+        val manager = qrcLyricPrebuildManager ?: QrcLyricPrebuildManager(
+            context = this,
+            logger = ::appendThreadSafeLog,
+            progressListener = ::updateQrcCacheBuildProgress
+        ).also {
+            qrcLyricPrebuildManager = it
+        }
+        manager.start()
+    }
+
+    private fun stopQrcCacheBuild() {
+        qrcLyricPrebuildManager?.stop()
+    }
+
+    private fun updateQrcCacheBuildProgress(progress: QrcPrebuildProgress) {
+        runOnUiThread {
+            if (::qrcCacheBuildTextView.isInitialized) {
+                qrcCacheBuildTextView.text = progress.displayText()
+            }
         }
     }
 

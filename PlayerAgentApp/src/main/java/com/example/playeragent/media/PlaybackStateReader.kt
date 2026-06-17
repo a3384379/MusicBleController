@@ -13,7 +13,8 @@ import org.json.JSONObject
 
 class PlaybackStateReader(
     context: Context,
-    private val logger: (String) -> Unit
+    private val logger: (String) -> Unit,
+    private val includeLyric: Boolean = true
 ) {
 
     private val appContext = context.applicationContext
@@ -25,6 +26,7 @@ class PlaybackStateReader(
     )
     private var metadataMissingLogged = false
     private var durationMissingLogged = false
+    private var lastLoggedLyric: String? = null
 
     fun readPlaybackState(): JSONObject {
         verbose("[PlaybackState] GET_PLAYBACK_STATE received")
@@ -90,8 +92,16 @@ class PlaybackStateReader(
         } else if (duration > 0L) {
             durationMissingLogged = false
         }
-        lyricManager.loadLyric(title, artist, album)
-        val lyric = lyricManager.getCurrentLine(position)
+        val lyric = if (includeLyric) {
+            lyricManager.requestLyricLoadAsync(title, artist, album)
+            lyricManager.getCurrentLine(position)
+        } else {
+            ""
+        }
+        if (lyric != lastLoggedLyric) {
+            lastLoggedLyric = lyric
+            logger("[PlaybackState] lyric=$lyric")
+        }
 
         verbose(
             "[PlaybackState] selected package=${selected.packageName}\n" +

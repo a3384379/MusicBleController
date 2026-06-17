@@ -41,10 +41,16 @@ final class BLETestManager: NSObject, ObservableObject {
     private var albumArtExpectedSize = 0
     private var albumArtExpectedChunks = 0
     private var albumArtChunks: [Int: Data] = [:]
+    private var binaryAlbumArtID = ""
+    private var binaryAlbumArtQuality = ""
+    private var binaryAlbumArtExpectedSize = 0
+    private var binaryAlbumArtExpectedChunks = 0
+    private var binaryAlbumArtChunks: [Int: Data] = [:]
     private var currentAlbumArtID = ""
     private var currentCachedAlbumArtQuality = ""
     private var requestedAlbumArtKeys: Set<String> = []
     private var albumArtPreviewRetryCount = 0
+    private var albumArtFallbackWorkItem: DispatchWorkItem?
     private var remoteLogExpectedChunks = 0
     private var remoteLogExpectedLines = 0
     private var remoteLogChunks: [Int: Data] = [:]
@@ -239,6 +245,7 @@ final class BLETestManager: NSObject, ObservableObject {
         sonyCommandCharacteristic = nil
         sonyStatusCharacteristic = nil
         resetAlbumArtTransfer()
+        resetBinaryAlbumArtTransfer()
         requestedAlbumArtKeys.removeAll()
         resetRemoteLogTransfer()
         resetMediaFieldDumpTransfer()
@@ -329,6 +336,10 @@ final class BLETestManager: NSObject, ObservableObject {
                 self.logs.removeFirst(self.logs.count - 300)
             }
         }
+    }
+
+    private func albumArtConsoleLog(_ message: String) {
+        print(message)
     }
 
     private func setMode(_ value: String) {
@@ -487,6 +498,12 @@ extension BLETestManager: CBPeripheralDelegate {
             setStatus(characteristic.isNotifying ? "已连接" : "连接中")
             log("[BLE] status notify subscribed")
             guard characteristic.isNotifying else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.sendCommand(
+                    cmd: "CLIENT_CAPABILITIES",
+                    extra: ["albumArtBinary": true]
+                )
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                 self?.sendGetPlaybackState()
             }
@@ -508,8 +525,16 @@ extension BLETestManager: CBPeripheralDelegate {
             return
         }
 
-        guard let data = characteristic.value,
-              let text = String(data: data, encoding: .utf8) else {
+        guard let data = characteristic.value else {
+            log("[Status] empty notify")
+            return
+        }
+        if data.first == 0xA1 {
+            handleBinaryAlbumArtChunk(data)
+            return
+        }
+
+        guard let text = String(data: data, encoding: .utf8) else {
             log("[Status] invalid UTF-8")
             return
         }
@@ -601,13 +626,12 @@ extension BLETestManager: CBPeripheralDelegate {
                 }
                 self.log("[AlbumArt] offer id=\(id)")
                 self.handleAlbumArtIdentity(id)
-                if self.currentCachedAlbumArtQuality == "full" {
+                if self.currentCachedAlbumArtQuality == "full" ||
+                    self.currentCachedAlbumArtQuality == "preview" {
                     self.sendCommand(
                         cmd: "ALBUM_ART_SKIP",
                         extra: ["id": id]
                     )
-                } else if self.currentCachedAlbumArtQuality == "preview" {
-                    self.requestAlbumArt(id: id, quality: "full")
                 } else {
                     self.requestAlbumArt(id: id, quality: "preview")
                 }
@@ -638,6 +662,29 @@ extension BLETestManager: CBPeripheralDelegate {
                     "[AlbumArt] start id=\(id) quality=\(quality) " +
                         "chunks=\(chunks) size=\(size)"
                 )
+
+            case "albumArtBinaryStart":
+                let id = object["id"] as? String ?? ""
+                let quality = object["quality"] as? String ?? ""
+                let size = Self.intValue(object["size"])
+                let chunks = Self.intValue(object["chunks"])
+                guard !id.isEmpty,
+                      quality == "preview" || quality == "full",
+                      size > 0,
+                      chunks > 0 else {
+                    self.resetBinaryAlbumArtTransfer()
+                    self.log("[AlbumArtBinary] invalid start")
+                    return
+                }
+                self.handleAlbumArtIdentity(id)
+                self.resetBinaryAlbumArtTransfer()
+                self.binaryAlbumArtID = id
+                self.binaryAlbumArtQuality = quality
+                self.binaryAlbumArtExpectedSize = size
+                self.binaryAlbumArtExpectedChunks = chunks
+                let message = "[AlbumArtBinary] start chunks=\(chunks)"
+                self.log(message)
+                self.albumArtConsoleLog(message)
 
             case "albumArtChunk":
                 let id = object["id"] as? String ?? ""
@@ -677,6 +724,29 @@ extension BLETestManager: CBPeripheralDelegate {
                 }
                 self.finishAlbumArtTransfer(id: id, quality: quality)
 
+            case "albumArtBinaryEnd":
+                let id = object["id"] as? String ?? ""
+                let quality =
+                    object["quality"] as? String ?? self.binaryAlbumArtQuality
+                let message =
+                    "[AlbumArtBinary] end received=\(self.binaryAlbumArtChunks.count)"
+                self.log(message)
+                self.albumArtConsoleLog(message)
+                guard id == self.binaryAlbumArtID,
+                      quality == self.binaryAlbumArtQuality else {
+                    let failMessage = "[AlbumArtBinary] decode failed transfer mismatch"
+                    self.log(failMessage)
+                    self.albumArtConsoleLog(failMessage)
+                    self.resetBinaryAlbumArtTransfer()
+                    return
+                }
+                self.finishBinaryAlbumArtTransfer(id: id, quality: quality)
+
+            case "albumArtBinaryError":
+                let message = object["message"] as? String ?? "unknown"
+                self.resetBinaryAlbumArtTransfer()
+                self.log("[AlbumArtBinary] error \(message)")
+
             case "albumArtUnavailable":
                 let id = object["id"] as? String ?? ""
                 let quality = object["quality"] as? String ?? "preview"
@@ -686,7 +756,6 @@ extension BLETestManager: CBPeripheralDelegate {
                    quality == "preview",
                    self.albumArtImage == nil {
                     self.albumArtImage = nil
-                    self.retryAlbumArtPreviewIfNeeded(id: id)
                 }
                 self.log(
                     "[AlbumArt] unavailable id=\(id) quality=\(quality)"
@@ -819,6 +888,7 @@ extension BLETestManager: CBPeripheralDelegate {
 
         saveAlbumArt(jpegData, id: id, quality: quality)
         if id == currentAlbumArtID {
+            cancelAlbumArtFallback()
             albumArtImage = image
             currentCachedAlbumArtQuality = quality
         }
@@ -829,10 +899,7 @@ extension BLETestManager: CBPeripheralDelegate {
         log("[AlbumArt] decode success imageSize=\(pixelWidth)x\(pixelHeight)")
         resetAlbumArtTransfer()
 
-        if id == currentAlbumArtID, quality == "preview" {
-            albumArtPreviewRetryCount = 0
-            requestAlbumArt(id: id, quality: "full")
-        }
+        albumArtPreviewRetryCount = 0
     }
 
     private func resetAlbumArtTransfer() {
@@ -843,16 +910,107 @@ extension BLETestManager: CBPeripheralDelegate {
         albumArtChunks.removeAll()
     }
 
+    private func handleBinaryAlbumArtChunk(_ data: Data) {
+        guard data.count > 6 else {
+            let message = "[AlbumArtBinary] invalid chunk"
+            log(message)
+            albumArtConsoleLog(message)
+            return
+        }
+        let bytes = [UInt8](data.prefix(6))
+        let qualityCode = bytes[1]
+        let index = (Int(bytes[2]) << 8) | Int(bytes[3])
+        let totalChunks = (Int(bytes[4]) << 8) | Int(bytes[5])
+        let quality = qualityCode == 2 ? "full" : "preview"
+        guard binaryAlbumArtExpectedChunks > 0,
+              totalChunks == binaryAlbumArtExpectedChunks,
+              quality == binaryAlbumArtQuality,
+              index >= 0,
+              index < binaryAlbumArtExpectedChunks else {
+            let message = "[AlbumArtBinary] invalid chunk index=\(index)"
+            log(message)
+            albumArtConsoleLog(message)
+            return
+        }
+        binaryAlbumArtChunks[index] = data.subdata(in: 6..<data.count)
+        let message =
+            "[AlbumArtBinary] chunk index=\(index) " +
+            "received=\(binaryAlbumArtChunks.count)/\(binaryAlbumArtExpectedChunks)"
+        log(message)
+        if index == 0 ||
+            index == binaryAlbumArtExpectedChunks - 1 ||
+            index % 10 == 0 {
+            albumArtConsoleLog(message)
+        }
+    }
+
+    private func finishBinaryAlbumArtTransfer(id: String, quality: String) {
+        guard binaryAlbumArtExpectedChunks > 0,
+              binaryAlbumArtChunks.count == binaryAlbumArtExpectedChunks else {
+            let message =
+                "[AlbumArtBinary] decode failed received=\(binaryAlbumArtChunks.count) " +
+                "expected=\(binaryAlbumArtExpectedChunks)"
+            log(message)
+            albumArtConsoleLog(message)
+            resetBinaryAlbumArtTransfer()
+            return
+        }
+
+        var jpegData = Data()
+        jpegData.reserveCapacity(binaryAlbumArtExpectedSize)
+        for index in 0..<binaryAlbumArtExpectedChunks {
+            guard let chunk = binaryAlbumArtChunks[index] else {
+                let message = "[AlbumArtBinary] decode failed missing index=\(index)"
+                log(message)
+                albumArtConsoleLog(message)
+                resetBinaryAlbumArtTransfer()
+                return
+            }
+            jpegData.append(chunk)
+        }
+        guard jpegData.count == binaryAlbumArtExpectedSize,
+              let image = UIImage(data: jpegData) else {
+            let message = "[AlbumArtBinary] decode failed"
+            log(message)
+            albumArtConsoleLog(message)
+            resetBinaryAlbumArtTransfer()
+            return
+        }
+        saveAlbumArt(jpegData, id: id, quality: quality)
+        if id == currentAlbumArtID {
+            cancelAlbumArtFallback()
+            albumArtImage = image
+            currentCachedAlbumArtQuality = quality
+        }
+        requestedAlbumArtKeys.remove("\(id)|\(quality)")
+        let message = "[AlbumArtBinary] decode success bytes=\(jpegData.count)"
+        log(message)
+        albumArtConsoleLog(message)
+        resetBinaryAlbumArtTransfer()
+    }
+
+    private func resetBinaryAlbumArtTransfer() {
+        binaryAlbumArtID = ""
+        binaryAlbumArtQuality = ""
+        binaryAlbumArtExpectedSize = 0
+        binaryAlbumArtExpectedChunks = 0
+        binaryAlbumArtChunks.removeAll()
+    }
+
     private func applyTrackInfo(_ object: [String: Any]) {
         let newTitle = object["title"] as? String ?? "-"
         let newArtist = object["artist"] as? String ?? "-"
         let newAlbum = object["album"] as? String ?? "-"
+        let trackID = object["trackId"] as? String ?? ""
         if newTitle != title || newArtist != artist || newAlbum != album {
             lyric = ""
         }
         title = newTitle
         artist = newArtist
         album = newAlbum
+        if !trackID.isEmpty {
+            handleAlbumArtIdentity(trackID)
+        }
         log("[TrackInfo] updated title=\(title) artist=\(artist)")
     }
 
@@ -908,13 +1066,38 @@ extension BLETestManager: CBPeripheralDelegate {
         resetAlbumArtTransfer()
 
         if let cached = loadCachedAlbumArt(id: id) {
+            cancelAlbumArtFallback()
             albumArtImage = cached.image
             currentCachedAlbumArtQuality = cached.quality
-            log("[AlbumArtCache] hit id=\(id)")
+            let message = "[AlbumArtCache] hit id=\(id)"
+            log(message)
+            albumArtConsoleLog(message)
         } else {
-            albumArtImage = nil
-            log("[AlbumArtCache] miss id=\(id)")
+            let message = "[AlbumArtCache] miss id=\(id)"
+            log(message)
+            albumArtConsoleLog(message)
+            scheduleAlbumArtFallback(id: id)
         }
+    }
+
+    private func scheduleAlbumArtFallback(id: String) {
+        cancelAlbumArtFallback()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.currentAlbumArtID == id,
+                  self.currentCachedAlbumArtQuality.isEmpty else {
+                return
+            }
+            self.albumArtImage = nil
+            self.log("[AlbumArt] fallback default id=\(id)")
+        }
+        albumArtFallbackWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: workItem)
+    }
+
+    private func cancelAlbumArtFallback() {
+        albumArtFallbackWorkItem?.cancel()
+        albumArtFallbackWorkItem = nil
     }
 
     private func requestAlbumArt(id: String, quality: String) {
@@ -974,12 +1157,15 @@ extension BLETestManager: CBPeripheralDelegate {
                 atomically: true,
                 encoding: .utf8
             )
-            log("[AlbumArtCache] saved id=\(id)")
+            let message = "[AlbumArtCache] saved id=\(id)"
+            log(message)
+            albumArtConsoleLog(message)
         } catch {
-            log(
+            let message =
                 "[AlbumArtCache] save failed id=\(id) " +
-                    "error=\(error.localizedDescription)"
-            )
+                "error=\(error.localizedDescription)"
+            log(message)
+            albumArtConsoleLog(message)
         }
     }
 
