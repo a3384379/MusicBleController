@@ -12,6 +12,10 @@ class QrcLyricCacheManager(
 ) {
 
     private val appContext = context.applicationContext
+    private val aliasCacheManager = QrcAliasCacheManager(
+        context = appContext,
+        logger = logger
+    )
     private val memoryCache =
         object : LinkedHashMap<String, ParsedLyric>(MAX_MEMORY_CACHE, 0.75f, true) {
             override fun removeEldestEntry(
@@ -23,18 +27,51 @@ class QrcLyricCacheManager(
     private var indexEntries: List<CacheIndexEntry> = emptyList()
     private var indexBuiltAt: Long = 0L
     private var indexFileCount: Int = -1
+    private var stats = MutableLyricCacheStats()
+    private var queryCount = 0L
 
     @Synchronized
     fun get(title: String, artist: String, album: String): ParsedLyric? {
+        queryCount += 1
         val songKey = QrcLyricUtils.buildSongKey(title, artist, album)
         memoryCache[songKey]?.let {
+            stats.l1Hit += 1
+            stats.lastSource = "L1"
+            maybeLogStats()
             logger("[QrcCache] L1 hit songKey=$songKey")
             return it
+        }
+
+        val aliasTarget = aliasCacheManager.getAlias(songKey)
+        if (!aliasTarget.isNullOrBlank()) {
+            memoryCache[aliasTarget]?.let { aliased ->
+                val copy = aliased.copy(songKey = songKey)
+                memoryCache[songKey] = copy
+                stats.aliasHit += 1
+                stats.lastSource = "ALIAS"
+                maybeLogStats()
+                logger("[QrcCache] L1 hit songKey=$aliasTarget")
+                return copy
+            }
+            val aliasedDisk = readBySongKey(aliasTarget)
+            if (aliasedDisk != null) {
+                val copy = aliasedDisk.copy(songKey = songKey)
+                memoryCache[songKey] = copy
+                stats.aliasHit += 1
+                stats.lastSource = "ALIAS"
+                maybeLogStats()
+                logger("[QrcCache] L2 hit songKey=$aliasTarget")
+                return copy
+            }
+            aliasCacheManager.removeAlias(songKey)
         }
 
         val disk = readBySongKey(songKey)
         if (disk != null) {
             memoryCache[songKey] = disk
+            stats.l2Hit += 1
+            stats.lastSource = "L2"
+            maybeLogStats()
             logger("[QrcCache] L2 hit songKey=$songKey")
             return disk
         }
@@ -48,7 +85,11 @@ class QrcLyricCacheManager(
                 album = album
             )
             memoryCache[songKey] = alias
-            saveSongAlias(alias, fuzzy.parsed.songKey)
+            aliasCacheManager.saveAlias(songKey, fuzzy.parsed.songKey)
+            stats.l2FuzzyHit += 1
+            stats.aliasSaved += 1
+            stats.lastSource = "FUZZY"
+            maybeLogStats()
             logger("[QrcCache] L2 fuzzy hit currentSongKey=$songKey")
             logger("[QrcCache] matched cachedSongKey=${fuzzy.parsed.songKey}")
             logger("[QrcCache] score=${fuzzy.score}")
@@ -61,6 +102,8 @@ class QrcLyricCacheManager(
         }
 
         logger("[QrcCache] miss songKey=$songKey")
+        stats.lastSource = "NONE"
+        maybeLogStats()
         return null
     }
 
@@ -120,6 +163,49 @@ class QrcLyricCacheManager(
         groupFile.writeText(text, Charsets.UTF_8)
         memoryCache[parsed.songKey] = parsed
         logger("[QrcCache] saved songKey=${parsed.songKey} lines=${parsed.lines.size}")
+    }
+
+    @Synchronized
+    fun saveAlias(sourceSongKey: String, targetSongKey: String) {
+        aliasCacheManager.saveAlias(sourceSongKey, targetSongKey)
+        stats.aliasSaved += 1
+        maybeLogStats()
+    }
+
+    @Synchronized
+    fun getStats(): LyricCacheStats {
+        return stats.toImmutable()
+    }
+
+    @Synchronized
+    fun resetStats() {
+        stats = MutableLyricCacheStats()
+        queryCount = 0L
+    }
+
+    @Synchronized
+    fun recordNegativeHit() {
+        stats.negativeHit += 1
+        stats.lastSource = "NEGATIVE"
+        maybeLogStats()
+    }
+
+    @Synchronized
+    fun recordNegativeSaved() {
+        stats.negativeSaved += 1
+        maybeLogStats()
+    }
+
+    @Synchronized
+    fun recordQrcDecrypt(success: Boolean) {
+        stats.qrcDecryptCount += 1
+        if (success) {
+            stats.qrcDecryptSuccess += 1
+            stats.lastSource = "QRC"
+        } else {
+            stats.qrcDecryptFailed += 1
+        }
+        maybeLogStats()
     }
 
     fun isGroupCacheValid(group: QrcFileGroup): Boolean {
@@ -471,41 +557,6 @@ class QrcLyricCacheManager(
         }
     }
 
-    private fun saveSongAlias(
-        parsed: ParsedLyric,
-        matchedSongKey: String
-    ) {
-        try {
-            val objectValue = JSONObject()
-                .put("version", CACHE_VERSION)
-                .put("songKey", parsed.songKey)
-                .put("title", parsed.title)
-                .put("artist", parsed.artist)
-                .put("album", parsed.album)
-                .put("groupId", parsed.groupId)
-                .put("sourceCachedSongKey", matchedSongKey)
-                .put("qrcLastModified", parsed.qrcLastModified)
-                .put("createdAt", System.currentTimeMillis())
-                .put("lines", JSONArray().also { array ->
-                    parsed.lines.forEach { line ->
-                        if (line.text.isNotBlank()) {
-                            array.put(
-                                JSONObject()
-                                    .put("timeMs", line.timeMs)
-                                    .put("text", line.text)
-                            )
-                        }
-                    }
-                })
-            songCacheFile(parsed.songKey).writeText(objectValue.toString(), Charsets.UTF_8)
-            indexEntries = emptyList()
-            indexFileCount = -1
-            logger("[QrcCache] alias saved currentSongKey=${parsed.songKey} sourceSongKey=$matchedSongKey")
-        } catch (_: Exception) {
-            logger("[QrcCache] alias save failed currentSongKey=${parsed.songKey}")
-        }
-    }
-
     private fun shouldKeepExisting(
         existing: ParsedLyric,
         candidate: ParsedLyric
@@ -530,6 +581,7 @@ class QrcLyricCacheManager(
         private const val MIN_FUZZY_TITLE_LENGTH = 2
         private const val MIN_FUZZY_SCORE = 120
         private const val MIN_SCORE_GAP = 20
+        private const val STATS_LOG_INTERVAL = 50L
         private val GENERIC_TITLES = setOf(
             "intro",
             "outro",
@@ -565,4 +617,45 @@ class QrcLyricCacheManager(
         val createdAt: Long,
         val groupId: String?
     )
+
+    private fun maybeLogStats() {
+        if (queryCount > 0L && queryCount % STATS_LOG_INTERVAL == 0L) {
+            logger(
+                "[LyricStats] l1=${stats.l1Hit} l2=${stats.l2Hit} " +
+                    "fuzzy=${stats.l2FuzzyHit} alias=${stats.aliasHit} " +
+                    "negative=${stats.negativeHit} qrc=${stats.qrcDecryptCount} " +
+                    "success=${stats.qrcDecryptSuccess} failed=${stats.qrcDecryptFailed}"
+            )
+        }
+    }
+
+    private data class MutableLyricCacheStats(
+        var l1Hit: Long = 0,
+        var l2Hit: Long = 0,
+        var l2FuzzyHit: Long = 0,
+        var aliasHit: Long = 0,
+        var negativeHit: Long = 0,
+        var qrcDecryptCount: Long = 0,
+        var qrcDecryptSuccess: Long = 0,
+        var qrcDecryptFailed: Long = 0,
+        var negativeSaved: Long = 0,
+        var aliasSaved: Long = 0,
+        var lastSource: String = "NONE"
+    ) {
+        fun toImmutable(): LyricCacheStats {
+            return LyricCacheStats(
+                l1Hit = l1Hit,
+                l2Hit = l2Hit,
+                l2FuzzyHit = l2FuzzyHit,
+                aliasHit = aliasHit,
+                negativeHit = negativeHit,
+                qrcDecryptCount = qrcDecryptCount,
+                qrcDecryptSuccess = qrcDecryptSuccess,
+                qrcDecryptFailed = qrcDecryptFailed,
+                negativeSaved = negativeSaved,
+                aliasSaved = aliasSaved,
+                lastSource = lastSource
+            )
+        }
+    }
 }

@@ -17,6 +17,10 @@ class QrcLyricManager(
         context = appContext,
         logger = logger
     )
+    private val negativeCacheManager = QrcNegativeCacheManager(
+        context = appContext,
+        logger = logger
+    )
     private var indexEntries: List<QrcGroupIndexEntry> = emptyList()
     private var indexBuiltAt = 0L
     private var indexDirectoryModifiedAt = 0L
@@ -77,10 +81,17 @@ class QrcLyricManager(
             return lines.isNotEmpty()
         }
 
+        if (negativeCacheManager.isNegative(songKey)) {
+            cacheManager.recordNegativeHit()
+            logger("[QrcLyric] best group=none score=0")
+            return false
+        }
+
         val entries = getIndexEntries(forceRefresh = false)
         logger("[QrcLyric] scan groups count=${entries.size}")
         if (entries.isEmpty()) {
             logger("[QrcLyric] best group=none score=0")
+            saveNegative(songKey)
             return false
         }
 
@@ -112,16 +123,19 @@ class QrcLyricManager(
                 "[QrcLyric] best group=${best?.entry?.groupId ?: "none"} " +
                     "score=${best?.score ?: 0}"
             )
+            saveNegative(songKey)
             return false
         }
 
         val parsed = best.parsed ?: decryptAndParseQrc(best.entry)
         if (parsed == null || !parsedMatchesTitle(parsed, normalizedTitle)) {
             logger("[QrcLyric] best group=none score=0")
+            saveNegative(songKey)
             return false
         }
 
         applyParsedResult(songKey, best.entry, parsed)
+        negativeCacheManager.removeNegative(songKey)
         logger(
             "[QrcLyric] best group=${best.entry.groupId} score=${best.score}"
         )
@@ -426,6 +440,7 @@ class QrcLyricManager(
             val encrypted = file.readText(Charsets.US_ASCII)
                 .filterNot(Char::isWhitespace)
             if (!isEncryptedQrcHex(encrypted)) {
+                cacheManager.recordQrcDecrypt(success = false)
                 logger(
                     "[QrcLyric] decrypt failed groupId=${entry.groupId} " +
                         "error=not encrypted QRC hex"
@@ -435,6 +450,7 @@ class QrcLyricManager(
             }
             val decrypted = QrcDecrypter.decrypt(encrypted)
                 ?: run {
+                    cacheManager.recordQrcDecrypt(success = false)
                     logger(
                         "[QrcLyric] decrypt failed groupId=${entry.groupId} " +
                             "error=decrypt returned empty"
@@ -443,10 +459,12 @@ class QrcLyricManager(
                     return null
                 }
             parseQrc(decrypted).also {
+                cacheManager.recordQrcDecrypt(success = it.lines.isNotEmpty())
                 parsedQrcCache[cacheKey] = it
                 trimParsedQrcCache()
             }
         } catch (exception: Exception) {
+            cacheManager.recordQrcDecrypt(success = false)
             logger(
                 "[QrcLyric] decrypt failed groupId=${entry.groupId} " +
                     "error=${exception.message}"
@@ -479,8 +497,65 @@ class QrcLyricManager(
                     }
                 )
             )
+            val parsedSongKey = QrcLyricUtils.buildSongKey(
+                parsed.title,
+                parsed.artist,
+                parsed.album
+            )
+            if (shouldSaveAlias(
+                    sourceSongKey = songKey,
+                    targetSongKey = parsedSongKey,
+                    parsed = parsed
+                )
+            ) {
+                cacheManager.save(
+                    ParsedLyric(
+                        songKey = parsedSongKey,
+                        title = parsed.title,
+                        artist = parsed.artist,
+                        album = parsed.album,
+                        groupId = entry.groupId,
+                        qrcLastModified = entry.qrcFile?.lastModified() ?: 0L,
+                        lines = parsed.lines.map {
+                            QrcLyricLine(timeMs = it.timeMs, text = it.text)
+                        }
+                    )
+                )
+                cacheManager.saveAlias(songKey, parsedSongKey)
+            }
             trimSongCaches()
         }
+    }
+
+    private fun saveNegative(songKey: String) {
+        negativeCacheManager.saveNegative(songKey, "NO_QRC")
+        cacheManager.recordNegativeSaved()
+    }
+
+    private fun shouldSaveAlias(
+        sourceSongKey: String,
+        targetSongKey: String,
+        parsed: ParsedQrc
+    ): Boolean {
+        if (sourceSongKey == targetSongKey || targetSongKey.isBlank()) {
+            return false
+        }
+        val sourceParts = sourceSongKey.split("|")
+        val sourceTitle = sourceParts.getOrNull(0).orEmpty()
+        val sourceArtist = sourceParts.getOrNull(1).orEmpty()
+        val parsedTitle = normalizeForMatch(parsed.title)
+        val parsedArtist = normalizeForMatch(parsed.artist)
+        val titleMatches = sourceTitle.isNotBlank() &&
+            parsedTitle.isNotBlank() &&
+            (sourceTitle == parsedTitle ||
+                sourceTitle.contains(parsedTitle) ||
+                parsedTitle.contains(sourceTitle))
+        val artistMatches = sourceArtist.isBlank() ||
+            parsedArtist.isBlank() ||
+            sourceArtist == parsedArtist ||
+            sourceArtist.contains(parsedArtist) ||
+            parsedArtist.contains(sourceArtist)
+        return titleMatches && artistMatches
     }
 
     private fun trimSongCaches() {

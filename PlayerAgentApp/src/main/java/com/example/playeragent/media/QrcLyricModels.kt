@@ -22,6 +22,20 @@ data class ParsedLyric(
     val lines: List<QrcLyricLine>
 )
 
+data class LyricCacheStats(
+    val l1Hit: Long = 0,
+    val l2Hit: Long = 0,
+    val l2FuzzyHit: Long = 0,
+    val aliasHit: Long = 0,
+    val negativeHit: Long = 0,
+    val qrcDecryptCount: Long = 0,
+    val qrcDecryptSuccess: Long = 0,
+    val qrcDecryptFailed: Long = 0,
+    val negativeSaved: Long = 0,
+    val aliasSaved: Long = 0,
+    val lastSource: String = "NONE"
+)
+
 data class QrcFileGroup(
     val groupId: String,
     val qrcFile: File?,
