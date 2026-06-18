@@ -19,12 +19,17 @@ import com.example.playeragent.ble.BleAdvertiserManager
 import com.example.playeragent.ble.BleGattServerManager
 import com.example.playeragent.logging.LogConfig
 import com.example.playeragent.logging.LogBuffer
+import com.example.playeragent.media.QrcDirectoryWatcher
+import com.example.playeragent.media.QrcIncrementalPrebuildManager
+import com.example.playeragent.media.QrcWatcherStatus
 
 class PlayerAgentForegroundService : Service() {
 
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var advertiserManager: BleAdvertiserManager? = null
     private var gattServerManager: BleGattServerManager? = null
+    private var qrcIncrementalPrebuildManager: QrcIncrementalPrebuildManager? = null
+    private var qrcDirectoryWatcher: QrcDirectoryWatcher? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -34,11 +39,19 @@ class PlayerAgentForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        initializeBluetooth()
+        when (intent?.action) {
+            ACTION_STOP_QRC_WATCHER -> stopQrcWatcher()
+            ACTION_START_QRC_WATCHER -> startQrcWatcher()
+            else -> {
+                initializeBluetooth()
+                startQrcWatcher()
+            }
+        }
         return START_STICKY
     }
 
     override fun onDestroy() {
+        stopQrcWatcher()
         advertiserManager?.stopAdvertising()
         advertiserManager = null
         gattServerManager?.close()
@@ -119,6 +132,41 @@ class PlayerAgentForegroundService : Service() {
         }
     }
 
+    private fun startQrcWatcher() {
+        val manager = qrcIncrementalPrebuildManager ?: QrcIncrementalPrebuildManager(
+            context = this,
+            logger = ::log,
+            statusListener = ::publishQrcWatcherStatus
+        ).also {
+            qrcIncrementalPrebuildManager = it
+        }
+        val watcher = qrcDirectoryWatcher ?: QrcDirectoryWatcher(
+            incrementalPrebuildManager = manager,
+            logger = ::log,
+            statusListener = ::publishQrcWatcherStatus
+        ).also {
+            qrcDirectoryWatcher = it
+        }
+        watcher.start()
+    }
+
+    private fun stopQrcWatcher() {
+        qrcDirectoryWatcher?.stop()
+        qrcDirectoryWatcher = null
+        qrcIncrementalPrebuildManager?.stop()
+        qrcIncrementalPrebuildManager = null
+        publishQrcWatcherStatus(
+            QrcWatcherStatus(
+                watcherRunning = false,
+                pendingGroups = 0,
+                incrementalRunning = false,
+                incrementalSuccess = 0,
+                incrementalFailed = 0,
+                incrementalSkipped = 0
+            )
+        )
+    }
+
     private fun hasBluetoothRuntimePermissions(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) ==
@@ -196,9 +244,34 @@ class PlayerAgentForegroundService : Service() {
         )
     }
 
+    private fun publishQrcWatcherStatus(status: QrcWatcherStatus) {
+        sendBroadcast(
+            Intent(ACTION_QRC_WATCHER_STATUS)
+                .setPackage(packageName)
+                .putExtra(EXTRA_QRC_WATCHER_RUNNING, status.watcherRunning)
+                .putExtra(EXTRA_QRC_WATCHER_PENDING, status.pendingGroups)
+                .putExtra(EXTRA_QRC_INCREMENTAL_RUNNING, status.incrementalRunning)
+                .putExtra(EXTRA_QRC_INCREMENTAL_SUCCESS, status.incrementalSuccess)
+                .putExtra(EXTRA_QRC_INCREMENTAL_FAILED, status.incrementalFailed)
+                .putExtra(EXTRA_QRC_INCREMENTAL_SKIPPED, status.incrementalSkipped)
+        )
+    }
+
     companion object {
         const val ACTION_LOG = "com.example.playeragent.ACTION_LOG"
+        const val ACTION_QRC_WATCHER_STATUS =
+            "com.example.playeragent.ACTION_QRC_WATCHER_STATUS"
+        const val ACTION_START_QRC_WATCHER =
+            "com.example.playeragent.ACTION_START_QRC_WATCHER"
+        const val ACTION_STOP_QRC_WATCHER =
+            "com.example.playeragent.ACTION_STOP_QRC_WATCHER"
         const val EXTRA_LOG_MESSAGE = "extra_log_message"
+        const val EXTRA_QRC_WATCHER_RUNNING = "extra_qrc_watcher_running"
+        const val EXTRA_QRC_WATCHER_PENDING = "extra_qrc_watcher_pending"
+        const val EXTRA_QRC_INCREMENTAL_RUNNING = "extra_qrc_incremental_running"
+        const val EXTRA_QRC_INCREMENTAL_SUCCESS = "extra_qrc_incremental_success"
+        const val EXTRA_QRC_INCREMENTAL_FAILED = "extra_qrc_incremental_failed"
+        const val EXTRA_QRC_INCREMENTAL_SKIPPED = "extra_qrc_incremental_skipped"
 
         private const val TAG = "PlayerAgent"
         private const val CHANNEL_ID = "player_agent_service"

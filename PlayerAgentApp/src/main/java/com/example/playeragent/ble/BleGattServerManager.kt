@@ -781,6 +781,7 @@ class BleGattServerManager(
 
         val cacheKey = pending.cacheKey
         val protocolId = pending.protocolId
+        logAlbumArtDebugIdentity(pending.playbackState, protocolId)
         val device = subscribedDevices.values.firstOrNull() ?: run {
             logger("[AlbumArt][BLE] no iPhone subscriber")
             return
@@ -804,6 +805,7 @@ class BleGattServerManager(
         }
         lastAlbumArtKey = cacheKey
         logger("[AlbumArt] offer id=$protocolId")
+        logger("[AlbumArtDebug] offer sent id=$protocolId")
         notifyQueue.enqueueShort(
             device = device,
             type = "albumArtOffer",
@@ -864,25 +866,46 @@ class BleGattServerManager(
         logger(
             "[AlbumArt] request id=$protocolId quality=${quality.wireValue}"
         )
+        logger("[AlbumArtDebug] id=$protocolId")
 
         val device = subscribedDevices.values.firstOrNull()
         if (device == null) {
             albumArtRequestsInFlight.remove(requestKey)
             logger("[AlbumArt] request failed: no iPhone subscriber")
+            logger("[AlbumArtDebug] unavailable reason=no iPhone subscriber")
             return
         }
         val albumArt = albumArtTestManager.readCurrentNotificationAlbumArt()
         if (albumArt == null) {
             albumArtRequestsInFlight.remove(requestKey)
-            sendAlbumArtUnavailable(device, protocolId, quality)
+            sendAlbumArtUnavailable(
+                device = device,
+                protocolId = protocolId,
+                quality = quality,
+                reason = "no notification largeIcon"
+            )
             return
         }
 
         val bitmap = albumArt.bitmap
         logger("[AlbumArt][BLE] source=${albumArt.source}")
+        logger("[AlbumArtDebug] source ${albumArt.source} exists=true")
         logger(
             "[AlbumArt][BLE] original width=${bitmap.width} height=${bitmap.height}"
         )
+        logger(
+            "[AlbumArtDebug] bitmap width=${bitmap.width} height=${bitmap.height}"
+        )
+        if (isLikelyPlaceholderAlbumArt(bitmap)) {
+            albumArtRequestsInFlight.remove(requestKey)
+            sendAlbumArtUnavailable(
+                device = device,
+                protocolId = protocolId,
+                quality = quality,
+                reason = "placeholder album art"
+            )
+            return
+        }
         val useBinaryAlbumArt =
             quality == AlbumArtQuality.PREVIEW && clientSupportsBinaryAlbumArt
         val maximumPayload = if (useBinaryAlbumArt) {
@@ -902,7 +925,14 @@ class BleGattServerManager(
             albumArtRequestsInFlight.remove(requestKey)
             if (preparation.compressionFailed) {
                 logger("[AlbumArt][BLE] unavailable")
-                sendAlbumArtUnavailable(device, protocolId, quality)
+                sendAlbumArtUnavailable(
+                    device = device,
+                    protocolId = protocolId,
+                    quality = quality,
+                    reason = "compress failed"
+                )
+            } else {
+                logger("[AlbumArtDebug] unavailable reason=too large")
             }
             return
         }
@@ -1303,7 +1333,8 @@ class BleGattServerManager(
     private fun sendAlbumArtUnavailable(
         device: BluetoothDevice,
         protocolId: String,
-        quality: AlbumArtQuality
+        quality: AlbumArtQuality,
+        reason: String
     ) {
         val value = JSONObject()
             .put("type", "albumArtUnavailable")
@@ -1313,9 +1344,11 @@ class BleGattServerManager(
             .toByteArray(Charsets.UTF_8)
         if (value.size > maximumPayloadFor(device)) {
             logger("[AlbumArt][BLE] unavailable message exceeds MTU")
+            logger("[AlbumArtDebug] unavailable reason=unavailable message exceeds MTU")
             return
         }
         logger("[AlbumArt][BLE] unavailable")
+        logger("[AlbumArtDebug] unavailable reason=$reason")
         notifyQueue.enqueueShort(
             device = device,
             type = "albumArtUnavailable",
@@ -1342,6 +1375,75 @@ class BleGattServerManager(
             .digest(source.toByteArray(Charsets.UTF_8))
             .take(ALBUM_ART_ID_HASH_BYTES)
             .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    }
+
+    private fun logAlbumArtDebugIdentity(
+        playbackState: JSONObject,
+        protocolId: String
+    ) {
+        val title = playbackState.optString("title")
+        val artist = playbackState.optString("artist")
+        val album = playbackState.optString("album")
+        logger(
+            "[AlbumArtDebug] song title=$title artist=$artist album=$album"
+        )
+        logger(
+            "[AlbumArtDebug] id source title=$title artist=$artist album=$album"
+        )
+        logger("[AlbumArtDebug] id=$protocolId")
+    }
+
+    private fun isLikelyPlaceholderAlbumArt(bitmap: Bitmap): Boolean {
+        if (bitmap.width <= 0 || bitmap.height <= 0) return true
+        val sampleWidth = minOf(24, bitmap.width)
+        val sampleHeight = minOf(24, bitmap.height)
+        val sampled = if (sampleWidth == bitmap.width &&
+            sampleHeight == bitmap.height
+        ) {
+            bitmap
+        } else {
+            Bitmap.createScaledBitmap(bitmap, sampleWidth, sampleHeight, true)
+        }
+        return try {
+            val pixels = IntArray(sampleWidth * sampleHeight)
+            sampled.getPixels(
+                pixels,
+                0,
+                sampleWidth,
+                0,
+                0,
+                sampleWidth,
+                sampleHeight
+            )
+            val colorBuckets = HashSet<Int>()
+            var colorfulPixels = 0
+            var visiblePixels = 0
+            pixels.forEach { pixel ->
+                val alpha = pixel ushr 24
+                if (alpha < 24) return@forEach
+                val red = (pixel ushr 16) and 0xff
+                val green = (pixel ushr 8) and 0xff
+                val blue = pixel and 0xff
+                val maximum = maxOf(red, green, blue)
+                val minimum = minOf(red, green, blue)
+                if (maximum > 0 &&
+                    (maximum - minimum).toFloat() / maximum.toFloat() > 0.12f
+                ) {
+                    colorfulPixels += 1
+                }
+                colorBuckets.add(
+                    ((red / 32) shl 10) or
+                        ((green / 32) shl 5) or
+                        (blue / 32)
+                )
+                visiblePixels += 1
+            }
+            visiblePixels > 0 &&
+                colorBuckets.size <= 10 &&
+                colorfulPixels * 20 <= visiblePixels
+        } finally {
+            if (sampled !== bitmap) sampled.recycle()
+        }
     }
 
     private fun maximumPayloadFor(device: BluetoothDevice): Int {

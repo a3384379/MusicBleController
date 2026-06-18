@@ -27,16 +27,14 @@ class QrcLyricCacheManager(
     private var indexEntries: List<CacheIndexEntry> = emptyList()
     private var indexBuiltAt: Long = 0L
     private var indexFileCount: Int = -1
-    private var stats = MutableLyricCacheStats()
-    private var queryCount = 0L
 
     @Synchronized
     fun get(title: String, artist: String, album: String): ParsedLyric? {
-        queryCount += 1
+        sharedQueryCount += 1
         val songKey = QrcLyricUtils.buildSongKey(title, artist, album)
         memoryCache[songKey]?.let {
-            stats.l1Hit += 1
-            stats.lastSource = "L1"
+            sharedStats.l1Hit += 1
+            sharedStats.lastSource = "L1"
             maybeLogStats()
             logger("[QrcCache] L1 hit songKey=$songKey")
             return it
@@ -47,8 +45,8 @@ class QrcLyricCacheManager(
             memoryCache[aliasTarget]?.let { aliased ->
                 val copy = aliased.copy(songKey = songKey)
                 memoryCache[songKey] = copy
-                stats.aliasHit += 1
-                stats.lastSource = "ALIAS"
+                sharedStats.aliasHit += 1
+                sharedStats.lastSource = "ALIAS"
                 maybeLogStats()
                 logger("[QrcCache] L1 hit songKey=$aliasTarget")
                 return copy
@@ -57,8 +55,8 @@ class QrcLyricCacheManager(
             if (aliasedDisk != null) {
                 val copy = aliasedDisk.copy(songKey = songKey)
                 memoryCache[songKey] = copy
-                stats.aliasHit += 1
-                stats.lastSource = "ALIAS"
+                sharedStats.aliasHit += 1
+                sharedStats.lastSource = "ALIAS"
                 maybeLogStats()
                 logger("[QrcCache] L2 hit songKey=$aliasTarget")
                 return copy
@@ -69,8 +67,8 @@ class QrcLyricCacheManager(
         val disk = readBySongKey(songKey)
         if (disk != null) {
             memoryCache[songKey] = disk
-            stats.l2Hit += 1
-            stats.lastSource = "L2"
+            sharedStats.l2Hit += 1
+            sharedStats.lastSource = "L2"
             maybeLogStats()
             logger("[QrcCache] L2 hit songKey=$songKey")
             return disk
@@ -86,9 +84,9 @@ class QrcLyricCacheManager(
             )
             memoryCache[songKey] = alias
             aliasCacheManager.saveAlias(songKey, fuzzy.parsed.songKey)
-            stats.l2FuzzyHit += 1
-            stats.aliasSaved += 1
-            stats.lastSource = "FUZZY"
+            sharedStats.l2FuzzyHit += 1
+            sharedStats.aliasSaved += 1
+            sharedStats.lastSource = "FUZZY"
             maybeLogStats()
             logger("[QrcCache] L2 fuzzy hit currentSongKey=$songKey")
             logger("[QrcCache] matched cachedSongKey=${fuzzy.parsed.songKey}")
@@ -102,7 +100,7 @@ class QrcLyricCacheManager(
         }
 
         logger("[QrcCache] miss songKey=$songKey")
-        stats.lastSource = "NONE"
+        sharedStats.lastSource = "NONE"
         maybeLogStats()
         return null
     }
@@ -168,42 +166,42 @@ class QrcLyricCacheManager(
     @Synchronized
     fun saveAlias(sourceSongKey: String, targetSongKey: String) {
         aliasCacheManager.saveAlias(sourceSongKey, targetSongKey)
-        stats.aliasSaved += 1
+        sharedStats.aliasSaved += 1
         maybeLogStats()
     }
 
     @Synchronized
     fun getStats(): LyricCacheStats {
-        return stats.toImmutable()
+        return sharedStats.toImmutable()
     }
 
     @Synchronized
     fun resetStats() {
-        stats = MutableLyricCacheStats()
-        queryCount = 0L
+        sharedStats = MutableLyricCacheStats()
+        sharedQueryCount = 0L
     }
 
     @Synchronized
     fun recordNegativeHit() {
-        stats.negativeHit += 1
-        stats.lastSource = "NEGATIVE"
+        sharedStats.negativeHit += 1
+        sharedStats.lastSource = "NEGATIVE"
         maybeLogStats()
     }
 
     @Synchronized
     fun recordNegativeSaved() {
-        stats.negativeSaved += 1
+        sharedStats.negativeSaved += 1
         maybeLogStats()
     }
 
     @Synchronized
     fun recordQrcDecrypt(success: Boolean) {
-        stats.qrcDecryptCount += 1
+        sharedStats.qrcDecryptCount += 1
         if (success) {
-            stats.qrcDecryptSuccess += 1
-            stats.lastSource = "QRC"
+            sharedStats.qrcDecryptSuccess += 1
+            sharedStats.lastSource = "QRC"
         } else {
-            stats.qrcDecryptFailed += 1
+            sharedStats.qrcDecryptFailed += 1
         }
         maybeLogStats()
     }
@@ -582,6 +580,8 @@ class QrcLyricCacheManager(
         private const val MIN_FUZZY_SCORE = 120
         private const val MIN_SCORE_GAP = 20
         private const val STATS_LOG_INTERVAL = 50L
+        private var sharedStats = MutableLyricCacheStats()
+        private var sharedQueryCount = 0L
         private val GENERIC_TITLES = setOf(
             "intro",
             "outro",
@@ -619,12 +619,18 @@ class QrcLyricCacheManager(
     )
 
     private fun maybeLogStats() {
-        if (queryCount > 0L && queryCount % STATS_LOG_INTERVAL == 0L) {
+        if (sharedQueryCount > 0L &&
+            sharedQueryCount % STATS_LOG_INTERVAL == 0L
+        ) {
             logger(
-                "[LyricStats] l1=${stats.l1Hit} l2=${stats.l2Hit} " +
-                    "fuzzy=${stats.l2FuzzyHit} alias=${stats.aliasHit} " +
-                    "negative=${stats.negativeHit} qrc=${stats.qrcDecryptCount} " +
-                    "success=${stats.qrcDecryptSuccess} failed=${stats.qrcDecryptFailed}"
+                "[LyricStats] l1=${sharedStats.l1Hit} " +
+                    "l2=${sharedStats.l2Hit} " +
+                    "fuzzy=${sharedStats.l2FuzzyHit} " +
+                    "alias=${sharedStats.aliasHit} " +
+                    "negative=${sharedStats.negativeHit} " +
+                    "qrc=${sharedStats.qrcDecryptCount} " +
+                    "success=${sharedStats.qrcDecryptSuccess} " +
+                    "failed=${sharedStats.qrcDecryptFailed}"
             )
         }
     }

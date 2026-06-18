@@ -65,6 +65,7 @@ class QrcNegativeCacheManager(
         try {
             val root = JSONObject(file.readText(Charsets.UTF_8))
             if (root.optInt("version") != CACHE_VERSION) {
+                logger("[QrcNegativeCache] ignored old cache version")
                 return
             }
             val now = System.currentTimeMillis()
@@ -121,7 +122,7 @@ class QrcNegativeCacheManager(
     )
 
     companion object {
-        private const val CACHE_VERSION = 1
+        private const val CACHE_VERSION = 2
         private const val NEGATIVE_TTL_MS = 7L * 24L * 60L * 60L * 1000L
     }
 }

@@ -35,6 +35,7 @@ class AlbumArtTestManager(
         if (!isNotificationAccessEnabled() ||
             !PlayerNotificationListenerService.isConnected()
         ) {
+            logger("[AlbumArtDebug] unavailable reason=notification access unavailable")
             logger("[AlbumArt][BLE] unavailable")
             return null
         }
@@ -42,6 +43,7 @@ class AlbumArtTestManager(
         val selected = selectMusicNotification(
             PlayerNotificationListenerService.activeNotificationsSnapshot()
         ) ?: run {
+            logger("[AlbumArtDebug] unavailable reason=no QQMusic notification")
             logger("[AlbumArt][BLE] unavailable")
             return null
         }
@@ -57,7 +59,11 @@ class AlbumArtTestManager(
 
         sources.forEach { (source, value) ->
             val bitmap = valueToBitmap(value)
+            logger("[AlbumArtDebug] source $source exists=${bitmap != null}")
             if (bitmap != null) {
+                logger(
+                    "[AlbumArtDebug] bitmap width=${bitmap.width} height=${bitmap.height}"
+                )
                 return NotificationAlbumArt(
                     bitmap = scaleToMaximum(bitmap, MAX_ALBUM_ART_SIZE),
                     source = source
@@ -65,6 +71,7 @@ class AlbumArtTestManager(
             }
         }
 
+        logger("[AlbumArtDebug] unavailable reason=no notification largeIcon")
         logger("[AlbumArt][BLE] unavailable")
         return null
     }

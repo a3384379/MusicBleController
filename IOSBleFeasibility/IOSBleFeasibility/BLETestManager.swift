@@ -625,14 +625,26 @@ extension BLETestManager: CBPeripheralDelegate {
                     return
                 }
                 self.log("[AlbumArt] offer id=\(id)")
+                self.log(
+                    "[AlbumArtOffer] id=\(id) currentTitle=\(self.title)"
+                )
                 self.handleAlbumArtIdentity(id)
-                if self.currentCachedAlbumArtQuality == "full" ||
-                    self.currentCachedAlbumArtQuality == "preview" {
+                if let cached = self.validateCachedAlbumArt(id: id) {
+                    self.cancelAlbumArtFallback()
+                    self.albumArtImage = cached.image
+                    self.currentCachedAlbumArtQuality = cached.quality
+                    let message = "[AlbumArtCache] hit id=\(id), skip request"
+                    self.log(message)
+                    self.albumArtConsoleLog(message)
                     self.sendCommand(
                         cmd: "ALBUM_ART_SKIP",
                         extra: ["id": id]
                     )
                 } else {
+                    let message = "[AlbumArtCache] invalid id=\(id), request preview"
+                    self.log(message)
+                    self.albumArtConsoleLog(message)
+                    self.currentCachedAlbumArtQuality = ""
                     self.requestAlbumArt(id: id, quality: "preview")
                 }
 
@@ -751,11 +763,13 @@ extension BLETestManager: CBPeripheralDelegate {
                 let id = object["id"] as? String ?? ""
                 let quality = object["quality"] as? String ?? "preview"
                 self.resetAlbumArtTransfer()
+                self.resetBinaryAlbumArtTransfer()
                 self.requestedAlbumArtKeys.remove("\(id)|\(quality)")
                 if id == self.currentAlbumArtID,
-                   quality == "preview",
-                   self.albumArtImage == nil {
+                   quality == "preview" {
+                    self.cancelAlbumArtFallback()
                     self.albumArtImage = nil
+                    self.currentCachedAlbumArtQuality = ""
                 }
                 self.log(
                     "[AlbumArt] unavailable id=\(id) quality=\(quality)"
@@ -885,6 +899,17 @@ extension BLETestManager: CBPeripheralDelegate {
             resetAlbumArtTransfer()
             return
         }
+        if isLikelyPlaceholderAlbumArt(image, dataSize: jpegData.count) {
+            log("[AlbumArt] placeholder ignored id=\(id)")
+            if id == currentAlbumArtID {
+                cancelAlbumArtFallback()
+                albumArtImage = nil
+                currentCachedAlbumArtQuality = ""
+            }
+            requestedAlbumArtKeys.remove("\(id)|\(quality)")
+            resetAlbumArtTransfer()
+            return
+        }
 
         saveAlbumArt(jpegData, id: id, quality: quality)
         if id == currentAlbumArtID {
@@ -973,6 +998,19 @@ extension BLETestManager: CBPeripheralDelegate {
             let message = "[AlbumArtBinary] decode failed"
             log(message)
             albumArtConsoleLog(message)
+            resetBinaryAlbumArtTransfer()
+            return
+        }
+        if isLikelyPlaceholderAlbumArt(image, dataSize: jpegData.count) {
+            let message = "[AlbumArtBinary] placeholder ignored id=\(id)"
+            log(message)
+            albumArtConsoleLog(message)
+            if id == currentAlbumArtID {
+                cancelAlbumArtFallback()
+                albumArtImage = nil
+                currentCachedAlbumArtQuality = ""
+            }
+            requestedAlbumArtKeys.remove("\(id)|\(quality)")
             resetBinaryAlbumArtTransfer()
             return
         }
@@ -1131,9 +1169,32 @@ extension BLETestManager: CBPeripheralDelegate {
     private func loadCachedAlbumArt(
         id: String
     ) -> (image: UIImage, quality: String)? {
+        validateCachedAlbumArt(id: id)
+    }
+
+    private func validateCachedAlbumArt(
+        id: String
+    ) -> (image: UIImage, quality: String)? {
         let imageURL = albumArtCacheURL(id: id)
-        guard let data = try? Data(contentsOf: imageURL),
-              let image = UIImage(data: data) else {
+        let exists = FileManager.default.fileExists(atPath: imageURL.path)
+        let data = try? Data(contentsOf: imageURL)
+        let size = data?.count ?? 0
+        let image = data.flatMap(UIImage.init(data:))
+        let decoded = image != nil
+        let validateMessage =
+            "[AlbumArtCache] validate id=\(id) exists=\(exists) " +
+            "size=\(size) decode=\(decoded)"
+        log(validateMessage)
+        albumArtConsoleLog(validateMessage)
+
+        guard let image, size > 0 else {
+            if exists {
+                removeCorruptedAlbumArt(id: id)
+            }
+            return nil
+        }
+        if isLikelyPlaceholderAlbumArt(image, dataSize: size) {
+            removePlaceholderAlbumArt(id: id)
             return nil
         }
 
@@ -1142,6 +1203,80 @@ extension BLETestManager: CBPeripheralDelegate {
             try? String(contentsOf: qualityURL, encoding: .utf8)
         )?.trimmingCharacters(in: .whitespacesAndNewlines)
         return (image, quality == "preview" ? "preview" : "full")
+    }
+
+    private func removeCorruptedAlbumArt(id: String) {
+        let imageURL = albumArtCacheURL(id: id)
+        let qualityURL = albumArtQualityURL(id: id)
+        try? FileManager.default.removeItem(at: imageURL)
+        try? FileManager.default.removeItem(at: qualityURL)
+        let message = "[AlbumArtCache] corrupted removed id=\(id)"
+        log(message)
+        albumArtConsoleLog(message)
+    }
+
+    private func removePlaceholderAlbumArt(id: String) {
+        let imageURL = albumArtCacheURL(id: id)
+        let qualityURL = albumArtQualityURL(id: id)
+        try? FileManager.default.removeItem(at: imageURL)
+        try? FileManager.default.removeItem(at: qualityURL)
+        let message = "[AlbumArtCache] placeholder removed id=\(id)"
+        log(message)
+        albumArtConsoleLog(message)
+    }
+
+    private func isLikelyPlaceholderAlbumArt(
+        _ image: UIImage,
+        dataSize: Int
+    ) -> Bool {
+        guard dataSize < 1_800,
+              let cgImage = image.cgImage else {
+            return false
+        }
+        let width = 24
+        let height = 24
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return false
+        }
+        context.interpolationQuality = .low
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        var buckets = Set<Int>()
+        var colorfulPixels = 0
+        var visiblePixels = 0
+        stride(from: 0, to: pixels.count, by: 4).forEach { index in
+            let red = Int(pixels[index])
+            let green = Int(pixels[index + 1])
+            let blue = Int(pixels[index + 2])
+            let alpha = Int(pixels[index + 3])
+            guard alpha >= 24 else { return }
+            let maximum = max(red, max(green, blue))
+            let minimum = min(red, min(green, blue))
+            if maximum > 0 &&
+                Double(maximum - minimum) / Double(maximum) > 0.12 {
+                colorfulPixels += 1
+            }
+            buckets.insert(
+                ((red / 32) << 10) |
+                    ((green / 32) << 5) |
+                    (blue / 32)
+            )
+            visiblePixels += 1
+        }
+
+        return visiblePixels > 0 &&
+            buckets.count <= 10 &&
+            colorfulPixels * 20 <= visiblePixels
     }
 
     private func saveAlbumArt(_ data: Data, id: String, quality: String) {

@@ -46,6 +46,47 @@ data class QrcFileGroup(
     val lastModified: Long
 )
 
+data class QrcGroupIndexEntry(
+    val groupId: String,
+    val qrcFile: File?,
+    val producerFile: File?,
+    val exFile: File?,
+    val translrcFile: File?,
+    val romaqrcFile: File?,
+    val lastModified: Long,
+    val title: String,
+    val artist: String,
+    val album: String,
+    val normalizedTitle: String,
+    val normalizedArtist: String,
+    val normalizedAlbum: String,
+    val normalizedProducerText: String,
+    val producerTextLoaded: Boolean,
+    val hasQrc: Boolean,
+    val hasProducer: Boolean,
+    val hasTranslrc: Boolean,
+    val hasRomaqrc: Boolean
+) {
+    fun toGroup(): QrcLyricManager.QrcGroup {
+        return QrcLyricManager.QrcGroup(
+            groupId = groupId,
+            qrcFile = qrcFile,
+            producerFile = producerFile,
+            exFile = exFile,
+            translrcFile = translrcFile,
+            romaqrcFile = romaqrcFile,
+            lastModified = lastModified
+        )
+    }
+}
+
+data class QrcPersistentIndexStatus(
+    val loaded: Boolean,
+    val dirty: Boolean,
+    val entries: Int,
+    val builtAt: Long
+)
+
 object QrcLyricUtils {
 
     fun cacheDirectory(context: Context): File {
@@ -298,7 +339,7 @@ object QrcLyricUtils {
         Regex("""[-_.·・/\\:，,、&+]""")
     private val VERSION_WORD_REGEX =
         Regex(
-            """\b(live|remaster|remastered|version|demo)\b|伴奏|纯音乐|现场版|原版|完整版|电视剧|电影|片尾曲|主题曲""",
+            """\b(live|remaster|remastered|version|demo|remix|cover)\b|合唱版|独唱版|现场版|完整版|原版|新版|dj版|伴奏|纯音乐|翻唱|电视剧|电影|片尾曲|主题曲""",
             RegexOption.IGNORE_CASE
         )
     private val ARTIST_SPLIT_REGEX =

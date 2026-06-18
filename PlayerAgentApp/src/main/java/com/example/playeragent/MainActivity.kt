@@ -32,8 +32,11 @@ import com.example.playeragent.media.LyricManager
 import com.example.playeragent.media.LyricSourceTestManager
 import com.example.playeragent.media.PlaybackStateReader
 import com.example.playeragent.media.QrcDumpManager
+import com.example.playeragent.media.QrcLyricCacheManager
 import com.example.playeragent.media.QrcLyricPrebuildManager
+import com.example.playeragent.media.QrcPersistentIndexManager
 import com.example.playeragent.media.QrcPrebuildProgress
+import com.example.playeragent.media.QrcWatcherStatus
 import com.example.playeragent.service.PlayerAgentForegroundService
 import com.example.playeragent.service.QQMusicLyricAccessibilityService
 
@@ -48,6 +51,8 @@ class MainActivity : Activity() {
     private lateinit var debugPanel: LinearLayout
     private lateinit var debugToggleButton: Button
     private lateinit var qrcCacheBuildTextView: TextView
+    private lateinit var qrcWatcherStatusTextView: TextView
+    private lateinit var lyricCacheStatsTextView: TextView
     private lateinit var logTextView: TextView
     private lateinit var logScrollView: ScrollView
     private lateinit var logToggleButton: Button
@@ -55,9 +60,48 @@ class MainActivity : Activity() {
     private var controllerScannerManager: ControllerScannerManager? = null
     private var rfcommClientManager: RfcommClientManager? = null
     private var qrcLyricPrebuildManager: QrcLyricPrebuildManager? = null
+    private var lastQrcWatcherStatus = QrcWatcherStatus(
+        watcherRunning = false,
+        pendingGroups = 0,
+        incrementalRunning = false,
+        incrementalSuccess = 0,
+        incrementalFailed = 0,
+        incrementalSkipped = 0
+    )
 
     private val logReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == PlayerAgentForegroundService.ACTION_QRC_WATCHER_STATUS) {
+                updateQrcWatcherStatus(
+                    QrcWatcherStatus(
+                        watcherRunning = intent.getBooleanExtra(
+                            PlayerAgentForegroundService.EXTRA_QRC_WATCHER_RUNNING,
+                            false
+                        ),
+                        pendingGroups = intent.getIntExtra(
+                            PlayerAgentForegroundService.EXTRA_QRC_WATCHER_PENDING,
+                            0
+                        ),
+                        incrementalRunning = intent.getBooleanExtra(
+                            PlayerAgentForegroundService.EXTRA_QRC_INCREMENTAL_RUNNING,
+                            false
+                        ),
+                        incrementalSuccess = intent.getIntExtra(
+                            PlayerAgentForegroundService.EXTRA_QRC_INCREMENTAL_SUCCESS,
+                            0
+                        ),
+                        incrementalFailed = intent.getIntExtra(
+                            PlayerAgentForegroundService.EXTRA_QRC_INCREMENTAL_FAILED,
+                            0
+                        ),
+                        incrementalSkipped = intent.getIntExtra(
+                            PlayerAgentForegroundService.EXTRA_QRC_INCREMENTAL_SKIPPED,
+                            0
+                        )
+                    )
+                )
+                return
+            }
             val message = intent
                 ?.getStringExtra(PlayerAgentForegroundService.EXTRA_LOG_MESSAGE)
                 ?: return
@@ -91,7 +135,10 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
-        val filter = IntentFilter(PlayerAgentForegroundService.ACTION_LOG)
+        val filter = IntentFilter().apply {
+            addAction(PlayerAgentForegroundService.ACTION_LOG)
+            addAction(PlayerAgentForegroundService.ACTION_QRC_WATCHER_STATUS)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(logReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
@@ -237,6 +284,29 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.WHITE)
         }
         debugPanel.addView(qrcCacheBuildTextView)
+        qrcWatcherStatusTextView = TextView(this).apply {
+            text = QrcWatcherStatus(
+                watcherRunning = false,
+                pendingGroups = 0,
+                incrementalRunning = false,
+                incrementalSuccess = 0,
+                incrementalFailed = 0,
+                incrementalSkipped = 0
+            ).displayText()
+            textSize = 13f
+            setTextIsSelectable(true)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            setBackgroundColor(Color.WHITE)
+        }
+        debugPanel.addView(qrcWatcherStatusTextView)
+        lyricCacheStatsTextView = TextView(this).apply {
+            text = lyricCacheStatsText()
+            textSize = 13f
+            setTextIsSelectable(true)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            setBackgroundColor(Color.WHITE)
+        }
+        debugPanel.addView(lyricCacheStatsTextView)
         addDebugButtons(debugPanel)
         content.addView(debugPanel)
 
@@ -279,6 +349,16 @@ class MainActivity : Activity() {
         panel.addView(actionButton("DUMP FIRST QRC", ::dumpFirstQrc))
         panel.addView(actionButton("START QRC CACHE BUILD", ::startQrcCacheBuild))
         panel.addView(actionButton("STOP QRC CACHE BUILD", ::stopQrcCacheBuild))
+        panel.addView(actionButton("START QRC WATCHER", ::startQrcWatcher))
+        panel.addView(actionButton("STOP QRC WATCHER", ::stopQrcWatcher))
+        panel.addView(actionButton("REFRESH LYRIC STATS", ::refreshLyricStats))
+        panel.addView(actionButton("RESET LYRIC STATS", ::resetLyricStats))
+        panel.addView(
+            actionButton(
+                "FORCE REFRESH QRC INDEX",
+                ::forceRefreshQrcIndex
+            )
+        )
         panel.addView(
             actionButton(
                 "DUMP ACCESSIBILITY TREE",
@@ -599,12 +679,116 @@ class MainActivity : Activity() {
         qrcLyricPrebuildManager?.stop()
     }
 
+    private fun startQrcWatcher() {
+        if (!ensureLyricStorageAccess()) {
+            return
+        }
+        val intent = Intent(
+            this,
+            PlayerAgentForegroundService::class.java
+        ).setAction(PlayerAgentForegroundService.ACTION_START_QRC_WATCHER)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+        appendLog("[QrcWatcher] start requested")
+    }
+
+    private fun stopQrcWatcher() {
+        startService(
+            Intent(this, PlayerAgentForegroundService::class.java)
+                .setAction(PlayerAgentForegroundService.ACTION_STOP_QRC_WATCHER)
+        )
+        appendLog("[QrcWatcher] stop requested")
+    }
+
     private fun updateQrcCacheBuildProgress(progress: QrcPrebuildProgress) {
         runOnUiThread {
             if (::qrcCacheBuildTextView.isInitialized) {
                 qrcCacheBuildTextView.text = progress.displayText()
             }
         }
+    }
+
+    private fun updateQrcWatcherStatus(status: QrcWatcherStatus) {
+        lastQrcWatcherStatus = status
+        runOnUiThread {
+            if (::qrcWatcherStatusTextView.isInitialized) {
+                qrcWatcherStatusTextView.text = status.displayText()
+            }
+            refreshLyricStatsText()
+        }
+    }
+
+    private fun refreshLyricStats() {
+        refreshLyricStatsText()
+        appendLog("[LyricStats] refresh requested")
+    }
+
+    private fun resetLyricStats() {
+        QrcLyricCacheManager(
+            context = this,
+            logger = ::appendThreadSafeLog
+        ).resetStats()
+        refreshLyricStatsText()
+        appendLog("[LyricStats] reset")
+    }
+
+    private fun forceRefreshQrcIndex() {
+        if (!ensureLyricStorageAccess()) {
+            return
+        }
+        appendLog("[QrcIndex] force refresh requested")
+        val manager = QrcPersistentIndexManager(
+            context = this,
+            logger = ::appendThreadSafeLog
+        )
+        manager.markDirty("manual")
+        Thread {
+            manager.rebuildAsync()
+            runOnUiThread {
+                refreshLyricStatsText()
+            }
+        }.apply {
+            name = "QrcIndexForceRefreshThread"
+            start()
+        }
+    }
+
+    private fun refreshLyricStatsText() {
+        if (::lyricCacheStatsTextView.isInitialized) {
+            lyricCacheStatsTextView.text = lyricCacheStatsText()
+        }
+    }
+
+    private fun lyricCacheStatsText(): String {
+        val stats = QrcLyricCacheManager(
+            context = this,
+            logger = ::appendThreadSafeLog
+        ).getStats()
+        val indexStatus = QrcPersistentIndexManager(
+            context = this,
+            logger = ::appendThreadSafeLog
+        ).status()
+        return "Lyric Cache Stats\n" +
+            "L1 hit: ${stats.l1Hit}\n" +
+            "L2 hit: ${stats.l2Hit}\n" +
+            "Fuzzy hit: ${stats.l2FuzzyHit}\n" +
+            "Alias hit: ${stats.aliasHit}\n" +
+            "Negative hit: ${stats.negativeHit}\n" +
+            "QRC decrypt count: ${stats.qrcDecryptCount}\n" +
+            "QRC decrypt success: ${stats.qrcDecryptSuccess}\n" +
+            "QRC decrypt failed: ${stats.qrcDecryptFailed}\n" +
+            "Last source: ${stats.lastSource}\n" +
+            "QrcIndex loaded: ${indexStatus.loaded}\n" +
+            "QrcIndex dirty: ${indexStatus.dirty}\n" +
+            "QrcIndex entries: ${indexStatus.entries}\n" +
+            "QrcIndex builtAt: ${indexStatus.builtAt}\n" +
+            "QrcWatcher running: ${lastQrcWatcherStatus.watcherRunning}\n" +
+            "QrcWatcher pending groups: ${lastQrcWatcherStatus.pendingGroups}\n" +
+            "QrcIncremental success: ${lastQrcWatcherStatus.incrementalSuccess}\n" +
+            "QrcIncremental failed: ${lastQrcWatcherStatus.incrementalFailed}"
     }
 
     private fun openNotificationAccessSettings() {
