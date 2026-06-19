@@ -156,6 +156,15 @@ class BleAdvertiserManager(
         )
     }
 
+    @Synchronized
+    fun forceMarkStopped(reason: String) {
+        logger("[BLE-ADV] force mark stopped reason=$reason")
+        handler.removeCallbacksAndMessages(null)
+        restartPending = false
+        alreadyStartedRetryUsed = false
+        updateState(AdvertisingState.STOPPED)
+    }
+
     @SuppressLint("MissingPermission")
     @Synchronized
     private fun restartAdvertising(

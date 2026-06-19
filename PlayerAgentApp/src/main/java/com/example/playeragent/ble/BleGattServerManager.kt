@@ -94,13 +94,17 @@ class BleGattServerManager(
     private var clientSupportsBinaryAlbumArt = false
     @Volatile
     private var started = false
+    @Volatile
+    private var serverState = ServerState.STOPPED
 
     private val callback = object : BluetoothGattServerCallback() {
         override fun onServiceAdded(status: Int, service: BluetoothGattService?) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 logger("[BLE-A] service added success")
+                updateServerState(ServerState.READY)
             } else {
                 logger("[BLE-A] service added failed: status=$status")
+                updateServerState(ServerState.FAILED)
             }
         }
 
@@ -294,6 +298,7 @@ class BleGattServerManager(
             logger("[BLE-A] GATT server already started; skip initialization")
             return true
         }
+        updateServerState(ServerState.STARTING)
 
         try {
             gattServer = bluetoothManager.openGattServer(appContext, callback)
@@ -307,6 +312,7 @@ class BleGattServerManager(
 
         if (gattServer == null) {
             logger("[BLE-A] GATT server start failed: openGattServer returned null")
+            updateServerState(ServerState.FAILED)
             return false
         }
 
@@ -356,11 +362,19 @@ class BleGattServerManager(
     @SuppressLint("MissingPermission")
     @Synchronized
     fun close() {
+        close("close requested")
+    }
+
+    @SuppressLint("MissingPermission")
+    @Synchronized
+    fun close(reason: String) {
         if (!started && gattServer == null) {
+            updateServerState(ServerState.STOPPED)
             return
         }
+        logger("[BLE-GATT] close reason=$reason")
         stopAutoPush()
-        notifyQueue.clear()
+        notifyQueue.clearAllForDisconnect(reason)
         lastAlbumArtKey = null
         currentAlbumArtId = null
         albumArtRequestsInFlight.clear()
@@ -379,6 +393,11 @@ class BleGattServerManager(
         mediaFieldDumpExecutor.shutdownNow()
 
         try {
+            try {
+                gattServer?.clearServices()
+            } catch (_: Exception) {
+                // Some vendor stacks throw while already tearing down; close still follows.
+            }
             gattServer?.close()
             logger("[BLE-A] GATT server closed")
         } catch (securityException: SecurityException) {
@@ -388,10 +407,36 @@ class BleGattServerManager(
         } finally {
             gattServer = null
             started = false
+            updateServerState(ServerState.STOPPED)
         }
     }
 
     fun isStarted(): Boolean = started && gattServer != null
+
+    fun isServerReady(): Boolean = isStarted() && serverState == ServerState.READY
+
+    fun snapshot(): BleGattServerSnapshot {
+        val queueSnapshot = notifyQueue.snapshot()
+        return BleGattServerSnapshot(
+            serverState = serverState,
+            started = started,
+            connectedDevices = connectedDeviceAddresses.toList(),
+            subscribedDevices = subscribedDevices.keys().toList(),
+            notificationInFlight = queueSnapshot.notificationInFlight,
+            pendingJobs = queueSnapshot.pendingJobCount,
+            activeJob = queueSnapshot.activeJobType,
+            pendingShortMessages = queueSnapshot.pendingShortMessageCount
+        )
+    }
+
+    private fun updateServerState(newState: ServerState) {
+        val oldState = serverState
+        if (oldState == newState) {
+            return
+        }
+        serverState = newState
+        logger("[BLE-GATT] state $oldState -> $newState")
+    }
 
     private fun logDisconnectDiagnostics(address: String) {
         val snapshot = notifyQueue.snapshot()
@@ -2056,6 +2101,24 @@ class BleGattServerManager(
             }
         }
     }
+
+    enum class ServerState {
+        STOPPED,
+        STARTING,
+        READY,
+        FAILED
+    }
+
+    data class BleGattServerSnapshot(
+        val serverState: ServerState,
+        val started: Boolean,
+        val connectedDevices: List<String>,
+        val subscribedDevices: List<String>,
+        val notificationInFlight: Boolean,
+        val pendingJobs: Int,
+        val activeJob: String?,
+        val pendingShortMessages: Int
+    )
 
     private data class CompressedAlbumArt(
         val bytes: ByteArray,

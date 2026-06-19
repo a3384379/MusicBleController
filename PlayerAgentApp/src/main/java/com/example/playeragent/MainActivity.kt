@@ -351,6 +351,7 @@ class MainActivity : Activity() {
         panel.addView(actionButton("STOP QRC CACHE BUILD", ::stopQrcCacheBuild))
         panel.addView(actionButton("START QRC WATCHER", ::startQrcWatcher))
         panel.addView(actionButton("STOP QRC WATCHER", ::stopQrcWatcher))
+        panel.addView(actionButton("RECOVER BLE STACK", ::recoverBleStack))
         panel.addView(actionButton("REFRESH LYRIC STATS", ::refreshLyricStats))
         panel.addView(actionButton("RESET LYRIC STATS", ::resetLyricStats))
         panel.addView(
@@ -701,6 +702,17 @@ class MainActivity : Activity() {
                 .setAction(PlayerAgentForegroundService.ACTION_STOP_QRC_WATCHER)
         )
         appendLog("[QrcWatcher] stop requested")
+    }
+
+    private fun recoverBleStack() {
+        val intent = Intent(this, PlayerAgentForegroundService::class.java)
+            .setAction(PlayerAgentForegroundService.ACTION_RECOVER_BLE_STACK)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+        appendLog("[BLE-RECOVERY] manual recover requested")
     }
 
     private fun updateQrcCacheBuildProgress(progress: QrcPrebuildProgress) {

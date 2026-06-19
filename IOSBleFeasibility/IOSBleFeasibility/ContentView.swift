@@ -2,12 +2,9 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var bleManager = BLETestManager()
-    @State private var showLogs = false
-    @State private var showSonyLogs = false
-    @State private var showDebugTools = false
-    @State private var showMediaFieldDump = false
     @State private var showVolumeDetails = false
     @State private var showFullLyrics = false
+    @State private var showDebugPage = false
 
     var body: some View {
         NavigationStack {
@@ -23,7 +20,6 @@ struct ContentView: View {
                         progressSection
                         playbackControls
                         volumeSection
-                        debugToolsSection
                     }
                     .frame(maxWidth: 390)
                     .padding(.horizontal, 24)
@@ -33,6 +29,9 @@ struct ContentView: View {
                 }
             }
             .toolbar(.hidden, for: .navigationBar)
+            .sheet(isPresented: $showDebugPage) {
+                DebugToolsView(bleManager: bleManager)
+            }
             .fullScreenCover(isPresented: $showFullLyrics) {
                 FullLyricsView(
                     title: nowPlayingInfo.title,
@@ -40,11 +39,14 @@ struct ContentView: View {
                     albumArtImage: bleManager.albumArtImage,
                     lyrics: bleManager.fullLyrics,
                     currentIndex: currentFullLyricIndex,
+                    positionMs: displayedPositionMs,
                     isPlaying: bleManager.isPlaying,
+                    isConnected: isConnected,
                     onDismiss: { showFullLyrics = false },
                     onPrevious: bleManager.sendPrevious,
                     onPlayPause: bleManager.sendPlayPause,
-                    onNext: bleManager.sendNext
+                    onNext: bleManager.sendNext,
+                    onSeekToLine: bleManager.seekToLyricLine
                 )
             }
         }
@@ -78,20 +80,29 @@ struct ContentView: View {
 
             Spacer()
 
-            Button {
-                bleManager.scanSony()
+            Menu {
+                Button {
+                    bleManager.scanSonyFromMenu()
+                } label: {
+                    Label("扫描 / 重连", systemImage: "antenna.radiowaves.left.and.right")
+                }
+
+                Button {
+                    showDebugPage = true
+                } label: {
+                    Label("调试工具", systemImage: "slider.horizontal.3")
+                }
             } label: {
-                Label("扫描 / 重连", systemImage: "antenna.radiowaves.left.and.right")
-                    .labelStyle(.iconOnly)
-                    .font(.headline)
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 19, weight: .bold))
                     .frame(width: 44, height: 44)
             }
             .buttonStyle(PressScaleButtonStyle(pressedScale: 0.96))
-            .background(.white.opacity(0.11), in: Circle())
+            .background(.white.opacity(0.09), in: Circle())
             .overlay {
-                Circle().stroke(.white.opacity(0.10), lineWidth: 1)
+                Circle().stroke(.white.opacity(0.09), lineWidth: 1)
             }
-            .accessibilityLabel("扫描或重新连接")
+            .accessibilityLabel("更多操作")
         }
         .foregroundStyle(.white)
         .animation(.easeInOut(duration: 0.2), value: bleManager.connectionStatus)
@@ -199,11 +210,16 @@ struct ContentView: View {
                             .font(.system(size: 17, weight: .medium, design: .rounded))
                             .foregroundStyle(.white.opacity(0.44))
                             .lineLimit(1)
-                        Text(lyricPreviewLine(offset: 0))
-                            .font(.system(size: 24, weight: .bold, design: .rounded))
-                            .foregroundStyle(Color.green.opacity(0.96))
-                            .lineLimit(2)
-                            .minimumScaleFactor(0.72)
+                        KaraokeLyricText(
+                            text: lyricPreviewLine(offset: 0),
+                            progress: currentLyricProgress,
+                            highlightColor: Color.green.opacity(0.98),
+                            normalColor: Color.white.opacity(0.48),
+                            font: .system(size: 24, weight: .bold, design: .rounded),
+                            lineLimit: 2,
+                            alignment: .center
+                        )
+                        .minimumScaleFactor(0.72)
                         Text(lyricPreviewLine(offset: 1))
                             .font(.system(size: 17, weight: .medium, design: .rounded))
                             .foregroundStyle(.white.opacity(0.44))
@@ -395,253 +411,6 @@ struct ContentView: View {
         }
     }
 
-    private var debugToolsSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            debugToolsHeader
-
-            if showDebugTools {
-                VStack(alignment: .leading, spacing: 14) {
-                    refreshControls
-                    localLogSection
-                    Divider().overlay(.white.opacity(0.18))
-                    remoteLogSection
-                    Divider().overlay(.white.opacity(0.18))
-                    mediaFieldDumpSection
-                }
-                .padding(13)
-                .foregroundStyle(.white)
-                .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(.white.opacity(0.08), lineWidth: 1)
-                }
-                .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-        }
-    }
-
-    private var debugToolsHeader: some View {
-        Button {
-            withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
-                showDebugTools.toggle()
-            }
-        } label: {
-            HStack {
-                Label("Debug Tools", systemImage: "wrench.and.screwdriver")
-                    .font(.subheadline.weight(.semibold))
-                Spacer()
-                Image(systemName: showDebugTools ? "chevron.up" : "chevron.down")
-                    .font(.caption.weight(.bold))
-            }
-            .padding(13)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(.white)
-        .background(.white.opacity(0.050), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(.white.opacity(0.07), lineWidth: 1)
-        }
-    }
-
-    private var refreshControls: some View {
-        HStack(spacing: 12) {
-            compactButton(
-                title: "刷新播放状态",
-                systemImage: "arrow.clockwise",
-                action: bleManager.sendGetPlaybackState
-            )
-            compactButton(
-                title: "刷新音量",
-                systemImage: "speaker.wave.2",
-                action: bleManager.sendGetVolume
-            )
-        }
-        .disabled(!isConnected)
-        .opacity(isConnected ? 1 : 0.52)
-    }
-
-    private var localLogSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Button {
-                showLogs.toggle()
-            } label: {
-                Label(
-                    showLogs ? "隐藏 iOS 日志" : "显示 iOS 日志",
-                    systemImage: showLogs ? "chevron.up" : "chevron.down"
-                )
-            }
-            .buttonStyle(.plain)
-
-            if showLogs {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 4) {
-                            ForEach(Array(bleManager.logs.enumerated()), id: \.offset) { index, line in
-                                Text(line)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundStyle(.white.opacity(0.78))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .id(index)
-                            }
-                        }
-                        .padding(10)
-                    }
-                    .frame(height: 150)
-                    .background(.black.opacity(0.26), in: RoundedRectangle(cornerRadius: 12))
-                    .onChange(of: bleManager.logs.count) { _, count in
-                        guard count > 0 else { return }
-                        proxy.scrollTo(count - 1, anchor: .bottom)
-                    }
-                }
-            }
-        }
-    }
-
-    private var mediaFieldDumpSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Media Field Dump")
-                    .font(.headline)
-                Spacer()
-                Button(action: bleManager.sendDumpMediaFields) {
-                    Label("Dump", systemImage: "list.bullet.clipboard")
-                }
-                .buttonStyle(.bordered)
-                .tint(.white)
-                .disabled(!isConnected || bleManager.isMediaFieldDumpReceiving)
-            }
-
-            if bleManager.isMediaFieldDumpReceiving ||
-                !bleManager.mediaFieldDumpProgressText.isEmpty {
-                HStack(spacing: 8) {
-                    if bleManager.isMediaFieldDumpReceiving {
-                        ProgressView()
-                            .tint(.white)
-                    }
-                    Text(bleManager.mediaFieldDumpProgressText)
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.68))
-                }
-            }
-
-            Button {
-                showMediaFieldDump.toggle()
-            } label: {
-                Label(
-                    showMediaFieldDump
-                        ? "隐藏 Media Field Dump"
-                        : "显示 Media Field Dump",
-                    systemImage: showMediaFieldDump
-                        ? "chevron.up"
-                        : "chevron.down"
-                )
-            }
-            .buttonStyle(.plain)
-
-            if showMediaFieldDump {
-                if bleManager.mediaFieldDumpText.isEmpty {
-                    Text("尚未获取")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.58))
-                } else {
-                    ScrollView {
-                        Text(bleManager.mediaFieldDumpText)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(.white.opacity(0.82))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(10)
-                    }
-                    .frame(height: 260)
-                    .background(.black.opacity(0.26), in: RoundedRectangle(cornerRadius: 12))
-
-                    HStack {
-                        Button(action: bleManager.copyMediaFieldDump) {
-                            Label("复制 Media Dump", systemImage: "doc.on.doc")
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(.white)
-
-                        if !bleManager.mediaFieldDumpCopyStatus.isEmpty {
-                            Text(bleManager.mediaFieldDumpCopyStatus)
-                                .font(.caption)
-                                .foregroundStyle(.green)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private var remoteLogSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Sony 日志")
-                    .font(.headline)
-                Spacer()
-                Button(action: bleManager.sendGetSonyLogs) {
-                    Label("获取", systemImage: "arrow.down.doc")
-                }
-                .buttonStyle(.bordered)
-                .tint(.white)
-                .disabled(!isConnected)
-            }
-
-            if bleManager.isRemoteLogTransferInProgress {
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .tint(.white)
-                    Text("Sony 日志传输中...")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.68))
-                }
-            }
-
-            Button {
-                showSonyLogs.toggle()
-            } label: {
-                Label(
-                    showSonyLogs ? "隐藏 Sony 日志" : "显示 Sony 日志",
-                    systemImage: showSonyLogs ? "chevron.up" : "chevron.down"
-                )
-            }
-            .buttonStyle(.plain)
-
-            if showSonyLogs && !bleManager.remoteLogText.isEmpty {
-                ScrollView {
-                    Text(bleManager.remoteLogText)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.82))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
-                }
-                .frame(height: 220)
-                .background(.black.opacity(0.26), in: RoundedRectangle(cornerRadius: 12))
-
-                HStack {
-                    Button(action: bleManager.copySonyLogs) {
-                        Label("复制 Sony 日志", systemImage: "doc.on.doc")
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.white)
-
-                    if !bleManager.remoteLogCopyStatus.isEmpty {
-                        Text(bleManager.remoteLogCopyStatus)
-                            .font(.caption)
-                            .foregroundStyle(.green)
-                    }
-                }
-            } else if showSonyLogs {
-                Text("尚未获取")
-                    .font(.caption)
-                    .foregroundStyle(.white.opacity(0.58))
-            }
-        }
-    }
-
     private var connectionColor: Color {
         switch bleManager.connectionStatus {
         case "已连接":
@@ -683,17 +452,18 @@ struct ContentView: View {
     }
 
     private var currentFullLyricIndex: Int {
-        guard !bleManager.fullLyrics.isEmpty else { return -1 }
-        let position = displayedPositionMs
-        var result = 0
-        for (index, line) in bleManager.fullLyrics.enumerated() {
-            if line.timeMs <= position {
-                result = index
-            } else {
-                break
-            }
-        }
-        return result
+        LyricTimelineHelper.currentIndex(
+            lines: bleManager.fullLyrics,
+            positionMs: displayedPositionMs
+        ) ?? -1
+    }
+
+    private var currentLyricProgress: Double {
+        LyricTimelineHelper.lineProgress(
+            lines: bleManager.fullLyrics,
+            index: currentFullLyricIndex,
+            positionMs: displayedPositionMs
+        )
     }
 
     private var lyricPreviewIdentity: String {
@@ -845,6 +615,81 @@ private struct PressScaleButtonStyle: ButtonStyle {
         configuration.label
             .scaleEffect(configuration.isPressed ? pressedScale : 1.0)
             .animation(.spring(response: 0.18, dampingFraction: 0.72), value: configuration.isPressed)
+    }
+}
+
+struct KaraokeLyricText: View {
+    let text: String
+    let progress: Double
+    let highlightColor: Color
+    let normalColor: Color
+    let font: Font
+    var lineLimit: Int? = nil
+    var alignment: TextAlignment = .leading
+
+    private var highlightCount: Int {
+        let count = Array(text).count
+        guard count > 0 else { return 0 }
+        let boundedProgress = min(max(progress, 0), 1)
+        let rawCount = Int((Double(count) * boundedProgress).rounded(.down))
+        return min(max(rawCount, 0), count)
+    }
+
+    private var splitText: (String, String) {
+        guard highlightCount > 0 else { return ("", text) }
+        guard highlightCount < text.count else { return (text, "") }
+        let index = text.index(text.startIndex, offsetBy: highlightCount)
+        return (String(text[..<index]), String(text[index...]))
+    }
+
+    var body: some View {
+        let parts = splitText
+        (Text(parts.0).foregroundColor(highlightColor) +
+            Text(parts.1).foregroundColor(normalColor))
+            .font(font)
+            .multilineTextAlignment(alignment)
+            .lineLimit(lineLimit)
+            .animation(.linear(duration: 0.25), value: highlightCount)
+    }
+}
+
+enum LyricTimelineHelper {
+    static func currentIndex(lines: [LyricLine], positionMs: Int64) -> Int? {
+        guard !lines.isEmpty else { return nil }
+        if positionMs < lines[0].timeMs {
+            return 0
+        }
+
+        var low = 0
+        var high = lines.count - 1
+        var result = 0
+        while low <= high {
+            let mid = (low + high) / 2
+            if lines[mid].timeMs <= positionMs {
+                result = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        return result
+    }
+
+    static func lineProgress(
+        lines: [LyricLine],
+        index: Int,
+        positionMs: Int64
+    ) -> Double {
+        guard lines.indices.contains(index) else { return 0 }
+        let start = lines[index].timeMs
+        let end: Int64
+        if lines.indices.contains(index + 1) {
+            end = max(lines[index + 1].timeMs, start + 1_000)
+        } else {
+            end = start + 4_000
+        }
+        let duration = max(end - start, 1_000)
+        return Double(positionMs - start) / Double(duration)
     }
 }
 

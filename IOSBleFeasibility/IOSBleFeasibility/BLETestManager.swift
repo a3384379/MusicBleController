@@ -112,9 +112,11 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     func scanSony() {
+        log("[BLE-iOS] scanSony called")
         setMode("BLE Central / GATT Client")
         shouldScanWhenPoweredOn = true
         _ = centralManager
+        log("[BLE-iOS] central state=\(centralManager.state.rawValue)")
 
         guard centralManager.state == .poweredOn else {
             setStatus("未连接")
@@ -123,6 +125,11 @@ final class BLETestManager: NSObject, ObservableObject {
         }
 
         beginSonyScan()
+    }
+
+    func scanSonyFromMenu() {
+        log("[UI] menu scan reconnect tapped")
+        scanSony()
     }
 
     func sendPlayPause() {
@@ -222,6 +229,18 @@ final class BLETestManager: NSObject, ObservableObject {
         sendCommand(cmd: "SEEK_TO", extra: ["position": max(position, 0)])
     }
 
+    func seekToLyricLine(_ timeMs: Int64) {
+        let targetPosition = timeMs.clamped(to: 0...max(durationMs, 0))
+        positionMs = targetPosition
+        displayPositionMs = targetPosition
+        seekPositionMs = targetPosition
+        basePlaybackPositionMs = targetPosition
+        playbackStateReceivedAt = Date()
+        log("[iOS][Seek] lyric line position=\(targetPosition)")
+        seek(to: targetPosition)
+        refreshPlaybackState(after: 0.5)
+    }
+
     func beginSeeking() {
         guard durationMs > 0 else { return }
         isSeeking = true
@@ -274,7 +293,13 @@ final class BLETestManager: NSObject, ObservableObject {
 
     private func beginSonyScan() {
         shouldScanWhenPoweredOn = false
+        log("[BLE-iOS] stop previous scan")
+        centralManager.stopScan()
         if let sonyPeripheral, sonyPeripheral.state != .disconnected {
+            log(
+                "[BLE-iOS] cancel previous peripheral " +
+                    "id=\(sonyPeripheral.identifier) state=\(sonyPeripheral.state.rawValue)"
+            )
             centralManager.cancelPeripheralConnection(sonyPeripheral)
         }
 
@@ -296,22 +321,23 @@ final class BLETestManager: NSObject, ObservableObject {
         isMediaFieldDumpReceiving = false
         mediaFieldDumpProgressText = ""
         scanTimeoutWorkItem?.cancel()
-        centralManager.stopScan()
         centralManager.scanForPeripherals(
             withServices: [BLEUUIDs.service],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
         )
         setStatus("扫描中")
         log("[BLE] scan started")
+        log("[BLE-iOS] start scan services=\(BLEUUIDs.service.uuidString)")
 
         let timeoutWorkItem = DispatchWorkItem { [weak self] in
             guard let self, self.sonyPeripheral == nil else { return }
             self.centralManager.stopScan()
             self.setStatus("未连接")
             self.log("[BLE] scan timeout: SonyPlayerAgent not found")
+            self.log("[BLE-iOS] scan timeout status reset to 未连接")
         }
         scanTimeoutWorkItem = timeoutWorkItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: timeoutWorkItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: timeoutWorkItem)
     }
 
     private func refreshPlaybackState(after delay: TimeInterval) {
@@ -417,6 +443,7 @@ extension BLETestManager: CBCentralManagerDelegate {
             ?? peripheral.name
             ?? "Unknown"
         log("[BLE] scan result name=\(name) rssi=\(RSSI)")
+        log("[BLE-iOS] didDiscover name=\(name) id=\(peripheral.identifier)")
 
         guard sonyPeripheral == nil else { return }
 
@@ -426,12 +453,14 @@ extension BLETestManager: CBCentralManagerDelegate {
         peripheral.delegate = self
         setStatus("连接中")
         log("[BLE] connecting \(name) id=\(peripheral.identifier)")
+        log("[BLE-iOS] connect peripheral=\(peripheral.identifier)")
         central.connect(peripheral)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         setStatus("连接中")
         log("[BLE] connected")
+        log("[BLE-iOS] didConnect")
         peripheral.discoverServices([BLEUUIDs.service])
     }
 
@@ -442,6 +471,7 @@ extension BLETestManager: CBCentralManagerDelegate {
     ) {
         setStatus("未连接")
         log("[BLE] connection failed error=\(error?.localizedDescription ?? "unknown")")
+        log("[BLE-iOS] didFailToConnect error=\(error?.localizedDescription ?? "unknown")")
         sonyPeripheral = nil
     }
 
@@ -452,6 +482,7 @@ extension BLETestManager: CBCentralManagerDelegate {
     ) {
         setStatus("未连接")
         log("[BLE] disconnected error=\(error?.localizedDescription ?? "none")")
+        log("[BLE-iOS] didDisconnect error=\(error?.localizedDescription ?? "none")")
         sonyPeripheral = nil
         sonyCommandCharacteristic = nil
         sonyStatusCharacteristic = nil

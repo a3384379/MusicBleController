@@ -8,8 +8,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
@@ -35,12 +37,31 @@ class PlayerAgentForegroundService : Service() {
     private var qrcDirectoryWatcher: QrcDirectoryWatcher? = null
     @Volatile
     private var serviceStopping = false
+    @Volatile
+    private var bluetoothAvailable = false
+    private var recoverRunnable: Runnable? = null
+    private val bluetoothStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) {
+                return
+            }
+            val state = intent.getIntExtra(
+                BluetoothAdapter.EXTRA_STATE,
+                BluetoothAdapter.ERROR
+            )
+            handleBluetoothStateChanged(state)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         serviceStopping = false
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification("PlayerAgent is running"))
+        registerReceiver(
+            bluetoothStateReceiver,
+            IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        )
         log("Foreground service started")
     }
 
@@ -48,8 +69,9 @@ class PlayerAgentForegroundService : Service() {
         when (intent?.action) {
             ACTION_STOP_QRC_WATCHER -> stopQrcWatcher()
             ACTION_START_QRC_WATCHER -> startQrcWatcher()
+            ACTION_RECOVER_BLE_STACK -> recoverBleStack("manual debug")
             else -> {
-                initializeBluetooth()
+                ensureBleStackStarted("service start")
                 startQrcWatcher()
             }
         }
@@ -59,10 +81,11 @@ class PlayerAgentForegroundService : Service() {
     override fun onDestroy() {
         serviceStopping = true
         mainHandler.removeCallbacksAndMessages(null)
+        runCatching { unregisterReceiver(bluetoothStateReceiver) }
         stopQrcWatcher()
         advertiserManager?.stopAdvertising()
         advertiserManager = null
-        gattServerManager?.close()
+        gattServerManager?.close("service destroyed")
         gattServerManager = null
         log("Foreground service stopped")
         super.onDestroy()
@@ -70,7 +93,15 @@ class PlayerAgentForegroundService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun initializeBluetooth() {
+    private fun ensureBleStackStarted(reason: String, forceRebuild: Boolean = false) {
+        log("[BLE-RECOVERY] ensure start reason=$reason")
+        initializeBluetooth(reason = reason, forceRebuild = forceRebuild)
+    }
+
+    private fun initializeBluetooth(
+        reason: String = "initialize",
+        forceRebuild: Boolean = false
+    ) {
         val bluetoothManager = getSystemService(BluetoothManager::class.java)
         val adapter = bluetoothManager?.adapter
 
@@ -95,14 +126,27 @@ class PlayerAgentForegroundService : Service() {
 
         if (!adapter.isEnabled) {
             log("Bluetooth is disabled")
+            bluetoothAvailable = false
             return
         }
+        bluetoothAvailable = true
 
         val advertisingSupported = adapter.isMultipleAdvertisementSupported
         log("BLE advertising supported: $advertisingSupported")
 
+        logBleDiagnostics("before ensureBleStackStarted reason=$reason")
+
+        if (forceRebuild) {
+            log("[BLE-RECOVERY] close stale gatt server")
+            advertiserManager?.stopAdvertising()
+            advertiserManager = null
+            gattServerManager?.close("force rebuild reason=$reason")
+            gattServerManager = null
+        }
+
         val existingGattServerManager = gattServerManager
         if (existingGattServerManager == null) {
+            log("[BLE-RECOVERY] open gatt server")
             val manager = BleGattServerManager(
                 context = this,
                 bluetoothManager = bluetoothManager,
@@ -116,8 +160,10 @@ class PlayerAgentForegroundService : Service() {
             )
             if (manager.start()) {
                 gattServerManager = manager
+                log("[BLE-RECOVERY] add service")
             }
         } else if (!existingGattServerManager.isStarted()) {
+            log("[BLE-RECOVERY] restart existing gatt server")
             existingGattServerManager.start()
         } else {
             logVerbose("GATT server already running; initialization skipped")
@@ -130,6 +176,7 @@ class PlayerAgentForegroundService : Service() {
 
         val existingAdvertiserManager = advertiserManager
         if (existingAdvertiserManager == null) {
+            log("[BLE-RECOVERY] start advertising")
             advertiserManager = BleAdvertiserManager(
                 context = this,
                 bluetoothAdapter = adapter,
@@ -138,10 +185,94 @@ class PlayerAgentForegroundService : Service() {
                 it.startAdvertising()
             }
         } else if (!existingAdvertiserManager.isAdvertising()) {
+            log("[BLE-RECOVERY] start advertising")
             existingAdvertiserManager.startAdvertising()
         } else {
             logVerbose("BLE advertising already running; initialization skipped")
         }
+        logBleDiagnostics("after ensureBleStackStarted reason=$reason")
+    }
+
+    private fun handleBluetoothStateChanged(state: Int) {
+        val name = when (state) {
+            BluetoothAdapter.STATE_TURNING_OFF -> "TURNING_OFF"
+            BluetoothAdapter.STATE_OFF -> "OFF"
+            BluetoothAdapter.STATE_TURNING_ON -> "TURNING_ON"
+            BluetoothAdapter.STATE_ON -> "ON"
+            else -> "UNKNOWN_$state"
+        }
+        log("[BT-STATE] state=$name")
+        when (state) {
+            BluetoothAdapter.STATE_TURNING_OFF,
+            BluetoothAdapter.STATE_OFF -> handleBluetoothUnavailable()
+            BluetoothAdapter.STATE_ON -> scheduleBleRecovery("bluetooth state on")
+        }
+    }
+
+    private fun handleBluetoothUnavailable() {
+        bluetoothAvailable = false
+        recoverRunnable?.let { mainHandler.removeCallbacks(it) }
+        recoverRunnable = null
+        log("[BLE-RECOVERY] bluetooth off, clearing runtime state")
+        gattServerManager?.close("bluetooth off")
+        gattServerManager = null
+        advertiserManager?.forceMarkStopped("bluetooth off")
+        advertiserManager = null
+        logBleDiagnostics("bluetooth off")
+    }
+
+    private fun scheduleBleRecovery(reason: String) {
+        if (serviceStopping) {
+            log("[BLE-RECOVERY] schedule skipped reason=service stopping")
+            return
+        }
+        recoverRunnable?.let { mainHandler.removeCallbacks(it) }
+        val runnable = Runnable {
+            recoverRunnable = null
+            recoverBleStack(reason)
+        }
+        recoverRunnable = runnable
+        log("[BLE-RECOVERY] scheduled reason=$reason")
+        mainHandler.postDelayed(runnable, BLE_RECOVERY_DELAY_MS)
+    }
+
+    private fun recoverBleStack(reason: String) {
+        if (serviceStopping) {
+            log("[BLE-RECOVERY] skipped reason=service stopping")
+            return
+        }
+        val adapter = bluetoothAdapter ?: getSystemService(BluetoothManager::class.java)?.adapter
+        if (adapter == null || !adapter.isEnabled) {
+            log("[BLE-RECOVERY] skipped reason=bluetooth disabled")
+            return
+        }
+        bluetoothAvailable = true
+        log("[BLE-RECOVERY] start reason=$reason")
+        logBleDiagnostics("before recovery reason=$reason")
+        ensureBleStackStarted(reason = reason, forceRebuild = true)
+        log("[BLE-RECOVERY] done")
+        logBleDiagnostics("after recovery reason=$reason")
+    }
+
+    private fun logBleDiagnostics(reason: String) {
+        val gattSnapshot = gattServerManager?.snapshot()
+        val advertiserSnapshot = advertiserManager?.snapshot()
+        val watcher = qrcDirectoryWatcher
+        log(
+            "[BLE-DIAG] reason=$reason " +
+                "bluetoothEnabled=${bluetoothAdapter?.isEnabled ?: false} " +
+                "bluetoothAvailable=$bluetoothAvailable " +
+                "gattState=${gattSnapshot?.serverState ?: "none"} " +
+                "gattStarted=${gattSnapshot?.started ?: false} " +
+                "advertisingState=${advertiserSnapshot?.state ?: "none"} " +
+                "connectedDevices=${gattSnapshot?.connectedDevices ?: emptyList<String>()} " +
+                "subscribedDevices=${gattSnapshot?.subscribedDevices ?: emptyList<String>()} " +
+                "notificationInFlight=${gattSnapshot?.notificationInFlight ?: false} " +
+                "pendingJobs=${gattSnapshot?.pendingJobs ?: 0} " +
+                "activeJob=${gattSnapshot?.activeJob} " +
+                "pendingShortMessages=${gattSnapshot?.pendingShortMessages ?: 0} " +
+                "watcherRunning=${watcher != null}"
+        )
     }
 
     private fun handleAllClientsDisconnected(reason: String) {
@@ -305,6 +436,8 @@ class PlayerAgentForegroundService : Service() {
             "com.example.playeragent.ACTION_START_QRC_WATCHER"
         const val ACTION_STOP_QRC_WATCHER =
             "com.example.playeragent.ACTION_STOP_QRC_WATCHER"
+        const val ACTION_RECOVER_BLE_STACK =
+            "com.example.playeragent.ACTION_RECOVER_BLE_STACK"
         const val EXTRA_LOG_MESSAGE = "extra_log_message"
         const val EXTRA_QRC_WATCHER_RUNNING = "extra_qrc_watcher_running"
         const val EXTRA_QRC_WATCHER_PENDING = "extra_qrc_watcher_pending"
@@ -317,5 +450,6 @@ class PlayerAgentForegroundService : Service() {
         private const val CHANNEL_ID = "player_agent_service"
         private const val NOTIFICATION_ID = 10001
         private const val ADVERTISING_RESTORE_DIAG_DELAY_MS = 1_000L
+        private const val BLE_RECOVERY_DELAY_MS = 1_200L
     }
 }
