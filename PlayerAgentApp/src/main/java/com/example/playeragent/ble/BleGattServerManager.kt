@@ -22,6 +22,7 @@ import com.example.playeragent.logging.LogBuffer
 import com.example.playeragent.media.MediaCommandExecutor
 import com.example.playeragent.media.MediaFieldDumpManager
 import com.example.playeragent.media.PlaybackStateReader
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.security.MessageDigest
@@ -38,7 +39,8 @@ class BleGattServerManager(
     private val transientLogger: (String) -> Unit = logger,
     private val verboseLogger: (String) -> Unit = logger,
     private val advertisingStateProvider: () -> String = { "unknown" },
-    private val onAllClientsDisconnected: (reason: String) -> Unit = {}
+    private val onAllClientsDisconnected: (reason: String) -> Unit = {},
+    private val onPlaybackUiState: (JSONObject) -> Unit = {}
 ) {
 
     private val appContext = context.applicationContext
@@ -188,38 +190,82 @@ class BleGattServerManager(
                 return
             }
 
+            val receiveElapsedMs = SystemClock.elapsedRealtime()
+            val receiveWallMs = System.currentTimeMillis()
             val valueText = value?.toString(Charsets.UTF_8).orEmpty()
+            logger(
+                "[CTRL-Sony] write received seq=unknown cmdRaw=$valueText " +
+                    "device=${device?.address ?: "unknown"} timeMs=$receiveWallMs"
+            )
             logger("[BLE-A] command write received: $valueText")
 
+            val parseStartedAtMs = SystemClock.elapsedRealtime()
             val request = try {
                 JSONObject(valueText)
             } catch (exception: Exception) {
                 logger("[BLE-A] command parse failed: ${exception.message}")
                 if (responseNeeded) {
-                    sendWriteResponse(
+                    val responseStartMs = SystemClock.elapsedRealtime()
+                    logger(
+                        "[CTRL-Sony] sendResponse begin seq=unknown cmd=parse_failed " +
+                            "timeMs=${System.currentTimeMillis()}"
+                    )
+                    val ok = sendWriteResponse(
                         device,
                         requestId,
                         BluetoothGatt.GATT_FAILURE,
                         offset,
                         value
                     )
+                    logger(
+                        "[CTRL-Sony] sendResponse end seq=unknown cmd=parse_failed " +
+                            "costMs=${SystemClock.elapsedRealtime() - responseStartMs} ok=$ok"
+                    )
                 }
                 return
             }
 
             val command = request.optString("cmd")
+            val seq = request.optString("seq").ifBlank { "unknown" }
+            logger(
+                "[CTRL-Sony] command parsed seq=$seq cmd=$command " +
+                    "parseCostMs=${SystemClock.elapsedRealtime() - parseStartedAtMs}"
+            )
             logger("[BLE-A] command received: $command")
-            handleCommand(command, request)
+            logger(
+                "[CTRL-Sony] before handle seq=$seq cmd=$command " +
+                    "queueSnapshot=${controlQueueSnapshot()}"
+            )
+            val handleStartedAtMs = SystemClock.elapsedRealtime()
+            handleCommand(command, request, seq)
+            val handleCostMs = SystemClock.elapsedRealtime() - handleStartedAtMs
+            logger(
+                "[CTRL-Sony] after handle seq=$seq cmd=$command " +
+                    "handleCostMs=$handleCostMs"
+            )
 
             if (responseNeeded) {
-                sendWriteResponse(
+                val responseStartMs = SystemClock.elapsedRealtime()
+                logger(
+                    "[CTRL-Sony] sendResponse begin seq=$seq cmd=$command " +
+                        "timeMs=${System.currentTimeMillis()}"
+                )
+                val ok = sendWriteResponse(
                     device,
                     requestId,
                     BluetoothGatt.GATT_SUCCESS,
                     offset,
                     value
                 )
+                logger(
+                    "[CTRL-Sony] sendResponse end seq=$seq cmd=$command " +
+                        "costMs=${SystemClock.elapsedRealtime() - responseStartMs} ok=$ok"
+                )
             }
+            logger(
+                "[CTRL-Sony] total cost seq=$seq cmd=$command " +
+                    "totalCostMs=${SystemClock.elapsedRealtime() - receiveElapsedMs}"
+            )
         }
 
         override fun onDescriptorWriteRequest(
@@ -451,6 +497,15 @@ class BleGattServerManager(
         )
     }
 
+    private fun controlQueueSnapshot(): String {
+        val snapshot = notifyQueue.snapshot()
+        return "notificationInFlight=${snapshot.notificationInFlight}," +
+            "pendingJobs=${snapshot.pendingJobCount}," +
+            "activeJobType=${snapshot.activeJobType}," +
+            "activeDeviceAddress=${snapshot.activeDeviceAddress}," +
+            "pendingShortMessageCount=${snapshot.pendingShortMessageCount}"
+    }
+
     private fun shouldLogCallback(
         timestamps: ConcurrentHashMap<String, Long>,
         key: String
@@ -461,23 +516,25 @@ class BleGattServerManager(
             now - previous >= CALLBACK_LOG_DEDUP_WINDOW_MS
     }
 
-    private fun handleCommand(command: String, request: JSONObject) {
+    private fun handleCommand(command: String, request: JSONObject, seq: String? = null) {
         when (command) {
             "PLAY_PAUSE",
             "NEXT",
             "PREVIOUS",
             "VOLUME_UP",
-            "VOLUME_DOWN" -> mediaCommandExecutor.execute(command)
+            "VOLUME_DOWN" -> mediaCommandExecutor.execute(command, seq)
 
             "SEEK_TO" -> {
                 val position = request.optLong("position").coerceAtLeast(0L)
                 logger("[BLE-A][Seek] position=$position")
-                mediaCommandExecutor.seekTo(position)
+                mediaCommandExecutor.seekTo(position, seq)
                 logger("[BLE-A][Seek] seekTo called")
                 sendPlaybackState()
             }
             "SET_VOLUME" -> {
                 val requestedVolume = request.optInt("volume")
+                val volumeStartedAtMs = SystemClock.elapsedRealtime()
+                logger("[CTRL-Sony] volume begin seq=${seq ?: "unknown"} cmd=SET_VOLUME")
                 logger("[BLE-A][Volume] SET_VOLUME requested=$requestedVolume")
                 val volumeState = mediaCommandExecutor.setVolume(requestedVolume)
                 val currentVolume = volumeState.optInt("current")
@@ -490,6 +547,10 @@ class BleGattServerManager(
                 logger("[BLE-A][Volume] after=$currentVolume")
                 sendStatusMessage(volumeState.toString())
                 logger("[BLE-A][Volume] notify volumeState")
+                logger(
+                    "[CTRL-Sony] volume end seq=${seq ?: "unknown"} " +
+                        "cmd=SET_VOLUME costMs=${SystemClock.elapsedRealtime() - volumeStartedAtMs}"
+                )
             }
             "GET_PLAYBACK_STATE" -> {
                 sendPlaybackState(includeAlbumArt = true)
@@ -516,6 +577,7 @@ class BleGattServerManager(
 
     private fun sendPlaybackState(includeAlbumArt: Boolean = false) {
         val source = playbackStateReader.readPlaybackState()
+        onPlaybackUiState(source)
         if (includeAlbumArt) {
             sendTrackInfo(source)
         }
@@ -616,6 +678,7 @@ class BleGattServerManager(
 
         try {
             val source = playbackStateReader.readPlaybackState()
+            onPlaybackUiState(source)
             val wasPlaying = lastAutoPushPlaying
             val playing = source.optBoolean("playing")
             val songChanged = logAutoPushStateChanges(source)
@@ -932,6 +995,19 @@ class BleGattServerManager(
             logger("[AlbumArt] full ignored id=$protocolId")
             return
         }
+        if (quality == AlbumArtQuality.HQ) {
+            if (!clientSupportsBinaryAlbumArt) {
+                logger("[AlbumArtHQ] request skipped reason=binary unsupported")
+                return
+            }
+            if (notifyQueue.hasJobTypeActiveOrQueued(FULL_LYRICS_JOB_TYPE) ||
+                notifyQueue.hasJobTypeActiveOrQueued(REMOTE_LOG_JOB_TYPE) ||
+                notifyQueue.hasJobTypeActiveOrQueued(MEDIA_FIELD_DUMP_JOB_TYPE)
+            ) {
+                logger("[AlbumArtHQ] request skipped reason=long job active")
+                return
+            }
+        }
         val requestKey = "$protocolId|${quality.wireValue}"
         if (albumArtRequestsCompleted.contains(requestKey)) {
             logger("[AlbumArt] skip duplicate sending id=$protocolId")
@@ -944,6 +1020,9 @@ class BleGattServerManager(
         logger(
             "[AlbumArt] request id=$protocolId quality=${quality.wireValue}"
         )
+        if (quality == AlbumArtQuality.HQ) {
+            logger("[AlbumArtHQ] request accepted id=$protocolId")
+        }
         logger("[AlbumArtDebug] id=$protocolId")
 
         val device = subscribedDevices.values.firstOrNull()
@@ -985,7 +1064,8 @@ class BleGattServerManager(
             return
         }
         val useBinaryAlbumArt =
-            quality == AlbumArtQuality.PREVIEW && clientSupportsBinaryAlbumArt
+            (quality == AlbumArtQuality.PREVIEW || quality == AlbumArtQuality.HQ) &&
+                clientSupportsBinaryAlbumArt
         val maximumPayload = if (useBinaryAlbumArt) {
             albumArtMaximumPayloadFor(device)
         } else {
@@ -1018,7 +1098,13 @@ class BleGattServerManager(
         val compressedAlbumArt = preparedAlbumArt.compressed
         val albumPackets = preparedAlbumArt.packets
         val totalChunks = albumPackets.totalChunks
-        if (useBinaryAlbumArt) {
+        if (quality == AlbumArtQuality.HQ) {
+            logger(
+                "[AlbumArtHQ] selected scale=${compressedAlbumArt.width} " +
+                    "quality=${compressedAlbumArt.quality} " +
+                    "bytes=${compressedAlbumArt.bytes.size} chunks=$totalChunks"
+            )
+        } else if (useBinaryAlbumArt) {
             logger(
                 "[AlbumArtBinary] selected scale=${compressedAlbumArt.width} " +
                     "quality=${compressedAlbumArt.quality} " +
@@ -1034,7 +1120,9 @@ class BleGattServerManager(
         }
 
         val startAt = SystemClock.elapsedRealtime()
-        if (useBinaryAlbumArt) {
+        if (quality == AlbumArtQuality.HQ) {
+            logger("[AlbumArtHQ] send start chunks=$totalChunks")
+        } else if (useBinaryAlbumArt) {
             logger("[AlbumArtBinary] send start chunks=$totalChunks")
         } else {
             logger(
@@ -1048,13 +1136,19 @@ class BleGattServerManager(
             packets = albumPackets.packets,
             maxSendDurationMs = when (quality) {
                 AlbumArtQuality.PREVIEW -> ALBUM_ART_PREVIEW_MAX_SEND_MS
+                AlbumArtQuality.HQ -> ALBUM_ART_HQ_MAX_SEND_MS
                 AlbumArtQuality.FULL -> ALBUM_ART_FULL_MAX_SEND_MS
+            },
+            shouldCancel = {
+                quality == AlbumArtQuality.HQ && currentAlbumArtId != protocolId
             },
             onComplete = {
                 albumArtRequestsInFlight.remove(requestKey)
                 albumArtRequestsCompleted.add(requestKey)
                 val costMs = SystemClock.elapsedRealtime() - startAt
-                if (useBinaryAlbumArt) {
+                if (quality == AlbumArtQuality.HQ) {
+                    logger("[AlbumArtHQ] send end costMs=$costMs")
+                } else if (useBinaryAlbumArt) {
                     val avg = if (totalChunks > 0) {
                         costMs.toDouble() / totalChunks.toDouble()
                     } else {
@@ -1073,6 +1167,9 @@ class BleGattServerManager(
             },
             onFailure = {
                 albumArtRequestsInFlight.remove(requestKey)
+                if (quality == AlbumArtQuality.HQ && currentAlbumArtId != protocolId) {
+                    logger("[AlbumArtHQ] cancelled reason=track changed")
+                }
                 sendPendingAlbumArtIfAny()
             }
         )
@@ -1095,6 +1192,13 @@ class BleGattServerManager(
                 CompressionAttempt(112, 112, 40, PREVIEW_MAX_JPEG_BYTES),
                 CompressionAttempt(96, 96, 35, PREVIEW_MAX_JPEG_BYTES)
             )
+            AlbumArtQuality.HQ -> listOf(
+                CompressionAttempt(280, 280, 85, HQ_MAX_JPEG_BYTES),
+                CompressionAttempt(256, 256, 82, HQ_MAX_JPEG_BYTES),
+                CompressionAttempt(240, 240, 80, HQ_MAX_JPEG_BYTES),
+                CompressionAttempt(220, 220, 78, HQ_MAX_JPEG_BYTES),
+                CompressionAttempt(200, 200, 75, HQ_MAX_JPEG_BYTES)
+            )
             AlbumArtQuality.FULL -> listOf(
                 CompressionAttempt(160, 160, 55, FULL_MAX_JPEG_BYTES),
                 CompressionAttempt(144, 144, 50, FULL_MAX_JPEG_BYTES),
@@ -1104,18 +1208,19 @@ class BleGattServerManager(
         }
         val maximumChunks = when (quality) {
             AlbumArtQuality.PREVIEW -> ALBUM_ART_PREVIEW_MAX_CHUNKS
+            AlbumArtQuality.HQ -> ALBUM_ART_HQ_MAX_CHUNKS
             AlbumArtQuality.FULL -> ALBUM_ART_FULL_MAX_CHUNKS
         }
 
         attempts.forEachIndexed { index, attempt ->
             if (index > 0) {
-                if (quality == AlbumArtQuality.PREVIEW) {
+                if (quality == AlbumArtQuality.PREVIEW || quality == AlbumArtQuality.HQ) {
                     val prefix = if (binaryTransport) {
-                        "[AlbumArtBinary]"
+                        if (quality == AlbumArtQuality.HQ) "[AlbumArtHQ]" else "[AlbumArtBinary]"
                     } else {
                         "[AlbumArt]"
                     }
-                    logger("$prefix preview fallback scale=${attempt.width}")
+                    logger("$prefix fallback scale=${attempt.width}")
                 } else {
                     logger(
                         "[AlbumArt][BLE] fallback scale=${attempt.width} " +
@@ -1126,9 +1231,9 @@ class BleGattServerManager(
 
             val compressed = compressAlbumArt(bitmap, attempt)
             if (compressed == null) {
-                if (quality == AlbumArtQuality.PREVIEW) {
+                if (quality == AlbumArtQuality.PREVIEW || quality == AlbumArtQuality.HQ) {
                     val prefix = if (binaryTransport) {
-                        "[AlbumArtBinary]"
+                        if (quality == AlbumArtQuality.HQ) "[AlbumArtHQ]" else "[AlbumArtBinary]"
                     } else {
                         "[AlbumArt]"
                     }
@@ -1159,7 +1264,9 @@ class BleGattServerManager(
                 )
             }
             if (packets == null) {
-                val prefix = if (quality == AlbumArtQuality.PREVIEW && binaryTransport) {
+                val prefix = if (binaryTransport && quality == AlbumArtQuality.HQ) {
+                    "[AlbumArtHQ]"
+                } else if (quality == AlbumArtQuality.PREVIEW && binaryTransport) {
                     "[AlbumArtBinary]"
                 } else {
                     "[AlbumArt][BLE]"
@@ -1171,9 +1278,9 @@ class BleGattServerManager(
                 )
                 return@forEachIndexed
             }
-            if (quality == AlbumArtQuality.PREVIEW) {
+            if (quality == AlbumArtQuality.PREVIEW || quality == AlbumArtQuality.HQ) {
                 val prefix = if (binaryTransport) {
-                    "[AlbumArtBinary]"
+                    if (quality == AlbumArtQuality.HQ) "[AlbumArtHQ]" else "[AlbumArtBinary]"
                 } else {
                     "[AlbumArt]"
                 }
@@ -1195,9 +1302,9 @@ class BleGattServerManager(
             if (compressed.bytes.size <= attempt.maximumBytes &&
                 packets.totalChunks <= maximumChunks
             ) {
-                if (quality == AlbumArtQuality.PREVIEW) {
+                if (quality == AlbumArtQuality.PREVIEW || quality == AlbumArtQuality.HQ) {
                     val prefix = if (binaryTransport) {
-                        "[AlbumArtBinary]"
+                        if (quality == AlbumArtQuality.HQ) "[AlbumArtHQ]" else "[AlbumArtBinary]"
                     } else {
                         "[AlbumArt]"
                     }
@@ -1229,6 +1336,8 @@ class BleGattServerManager(
         }
         if (quality == AlbumArtQuality.PREVIEW) {
             logger("[AlbumArtBinary] no acceptable candidate")
+        } else if (quality == AlbumArtQuality.HQ) {
+            logger("[AlbumArtHQ] unavailable reason=no acceptable compressed candidate")
         } else {
             logger("[AlbumArt] skip because too large chunks")
         }
@@ -1396,6 +1505,7 @@ class BleGattServerManager(
         )
         val qualityCode = when (quality) {
             AlbumArtQuality.PREVIEW -> 1
+            AlbumArtQuality.HQ -> 3
             AlbumArtQuality.FULL -> 2
         }
         for (index in 0 until totalChunks) {
@@ -1877,7 +1987,9 @@ class BleGattServerManager(
                 trackId = trackId,
                 index = index,
                 timeMs = line.timeMs,
+                durationMs = line.durationMs,
                 text = line.text,
+                words = line.words,
                 maximumPayload = maximumPayload
             )
             if (chunk == null) {
@@ -1952,20 +2064,44 @@ class BleGattServerManager(
         trackId: String,
         index: Int,
         timeMs: Long,
+        durationMs: Long,
         text: String,
+        words: List<com.example.playeragent.media.QrcLyricWord>,
         maximumPayload: Int
     ): ByteArray? {
         var fittedText = text.take(MAX_FULL_LYRICS_TEXT_LENGTH)
+        if (words.isNotEmpty() && fittedText == text) {
+            val withWords = buildFullLyricsChunkJson(
+                trackId = trackId,
+                index = index,
+                timeMs = timeMs,
+                durationMs = durationMs,
+                text = fittedText,
+                words = words
+            ).toByteArray(Charsets.UTF_8)
+            if (withWords.size <= maximumPayload) {
+                logger(
+                    "[FullLyrics] chunk index=$index words=${words.size} " +
+                        "payloadBytes=${withWords.size}"
+                )
+                return withWords
+            }
+            logger("[FullLyrics] words omitted index=$index reason=payload too large")
+        }
         while (true) {
-            val value = JSONObject()
-                .put("type", "fullLyricsChunk")
-                .put("trackId", trackId)
-                .put("index", index)
-                .put("timeMs", timeMs)
-                .put("text", fittedText)
-                .toString()
-                .toByteArray(Charsets.UTF_8)
+            val value = buildFullLyricsChunkJson(
+                trackId = trackId,
+                index = index,
+                timeMs = timeMs,
+                durationMs = durationMs,
+                text = fittedText,
+                words = emptyList()
+            ).toByteArray(Charsets.UTF_8)
             if (value.size <= maximumPayload) {
+                logger(
+                    "[FullLyrics] chunk index=$index words=0 " +
+                        "payloadBytes=${value.size}"
+                )
                 return value
             }
             if (fittedText.isEmpty()) {
@@ -1973,6 +2109,43 @@ class BleGattServerManager(
             }
             fittedText = fittedText.dropLast(1)
         }
+    }
+
+    private fun buildFullLyricsChunkJson(
+        trackId: String,
+        index: Int,
+        timeMs: Long,
+        durationMs: Long,
+        text: String,
+        words: List<com.example.playeragent.media.QrcLyricWord>
+    ): String {
+        return JSONObject()
+            .put("type", "fullLyricsChunk")
+            .put("trackId", trackId)
+            .put("index", index)
+            .put("timeMs", timeMs)
+            .put("durationMs", durationMs)
+            .put("text", text)
+            .also { objectValue ->
+                if (words.isNotEmpty()) {
+                    objectValue.put(
+                        "words",
+                        JSONArray().also { array ->
+                            words.forEach { word ->
+                                if (word.text.isNotBlank()) {
+                                    array.put(
+                                        JSONObject()
+                                            .put("startMs", word.startMs)
+                                            .put("durationMs", word.durationMs)
+                                            .put("text", word.text)
+                                    )
+                                }
+                            }
+                        }
+                    )
+                }
+            }
+            .toString()
     }
 
     private fun chooseLogChunkSize(maximumPayload: Int): Int {
@@ -2008,20 +2181,23 @@ class BleGattServerManager(
         status: Int,
         offset: Int,
         value: ByteArray?
-    ) {
+    ): Boolean {
         val server = gattServer
         if (server == null || device == null) {
             logger("[BLE-A] write response skipped: server or device unavailable")
-            return
+            return false
         }
 
-        try {
+        return try {
             val sent = server.sendResponse(device, requestId, status, offset, value)
             logger("[BLE-A] write response sent=$sent status=$status")
+            sent
         } catch (securityException: SecurityException) {
             logger("[BLE-A] write response failed: missing permission")
+            false
         } catch (exception: Exception) {
             logger("[BLE-A] write response failed: ${exception.message}")
+            false
         }
     }
 
@@ -2033,8 +2209,10 @@ class BleGattServerManager(
         private const val AUTO_PUSH_INTERVAL_MS = 1000L
         private const val ALBUM_ART_ENABLED = true
         private const val ALBUM_ART_PREVIEW_MAX_CHUNKS = 35
+        private const val ALBUM_ART_HQ_MAX_CHUNKS = 95
         private const val ALBUM_ART_FULL_MAX_CHUNKS = 90
         private const val ALBUM_ART_PREVIEW_MAX_SEND_MS = 1200L
+        private const val ALBUM_ART_HQ_MAX_SEND_MS = 8000L
         private const val ALBUM_ART_FULL_MAX_SEND_MS = 3500L
         private const val ALBUM_ART_COOLDOWN_AFTER_TRACK_CHANGE_MS = 1500L
         private const val MAX_TRACK_INFO_TEXT_LENGTH = 300
@@ -2045,6 +2223,7 @@ class BleGattServerManager(
         private const val ALBUM_ART_BINARY_HEADER_BYTES = 6
         private const val ALBUM_ART_ID_HASH_BYTES = 12
         private const val PREVIEW_MAX_JPEG_BYTES = 6200
+        private const val HQ_MAX_JPEG_BYTES = 16000
         private const val FULL_MAX_JPEG_BYTES = 5200
         private const val SHORT_MESSAGE_DELAY_MS = 20L
         private const val ALBUM_ART_NOTIFICATION_DELAY_MS = 35L
@@ -2091,6 +2270,7 @@ class BleGattServerManager(
 
     private enum class AlbumArtQuality(val wireValue: String) {
         PREVIEW("preview"),
+        HQ("hq"),
         FULL("full");
 
         companion object {

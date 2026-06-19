@@ -12,6 +12,7 @@ struct DebugToolsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     statusSection
+                    karaokeOffsetSection
                     actionSection
                     sonyLogSection
                     mediaFieldDumpSection
@@ -93,6 +94,46 @@ struct DebugToolsView: View {
                         disabled: !isConnected || bleManager.isMediaFieldDumpReceiving,
                         action: bleManager.sendDumpMediaFields
                     )
+                }
+            }
+        }
+    }
+
+    private var karaokeOffsetSection: some View {
+        DebugCard {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Label("Karaoke Offset", systemImage: "textformat")
+                        .font(.headline)
+                    Spacer()
+                    Text(offsetLabel(bleManager.karaokeOffsetMs))
+                        .font(.subheadline.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(.green)
+                }
+
+                Text("只影响逐字高亮提前/延后，不影响进度条和歌词点击跳转。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                LazyVGrid(
+                    columns: [
+                        GridItem(.flexible(), spacing: 8),
+                        GridItem(.flexible(), spacing: 8),
+                        GridItem(.flexible(), spacing: 8)
+                    ],
+                    spacing: 8
+                ) {
+                    ForEach(karaokeOffsetOptions, id: \.self) { value in
+                        Button {
+                            bleManager.setKaraokeOffsetMs(value)
+                        } label: {
+                            Text(offsetLabel(value))
+                                .font(.caption.monospacedDigit().weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(value == bleManager.karaokeOffsetMs ? .green : .gray.opacity(0.35))
+                    }
                 }
             }
         }
@@ -242,6 +283,17 @@ struct DebugToolsView: View {
 
     private var isConnected: Bool {
         bleManager.connectionStatus == "已连接"
+    }
+
+    private var karaokeOffsetOptions: [Int64] {
+        [-300, -100, 0, 300, 600, 900]
+    }
+
+    private func offsetLabel(_ value: Int64) -> String {
+        if value > 0 {
+            return "+\(value)ms"
+        }
+        return "\(value)ms"
     }
 
     private func debugRow(_ title: String, _ value: String) -> some View {

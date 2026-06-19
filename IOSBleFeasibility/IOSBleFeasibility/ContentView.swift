@@ -39,7 +39,7 @@ struct ContentView: View {
                     albumArtImage: bleManager.albumArtImage,
                     lyrics: bleManager.fullLyrics,
                     currentIndex: currentFullLyricIndex,
-                    positionMs: displayedPositionMs,
+                    positionMs: karaokePositionMs,
                     isPlaying: bleManager.isPlaying,
                     isConnected: isConnected,
                     onDismiss: { showFullLyrics = false },
@@ -48,6 +48,9 @@ struct ContentView: View {
                     onNext: bleManager.sendNext,
                     onSeekToLine: bleManager.seekToLyricLine
                 )
+            }
+            .onChange(of: displayedPositionMs) { _, newValue in
+                bleManager.logKaraokeOffset(rawPositionMs: newValue)
             }
         }
     }
@@ -213,6 +216,8 @@ struct ContentView: View {
                         KaraokeLyricText(
                             text: lyricPreviewLine(offset: 0),
                             progress: currentLyricProgress,
+                            words: lyricPreviewLineModel(offset: 0)?.words ?? [],
+                            positionMs: karaokePositionMs,
                             highlightColor: Color.green.opacity(0.98),
                             normalColor: Color.white.opacity(0.48),
                             font: .system(size: 24, weight: .bold, design: .rounded),
@@ -430,6 +435,10 @@ struct ContentView: View {
         bleManager.isSeeking ? bleManager.seekPositionMs : bleManager.displayPositionMs
     }
 
+    private var karaokePositionMs: Int64 {
+        bleManager.karaokePositionMs(rawPositionMs: displayedPositionMs)
+    }
+
     private var displayedVolume: Int {
         bleManager.isVolumeSeeking ? bleManager.volumeSeekValue : bleManager.volumeCurrent
     }
@@ -454,7 +463,7 @@ struct ContentView: View {
     private var currentFullLyricIndex: Int {
         LyricTimelineHelper.currentIndex(
             lines: bleManager.fullLyrics,
-            positionMs: displayedPositionMs
+            positionMs: karaokePositionMs
         ) ?? -1
     }
 
@@ -462,7 +471,7 @@ struct ContentView: View {
         LyricTimelineHelper.lineProgress(
             lines: bleManager.fullLyrics,
             index: currentFullLyricIndex,
-            positionMs: displayedPositionMs
+            positionMs: karaokePositionMs
         )
     }
 
@@ -474,13 +483,19 @@ struct ContentView: View {
     }
 
     private func lyricPreviewLine(offset: Int) -> String {
-        let index = currentFullLyricIndex + offset
-        guard bleManager.fullLyrics.indices.contains(index) else {
+        guard let line = lyricPreviewLineModel(offset: offset) else {
             return offset == 0 ? currentLyricText : " "
         }
-        let text = bleManager.fullLyrics[index].text
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
         return text.isEmpty ? " " : text
+    }
+
+    private func lyricPreviewLineModel(offset: Int) -> LyricLine? {
+        let index = currentFullLyricIndex + offset
+        guard bleManager.fullLyrics.indices.contains(index) else {
+            return nil
+        }
+        return bleManager.fullLyrics[index]
     }
 
     private var albumArtIdentity: String {
@@ -621,6 +636,8 @@ private struct PressScaleButtonStyle: ButtonStyle {
 struct KaraokeLyricText: View {
     let text: String
     let progress: Double
+    var words: [LyricWord] = []
+    var positionMs: Int64? = nil
     let highlightColor: Color
     let normalColor: Color
     let font: Font
@@ -628,8 +645,16 @@ struct KaraokeLyricText: View {
     var alignment: TextAlignment = .leading
 
     private var highlightCount: Int {
-        let count = Array(text).count
+        let characters = Array(text)
+        let count = characters.count
         guard count > 0 else { return 0 }
+        if let positionMs, !words.isEmpty {
+            let wordCharacterCount = words.reduce(0) { partial, word in
+                guard positionMs >= word.startMs else { return partial }
+                return partial + Array(word.text).count
+            }
+            return min(max(wordCharacterCount, 0), count)
+        }
         let boundedProgress = min(max(progress, 0), 1)
         let rawCount = Int((Double(count) * boundedProgress).rounded(.down))
         return min(max(rawCount, 0), count)
@@ -637,9 +662,12 @@ struct KaraokeLyricText: View {
 
     private var splitText: (String, String) {
         guard highlightCount > 0 else { return ("", text) }
-        guard highlightCount < text.count else { return (text, "") }
-        let index = text.index(text.startIndex, offsetBy: highlightCount)
-        return (String(text[..<index]), String(text[index...]))
+        let characters = Array(text)
+        guard highlightCount < characters.count else { return (text, "") }
+        return (
+            String(characters.prefix(highlightCount)),
+            String(characters.dropFirst(highlightCount))
+        )
     }
 
     var body: some View {
@@ -683,7 +711,9 @@ enum LyricTimelineHelper {
         guard lines.indices.contains(index) else { return 0 }
         let start = lines[index].timeMs
         let end: Int64
-        if lines.indices.contains(index + 1) {
+        if lines[index].durationMs > 0 {
+            end = start + lines[index].durationMs
+        } else if lines.indices.contains(index + 1) {
             end = max(lines[index + 1].timeMs, start + 1_000)
         } else {
             end = start + 4_000

@@ -150,6 +150,26 @@ class QrcLyricCacheManager(
                             JSONObject()
                                 .put("timeMs", line.timeMs)
                                 .put("text", line.text)
+                                .put("durationMs", line.durationMs)
+                                .also { lineObject ->
+                                    if (line.words.isNotEmpty()) {
+                                        lineObject.put(
+                                            "words",
+                                            JSONArray().also { wordsArray ->
+                                                line.words.forEach { word ->
+                                                    if (word.text.isNotBlank()) {
+                                                        wordsArray.put(
+                                                            JSONObject()
+                                                                .put("startMs", word.startMs)
+                                                                .put("durationMs", word.durationMs)
+                                                                .put("text", word.text)
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        )
+                                    }
+                                }
                         )
                     }
                 }
@@ -406,10 +426,28 @@ class QrcLyricCacheManager(
             } else {
                 QrcLyricLine(
                     timeMs = lineObject.optLong("timeMs"),
-                    text = text
+                    text = text,
+                    durationMs = lineObject.optLong("durationMs"),
+                    words = readWords(lineObject.optJSONArray("words") ?: JSONArray())
                 )
             }
         }.sortedBy(QrcLyricLine::timeMs)
+    }
+
+    private fun readWords(wordsArray: JSONArray): List<QrcLyricWord> {
+        return (0 until wordsArray.length()).mapNotNull { index ->
+            val wordObject = wordsArray.optJSONObject(index) ?: return@mapNotNull null
+            val text = wordObject.optString("text")
+            if (text.isBlank()) {
+                null
+            } else {
+                QrcLyricWord(
+                    startMs = wordObject.optLong("startMs"),
+                    durationMs = wordObject.optLong("durationMs"),
+                    text = text
+                )
+            }
+        }
     }
 
     private fun logFuzzyRejected(
@@ -559,6 +597,11 @@ class QrcLyricCacheManager(
         existing: ParsedLyric,
         candidate: ParsedLyric
     ): Boolean {
+        val existingWordCount = existing.lines.sumOf { it.words.size }
+        val candidateWordCount = candidate.lines.sumOf { it.words.size }
+        if (candidateWordCount > existingWordCount) {
+            return false
+        }
         return existing.lines.size > candidate.lines.size ||
             (existing.lines.size == candidate.lines.size &&
                 existing.qrcLastModified >= candidate.qrcLastModified)

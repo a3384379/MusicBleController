@@ -211,6 +211,8 @@ struct FullLyricsView: View {
             KaraokeLyricText(
                 text: line.text,
                 progress: lineProgress(index: index),
+                words: line.words,
+                positionMs: positionMs,
                 highlightColor: Color.green.opacity(0.98),
                 normalColor: Color.white.opacity(isSelected ? 0.58 : 0.36),
                 font: .system(size: 28, weight: .bold, design: .rounded),

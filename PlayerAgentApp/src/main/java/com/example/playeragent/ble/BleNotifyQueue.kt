@@ -60,6 +60,7 @@ class BleNotifyQueue(
         device: BluetoothDevice,
         packets: List<Packet>,
         maxSendDurationMs: Long? = null,
+        shouldCancel: (() -> Boolean)? = null,
         onComplete: (() -> Unit)? = null,
         onFailure: (() -> Unit)? = null
     ) {
@@ -73,6 +74,7 @@ class BleNotifyQueue(
                 packets = packets,
                 isLongJob = true,
                 maxSendDurationMs = maxSendDurationMs,
+                shouldCancel = shouldCancel,
                 onComplete = onComplete,
                 onFailure = onFailure
             )
@@ -233,6 +235,15 @@ class BleNotifyQueue(
         }
 
         val job = activeJob ?: return
+        if (job.shouldCancel?.invoke() == true) {
+            markJobFailed(job, "cancelled")
+            job.onFailure?.invoke()
+            activeJob = null
+            activePacketIndex = 0
+            activeJobStartedAtMs = 0L
+            sendNextPacket()
+            return
+        }
         val maxSendDurationMs = job.maxSendDurationMs
         if (maxSendDurationMs != null &&
             activePacketIndex < job.packets.size &&
@@ -496,6 +507,7 @@ class BleNotifyQueue(
         val packets: List<Packet>,
         val isLongJob: Boolean,
         val maxSendDurationMs: Long? = null,
+        val shouldCancel: (() -> Boolean)? = null,
         val onComplete: (() -> Unit)? = null,
         val onFailure: (() -> Unit)? = null,
         var failed: Boolean = false,

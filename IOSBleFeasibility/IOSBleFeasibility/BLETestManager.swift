@@ -3,10 +3,19 @@ import CryptoKit
 import Foundation
 import UIKit
 
+struct LyricWord: Identifiable, Equatable {
+    let id: Int
+    let startMs: Int64
+    let durationMs: Int64
+    let text: String
+}
+
 struct LyricLine: Identifiable, Equatable {
     let index: Int
     let timeMs: Int64
+    let durationMs: Int64
     let text: String
+    let words: [LyricWord]
 
     var id: Int { index }
 }
@@ -40,6 +49,7 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var mediaFieldDumpCopyStatus = ""
     @Published private(set) var isMediaFieldDumpReceiving = false
     @Published private(set) var mediaFieldDumpProgressText = ""
+    @Published private(set) var karaokeOffsetMs: Int64 = 600
 
     private lazy var centralManager = CBCentralManager(delegate: self, queue: nil)
     private lazy var peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
@@ -48,6 +58,11 @@ final class BLETestManager: NSObject, ObservableObject {
     private var sonyCommandCharacteristic: CBCharacteristic?
     private var sonyStatusCharacteristic: CBCharacteristic?
     private var pendingWriteCommand = ""
+    private var commandSeq: UInt64 = 0
+    private var commandWriteInflight: [CommandWriteInfo] = []
+    private var mainHeartbeatWorkItem: DispatchWorkItem?
+    private var lastMainHeartbeatAtMs: Int64 = 0
+    private var lastKaraokeOffsetLogAtMs: Int64 = 0
     private var albumArtID = ""
     private var albumArtQuality = ""
     private var albumArtExpectedSize = 0
@@ -62,6 +77,8 @@ final class BLETestManager: NSObject, ObservableObject {
     private var currentTrackID = ""
     private var currentCachedAlbumArtQuality = ""
     private var requestedAlbumArtKeys: Set<String> = []
+    private var requestedHqAlbumArtIDs: Set<String> = []
+    private var hqAlbumArtWorkItem: DispatchWorkItem?
     private var requestedFullLyricsTrackIDs: Set<String> = []
     private var fullLyricsReceivingTrackID = ""
     private var fullLyricsExpectedCount = 0
@@ -89,13 +106,21 @@ final class BLETestManager: NSObject, ObservableObject {
     private var shouldScanWhenPoweredOn = false
     private var scanTimeoutWorkItem: DispatchWorkItem?
 
+    private struct CommandWriteInfo {
+        let seq: UInt64
+        let cmd: String
+        let writeCalledAtMs: Int64
+    }
+
     override init() {
         super.init()
         startProgressTimer()
+        startMainHeartbeatDiagnostics()
     }
 
     deinit {
         progressTimer?.invalidate()
+        mainHeartbeatWorkItem?.cancel()
     }
 
     func startPeripheral() {
@@ -133,27 +158,27 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     func sendPlayPause() {
-        sendCommand(cmd: "PLAY_PAUSE")
+        sendUserCommand(cmd: "PLAY_PAUSE")
         refreshPlaybackState(after: 0.5)
     }
 
     func sendNext() {
-        sendCommand(cmd: "NEXT")
+        sendUserCommand(cmd: "NEXT")
         refreshPlaybackState(after: 0.5)
     }
 
     func sendPrevious() {
-        sendCommand(cmd: "PREVIOUS")
+        sendUserCommand(cmd: "PREVIOUS")
         refreshPlaybackState(after: 0.5)
     }
 
     func sendVolumeUp() {
-        sendCommand(cmd: "VOLUME_UP")
+        sendUserCommand(cmd: "VOLUME_UP")
         refreshVolume(after: 0.3)
     }
 
     func sendVolumeDown() {
-        sendCommand(cmd: "VOLUME_DOWN")
+        sendUserCommand(cmd: "VOLUME_DOWN")
         refreshVolume(after: 0.3)
     }
 
@@ -167,6 +192,26 @@ final class BLETestManager: NSObject, ObservableObject {
 
     func sendGetFullLyrics(force: Bool = false) {
         requestFullLyricsIfNeeded(force: force)
+    }
+
+    func setKaraokeOffsetMs(_ value: Int64) {
+        karaokeOffsetMs = value
+        log("[Lyrics-iOS] karaoke offsetMs=\(value)")
+    }
+
+    func karaokePositionMs(rawPositionMs: Int64) -> Int64 {
+        rawPositionMs + karaokeOffsetMs
+    }
+
+    func logKaraokeOffset(rawPositionMs: Int64) {
+        let now = currentTimeMs()
+        guard now - lastKaraokeOffsetLogAtMs >= 3_000 else { return }
+        lastKaraokeOffsetLogAtMs = now
+        log(
+            "[Lyrics-iOS] karaoke offsetMs=\(karaokeOffsetMs) " +
+                "rawPosition=\(rawPositionMs) " +
+                "effectivePosition=\(karaokePositionMs(rawPositionMs: rawPositionMs))"
+        )
     }
 
     func sendGetSonyLogs() {
@@ -196,14 +241,37 @@ final class BLETestManager: NSObject, ObservableObject {
         mediaFieldDumpCopyStatus = "已复制 Media Field Dump"
     }
 
+    private func sendUserCommand(cmd: String, extra: [String: Any] = [:]) {
+        let seq = nextCommandSeq()
+        ctrlLog("[CTRL-iOS] tap seq=\(seq) cmd=\(cmd) uiTimeMs=\(currentTimeMs())")
+        sendCommand(cmd: cmd, extra: extra, seq: seq)
+    }
+
     func sendCommand(cmd: String, extra: [String: Any] = [:]) {
+        sendCommand(cmd: cmd, extra: extra, seq: nil)
+    }
+
+    private func sendCommand(cmd: String, extra: [String: Any] = [:], seq providedSeq: UInt64?) {
+        let seq = providedSeq ?? nextCommandSeq()
+        let startMs = currentTimeMs()
         var payload = extra
         payload["cmd"] = cmd
-        payload["time"] = Int64(Date().timeIntervalSince1970 * 1_000)
+        payload["time"] = startMs
+        payload["seq"] = seq
+
+        let connected = sonyPeripheral?.state == .connected
+        let characteristicReady = sonyCommandCharacteristic != nil
+        ctrlLog(
+            "[CTRL-iOS] send start seq=\(seq) cmd=\(cmd) timeMs=\(startMs) " +
+                "connected=\(connected) characteristicReady=\(characteristicReady) " +
+                "connectionStatus=\(connectionStatus) centralState=\(centralManager.state.rawValue) " +
+                "peripheralId=\(sonyPeripheral?.identifier.uuidString ?? "nil")"
+        )
 
         guard JSONSerialization.isValidJSONObject(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload),
               let text = String(data: data, encoding: .utf8) else {
+            ctrlLog("[CTRL-iOS] write skipped seq=\(seq) cmd=\(cmd) reason=encode_failed")
             log("[Command] encode failed \(cmd)")
             return
         }
@@ -211,12 +279,23 @@ final class BLETestManager: NSObject, ObservableObject {
         guard let sonyPeripheral,
               sonyPeripheral.state == .connected,
               let sonyCommandCharacteristic else {
+            ctrlLog("[CTRL-iOS] write skipped seq=\(seq) cmd=\(cmd) reason=not_connected")
             log("[Command] send failed \(cmd): not connected")
             return
         }
 
         pendingWriteCommand = cmd
+        let writeBeginMs = currentTimeMs()
+        ctrlLog("[CTRL-iOS] write begin seq=\(seq) cmd=\(cmd) timeMs=\(writeBeginMs)")
+        commandWriteInflight.append(
+            CommandWriteInfo(
+                seq: seq,
+                cmd: cmd,
+                writeCalledAtMs: writeBeginMs
+            )
+        )
         sonyPeripheral.writeValue(data, for: sonyCommandCharacteristic, type: .withResponse)
+        ctrlLog("[CTRL-iOS] write called seq=\(seq) cmd=\(cmd) timeMs=\(currentTimeMs())")
         if cmd == "SET_VOLUME" {
             log("[iOS][BLE] write SET_VOLUME requested")
         } else {
@@ -226,7 +305,7 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     func seek(to position: Int64) {
-        sendCommand(cmd: "SEEK_TO", extra: ["position": max(position, 0)])
+        sendUserCommand(cmd: "SEEK_TO", extra: ["position": max(position, 0)])
     }
 
     func seekToLyricLine(_ timeMs: Int64) {
@@ -288,7 +367,7 @@ final class BLETestManager: NSObject, ObservableObject {
         volumeCurrent = targetVolume
         isVolumeSeeking = false
         log("[iOS][Volume] user set volume=\(targetVolume)")
-        sendCommand(cmd: "SET_VOLUME", extra: ["volume": targetVolume])
+        sendUserCommand(cmd: "SET_VOLUME", extra: ["volume": targetVolume])
     }
 
     private func beginSonyScan() {
@@ -309,6 +388,8 @@ final class BLETestManager: NSObject, ObservableObject {
         resetAlbumArtTransfer()
         resetBinaryAlbumArtTransfer()
         requestedAlbumArtKeys.removeAll()
+        requestedHqAlbumArtIDs.removeAll()
+        cancelHqAlbumArtRequest()
         resetRemoteLogTransfer()
         resetMediaFieldDumpTransfer()
         resetTrackInfoTransfer()
@@ -404,6 +485,41 @@ final class BLETestManager: NSObject, ObservableObject {
                 self.logs.removeFirst(self.logs.count - 300)
             }
         }
+    }
+
+    private func ctrlLog(_ message: String) {
+        log(message)
+        print(message)
+    }
+
+    private func nextCommandSeq() -> UInt64 {
+        commandSeq += 1
+        return commandSeq
+    }
+
+    private func currentTimeMs() -> Int64 {
+        Int64(Date().timeIntervalSince1970 * 1_000)
+    }
+
+    private func startMainHeartbeatDiagnostics() {
+        lastMainHeartbeatAtMs = currentTimeMs()
+        scheduleMainHeartbeatDiagnostics()
+    }
+
+    private func scheduleMainHeartbeatDiagnostics() {
+        mainHeartbeatWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let now = self.currentTimeMs()
+            let gapMs = now - self.lastMainHeartbeatAtMs
+            if gapMs > 2_000 {
+                self.ctrlLog("[CTRL-iOS] main stall detected gapMs=\(gapMs) timeMs=\(now)")
+            }
+            self.lastMainHeartbeatAtMs = now
+            self.scheduleMainHeartbeatDiagnostics()
+        }
+        mainHeartbeatWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: item)
     }
 
     private func albumArtConsoleLog(_ message: String) {
@@ -541,6 +657,23 @@ extension BLETestManager: CBPeripheralDelegate {
         didWriteValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        let completed = commandWriteInflight.isEmpty ? nil : commandWriteInflight.removeFirst()
+        let didWriteMs = currentTimeMs()
+        if let completed {
+            let costMs = didWriteMs - completed.writeCalledAtMs
+            let errorText = error?.localizedDescription ?? "nil"
+            ctrlLog(
+                "[CTRL-iOS] didWrite seq=\(completed.seq) cmd=\(completed.cmd) " +
+                    "timeMs=\(didWriteMs) costMs=\(costMs) error=\(errorText)"
+            )
+        } else {
+            let errorText = error?.localizedDescription ?? "nil"
+            ctrlLog(
+                "[CTRL-iOS] didWrite seq=unknown cmd=\(pendingWriteCommand) " +
+                    "timeMs=\(didWriteMs) costMs=unknown error=\(errorText)"
+            )
+        }
+
         if let error {
             if pendingWriteCommand == "SET_VOLUME" {
                 log("[iOS][BLE] write SET_VOLUME failed: \(error.localizedDescription)")
@@ -721,8 +854,9 @@ extension BLETestManager: CBPeripheralDelegate {
                     "[AlbumArtOffer] id=\(id) currentTitle=\(self.title)"
                 )
                 self.handleAlbumArtIdentity(id)
-                if let cached = self.validateCachedAlbumArt(id: id) {
+                if let cached = self.validateCachedAlbumArt(id: id, preferredQuality: "hq") {
                     self.cancelAlbumArtFallback()
+                    self.cancelHqAlbumArtRequest()
                     self.albumArtImage = cached.image
                     self.currentCachedAlbumArtQuality = cached.quality
                     let message = "[AlbumArtCache] hit id=\(id), skip request"
@@ -732,6 +866,21 @@ extension BLETestManager: CBPeripheralDelegate {
                         cmd: "ALBUM_ART_SKIP",
                         extra: ["id": id]
                     )
+                } else if let cached = self.validateCachedAlbumArt(
+                    id: id,
+                    preferredQuality: "preview"
+                ) {
+                    self.cancelAlbumArtFallback()
+                    self.albumArtImage = cached.image
+                    self.currentCachedAlbumArtQuality = cached.quality
+                    let message = "[AlbumArtCache] hit preview id=\(id), schedule hq"
+                    self.log(message)
+                    self.albumArtConsoleLog(message)
+                    self.sendCommand(
+                        cmd: "ALBUM_ART_SKIP",
+                        extra: ["id": id]
+                    )
+                    self.scheduleHqAlbumArtRequest(id: id)
                 } else {
                     let message = "[AlbumArtCache] invalid id=\(id), request preview"
                     self.log(message)
@@ -746,7 +895,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 let size = Self.intValue(object["size"])
                 let chunks = Self.intValue(object["chunks"])
                 guard !id.isEmpty,
-                      quality == "preview" || quality == "full",
+                      quality == "preview" || quality == "hq" || quality == "full",
                       size > 0,
                       chunks > 0 else {
                     self.resetAlbumArtTransfer()
@@ -773,7 +922,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 let size = Self.intValue(object["size"])
                 let chunks = Self.intValue(object["chunks"])
                 guard !id.isEmpty,
-                      quality == "preview" || quality == "full",
+                      quality == "preview" || quality == "hq" || quality == "full",
                       size > 0,
                       chunks > 0 else {
                     self.resetBinaryAlbumArtTransfer()
@@ -993,7 +1142,8 @@ extension BLETestManager: CBPeripheralDelegate {
         }
         if isLikelyPlaceholderAlbumArt(image, dataSize: jpegData.count) {
             log("[AlbumArt] placeholder ignored id=\(id)")
-            if id == currentAlbumArtID {
+            if id == currentAlbumArtID,
+               quality == "preview" {
                 cancelAlbumArtFallback()
                 albumArtImage = nil
                 currentCachedAlbumArtQuality = ""
@@ -1005,9 +1155,12 @@ extension BLETestManager: CBPeripheralDelegate {
 
         saveAlbumArt(jpegData, id: id, quality: quality)
         if id == currentAlbumArtID {
-            cancelAlbumArtFallback()
-            albumArtImage = image
-            currentCachedAlbumArtQuality = quality
+            if quality == "hq" ||
+                currentCachedAlbumArtQuality != "hq" {
+                cancelAlbumArtFallback()
+                albumArtImage = image
+                currentCachedAlbumArtQuality = quality
+            }
         }
         requestedAlbumArtKeys.remove("\(id)|\(quality)")
         let pixelWidth = image.cgImage?.width ?? Int(image.size.width)
@@ -1017,6 +1170,9 @@ extension BLETestManager: CBPeripheralDelegate {
         resetAlbumArtTransfer()
 
         albumArtPreviewRetryCount = 0
+        if quality == "preview" {
+            scheduleHqAlbumArtRequest(id: id)
+        }
     }
 
     private func resetAlbumArtTransfer() {
@@ -1038,7 +1194,15 @@ extension BLETestManager: CBPeripheralDelegate {
         let qualityCode = bytes[1]
         let index = (Int(bytes[2]) << 8) | Int(bytes[3])
         let totalChunks = (Int(bytes[4]) << 8) | Int(bytes[5])
-        let quality = qualityCode == 2 ? "full" : "preview"
+        let quality: String
+        switch qualityCode {
+        case 2:
+            quality = "full"
+        case 3:
+            quality = "hq"
+        default:
+            quality = "preview"
+        }
         guard binaryAlbumArtExpectedChunks > 0,
               totalChunks == binaryAlbumArtExpectedChunks,
               quality == binaryAlbumArtQuality,
@@ -1097,7 +1261,8 @@ extension BLETestManager: CBPeripheralDelegate {
             let message = "[AlbumArtBinary] placeholder ignored id=\(id)"
             log(message)
             albumArtConsoleLog(message)
-            if id == currentAlbumArtID {
+            if id == currentAlbumArtID,
+               quality == "preview" {
                 cancelAlbumArtFallback()
                 albumArtImage = nil
                 currentCachedAlbumArtQuality = ""
@@ -1108,14 +1273,20 @@ extension BLETestManager: CBPeripheralDelegate {
         }
         saveAlbumArt(jpegData, id: id, quality: quality)
         if id == currentAlbumArtID {
-            cancelAlbumArtFallback()
-            albumArtImage = image
-            currentCachedAlbumArtQuality = quality
+            if quality == "hq" ||
+                currentCachedAlbumArtQuality != "hq" {
+                cancelAlbumArtFallback()
+                albumArtImage = image
+                currentCachedAlbumArtQuality = quality
+            }
         }
         requestedAlbumArtKeys.remove("\(id)|\(quality)")
         let message = "[AlbumArtBinary] decode success bytes=\(jpegData.count)"
         log(message)
         albumArtConsoleLog(message)
+        if quality == "preview" {
+            scheduleHqAlbumArtRequest(id: id)
+        }
         resetBinaryAlbumArtTransfer()
     }
 
@@ -1210,11 +1381,15 @@ extension BLETestManager: CBPeripheralDelegate {
         }
         let index = Self.intValue(object["index"])
         guard index >= 0, index < fullLyricsExpectedCount else { return }
+        let words = Self.parseLyricWords(object["words"])
         fullLyricsChunks[index] = LyricLine(
             index: index,
             timeMs: Self.int64Value(object["timeMs"]),
-            text: object["text"] as? String ?? ""
+            durationMs: Self.int64Value(object["durationMs"]),
+            text: object["text"] as? String ?? "",
+            words: words
         )
+        log("[Lyrics-iOS] chunk index=\(index) words=\(words.count)")
     }
 
     private func handleFullLyricsEnd(_ object: [String: Any]) {
@@ -1340,8 +1515,11 @@ extension BLETestManager: CBPeripheralDelegate {
         currentAlbumArtID = id
         currentCachedAlbumArtQuality = ""
         requestedAlbumArtKeys.removeAll()
+        requestedHqAlbumArtIDs.removeAll()
         albumArtPreviewRetryCount = 0
         resetAlbumArtTransfer()
+        resetBinaryAlbumArtTransfer()
+        cancelHqAlbumArtRequest()
 
         if let cached = loadCachedAlbumArt(id: id) {
             cancelAlbumArtFallback()
@@ -1378,6 +1556,43 @@ extension BLETestManager: CBPeripheralDelegate {
         albumArtFallbackWorkItem = nil
     }
 
+    private func scheduleHqAlbumArtRequest(id: String) {
+        guard id == currentAlbumArtID else { return }
+        guard currentCachedAlbumArtQuality != "hq" else { return }
+        guard !requestedHqAlbumArtIDs.contains(id) else { return }
+        cancelHqAlbumArtRequest()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.requestHqAlbumArt(id: id)
+        }
+        hqAlbumArtWorkItem = workItem
+        log("[AlbumArtHQ] scheduled id=\(id)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8, execute: workItem)
+    }
+
+    private func cancelHqAlbumArtRequest() {
+        hqAlbumArtWorkItem?.cancel()
+        hqAlbumArtWorkItem = nil
+    }
+
+    private func requestHqAlbumArt(id: String) {
+        guard id == currentAlbumArtID else { return }
+        guard currentCachedAlbumArtQuality != "hq" else { return }
+        guard connectionStatus == "已连接" else {
+            log("[AlbumArtHQ] request skipped not connected")
+            return
+        }
+        guard !isFullLyricsReceiving,
+              !isRemoteLogTransferInProgress,
+              !isMediaFieldDumpReceiving,
+              albumArtExpectedChunks == 0,
+              binaryAlbumArtExpectedChunks == 0 else {
+            log("[AlbumArtHQ] request skipped busy")
+            return
+        }
+        guard requestedHqAlbumArtIDs.insert(id).inserted else { return }
+        requestAlbumArt(id: id, quality: "hq")
+    }
+
     private func requestAlbumArt(id: String, quality: String) {
         guard id == currentAlbumArtID else { return }
         let key = "\(id)|\(quality)"
@@ -1409,13 +1624,16 @@ extension BLETestManager: CBPeripheralDelegate {
     private func loadCachedAlbumArt(
         id: String
     ) -> (image: UIImage, quality: String)? {
-        validateCachedAlbumArt(id: id)
+        validateCachedAlbumArt(id: id, preferredQuality: "hq") ??
+            validateCachedAlbumArt(id: id, preferredQuality: "preview") ??
+            validateCachedAlbumArt(id: id, preferredQuality: nil)
     }
 
     private func validateCachedAlbumArt(
-        id: String
+        id: String,
+        preferredQuality: String? = nil
     ) -> (image: UIImage, quality: String)? {
-        let imageURL = albumArtCacheURL(id: id)
+        let imageURL = albumArtCacheURL(id: id, quality: preferredQuality)
         let exists = FileManager.default.fileExists(atPath: imageURL.path)
         let data = try? Data(contentsOf: imageURL)
         let size = data?.count ?? 0
@@ -1423,31 +1641,34 @@ extension BLETestManager: CBPeripheralDelegate {
         let decoded = image != nil
         let validateMessage =
             "[AlbumArtCache] validate id=\(id) exists=\(exists) " +
-            "size=\(size) decode=\(decoded)"
+            "quality=\(preferredQuality ?? "legacy") size=\(size) decode=\(decoded)"
         log(validateMessage)
         albumArtConsoleLog(validateMessage)
 
         guard let image, size > 0 else {
             if exists {
-                removeCorruptedAlbumArt(id: id)
+                removeCorruptedAlbumArt(id: id, quality: preferredQuality)
             }
             return nil
         }
         if isLikelyPlaceholderAlbumArt(image, dataSize: size) {
-            removePlaceholderAlbumArt(id: id)
+            removePlaceholderAlbumArt(id: id, quality: preferredQuality)
             return nil
         }
 
-        let qualityURL = albumArtQualityURL(id: id)
+        let qualityURL = albumArtQualityURL(id: id, quality: preferredQuality)
         let quality = (
             try? String(contentsOf: qualityURL, encoding: .utf8)
         )?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (image, quality == "preview" ? "preview" : "full")
+        if let preferredQuality {
+            return (image, quality == preferredQuality ? preferredQuality : preferredQuality)
+        }
+        return (image, quality == "preview" ? "preview" : "hq")
     }
 
-    private func removeCorruptedAlbumArt(id: String) {
-        let imageURL = albumArtCacheURL(id: id)
-        let qualityURL = albumArtQualityURL(id: id)
+    private func removeCorruptedAlbumArt(id: String, quality: String? = nil) {
+        let imageURL = albumArtCacheURL(id: id, quality: quality)
+        let qualityURL = albumArtQualityURL(id: id, quality: quality)
         try? FileManager.default.removeItem(at: imageURL)
         try? FileManager.default.removeItem(at: qualityURL)
         let message = "[AlbumArtCache] corrupted removed id=\(id)"
@@ -1455,9 +1676,9 @@ extension BLETestManager: CBPeripheralDelegate {
         albumArtConsoleLog(message)
     }
 
-    private func removePlaceholderAlbumArt(id: String) {
-        let imageURL = albumArtCacheURL(id: id)
-        let qualityURL = albumArtQualityURL(id: id)
+    private func removePlaceholderAlbumArt(id: String, quality: String? = nil) {
+        let imageURL = albumArtCacheURL(id: id, quality: quality)
+        let qualityURL = albumArtQualityURL(id: id, quality: quality)
         try? FileManager.default.removeItem(at: imageURL)
         try? FileManager.default.removeItem(at: qualityURL)
         let message = "[AlbumArtCache] placeholder removed id=\(id)"
@@ -1526,13 +1747,16 @@ extension BLETestManager: CBPeripheralDelegate {
                 at: directory,
                 withIntermediateDirectories: true
             )
-            try data.write(to: albumArtCacheURL(id: id), options: .atomic)
+            try data.write(
+                to: albumArtCacheURL(id: id, quality: quality),
+                options: .atomic
+            )
             try quality.write(
-                to: albumArtQualityURL(id: id),
+                to: albumArtQualityURL(id: id, quality: quality),
                 atomically: true,
                 encoding: .utf8
             )
-            let message = "[AlbumArtCache] saved id=\(id)"
+            let message = "[AlbumArtCache] saved id=\(id) quality=\(quality)"
             log(message)
             albumArtConsoleLog(message)
         } catch {
@@ -1555,15 +1779,29 @@ extension BLETestManager: CBPeripheralDelegate {
         )
     }
 
-    private func albumArtCacheURL(id: String) -> URL {
-        albumArtCacheDirectory()
-            .appendingPathComponent(Self.sha256(id))
+    private func albumArtCacheURL(id: String, quality: String? = nil) -> URL {
+        let baseName = Self.sha256(id)
+        let fileName: String
+        if let quality, quality == "preview" || quality == "hq" {
+            fileName = "\(baseName)_\(quality)"
+        } else {
+            fileName = baseName
+        }
+        return albumArtCacheDirectory()
+            .appendingPathComponent(fileName)
             .appendingPathExtension("jpg")
     }
 
-    private func albumArtQualityURL(id: String) -> URL {
-        albumArtCacheDirectory()
-            .appendingPathComponent(Self.sha256(id))
+    private func albumArtQualityURL(id: String, quality: String? = nil) -> URL {
+        let baseName = Self.sha256(id)
+        let fileName: String
+        if let quality, quality == "preview" || quality == "hq" {
+            fileName = "\(baseName)_\(quality)"
+        } else {
+            fileName = baseName
+        }
+        return albumArtCacheDirectory()
+            .appendingPathComponent(fileName)
             .appendingPathExtension("quality")
     }
 
@@ -1673,6 +1911,24 @@ extension BLETestManager: CBPeripheralDelegate {
             return number.intValue
         }
         return 0
+    }
+
+    private static func parseLyricWords(_ value: Any?) -> [LyricWord] {
+        guard let array = value as? [[String: Any]] else {
+            return []
+        }
+        return array.enumerated().compactMap { offset, object in
+            let text = object["text"] as? String ?? ""
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return nil
+            }
+            return LyricWord(
+                id: offset,
+                startMs: int64Value(object["startMs"]),
+                durationMs: int64Value(object["durationMs"]),
+                text: text
+            )
+        }
     }
 }
 

@@ -60,6 +60,9 @@ class MainActivity : Activity() {
     private var controllerScannerManager: ControllerScannerManager? = null
     private var rfcommClientManager: RfcommClientManager? = null
     private var qrcLyricPrebuildManager: QrcLyricPrebuildManager? = null
+    private var lastPlayerUiSongKey: String = ""
+    private var lastPlayerUiLyric: String = ""
+    private var albumArtRefreshGeneration = 0L
     private var lastQrcWatcherStatus = QrcWatcherStatus(
         watcherRunning = false,
         pendingGroups = 0,
@@ -71,6 +74,10 @@ class MainActivity : Activity() {
 
     private val logReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == PlayerAgentForegroundService.ACTION_PLAYER_UI_STATE) {
+                updatePlayerUiState(intent)
+                return
+            }
             if (intent?.action == PlayerAgentForegroundService.ACTION_QRC_WATCHER_STATUS) {
                 updateQrcWatcherStatus(
                     QrcWatcherStatus(
@@ -116,7 +123,9 @@ class MainActivity : Activity() {
                 message.startsWith("[AccessibilityLyric] candidate=") -> {
                     val candidate =
                         QQMusicLyricAccessibilityService.latestCandidateLyric
-                    if (candidate.isNotBlank()) {
+                    if (candidate.isNotBlank() &&
+                        currentLyricTextView.text.toString().isBlank()
+                    ) {
                         currentLyricTextView.text = candidate
                     }
                 }
@@ -137,6 +146,7 @@ class MainActivity : Activity() {
         super.onStart()
         val filter = IntentFilter().apply {
             addAction(PlayerAgentForegroundService.ACTION_LOG)
+            addAction(PlayerAgentForegroundService.ACTION_PLAYER_UI_STATE)
             addAction(PlayerAgentForegroundService.ACTION_QRC_WATCHER_STATUS)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -459,15 +469,15 @@ class MainActivity : Activity() {
 
             runOnUiThread {
                 if (state != null) {
-                    val title = state.optString("title")
-                    val artist = state.optString("artist")
-                    val album = state.optString("album")
-                    currentSongTextView.text = listOf(title, artist, album)
-                        .filter(String::isNotBlank)
-                        .joinToString("\n")
-                        .ifBlank { "未检测到当前歌曲" }
-                    currentLyricTextView.text =
-                        state.optString("lyric").ifBlank { "暂无歌词" }
+                    renderPlayerUiState(
+                        title = state.optString("title"),
+                        artist = state.optString("artist"),
+                        album = state.optString("album"),
+                        lyric = state.optString("lyric"),
+                        positionMs = state.optLong("position"),
+                        durationMs = state.optLong("duration"),
+                        allowAlbumArtRefresh = false
+                    )
                 }
 
                 if (albumArt != null) {
@@ -482,6 +492,110 @@ class MainActivity : Activity() {
             }
         }.apply {
             name = "MainStatusRefreshThread"
+            start()
+        }
+    }
+
+    private fun updatePlayerUiState(intent: Intent) {
+        renderPlayerUiState(
+            title = intent.getStringExtra(PlayerAgentForegroundService.EXTRA_UI_TITLE)
+                .orEmpty(),
+            artist = intent.getStringExtra(PlayerAgentForegroundService.EXTRA_UI_ARTIST)
+                .orEmpty(),
+            album = intent.getStringExtra(PlayerAgentForegroundService.EXTRA_UI_ALBUM)
+                .orEmpty(),
+            lyric = intent.getStringExtra(PlayerAgentForegroundService.EXTRA_UI_LYRIC)
+                .orEmpty(),
+            positionMs = intent.getLongExtra(
+                PlayerAgentForegroundService.EXTRA_UI_POSITION,
+                0L
+            ),
+            durationMs = intent.getLongExtra(
+                PlayerAgentForegroundService.EXTRA_UI_DURATION,
+                0L
+            ),
+            allowAlbumArtRefresh = true
+        )
+    }
+
+    private fun renderPlayerUiState(
+        title: String,
+        artist: String,
+        album: String,
+        lyric: String,
+        positionMs: Long,
+        durationMs: Long,
+        allowAlbumArtRefresh: Boolean
+    ) {
+        val safeTitle = title.ifBlank { "-" }
+        val safeArtist = artist.ifBlank { "-" }
+        val safeAlbum = album.ifBlank { "-" }
+        val songKey = "$safeTitle|$safeArtist|$safeAlbum"
+        val songChanged = songKey != lastPlayerUiSongKey
+        if (songChanged) {
+            lastPlayerUiSongKey = songKey
+            appendLog(
+                "[PlayerUI] track changed title=$safeTitle " +
+                    "artist=$safeArtist album=$safeAlbum"
+            )
+            if (allowAlbumArtRefresh) {
+                currentAlbumArtImageView.setImageResource(android.R.drawable.ic_media_play)
+                currentAlbumArtTextView.text = "加载中..."
+                refreshCurrentAlbumArtForSong(songKey)
+            }
+        }
+
+        currentSongTextView.text = listOf(safeTitle, safeArtist, safeAlbum)
+            .filter { it.isNotBlank() && it != "-" }
+            .joinToString("\n")
+            .ifBlank { "未检测到当前歌曲" }
+
+        val lyricText = lyric.ifBlank { "暂无歌词" }
+        currentLyricTextView.text = lyricText
+        if (lyricText != lastPlayerUiLyric) {
+            lastPlayerUiLyric = lyricText
+            appendLog("[PlayerUI] lyric changed text=$lyricText")
+        }
+    }
+
+    private fun refreshCurrentAlbumArtForSong(songKey: String) {
+        val generation = ++albumArtRefreshGeneration
+        Thread {
+            val albumArt = try {
+                AlbumArtTestManager(
+                    context = this,
+                    logger = ::appendThreadSafeLog
+                ).readCurrentNotificationAlbumArt()
+            } catch (exception: Exception) {
+                appendThreadSafeLog(
+                    "[PlayerUI] album art refresh failed=${exception.message}"
+                )
+                null
+            }
+            runOnUiThread {
+                if (generation != albumArtRefreshGeneration ||
+                    songKey != lastPlayerUiSongKey
+                ) {
+                    return@runOnUiThread
+                }
+                if (albumArt != null) {
+                    currentAlbumArtImageView.setImageBitmap(albumArt.bitmap)
+                    currentAlbumArtTextView.text =
+                        "${albumArt.bitmap.width} x ${albumArt.bitmap.height}"
+                    appendLog(
+                        "[PlayerUI] album art changed exists=true " +
+                            "width=${albumArt.bitmap.width} " +
+                            "height=${albumArt.bitmap.height}"
+                    )
+                } else {
+                    currentAlbumArtImageView
+                        .setImageResource(android.R.drawable.ic_media_play)
+                    currentAlbumArtTextView.text = "未找到"
+                    appendLog("[PlayerUI] album art changed exists=false")
+                }
+            }
+        }.apply {
+            name = "MainAlbumArtRefreshThread"
             start()
         }
     }

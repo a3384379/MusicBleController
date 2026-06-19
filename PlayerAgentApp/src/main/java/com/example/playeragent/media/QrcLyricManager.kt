@@ -58,8 +58,27 @@ class QrcLyricManager(
         logger("[QrcLyric] findBestGroup start title=$title")
 
         cacheManager.get(title, artist, album)?.let { cached ->
+            if (cached.lines.none { it.words.isNotEmpty() }) {
+                val upgraded = upgradeCachedLyricsWithWords(
+                    songKey = songKey,
+                    cached = cached,
+                    normalizedTitle = normalizedTitle
+                )
+                if (upgraded) {
+                    logger(
+                        "[QrcLyric] parsed lines=${cachedLines.size} " +
+                            "totalCostMs=${System.currentTimeMillis() - startedAt}"
+                    )
+                    return cachedLines.isNotEmpty()
+                }
+            }
             cachedLines = cached.lines.map {
-                LyricLine(timeMs = it.timeMs, text = it.text)
+                LyricLine(
+                    timeMs = it.timeMs,
+                    text = it.text,
+                    durationMs = it.durationMs,
+                    words = it.words
+                )
             }
             cachedGroupId = cached.groupId
             logger(
@@ -459,7 +478,12 @@ class QrcLyricManager(
                     groupId = entry.groupId,
                     qrcLastModified = entry.qrcFile?.lastModified() ?: 0L,
                     lines = parsed.lines.map {
-                        QrcLyricLine(timeMs = it.timeMs, text = it.text)
+                        QrcLyricLine(
+                            timeMs = it.timeMs,
+                            text = it.text,
+                            durationMs = it.durationMs,
+                            words = it.words
+                        )
                     }
                 )
             )
@@ -483,7 +507,12 @@ class QrcLyricManager(
                         groupId = entry.groupId,
                         qrcLastModified = entry.qrcFile?.lastModified() ?: 0L,
                         lines = parsed.lines.map {
-                            QrcLyricLine(timeMs = it.timeMs, text = it.text)
+                            QrcLyricLine(
+                                timeMs = it.timeMs,
+                                text = it.text,
+                                durationMs = it.durationMs,
+                                words = it.words
+                            )
                         }
                     )
                 )
@@ -491,6 +520,31 @@ class QrcLyricManager(
             }
             trimSongCaches()
         }
+    }
+
+    private fun upgradeCachedLyricsWithWords(
+        songKey: String,
+        cached: ParsedLyric,
+        normalizedTitle: String
+    ): Boolean {
+        if (cached.groupId.isBlank()) {
+            return false
+        }
+        val entry = getIndexEntries(forceRefresh = false)
+            .firstOrNull { it.groupId == cached.groupId }
+            ?: return false
+        val parsed = decryptAndParseQrc(entry) ?: return false
+        if (!parsedMatchesTitle(parsed, normalizedTitle) ||
+            parsed.lines.none { it.words.isNotEmpty() }
+        ) {
+            return false
+        }
+        logger(
+            "[QrcLyric] upgrade cached lyrics with words " +
+                "songKey=$songKey groupId=${cached.groupId}"
+        )
+        applyParsedResult(songKey, entry, parsed)
+        return cachedLines.isNotEmpty()
     }
 
     private fun saveNegative(songKey: String) {
@@ -549,6 +603,7 @@ class QrcLyricManager(
         val markers = QRC_LINE_REGEX.findAll(lyricContent).map { match ->
             QrcLineMarker(
                 timeMs = match.groupValues[1].toLongOrNull() ?: 0L,
+                durationMs = match.groupValues[2].toLongOrNull() ?: 0L,
                 bodyStart = match.range.last + 1,
                 markerStart = match.range.first
             )
@@ -556,15 +611,31 @@ class QrcLyricManager(
         val lines = markers.mapIndexedNotNull { index, marker ->
             val bodyEnd = markers.getOrNull(index + 1)?.markerStart
                 ?: lyricContent.length
-            val text = lyricContent
-                .substring(marker.bodyStart, bodyEnd)
-                .replace(QRC_WORD_TIME_REGEX, "")
-                .trim()
-            text.takeIf(String::isNotBlank)?.let {
-                LyricLine(marker.timeMs, it)
+            val parsedBody = QrcLyricUtils.parseQrcLineBody(
+                lineStartMs = marker.timeMs,
+                body = lyricContent.substring(marker.bodyStart, bodyEnd)
+            )
+            parsedBody.text.takeIf(String::isNotBlank)?.let {
+                LyricLine(
+                    timeMs = marker.timeMs,
+                    text = it,
+                    durationMs = marker.durationMs,
+                    words = parsedBody.words
+                )
             }
         }.distinctBy { it.timeMs to it.text }
             .sortedBy(LyricLine::timeMs)
+        lines.withIndex()
+            .filter { it.value.words.isNotEmpty() }
+            .take(3)
+            .forEach { (index, line) ->
+                val firstStart = line.words.firstOrNull()?.startMs ?: 0L
+                val lastEnd = line.words.lastOrNull()?.let { it.startMs + it.durationMs } ?: 0L
+                logger(
+                    "[QrcWord] parsed line=$index text=${line.text} " +
+                        "words=${line.words.size} firstStart=$firstStart lastEnd=$lastEnd"
+                )
+            }
 
         return ParsedQrc(
             title = metadata["ti"].orEmpty(),
@@ -652,7 +723,9 @@ class QrcLyricManager(
 
     data class LyricLine(
         val timeMs: Long,
-        val text: String
+        val text: String,
+        val durationMs: Long = 0L,
+        val words: List<QrcLyricWord> = emptyList()
     )
 
     private data class ParsedQrc(
@@ -676,6 +749,7 @@ class QrcLyricManager(
 
     private data class QrcLineMarker(
         val timeMs: Long,
+        val durationMs: Long,
         val bodyStart: Int,
         val markerStart: Int
     )
@@ -697,8 +771,6 @@ class QrcLyricManager(
             Regex("""\[(\w+)\s*:\s*([^]]*)]""")
         private val QRC_LINE_REGEX =
             Regex("""\[(\d+)\s*,\s*(\d+)]""")
-        private val QRC_WORD_TIME_REGEX =
-            Regex("""\(\d+\s*,\s*\d+\)""")
         private val HEX_REGEX = Regex("""[0-9A-Fa-f]+""")
         private val BRACKET_CONTENT_REGEX =
             Regex("""\([^)]*\)|（[^）]*）|\[[^]]*]|\【[^】]*】""")

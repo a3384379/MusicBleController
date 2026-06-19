@@ -9,7 +9,20 @@ import java.util.Locale
 
 data class QrcLyricLine(
     val timeMs: Long,
+    val text: String,
+    val durationMs: Long = 0L,
+    val words: List<QrcLyricWord> = emptyList()
+)
+
+data class QrcLyricWord(
+    val startMs: Long,
+    val durationMs: Long,
     val text: String
+)
+
+data class QrcParsedLineBody(
+    val text: String,
+    val words: List<QrcLyricWord>
 )
 
 data class ParsedLyric(
@@ -229,6 +242,7 @@ object QrcLyricUtils {
         val markers = QRC_LINE_REGEX.findAll(lyricContent).map { match ->
             QrcLineMarker(
                 timeMs = match.groupValues[1].toLongOrNull() ?: 0L,
+                durationMs = match.groupValues[2].toLongOrNull() ?: 0L,
                 bodyStart = match.range.last + 1,
                 markerStart = match.range.first
             )
@@ -236,12 +250,17 @@ object QrcLyricUtils {
         val lines = markers.mapIndexedNotNull { index, marker ->
             val bodyEnd = markers.getOrNull(index + 1)?.markerStart
                 ?: lyricContent.length
-            val text = lyricContent
-                .substring(marker.bodyStart, bodyEnd)
-                .replace(QRC_WORD_TIME_REGEX, "")
-                .trim()
-            text.takeIf(String::isNotBlank)?.let {
-                QrcLyricLine(marker.timeMs, it)
+            val parsedBody = parseQrcLineBody(
+                lineStartMs = marker.timeMs,
+                body = lyricContent.substring(marker.bodyStart, bodyEnd)
+            )
+            parsedBody.text.takeIf(String::isNotBlank)?.let {
+                QrcLyricLine(
+                    timeMs = marker.timeMs,
+                    text = it,
+                    durationMs = marker.durationMs,
+                    words = parsedBody.words
+                )
             }
         }.distinctBy { it.timeMs to it.text }
             .sortedBy(QrcLyricLine::timeMs)
@@ -275,8 +294,38 @@ object QrcLyricUtils {
             .replace("&amp;", "&")
     }
 
+    fun parseQrcLineBody(lineStartMs: Long, body: String): QrcParsedLineBody {
+        val matches = QRC_WORD_TIME_REGEX.findAll(body).toList()
+        val text = body.replace(QRC_WORD_TIME_REGEX, "").trim()
+        if (matches.isEmpty()) {
+            return QrcParsedLineBody(text = text, words = emptyList())
+        }
+
+        val words = matches.mapIndexedNotNull { index, match ->
+            val relativeStartMs = match.groupValues.getOrNull(1)?.toLongOrNull()
+                ?: return@mapIndexedNotNull null
+            val durationMs = match.groupValues.getOrNull(2)?.toLongOrNull()
+                ?: return@mapIndexedNotNull null
+            val textStart = match.range.last + 1
+            val textEnd = matches.getOrNull(index + 1)?.range?.first ?: body.length
+            val wordText = body.substring(textStart, textEnd)
+                .replace(QRC_WORD_TIME_REGEX, "")
+            if (wordText.isBlank()) {
+                null
+            } else {
+                QrcLyricWord(
+                    startMs = lineStartMs + relativeStartMs,
+                    durationMs = durationMs,
+                    text = wordText
+                )
+            }
+        }
+        return QrcParsedLineBody(text = text, words = words)
+    }
+
     private data class QrcLineMarker(
         val timeMs: Long,
+        val durationMs: Long,
         val bodyStart: Int,
         val markerStart: Int
     )
@@ -331,7 +380,7 @@ object QrcLyricUtils {
     private val QRC_LINE_REGEX =
         Regex("""\[(\d+)\s*,\s*(\d+)]""")
     private val QRC_WORD_TIME_REGEX =
-        Regex("""\(\d+\s*,\s*\d+\)""")
+        Regex("""\((\d+)\s*,\s*(\d+)\)""")
     private val HEX_REGEX = Regex("""[0-9A-Fa-f]+""")
     private val BRACKET_CONTENT_REGEX =
         Regex("""\([^)]*\)|（[^）]*）|\[[^]]*]|\【[^】]*】""")

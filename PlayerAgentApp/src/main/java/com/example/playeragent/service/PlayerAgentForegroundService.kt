@@ -156,7 +156,8 @@ class PlayerAgentForegroundService : Service() {
                 advertisingStateProvider = {
                     advertiserManager?.getAdvertisingState()?.name ?: "none"
                 },
-                onAllClientsDisconnected = ::handleAllClientsDisconnected
+                onAllClientsDisconnected = ::handleAllClientsDisconnected,
+                onPlaybackUiState = ::publishPlaybackUiState
             )
             if (manager.start()) {
                 gattServerManager = manager
@@ -428,8 +429,23 @@ class PlayerAgentForegroundService : Service() {
         )
     }
 
+    private fun publishPlaybackUiState(state: org.json.JSONObject) {
+        sendBroadcast(
+            Intent(ACTION_PLAYER_UI_STATE)
+                .setPackage(packageName)
+                .putExtra(EXTRA_UI_TITLE, state.optString("title"))
+                .putExtra(EXTRA_UI_ARTIST, state.optString("artist"))
+                .putExtra(EXTRA_UI_ALBUM, state.optString("album"))
+                .putExtra(EXTRA_UI_LYRIC, state.optString("lyric"))
+                .putExtra(EXTRA_UI_POSITION, state.optLong("position"))
+                .putExtra(EXTRA_UI_DURATION, state.optLong("duration"))
+        )
+    }
+
     companion object {
         const val ACTION_LOG = "com.example.playeragent.ACTION_LOG"
+        const val ACTION_PLAYER_UI_STATE =
+            "com.example.playeragent.ACTION_PLAYER_UI_STATE"
         const val ACTION_QRC_WATCHER_STATUS =
             "com.example.playeragent.ACTION_QRC_WATCHER_STATUS"
         const val ACTION_START_QRC_WATCHER =
@@ -445,6 +461,12 @@ class PlayerAgentForegroundService : Service() {
         const val EXTRA_QRC_INCREMENTAL_SUCCESS = "extra_qrc_incremental_success"
         const val EXTRA_QRC_INCREMENTAL_FAILED = "extra_qrc_incremental_failed"
         const val EXTRA_QRC_INCREMENTAL_SKIPPED = "extra_qrc_incremental_skipped"
+        const val EXTRA_UI_TITLE = "extra_ui_title"
+        const val EXTRA_UI_ARTIST = "extra_ui_artist"
+        const val EXTRA_UI_ALBUM = "extra_ui_album"
+        const val EXTRA_UI_LYRIC = "extra_ui_lyric"
+        const val EXTRA_UI_POSITION = "extra_ui_position"
+        const val EXTRA_UI_DURATION = "extra_ui_duration"
 
         private const val TAG = "PlayerAgent"
         private const val CHANNEL_ID = "player_agent_service"

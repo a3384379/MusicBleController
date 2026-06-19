@@ -3,6 +3,7 @@ package com.example.playeragent.media
 import android.content.Context
 import android.media.AudioManager
 import android.media.session.MediaSessionManager
+import android.os.SystemClock
 import android.view.KeyEvent
 import com.example.playeragent.service.PlayerNotificationListenerService
 import android.content.ComponentName
@@ -19,46 +20,66 @@ class MediaCommandExecutor(
     private val appContext = context.applicationContext
     private val mediaSessionManager = appContext.getSystemService(MediaSessionManager::class.java)
 
-    fun execute(cmd: String) {
+    fun execute(cmd: String, seq: String? = null) {
         logger("Execute command: $cmd")
 
         when (cmd) {
-            "PLAY_PAUSE" -> playPause()
-            "NEXT" -> next()
-            "PREVIOUS" -> previous()
-            "VOLUME_UP" -> volumeUp()
-            "VOLUME_DOWN" -> volumeDown()
+            "PLAY_PAUSE" -> playPause(seq)
+            "NEXT" -> next(seq)
+            "PREVIOUS" -> previous(seq)
+            "VOLUME_UP" -> volumeUp(seq)
+            "VOLUME_DOWN" -> volumeDown(seq)
             "PING" -> logger("PING received")
             else -> logger("Unknown command: $cmd")
         }
     }
 
-    fun playPause() {
+    fun playPause(seq: String? = null) {
+        val start = SystemClock.elapsedRealtime()
+        logger("[CTRL-Sony] media key begin seq=${seq.orUnknown()} key=PLAY_PAUSE")
         logger("Media key: PLAY_PAUSE")
         dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
-    }
-
-    fun next() {
-        logger("Media key: NEXT")
-        dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
-    }
-
-    fun previous() {
-        logger("Media key: PREVIOUS")
-        dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
-    }
-
-    fun volumeUp() {
-        executeVolumeCommand(
-            command = "VOLUME_UP",
-            direction = AudioManager.ADJUST_RAISE
+        logger(
+            "[CTRL-Sony] media key end seq=${seq.orUnknown()} " +
+                "key=PLAY_PAUSE costMs=${SystemClock.elapsedRealtime() - start}"
         )
     }
 
-    fun volumeDown() {
+    fun next(seq: String? = null) {
+        val start = SystemClock.elapsedRealtime()
+        logger("[CTRL-Sony] media key begin seq=${seq.orUnknown()} key=NEXT")
+        logger("Media key: NEXT")
+        dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
+        logger(
+            "[CTRL-Sony] media key end seq=${seq.orUnknown()} " +
+                "key=NEXT costMs=${SystemClock.elapsedRealtime() - start}"
+        )
+    }
+
+    fun previous(seq: String? = null) {
+        val start = SystemClock.elapsedRealtime()
+        logger("[CTRL-Sony] media key begin seq=${seq.orUnknown()} key=PREVIOUS")
+        logger("Media key: PREVIOUS")
+        dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
+        logger(
+            "[CTRL-Sony] media key end seq=${seq.orUnknown()} " +
+                "key=PREVIOUS costMs=${SystemClock.elapsedRealtime() - start}"
+        )
+    }
+
+    fun volumeUp(seq: String? = null) {
+        executeVolumeCommand(
+            command = "VOLUME_UP",
+            direction = AudioManager.ADJUST_RAISE,
+            seq = seq
+        )
+    }
+
+    fun volumeDown(seq: String? = null) {
         executeVolumeCommand(
             command = "VOLUME_DOWN",
-            direction = AudioManager.ADJUST_LOWER
+            direction = AudioManager.ADJUST_LOWER,
+            seq = seq
         )
     }
 
@@ -75,17 +96,27 @@ class MediaCommandExecutor(
         return createVolumeState()
     }
 
-    fun seekTo(positionMs: Long) {
+    fun seekTo(positionMs: Long, seq: String? = null) {
+        val start = SystemClock.elapsedRealtime()
+        logger("[CTRL-Sony] seek begin seq=${seq.orUnknown()} positionMs=$positionMs")
         logger("[Seek]\nreceived position=$positionMs")
 
         val controller = findActiveMediaController()
         if (controller == null) {
             logger("[Seek]\nno active MediaController")
+            logger(
+                "[CTRL-Sony] seek end seq=${seq.orUnknown()} " +
+                    "costMs=${SystemClock.elapsedRealtime() - start}"
+            )
             return
         }
 
         controller.transportControls.seekTo(positionMs.coerceAtLeast(0L))
         logger("[Seek]\ntransportControls.seekTo()")
+        logger(
+            "[CTRL-Sony] seek end seq=${seq.orUnknown()} " +
+                "costMs=${SystemClock.elapsedRealtime() - start}"
+        )
     }
 
     private fun dispatchMediaKey(keyCode: Int) {
@@ -95,7 +126,13 @@ class MediaCommandExecutor(
         audioManager.dispatchMediaKeyEvent(upEvent)
     }
 
-    private fun executeVolumeCommand(command: String, direction: Int) {
+    private fun executeVolumeCommand(
+        command: String,
+        direction: Int,
+        seq: String? = null
+    ) {
+        val start = SystemClock.elapsedRealtime()
+        logger("[CTRL-Sony] volume begin seq=${seq.orUnknown()} cmd=$command")
         logger("[VolumeControl] command=$command")
 
         val before = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
@@ -113,6 +150,10 @@ class MediaCommandExecutor(
         logger("[VolumeControl] max=$max")
 
         sendVolumeState()
+        logger(
+            "[CTRL-Sony] volume end seq=${seq.orUnknown()} " +
+                "cmd=$command costMs=${SystemClock.elapsedRealtime() - start}"
+        )
     }
 
     fun sendVolumeState() {
@@ -146,4 +187,6 @@ class MediaCommandExecutor(
             it.playbackState?.state == PlaybackState.STATE_PLAYING
         } ?: controllers.firstOrNull()
     }
+
+    private fun String?.orUnknown(): String = this?.takeIf { it.isNotBlank() } ?: "unknown"
 }

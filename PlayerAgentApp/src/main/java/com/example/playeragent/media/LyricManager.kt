@@ -273,7 +273,12 @@ class LyricManager(
             return cachedLines.toList()
         }
         return qrcLyricManager.lyricLinesSnapshot().map {
-            LyricLine(timeMs = it.timeMs, text = it.text)
+            LyricLine(
+                timeMs = it.timeMs,
+                text = it.text,
+                durationMs = it.durationMs,
+                words = it.words
+            )
         }
     }
 
@@ -595,7 +600,9 @@ class LyricManager(
 
     data class LyricLine(
         val timeMs: Long,
-        val text: String
+        val text: String,
+        val durationMs: Long = 0L,
+        val words: List<QrcLyricWord> = emptyList()
     )
 
     private data class LyricCandidate(
