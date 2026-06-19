@@ -303,6 +303,8 @@ class BleNotifyQueue(
                         "remoteLog" -> logger("[RemoteLog] send end")
                         "mediaFieldDump" ->
                             logger("[MediaFieldDump] send end")
+                        "fullLyrics" ->
+                            logger("[FullLyrics] send end")
                         "trackInfo" ->
                             logger("[TrackInfo] send end")
                         else -> logger("[BleNotifyQueue] job end type=${job.type}")
@@ -336,6 +338,11 @@ class BleNotifyQueue(
         when {
             packet.type == "mediaFieldDumpChunk" -> {
                 // The dump contents are intentionally kept out of normal logs.
+            }
+            packet.type == "fullLyricsChunk" -> {
+                if (LogConfig.DEBUG_VERBOSE_LOG) {
+                    verboseLogger(sendLog)
+                }
             }
             packet.type == "trackInfoChunk" -> {
                 if (LogConfig.DEBUG_VERBOSE_LOG) {
@@ -390,6 +397,8 @@ class BleNotifyQueue(
                 logger("[RemoteLog] send failed reason=$reason")
             "mediaFieldDump" ->
                 logger("[MediaFieldDump] send failed reason=$reason")
+            "fullLyrics" ->
+                logger("[FullLyrics] send failed reason=$reason")
             "trackInfo" ->
                 logger("[TrackInfo] send failed reason=$reason")
         }
@@ -403,6 +412,7 @@ class BleNotifyQueue(
     private fun interleaveIntervalFor(jobType: String): Int {
         return when (jobType) {
             "albumArt" -> ALBUM_ART_INTERLEAVE_INTERVAL
+            "fullLyrics" -> FULL_LYRICS_INTERLEAVE_INTERVAL
             "remoteLog", "mediaFieldDump", "qrcDump" ->
                 OTHER_LONG_JOB_INTERLEAVE_INTERVAL
             else -> 0
@@ -497,6 +507,7 @@ class BleNotifyQueue(
                     || it.type == "albumArtBinaryChunk"
                     || it.type == "mediaFieldDumpChunk"
                     || it.type == "trackInfoChunk"
+                    || it.type == "fullLyricsChunk"
             }
 
         val albumArtId: String
@@ -522,6 +533,7 @@ class BleNotifyQueue(
         private const val SHORT_MESSAGE_DELAY_MS = 20L
         private const val CHUNK_PROGRESS_INTERVAL = 20
         private const val ALBUM_ART_INTERLEAVE_INTERVAL = 1
+        private const val FULL_LYRICS_INTERLEAVE_INTERVAL = 10
         private const val OTHER_LONG_JOB_INTERLEAVE_INTERVAL = 5
         private const val INTERLEAVED_LOG_THROTTLE_MS = 10_000L
     }

@@ -3,6 +3,14 @@ import CryptoKit
 import Foundation
 import UIKit
 
+struct LyricLine: Identifiable, Equatable {
+    let index: Int
+    let timeMs: Int64
+    let text: String
+
+    var id: Int { index }
+}
+
 final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var mode = "BLE Central / GATT Client"
     @Published private(set) var connectionStatus = "未连接"
@@ -11,8 +19,12 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var artist = "-"
     @Published private(set) var album = "-"
     @Published private(set) var lyric = ""
+    @Published private(set) var fullLyrics: [LyricLine] = []
+    @Published private(set) var fullLyricsTrackId = ""
+    @Published private(set) var isFullLyricsReceiving = false
     @Published private(set) var isPlaying = false
     @Published private(set) var positionMs: Int64 = 0
+    @Published private(set) var displayPositionMs: Int64 = 0
     @Published private(set) var durationMs: Int64 = 0
     @Published private(set) var seekPositionMs: Int64 = 0
     @Published private(set) var isSeeking = false
@@ -47,8 +59,14 @@ final class BLETestManager: NSObject, ObservableObject {
     private var binaryAlbumArtExpectedChunks = 0
     private var binaryAlbumArtChunks: [Int: Data] = [:]
     private var currentAlbumArtID = ""
+    private var currentTrackID = ""
     private var currentCachedAlbumArtQuality = ""
     private var requestedAlbumArtKeys: Set<String> = []
+    private var requestedFullLyricsTrackIDs: Set<String> = []
+    private var fullLyricsReceivingTrackID = ""
+    private var fullLyricsExpectedCount = 0
+    private var fullLyricsChunks: [Int: LyricLine] = [:]
+    private var fullLyricsTimeoutWorkItem: DispatchWorkItem?
     private var albumArtPreviewRetryCount = 0
     private var albumArtFallbackWorkItem: DispatchWorkItem?
     private var remoteLogExpectedChunks = 0
@@ -60,6 +78,9 @@ final class BLETestManager: NSObject, ObservableObject {
     private var trackInfoExpectedSize = 0
     private var trackInfoExpectedChunks = 0
     private var trackInfoChunks: [Int: Data] = [:]
+    private var basePlaybackPositionMs: Int64 = 0
+    private var playbackStateReceivedAt = Date()
+    private var progressTimer: Timer?
 
     private var commandCharacteristic: CBMutableCharacteristic?
     private var statusCharacteristic: CBMutableCharacteristic?
@@ -67,6 +88,15 @@ final class BLETestManager: NSObject, ObservableObject {
     private var shouldStartAdvertising = false
     private var shouldScanWhenPoweredOn = false
     private var scanTimeoutWorkItem: DispatchWorkItem?
+
+    override init() {
+        super.init()
+        startProgressTimer()
+    }
+
+    deinit {
+        progressTimer?.invalidate()
+    }
 
     func startPeripheral() {
         setMode("Peripheral / GATT Server (Scheme B)")
@@ -126,6 +156,10 @@ final class BLETestManager: NSObject, ObservableObject {
 
     func sendGetVolume() {
         sendCommand(cmd: "GET_VOLUME")
+    }
+
+    func sendGetFullLyrics(force: Bool = false) {
+        requestFullLyricsIfNeeded(force: force)
     }
 
     func sendGetSonyLogs() {
@@ -191,7 +225,7 @@ final class BLETestManager: NSObject, ObservableObject {
     func beginSeeking() {
         guard durationMs > 0 else { return }
         isSeeking = true
-        seekPositionMs = positionMs
+        seekPositionMs = displayPositionMs
     }
 
     func updateSeekPosition(_ value: Double) {
@@ -205,6 +239,9 @@ final class BLETestManager: NSObject, ObservableObject {
             to: 0...max(durationMs, 0)
         )
         positionMs = targetPosition
+        displayPositionMs = targetPosition
+        basePlaybackPositionMs = targetPosition
+        playbackStateReceivedAt = Date()
         isSeeking = false
         log("[iOS][Seek] user set position=\(targetPosition)")
         seek(to: targetPosition)
@@ -250,6 +287,11 @@ final class BLETestManager: NSObject, ObservableObject {
         resetRemoteLogTransfer()
         resetMediaFieldDumpTransfer()
         resetTrackInfoTransfer()
+        resetFullLyricsTransfer()
+        fullLyrics = []
+        fullLyricsTrackId = ""
+        currentTrackID = ""
+        requestedFullLyricsTrackIDs.removeAll()
         isRemoteLogTransferInProgress = false
         isMediaFieldDumpReceiving = false
         mediaFieldDumpProgressText = ""
@@ -566,10 +608,17 @@ extension BLETestManager: CBPeripheralDelegate {
                 self.durationMs = Self.int64Value(object["duration"])
                 if let lyric = object["lyric"] as? String {
                     self.lyric = lyric
+                    if !lyric.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                       self.fullLyrics.isEmpty {
+                        self.requestFullLyricsIfNeeded(after: 0.1)
+                    }
                 }
                 if !self.isSeeking {
                     self.positionMs = Self.int64Value(object["position"])
+                    self.displayPositionMs = self.positionMs
                     self.seekPositionMs = self.positionMs
+                    self.basePlaybackPositionMs = self.positionMs
+                    self.playbackStateReceivedAt = Date()
                 }
                 self.log(
                     "[iOS][Status] playbackState " +
@@ -606,6 +655,18 @@ extension BLETestManager: CBPeripheralDelegate {
 
             case "trackInfoEnd":
                 self.finishTrackInfoTransfer()
+
+            case "fullLyricsStart":
+                self.handleFullLyricsStart(object)
+
+            case "fullLyricsChunk":
+                self.handleFullLyricsChunk(object)
+
+            case "fullLyricsEnd":
+                self.handleFullLyricsEnd(object)
+
+            case "fullLyricsUnavailable":
+                self.handleFullLyricsUnavailable(object)
 
             case "volumeState":
                 self.volumeMax = Self.intValue(object["max"])
@@ -1040,16 +1101,164 @@ extension BLETestManager: CBPeripheralDelegate {
         let newArtist = object["artist"] as? String ?? "-"
         let newAlbum = object["album"] as? String ?? "-"
         let trackID = object["trackId"] as? String ?? ""
-        if newTitle != title || newArtist != artist || newAlbum != album {
+        let trackChanged = newTitle != title ||
+            newArtist != artist ||
+            newAlbum != album ||
+            (!trackID.isEmpty && trackID != currentTrackID)
+        if trackChanged {
             lyric = ""
+            fullLyrics = []
+            fullLyricsTrackId = ""
+            requestedFullLyricsTrackIDs.removeAll()
         }
         title = newTitle
         artist = newArtist
         album = newAlbum
         if !trackID.isEmpty {
+            currentTrackID = trackID
             handleAlbumArtIdentity(trackID)
+            requestFullLyricsIfNeeded(after: 0.3)
         }
         log("[TrackInfo] updated title=\(title) artist=\(artist)")
+    }
+
+    private func requestFullLyricsIfNeeded(
+        force: Bool = false,
+        after delay: TimeInterval = 0
+    ) {
+        let trackID = currentTrackID
+        guard !trackID.isEmpty else { return }
+        if !force,
+           fullLyricsTrackId == trackID,
+           !fullLyrics.isEmpty {
+            return
+        }
+        if !force,
+           requestedFullLyricsTrackIDs.contains(trackID) {
+            return
+        }
+        requestedFullLyricsTrackIDs.insert(trackID)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            guard self.currentTrackID == trackID else { return }
+            self.sendCommand(cmd: "GET_FULL_LYRICS")
+        }
+    }
+
+    private func handleFullLyricsStart(_ object: [String: Any]) {
+        let trackID = object["trackId"] as? String ?? ""
+        guard !trackID.isEmpty, trackID == currentTrackID else {
+            log("[FullLyrics] stale start ignored trackId=\(trackID)")
+            return
+        }
+        fullLyricsTimeoutWorkItem?.cancel()
+        fullLyricsReceivingTrackID = trackID
+        fullLyricsExpectedCount = Self.intValue(object["count"])
+        fullLyricsChunks.removeAll()
+        isFullLyricsReceiving = true
+        log("[FullLyrics] start trackId=\(trackID) count=\(fullLyricsExpectedCount)")
+
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.isFullLyricsReceiving,
+                  self.fullLyricsReceivingTrackID == trackID else { return }
+            self.resetFullLyricsTransfer()
+            self.requestedFullLyricsTrackIDs.remove(trackID)
+            self.log("[FullLyrics] timeout discard trackId=\(trackID)")
+        }
+        fullLyricsTimeoutWorkItem = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: timeout)
+    }
+
+    private func handleFullLyricsChunk(_ object: [String: Any]) {
+        let trackID = object["trackId"] as? String ?? ""
+        guard isFullLyricsReceiving,
+              trackID == fullLyricsReceivingTrackID,
+              trackID == currentTrackID else {
+            return
+        }
+        let index = Self.intValue(object["index"])
+        guard index >= 0, index < fullLyricsExpectedCount else { return }
+        fullLyricsChunks[index] = LyricLine(
+            index: index,
+            timeMs: Self.int64Value(object["timeMs"]),
+            text: object["text"] as? String ?? ""
+        )
+    }
+
+    private func handleFullLyricsEnd(_ object: [String: Any]) {
+        let trackID = object["trackId"] as? String ?? ""
+        guard isFullLyricsReceiving,
+              trackID == fullLyricsReceivingTrackID,
+              trackID == currentTrackID else {
+            log("[FullLyrics] stale end ignored trackId=\(trackID)")
+            return
+        }
+        fullLyricsTimeoutWorkItem?.cancel()
+        let lines = (0..<fullLyricsExpectedCount).compactMap {
+            fullLyricsChunks[$0]
+        }
+        if lines.count == fullLyricsExpectedCount {
+            fullLyrics = lines.sorted { $0.index < $1.index }
+            fullLyricsTrackId = trackID
+            log("[FullLyrics] end count=\(fullLyrics.count)")
+        } else {
+            requestedFullLyricsTrackIDs.remove(trackID)
+            log(
+                "[FullLyrics] incomplete received=\(lines.count) " +
+                    "expected=\(fullLyricsExpectedCount)"
+            )
+        }
+        resetFullLyricsTransfer()
+    }
+
+    private func handleFullLyricsUnavailable(_ object: [String: Any]) {
+        let trackID = object["trackId"] as? String ?? ""
+        guard trackID == currentTrackID else { return }
+        requestedFullLyricsTrackIDs.remove(trackID)
+        resetFullLyricsTransfer()
+        if fullLyricsTrackId != trackID {
+            fullLyrics = []
+            fullLyricsTrackId = ""
+        }
+        log("[FullLyrics] unavailable reason=\(object["reason"] as? String ?? "")")
+    }
+
+    private func resetFullLyricsTransfer() {
+        fullLyricsTimeoutWorkItem?.cancel()
+        fullLyricsTimeoutWorkItem = nil
+        fullLyricsReceivingTrackID = ""
+        fullLyricsExpectedCount = 0
+        fullLyricsChunks.removeAll()
+        isFullLyricsReceiving = false
+    }
+
+    private func startProgressTimer() {
+        progressTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
+            self?.updateInterpolatedProgress()
+        }
+        progressTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func updateInterpolatedProgress() {
+        guard !isSeeking else { return }
+        guard durationMs > 0 else {
+            displayPositionMs = 0
+            return
+        }
+        guard isPlaying else {
+            displayPositionMs = positionMs.clamped(to: 0...durationMs)
+            return
+        }
+
+        let elapsedMs = Int64(Date().timeIntervalSince(playbackStateReceivedAt) * 1_000)
+        let interpolated = (basePlaybackPositionMs + max(elapsedMs, 0))
+            .clamped(to: 0...durationMs)
+        if interpolated != displayPositionMs {
+            displayPositionMs = interpolated
+        }
     }
 
     private func finishTrackInfoTransfer() {

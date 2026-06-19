@@ -125,6 +125,10 @@ class PlaybackStateReader(
             .put("lyric", lyric)
     }
 
+    fun lyricLinesSnapshot(): List<LyricManager.LyricLine> {
+        return lyricManager.lyricLinesSnapshot()
+    }
+
     private fun logController(index: Int, controller: MediaController) {
         val state = controller.playbackState?.state
         val metadata = controller.metadata

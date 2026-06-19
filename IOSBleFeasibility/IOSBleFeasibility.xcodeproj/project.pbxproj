@@ -12,6 +12,7 @@
 		A10000000000000000000003 /* BLEUUIDs.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* BLEUUIDs.swift */; };
 		A10000000000000000000004 /* BLETestManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000004 /* BLETestManager.swift */; };
 		A10000000000000000000005 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000007 /* Assets.xcassets */; };
+		A10000000000000000000006 /* FullLyricsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000008 /* FullLyricsView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -22,6 +23,7 @@
 		A20000000000000000000005 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A20000000000000000000006 /* sonyMusic.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = sonyMusic.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A20000000000000000000007 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A20000000000000000000008 /* FullLyricsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FullLyricsView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -48,6 +50,7 @@
 			children = (
 				A20000000000000000000001 /* IOSBleFeasibilityApp.swift */,
 				A20000000000000000000002 /* ContentView.swift */,
+				A20000000000000000000008 /* FullLyricsView.swift */,
 				A20000000000000000000003 /* BLEUUIDs.swift */,
 				A20000000000000000000004 /* BLETestManager.swift */,
 				A20000000000000000000005 /* Info.plist */,
@@ -135,6 +138,7 @@
 			files = (
 				A10000000000000000000001 /* IOSBleFeasibilityApp.swift in Sources */,
 				A10000000000000000000002 /* ContentView.swift in Sources */,
+				A10000000000000000000006 /* FullLyricsView.swift in Sources */,
 				A10000000000000000000003 /* BLEUUIDs.swift in Sources */,
 				A10000000000000000000004 /* BLETestManager.swift in Sources */,
 			);

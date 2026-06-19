@@ -459,6 +459,7 @@ class BleGattServerManager(
             "ALBUM_ART_REQUEST" -> handleAlbumArtRequest(request)
             "CLIENT_CAPABILITIES" -> handleClientCapabilities(request)
             "DUMP_MEDIA_FIELDS" -> sendMediaFieldDump()
+            "GET_FULL_LYRICS" -> sendFullLyrics()
             else -> logger("[BLE-A] unknown command: $command")
         }
     }
@@ -1741,6 +1742,159 @@ class BleGattServerManager(
         )
     }
 
+    private fun sendFullLyrics() {
+        val device = subscribedDevices.values.firstOrNull() ?: run {
+            logger("[FullLyrics] send skipped: no iPhone subscriber")
+            return
+        }
+        val source = playbackStateReader.readPlaybackState()
+        val trackId = buildAlbumArtProtocolId(source)
+        val title = source.optString("title")
+        val artist = source.optString("artist")
+        val lines = playbackStateReader.lyricLinesSnapshot()
+            .filter { it.text.isNotBlank() }
+            .take(MAX_FULL_LYRICS_LINES)
+
+        if (lines.isEmpty()) {
+            val unavailable = JSONObject()
+                .put("type", "fullLyricsUnavailable")
+                .put("trackId", trackId)
+                .put("reason", "no parsed lyrics")
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            if (unavailable.size <= maximumPayloadFor(device)) {
+                notifyQueue.enqueueShort(
+                    device = device,
+                    type = "fullLyricsUnavailable",
+                    value = unavailable,
+                    delayAfterMs = SHORT_MESSAGE_DELAY_MS
+                )
+            }
+            logger("[FullLyrics] unavailable trackId=$trackId reason=no parsed lyrics")
+            return
+        }
+
+        val maximumPayload = maximumPayloadFor(device)
+        val packets = mutableListOf<BleNotifyQueue.Packet>()
+        val start = buildFittingFullLyricsStart(
+            trackId = trackId,
+            title = title,
+            artist = artist,
+            count = lines.size,
+            maximumPayload = maximumPayload
+        ) ?: run {
+            logger("[FullLyrics] send failed: start exceeds MTU")
+            return
+        }
+        packets += BleNotifyQueue.Packet(
+            type = "fullLyricsStart",
+            value = start,
+            delayAfterMs = FULL_LYRICS_NOTIFICATION_DELAY_MS
+        )
+
+        lines.forEachIndexed { index, line ->
+            val chunk = buildFittingFullLyricsChunk(
+                trackId = trackId,
+                index = index,
+                timeMs = line.timeMs,
+                text = line.text,
+                maximumPayload = maximumPayload
+            )
+            if (chunk == null) {
+                logger("[FullLyrics] send failed: chunk $index exceeds MTU")
+                return
+            }
+            packets += BleNotifyQueue.Packet(
+                type = "fullLyricsChunk",
+                value = chunk,
+                delayAfterMs = FULL_LYRICS_NOTIFICATION_DELAY_MS
+            )
+        }
+
+        val end = JSONObject()
+            .put("type", "fullLyricsEnd")
+            .put("trackId", trackId)
+            .toString()
+            .toByteArray(Charsets.UTF_8)
+        if (end.size > maximumPayload) {
+            logger("[FullLyrics] send failed: end exceeds MTU")
+            return
+        }
+        packets += BleNotifyQueue.Packet(
+            type = "fullLyricsEnd",
+            value = end,
+            delayAfterMs = FULL_LYRICS_NOTIFICATION_DELAY_MS
+        )
+        if (playbackStateReader.lyricLinesSnapshot().size > MAX_FULL_LYRICS_LINES) {
+            logger("[FullLyrics] truncated count=${playbackStateReader.lyricLinesSnapshot().size}")
+        }
+        logger("[FullLyrics] send start trackId=$trackId count=${lines.size}")
+        notifyQueue.enqueueLongJob(
+            type = FULL_LYRICS_JOB_TYPE,
+            device = device,
+            packets = packets,
+            onComplete = {
+                logger("[FullLyrics] send end trackId=$trackId")
+            }
+        )
+    }
+
+    private fun buildFittingFullLyricsStart(
+        trackId: String,
+        title: String,
+        artist: String,
+        count: Int,
+        maximumPayload: Int
+    ): ByteArray? {
+        val limits = listOf(
+            30 to 30,
+            20 to 20,
+            12 to 12,
+            0 to 0
+        )
+        limits.forEach { (titleLimit, artistLimit) ->
+            val objectValue = JSONObject()
+                .put("type", "fullLyricsStart")
+                .put("trackId", trackId)
+                .put("title", title.take(titleLimit))
+                .put("artist", artist.take(artistLimit))
+                .put("count", count)
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            if (objectValue.size <= maximumPayload) {
+                return objectValue
+            }
+        }
+        return null
+    }
+
+    private fun buildFittingFullLyricsChunk(
+        trackId: String,
+        index: Int,
+        timeMs: Long,
+        text: String,
+        maximumPayload: Int
+    ): ByteArray? {
+        var fittedText = text.take(MAX_FULL_LYRICS_TEXT_LENGTH)
+        while (true) {
+            val value = JSONObject()
+                .put("type", "fullLyricsChunk")
+                .put("trackId", trackId)
+                .put("index", index)
+                .put("timeMs", timeMs)
+                .put("text", fittedText)
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            if (value.size <= maximumPayload) {
+                return value
+            }
+            if (fittedText.isEmpty()) {
+                return null
+            }
+            fittedText = fittedText.dropLast(1)
+        }
+    }
+
     private fun chooseLogChunkSize(maximumPayload: Int): Int {
         for (candidate in MAX_LOG_CHUNK_RAW_BYTES downTo 1) {
             val sample = JSONObject()
@@ -1823,8 +1977,12 @@ class BleGattServerManager(
         private const val MAX_MEDIA_FIELD_DUMP_CHUNK_BYTES = 300
         private const val MAX_MEDIA_FIELD_DUMP_ERROR_CHARS = 80
         private const val MEDIA_FIELD_DUMP_DELAY_MS = 25L
+        private const val FULL_LYRICS_NOTIFICATION_DELAY_MS = 20L
+        private const val MAX_FULL_LYRICS_LINES = 120
+        private const val MAX_FULL_LYRICS_TEXT_LENGTH = 80
         private const val ALBUM_ART_JOB_TYPE = "albumArt"
         private const val TRACK_INFO_JOB_TYPE = "trackInfo"
+        private const val FULL_LYRICS_JOB_TYPE = "fullLyrics"
         private const val MAX_LYRIC_TEXT_LENGTH = 30
         private const val REMOTE_LOG_JOB_TYPE = "remoteLog"
         private const val MEDIA_FIELD_DUMP_JOB_TYPE = "mediaFieldDump"

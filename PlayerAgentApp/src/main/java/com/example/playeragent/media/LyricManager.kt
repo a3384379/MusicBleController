@@ -264,6 +264,19 @@ class LyricManager(
         return currentLine
     }
 
+    @Synchronized
+    fun lyricLinesSnapshot(): List<LyricLine> {
+        if (activeSongKey != loadedSongKey) {
+            return emptyList()
+        }
+        if (cachedLines.isNotEmpty()) {
+            return cachedLines.toList()
+        }
+        return qrcLyricManager.lyricLinesSnapshot().map {
+            LyricLine(timeMs = it.timeMs, text = it.text)
+        }
+    }
+
     private fun resolveLyricDirectory(): File {
         val publicDirectory = File(
             Environment.getExternalStorageDirectory(),

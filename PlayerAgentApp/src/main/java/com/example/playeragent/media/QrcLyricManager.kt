@@ -200,6 +200,11 @@ class QrcLyricManager(
     }
 
     @Synchronized
+    fun lyricLinesSnapshot(): List<LyricLine> {
+        return cachedLines.toList()
+    }
+
+    @Synchronized
     fun clearCacheIfSongChanged(
         title: String,
         artist: String,
