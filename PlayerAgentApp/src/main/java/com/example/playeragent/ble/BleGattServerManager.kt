@@ -565,7 +565,7 @@ class BleGattServerManager(
             "ALBUM_ART_REQUEST" -> handleAlbumArtRequest(request)
             "CLIENT_CAPABILITIES" -> handleClientCapabilities(request)
             "DUMP_MEDIA_FIELDS" -> sendMediaFieldDump()
-            "GET_FULL_LYRICS" -> sendFullLyrics()
+            "GET_FULL_LYRICS" -> sendFullLyrics(request)
             else -> logger("[BLE-A] unknown command: $command")
         }
     }
@@ -1932,11 +1932,12 @@ class BleGattServerManager(
         )
     }
 
-    private fun sendFullLyrics() {
+    private fun sendFullLyrics(request: JSONObject) {
         val device = subscribedDevices.values.firstOrNull() ?: run {
             logger("[FullLyrics] send skipped: no iPhone subscriber")
             return
         }
+        val buildStartedAtMs = SystemClock.elapsedRealtime()
         val source = playbackStateReader.readPlaybackState()
         val trackId = buildAlbumArtProtocolId(source)
         val title = source.optString("title")
@@ -1944,6 +1945,24 @@ class BleGattServerManager(
         val lines = playbackStateReader.lyricLinesSnapshot()
             .filter { it.text.isNotBlank() }
             .take(MAX_FULL_LYRICS_LINES)
+        val includeWordsAroundCurrent =
+            request.optBoolean("includeWordsAroundCurrent", false)
+        val requestedPositionMs = request.optLong(
+            "positionMs",
+            source.optLong("position", 0L)
+        )
+        val currentLineIndex = if (includeWordsAroundCurrent) {
+            findCurrentLyricIndex(lines, requestedPositionMs)
+        } else {
+            -1
+        }
+        val wordLineIndexes = if (currentLineIndex >= 0) {
+            setOf(currentLineIndex - 1, currentLineIndex, currentLineIndex + 1)
+                .filter { it in lines.indices }
+                .toSet()
+        } else {
+            emptySet()
+        }
 
         if (lines.isEmpty()) {
             val unavailable = JSONObject()
@@ -1989,7 +2008,8 @@ class BleGattServerManager(
                 timeMs = line.timeMs,
                 durationMs = line.durationMs,
                 text = line.text,
-                words = line.words,
+                words = if (index in wordLineIndexes) line.words else emptyList(),
+                includeWords = index in wordLineIndexes,
                 maximumPayload = maximumPayload
             )
             if (chunk == null) {
@@ -2020,15 +2040,47 @@ class BleGattServerManager(
         if (playbackStateReader.lyricLinesSnapshot().size > MAX_FULL_LYRICS_LINES) {
             logger("[FullLyrics] truncated count=${playbackStateReader.lyricLinesSnapshot().size}")
         }
+        val wordsLines = wordLineIndexes.count { lines[it].words.isNotEmpty() }
+        logger(
+            "[FullLyrics] mode=lineOnly wordsAroundCurrent=$includeWordsAroundCurrent " +
+                "wordLines=$wordsLines"
+        )
+        logger(
+            "[FullLyricsPerf] build done lines=${lines.size} " +
+                "wordsLines=$wordsLines costMs=${SystemClock.elapsedRealtime() - buildStartedAtMs}"
+        )
+        val sendStartedAtMs = SystemClock.elapsedRealtime()
         logger("[FullLyrics] send start trackId=$trackId count=${lines.size}")
         notifyQueue.enqueueLongJob(
             type = FULL_LYRICS_JOB_TYPE,
             device = device,
             packets = packets,
             onComplete = {
+                logger(
+                    "[FullLyricsPerf] send end costMs=" +
+                        "${SystemClock.elapsedRealtime() - sendStartedAtMs}"
+                )
                 logger("[FullLyrics] send end trackId=$trackId")
             }
         )
+    }
+
+    private fun findCurrentLyricIndex(
+        lines: List<com.example.playeragent.media.LyricManager.LyricLine>,
+        positionMs: Long
+    ): Int {
+        if (lines.isEmpty()) {
+            return -1
+        }
+        var result = 0
+        lines.forEachIndexed { index, line ->
+            if (line.timeMs <= positionMs) {
+                result = index
+            } else {
+                return result
+            }
+        }
+        return result
     }
 
     private fun buildFittingFullLyricsStart(
@@ -2067,10 +2119,11 @@ class BleGattServerManager(
         durationMs: Long,
         text: String,
         words: List<com.example.playeragent.media.QrcLyricWord>,
+        includeWords: Boolean,
         maximumPayload: Int
     ): ByteArray? {
         var fittedText = text.take(MAX_FULL_LYRICS_TEXT_LENGTH)
-        if (words.isNotEmpty() && fittedText == text) {
+        if (includeWords && words.isNotEmpty() && fittedText == text) {
             val withWords = buildFullLyricsChunkJson(
                 trackId = trackId,
                 index = index,
@@ -2080,10 +2133,12 @@ class BleGattServerManager(
                 words = words
             ).toByteArray(Charsets.UTF_8)
             if (withWords.size <= maximumPayload) {
-                logger(
-                    "[FullLyrics] chunk index=$index words=${words.size} " +
-                        "payloadBytes=${withWords.size}"
-                )
+                if (LogConfig.DEBUG_VERBOSE_LOG) {
+                    verboseLogger(
+                        "[FullLyrics] chunk index=$index words=${words.size} " +
+                            "payloadBytes=${withWords.size}"
+                    )
+                }
                 return withWords
             }
             logger("[FullLyrics] words omitted index=$index reason=payload too large")
@@ -2098,10 +2153,12 @@ class BleGattServerManager(
                 words = emptyList()
             ).toByteArray(Charsets.UTF_8)
             if (value.size <= maximumPayload) {
-                logger(
-                    "[FullLyrics] chunk index=$index words=0 " +
-                        "payloadBytes=${value.size}"
-                )
+                if (LogConfig.DEBUG_VERBOSE_LOG) {
+                    verboseLogger(
+                        "[FullLyrics] chunk index=$index words=0 " +
+                            "payloadBytes=${value.size}"
+                    )
+                }
                 return value
             }
             if (fittedText.isEmpty()) {

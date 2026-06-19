@@ -30,6 +30,7 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var lyric = ""
     @Published private(set) var fullLyrics: [LyricLine] = []
     @Published private(set) var fullLyricsTrackId = ""
+    @Published private(set) var isFullLyricsCurrent = false
     @Published private(set) var isFullLyricsReceiving = false
     @Published private(set) var isPlaying = false
     @Published private(set) var positionMs: Int64 = 0
@@ -50,6 +51,7 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var isMediaFieldDumpReceiving = false
     @Published private(set) var mediaFieldDumpProgressText = ""
     @Published private(set) var karaokeOffsetMs: Int64 = 600
+    @Published private(set) var localLogActionStatus = ""
 
     private lazy var centralManager = CBCentralManager(delegate: self, queue: nil)
     private lazy var peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
@@ -84,6 +86,7 @@ final class BLETestManager: NSObject, ObservableObject {
     private var fullLyricsExpectedCount = 0
     private var fullLyricsChunks: [Int: LyricLine] = [:]
     private var fullLyricsTimeoutWorkItem: DispatchWorkItem?
+    private var lastFullLyricsPartialPublishAtMs: Int64 = 0
     private var albumArtPreviewRetryCount = 0
     private var albumArtFallbackWorkItem: DispatchWorkItem?
     private var remoteLogExpectedChunks = 0
@@ -114,6 +117,7 @@ final class BLETestManager: NSObject, ObservableObject {
 
     override init() {
         super.init()
+        log("[BLE-iOS] app log store ready")
         startProgressTimer()
         startMainHeartbeatDiagnostics()
     }
@@ -197,6 +201,26 @@ final class BLETestManager: NSObject, ObservableObject {
     func setKaraokeOffsetMs(_ value: Int64) {
         karaokeOffsetMs = value
         log("[Lyrics-iOS] karaoke offsetMs=\(value)")
+    }
+
+    func copyIOSLogs() {
+        AppLogStore.shared.readRecentText { [weak self] text in
+            guard let self else { return }
+            if text.isEmpty {
+                self.localLogActionStatus = "暂无 iOS 日志"
+            } else {
+                UIPasteboard.general.string = text
+                self.localLogActionStatus = "已复制 iOS 日志"
+            }
+        }
+    }
+
+    func clearIOSLogs() {
+        AppLogStore.shared.clear { [weak self] in
+            guard let self else { return }
+            self.logs.removeAll()
+            self.localLogActionStatus = "已清空 iOS 日志"
+        }
     }
 
     func karaokePositionMs(rawPositionMs: Int64) -> Int64 {
@@ -477,6 +501,7 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     private func log(_ message: String) {
+        AppLogStore.shared.append(message)
         DispatchQueue.main.async {
             let formatter = DateFormatter()
             formatter.dateFormat = "HH:mm:ss.SSS"
@@ -523,6 +548,7 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     private func albumArtConsoleLog(_ message: String) {
+        AppLogStore.shared.append(message)
         print(message)
     }
 
@@ -607,6 +633,7 @@ extension BLETestManager: CBCentralManagerDelegate {
         resetRemoteLogTransfer()
         resetTrackInfoTransfer()
         isRemoteLogTransferInProgress = false
+        updateLiveActivityDisconnected()
     }
 }
 
@@ -768,6 +795,8 @@ extension BLETestManager: CBPeripheralDelegate {
         DispatchQueue.main.async {
             switch type {
             case "playbackState":
+                let oldLyric = self.lyric
+                let oldIsPlaying = self.isPlaying
                 self.isPlaying = object["playing"] as? Bool ?? false
                 self.durationMs = Self.int64Value(object["duration"])
                 if let lyric = object["lyric"] as? String {
@@ -788,6 +817,15 @@ extension BLETestManager: CBPeripheralDelegate {
                     "[iOS][Status] playbackState " +
                         "position=\(self.positionMs) duration=\(self.durationMs)"
                 )
+                let updateReason: String
+                if oldLyric != self.lyric {
+                    updateReason = "lyric"
+                } else if oldIsPlaying != self.isPlaying {
+                    updateReason = "playState"
+                } else {
+                    updateReason = "playbackState"
+                }
+                self.updateLiveActivity(force: false, reason: updateReason)
 
             case "trackInfo":
                 self.applyTrackInfo(object)
@@ -859,6 +897,7 @@ extension BLETestManager: CBPeripheralDelegate {
                     self.cancelHqAlbumArtRequest()
                     self.albumArtImage = cached.image
                     self.currentCachedAlbumArtQuality = cached.quality
+                    self.updateLiveActivity(force: true, reason: "albumArt")
                     let message = "[AlbumArtCache] hit id=\(id), skip request"
                     self.log(message)
                     self.albumArtConsoleLog(message)
@@ -873,6 +912,7 @@ extension BLETestManager: CBPeripheralDelegate {
                     self.cancelAlbumArtFallback()
                     self.albumArtImage = cached.image
                     self.currentCachedAlbumArtQuality = cached.quality
+                    self.updateLiveActivity(force: true, reason: "albumArt")
                     let message = "[AlbumArtCache] hit preview id=\(id), schedule hq"
                     self.log(message)
                     self.albumArtConsoleLog(message)
@@ -1011,6 +1051,7 @@ extension BLETestManager: CBPeripheralDelegate {
                     self.cancelAlbumArtFallback()
                     self.albumArtImage = nil
                     self.currentCachedAlbumArtQuality = ""
+                    self.updateLiveActivity(force: true, reason: "albumArt")
                 }
                 self.log(
                     "[AlbumArt] unavailable id=\(id) quality=\(quality)"
@@ -1147,6 +1188,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 cancelAlbumArtFallback()
                 albumArtImage = nil
                 currentCachedAlbumArtQuality = ""
+                updateLiveActivity(force: true, reason: "albumArt")
             }
             requestedAlbumArtKeys.remove("\(id)|\(quality)")
             resetAlbumArtTransfer()
@@ -1160,6 +1202,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 cancelAlbumArtFallback()
                 albumArtImage = image
                 currentCachedAlbumArtQuality = quality
+                updateLiveActivity(force: true, reason: "albumArt")
             }
         }
         requestedAlbumArtKeys.remove("\(id)|\(quality)")
@@ -1266,6 +1309,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 cancelAlbumArtFallback()
                 albumArtImage = nil
                 currentCachedAlbumArtQuality = ""
+                updateLiveActivity(force: true, reason: "albumArt")
             }
             requestedAlbumArtKeys.remove("\(id)|\(quality)")
             resetBinaryAlbumArtTransfer()
@@ -1278,6 +1322,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 cancelAlbumArtFallback()
                 albumArtImage = image
                 currentCachedAlbumArtQuality = quality
+                updateLiveActivity(force: true, reason: "albumArt")
             }
         }
         requestedAlbumArtKeys.remove("\(id)|\(quality)")
@@ -1309,9 +1354,10 @@ extension BLETestManager: CBPeripheralDelegate {
             (!trackID.isEmpty && trackID != currentTrackID)
         if trackChanged {
             lyric = ""
-            fullLyrics = []
             fullLyricsTrackId = ""
+            isFullLyricsCurrent = false
             requestedFullLyricsTrackIDs.removeAll()
+            log("[Lyrics-iOS] keep previous lyrics until new chunks")
         }
         title = newTitle
         artist = newArtist
@@ -1322,6 +1368,67 @@ extension BLETestManager: CBPeripheralDelegate {
             requestFullLyricsIfNeeded(after: 0.3)
         }
         log("[TrackInfo] updated title=\(title) artist=\(artist)")
+        updateLiveActivity(force: true, reason: "trackInfo")
+    }
+
+    private func updateLiveActivity(force: Bool, reason: String) {
+        let snapshotTitle = title
+        let snapshotArtist = artist
+        let snapshotAlbum = album
+        let snapshotLyric = lyric
+        let snapshotIsPlaying = isPlaying
+        let snapshotPositionMs = displayPositionMs
+        let snapshotDurationMs = durationMs
+        let snapshotTrackID = currentTrackID
+        let snapshotAlbumArtImage = albumArtImage
+
+        Task { @MainActor in
+            LiveActivityManager.shared.update(
+                title: snapshotTitle,
+                artist: snapshotArtist,
+                album: snapshotAlbum,
+                lyric: snapshotLyric,
+                isPlaying: snapshotIsPlaying,
+                positionMs: snapshotPositionMs,
+                durationMs: snapshotDurationMs,
+                trackId: snapshotTrackID,
+                albumArtImage: snapshotAlbumArtImage,
+                reason: reason,
+                force: force,
+                logger: { [weak self] message in
+                    self?.log(message)
+                }
+            )
+        }
+    }
+
+    private func updateLiveActivityDisconnected() {
+        let snapshotTitle = title
+        let snapshotArtist = artist
+        let snapshotAlbum = album
+        let snapshotPositionMs = displayPositionMs
+        let snapshotDurationMs = durationMs
+        let snapshotTrackID = currentTrackID
+        let snapshotAlbumArtImage = albumArtImage
+
+        Task { @MainActor in
+            LiveActivityManager.shared.update(
+                title: snapshotTitle,
+                artist: snapshotArtist,
+                album: snapshotAlbum,
+                lyric: "连接已断开",
+                isPlaying: false,
+                positionMs: snapshotPositionMs,
+                durationMs: snapshotDurationMs,
+                trackId: snapshotTrackID,
+                albumArtImage: snapshotAlbumArtImage,
+                reason: "disconnect",
+                force: true,
+                logger: { [weak self] message in
+                    self?.log(message)
+                }
+            )
+        }
     }
 
     private func requestFullLyricsIfNeeded(
@@ -1343,7 +1450,15 @@ extension BLETestManager: CBPeripheralDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             guard self.currentTrackID == trackID else { return }
-            self.sendCommand(cmd: "GET_FULL_LYRICS")
+            self.log("[LyricsPerf] request fullLyrics trackId=\(trackID)")
+            self.sendCommand(
+                cmd: "GET_FULL_LYRICS",
+                extra: [
+                    "trackId": trackID,
+                    "positionMs": self.displayPositionMs,
+                    "includeWordsAroundCurrent": true
+                ]
+            )
         }
     }
 
@@ -1358,7 +1473,9 @@ extension BLETestManager: CBPeripheralDelegate {
         fullLyricsExpectedCount = Self.intValue(object["count"])
         fullLyricsChunks.removeAll()
         isFullLyricsReceiving = true
+        lastFullLyricsPartialPublishAtMs = 0
         log("[FullLyrics] start trackId=\(trackID) count=\(fullLyricsExpectedCount)")
+        log("[LyricsPerf] receive start count=\(fullLyricsExpectedCount)")
 
         let timeout = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -1390,6 +1507,7 @@ extension BLETestManager: CBPeripheralDelegate {
             words: words
         )
         log("[Lyrics-iOS] chunk index=\(index) words=\(words.count)")
+        publishPartialFullLyricsIfNeeded(trackID: trackID)
     }
 
     private func handleFullLyricsEnd(_ object: [String: Any]) {
@@ -1405,9 +1523,11 @@ extension BLETestManager: CBPeripheralDelegate {
             fullLyricsChunks[$0]
         }
         if lines.count == fullLyricsExpectedCount {
-            fullLyrics = lines.sorted { $0.index < $1.index }
-            fullLyricsTrackId = trackID
-            log("[FullLyrics] end count=\(fullLyrics.count)")
+            publishFullLyrics(
+                lines: lines,
+                trackID: trackID,
+                isFinal: true
+            )
         } else {
             requestedFullLyricsTrackIDs.remove(trackID)
             log(
@@ -1426,6 +1546,7 @@ extension BLETestManager: CBPeripheralDelegate {
         if fullLyricsTrackId != trackID {
             fullLyrics = []
             fullLyricsTrackId = ""
+            isFullLyricsCurrent = false
         }
         log("[FullLyrics] unavailable reason=\(object["reason"] as? String ?? "")")
     }
@@ -1437,6 +1558,48 @@ extension BLETestManager: CBPeripheralDelegate {
         fullLyricsExpectedCount = 0
         fullLyricsChunks.removeAll()
         isFullLyricsReceiving = false
+        lastFullLyricsPartialPublishAtMs = 0
+    }
+
+    private func publishPartialFullLyricsIfNeeded(trackID: String) {
+        guard trackID == currentTrackID,
+              fullLyricsChunks.count >= 3 else {
+            return
+        }
+        let nowMs = currentTimeMs()
+        guard nowMs - lastFullLyricsPartialPublishAtMs >= 200 else {
+            return
+        }
+        lastFullLyricsPartialPublishAtMs = nowMs
+        publishFullLyrics(
+            lines: Array(fullLyricsChunks.values),
+            trackID: trackID,
+            isFinal: false
+        )
+    }
+
+    private func publishFullLyrics(
+        lines: [LyricLine],
+        trackID: String,
+        isFinal: Bool
+    ) {
+        let sortedLines = lines.sorted { $0.index < $1.index }
+        fullLyrics = sortedLines
+        fullLyricsTrackId = trackID
+        isFullLyricsCurrent = true
+        let wordsCount = sortedLines.reduce(0) { $0 + $1.words.count }
+        if isFinal {
+            log("[FullLyrics] end count=\(fullLyrics.count)")
+            log(
+                "[LyricsPerf] final publish lines=\(sortedLines.count) " +
+                    "words=\(wordsCount)"
+            )
+        } else {
+            log(
+                "[LyricsPerf] partial publish lines=\(sortedLines.count) " +
+                    "receiving=\(isFullLyricsReceiving)"
+            )
+        }
     }
 
     private func startProgressTimer() {
@@ -1525,6 +1688,7 @@ extension BLETestManager: CBPeripheralDelegate {
             cancelAlbumArtFallback()
             albumArtImage = cached.image
             currentCachedAlbumArtQuality = cached.quality
+            updateLiveActivity(force: true, reason: "albumArt")
             let message = "[AlbumArtCache] hit id=\(id)"
             log(message)
             albumArtConsoleLog(message)
@@ -1545,6 +1709,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 return
             }
             self.albumArtImage = nil
+            self.updateLiveActivity(force: true, reason: "albumArt")
             self.log("[AlbumArt] fallback default id=\(id)")
         }
         albumArtFallbackWorkItem = workItem

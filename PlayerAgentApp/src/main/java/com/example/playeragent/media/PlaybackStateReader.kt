@@ -29,6 +29,7 @@ class PlaybackStateReader(
     private var lastLoggedLyric: String? = null
 
     fun readPlaybackState(): JSONObject {
+        val startedAtMs = SystemClock.elapsedRealtime()
         verbose("[PlaybackState] GET_PLAYBACK_STATE received")
 
         if (mediaSessionManager == null) {
@@ -41,6 +42,7 @@ class PlaybackStateReader(
             PlayerNotificationListenerService::class.java
         )
 
+        val mediaStateStartedAtMs = SystemClock.elapsedRealtime()
         val controllers = try {
             mediaSessionManager.getActiveSessions(listenerComponent)
         } catch (securityException: SecurityException) {
@@ -53,6 +55,7 @@ class PlaybackStateReader(
             logger("[PlaybackState] getActiveSessions failed: ${exception.message}")
             return emptyResponse("getActiveSessions failed")
         }
+        val mediaStateCostMs = SystemClock.elapsedRealtime() - mediaStateStartedAtMs
 
         verbose("[PlaybackState] activeSessions count=${controllers.size}")
 
@@ -92,15 +95,25 @@ class PlaybackStateReader(
         } else if (duration > 0L) {
             durationMissingLogged = false
         }
+        val lyricStartedAtMs = SystemClock.elapsedRealtime()
         val lyric = if (includeLyric) {
             lyricManager.requestLyricLoadAsync(title, artist, album)
             lyricManager.getCurrentLine(position)
         } else {
             ""
         }
+        val cachedLyricCostMs = SystemClock.elapsedRealtime() - lyricStartedAtMs
         if (lyric != lastLoggedLyric) {
             lastLoggedLyric = lyric
             logger("[PlaybackState] lyric=$lyric")
+        }
+        val totalCostMs = SystemClock.elapsedRealtime() - startedAtMs
+        if (LogConfig.DEBUG_VERBOSE_LOG || totalCostMs > SLOW_PLAYBACK_READ_MS) {
+            logger(
+                "[PlaybackFast] mediaStateCostMs=$mediaStateCostMs " +
+                    "cachedLyricCostMs=$cachedLyricCostMs " +
+                    "totalCostMs=$totalCostMs"
+            )
         }
 
         verbose(
@@ -178,5 +191,9 @@ class PlaybackStateReader(
         val elapsedSinceUpdate = SystemClock.elapsedRealtime() - playbackState.lastPositionUpdateTime
         val adjustedPosition = basePosition + (elapsedSinceUpdate * playbackState.playbackSpeed).toLong()
         return adjustedPosition.coerceAtLeast(0L)
+    }
+
+    private companion object {
+        private const val SLOW_PLAYBACK_READ_MS = 200L
     }
 }

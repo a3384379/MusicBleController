@@ -31,6 +31,7 @@ class QrcLyricManager(
     private val songGroupCache = mutableMapOf<String, String>()
     private val songLinesCache = mutableMapOf<String, List<LyricLine>>()
     private val parsedQrcCache = mutableMapOf<String, ParsedQrc?>()
+    private val uncertainMissCooldown = mutableMapOf<String, Long>()
 
     @Synchronized
     fun load(title: String, artist: String, album: String): Boolean {
@@ -52,6 +53,7 @@ class QrcLyricManager(
         if (normalizedTitle.isBlank() && normalizedArtist.isBlank()) {
             return false
         }
+        clearUncertainCooldownIfIndexDirty()
 
         val startedAt = System.currentTimeMillis()
         logger("[QrcLyric] load title=$title artist=$artist album=$album")
@@ -101,6 +103,10 @@ class QrcLyricManager(
 
         if (negativeCacheManager.isNegative(songKey)) {
             cacheManager.recordNegativeHit()
+            logger("[QrcLyric] best group=none score=0")
+            return false
+        }
+        if (isUncertainCooldownActive(songKey)) {
             logger("[QrcLyric] best group=none score=0")
             return false
         }
@@ -157,6 +163,7 @@ class QrcLyricManager(
                     "score=${best?.score ?: 0}"
             )
             logger("[QrcLyric] skip negative cache reason=uncertain qrc match")
+            saveUncertainCooldown(songKey)
             return false
         }
 
@@ -466,6 +473,7 @@ class QrcLyricManager(
     ) {
         cachedGroupId = entry.groupId
         cachedLines = parsed.lines
+        uncertainMissCooldown.remove(songKey)
         songGroupCache[songKey] = entry.groupId
         if (parsed.lines.isNotEmpty()) {
             songLinesCache[songKey] = parsed.lines
@@ -654,6 +662,37 @@ class QrcLyricManager(
         parsedQrcCache.keys.take(overflow).forEach(parsedQrcCache::remove)
     }
 
+    private fun clearUncertainCooldownIfIndexDirty() {
+        if (uncertainMissCooldown.isEmpty()) {
+            return
+        }
+        if (persistentIndexManager.status().dirty) {
+            uncertainMissCooldown.clear()
+            logger("[QrcCooldown] cleared reason=qrc directory changed")
+        }
+    }
+
+    private fun isUncertainCooldownActive(songKey: String): Boolean {
+        val retryAfterMs = uncertainMissCooldown[songKey] ?: return false
+        val now = System.currentTimeMillis()
+        return if (now < retryAfterMs) {
+            logger("[QrcCooldown] hit songKey=$songKey skip qrc lookup")
+            true
+        } else {
+            uncertainMissCooldown.remove(songKey)
+            false
+        }
+    }
+
+    private fun saveUncertainCooldown(songKey: String) {
+        if (songKey.isBlank()) {
+            return
+        }
+        val retryAfterMs = System.currentTimeMillis() + UNCERTAIN_MISS_COOLDOWN_MS
+        uncertainMissCooldown[songKey] = retryAfterMs
+        logger("[QrcCooldown] saved songKey=$songKey retryAfter=$retryAfterMs")
+    }
+
     private fun isEncryptedQrcHex(value: String): Boolean {
         return value.length >= MIN_HEX_LENGTH &&
             value.length % 16 == 0 &&
@@ -764,6 +803,7 @@ class QrcLyricManager(
         private const val MAX_PARSED_QRC_CACHE_SIZE = 80
         private const val MAX_SONG_CACHE_SIZE = 80
         private const val MIN_HEX_LENGTH = 128
+        private const val UNCERTAIN_MISS_COOLDOWN_MS = 10 * 60_000L
 
         private val QRC_LYRIC_CONTENT_REGEX =
             Regex("""LyricContent\s*=\s*"([\s\S]*?)"""")

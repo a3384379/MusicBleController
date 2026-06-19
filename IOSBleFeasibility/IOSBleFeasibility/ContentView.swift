@@ -37,7 +37,7 @@ struct ContentView: View {
                     title: nowPlayingInfo.title,
                     artist: nowPlayingInfo.artist,
                     albumArtImage: bleManager.albumArtImage,
-                    lyrics: bleManager.fullLyrics,
+                    lyrics: currentTrackFullLyrics,
                     currentIndex: currentFullLyricIndex,
                     positionMs: karaokePositionMs,
                     isPlaying: bleManager.isPlaying,
@@ -195,7 +195,7 @@ struct ContentView: View {
                     .textCase(.uppercase)
                     .tracking(1.2)
 
-                if bleManager.fullLyrics.isEmpty {
+                if currentTrackFullLyrics.isEmpty {
                     Text(currentLyricText)
                         .font(.system(size: 28, weight: .semibold, design: .rounded))
                         .foregroundStyle(
@@ -462,21 +462,21 @@ struct ContentView: View {
 
     private var currentFullLyricIndex: Int {
         LyricTimelineHelper.currentIndex(
-            lines: bleManager.fullLyrics,
+            lines: currentTrackFullLyrics,
             positionMs: karaokePositionMs
         ) ?? -1
     }
 
     private var currentLyricProgress: Double {
         LyricTimelineHelper.lineProgress(
-            lines: bleManager.fullLyrics,
+            lines: currentTrackFullLyrics,
             index: currentFullLyricIndex,
             positionMs: karaokePositionMs
         )
     }
 
     private var lyricPreviewIdentity: String {
-        if bleManager.fullLyrics.isEmpty {
+        if currentTrackFullLyrics.isEmpty {
             return currentLyricText
         }
         return "\(bleManager.fullLyricsTrackId)-\(currentFullLyricIndex)"
@@ -492,10 +492,14 @@ struct ContentView: View {
 
     private func lyricPreviewLineModel(offset: Int) -> LyricLine? {
         let index = currentFullLyricIndex + offset
-        guard bleManager.fullLyrics.indices.contains(index) else {
+        guard currentTrackFullLyrics.indices.contains(index) else {
             return nil
         }
-        return bleManager.fullLyrics[index]
+        return currentTrackFullLyrics[index]
+    }
+
+    private var currentTrackFullLyrics: [LyricLine] {
+        bleManager.isFullLyricsCurrent ? bleManager.fullLyrics : []
     }
 
     private var albumArtIdentity: String {

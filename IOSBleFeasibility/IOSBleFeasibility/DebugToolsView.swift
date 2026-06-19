@@ -244,6 +244,37 @@ struct DebugToolsView: View {
                 }
 
                 if showIOSLogs {
+                    HStack(spacing: 10) {
+                        Button(action: bleManager.copyIOSLogs) {
+                            Label("Copy iOS Logs", systemImage: "doc.on.doc")
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button(role: .destructive, action: bleManager.clearIOSLogs) {
+                            Label("Clear", systemImage: "trash")
+                        }
+                        .buttonStyle(.bordered)
+
+                        if AppLogStore.shared.currentLogFileExists() {
+                            ShareLink(item: AppLogStore.shared.currentLogURL) {
+                                Label("Share", systemImage: "square.and.arrow.up")
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+
+                    Text(AppLogStore.shared.currentLogURL.path)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+
+                    if !bleManager.localLogActionStatus.isEmpty {
+                        Text(bleManager.localLogActionStatus)
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    }
+
                     ScrollViewReader { proxy in
                         ScrollView {
                             LazyVStack(alignment: .leading, spacing: 4) {
