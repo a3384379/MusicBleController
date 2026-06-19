@@ -7,6 +7,7 @@ import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.SystemClock
+import com.example.playeragent.history.FastPlaybackSnapshot
 import com.example.playeragent.logging.LogConfig
 import com.example.playeragent.service.PlayerNotificationListenerService
 import org.json.JSONObject
@@ -143,6 +144,54 @@ class PlaybackStateReader(
 
     fun lyricLinesSnapshot(): List<LyricManager.LyricLine> {
         return lyricManager.lyricLinesSnapshot()
+    }
+
+    fun readFastPlaybackSnapshot(): FastPlaybackSnapshot? {
+        val manager = mediaSessionManager ?: return null
+        val listenerComponent = ComponentName(
+            appContext,
+            PlayerNotificationListenerService::class.java
+        )
+        val controllers = try {
+            manager.getActiveSessions(listenerComponent)
+        } catch (securityException: SecurityException) {
+            logger(
+                "[History] getActiveSessions failed: Notification Access is not enabled " +
+                    "or permission denied. ${securityException.message}"
+            )
+            return null
+        } catch (exception: Exception) {
+            logger("[History] getActiveSessions failed: ${exception.message}")
+            return null
+        }
+        if (controllers.isEmpty()) {
+            return null
+        }
+        val selected = controllers.firstOrNull {
+            it.playbackState?.state == PlaybackState.STATE_PLAYING
+        } ?: controllers.first()
+        val metadata = selected.metadata ?: return FastPlaybackSnapshot(
+            packageName = selected.packageName.orEmpty(),
+            title = "",
+            artist = "",
+            album = "",
+            playing = false,
+            stopped = selected.playbackState?.state == PlaybackState.STATE_STOPPED,
+            positionMs = 0L,
+            durationMs = 0L
+        )
+        val playbackState = selected.playbackState
+        val state = playbackState?.state
+        return FastPlaybackSnapshot(
+            packageName = selected.packageName.orEmpty(),
+            title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty(),
+            artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty(),
+            album = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM).orEmpty(),
+            playing = state == PlaybackState.STATE_PLAYING,
+            stopped = state == PlaybackState.STATE_STOPPED,
+            positionMs = calculatePosition(playbackState),
+            durationMs = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION)
+        )
     }
 
     fun currentTrackSnapshot(): CurrentTrackSnapshot? {

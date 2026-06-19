@@ -27,6 +27,9 @@ import android.widget.ScrollView
 import android.widget.TextView
 import com.example.playeragent.ble.ControllerScannerManager
 import com.example.playeragent.classicbluetooth.RfcommClientManager
+import com.example.playeragent.history.HistorySessionRow
+import com.example.playeragent.history.PlaybackHistoryRepository
+import com.example.playeragent.history.StatsRange
 import com.example.playeragent.logging.LogBuffer
 import com.example.playeragent.media.AlbumArtTestManager
 import com.example.playeragent.media.CurrentLyricProbe
@@ -42,6 +45,9 @@ import com.example.playeragent.media.QrcV2RebuildProgress
 import com.example.playeragent.media.QrcWatcherStatus
 import com.example.playeragent.service.PlayerAgentForegroundService
 import com.example.playeragent.service.QQMusicLyricAccessibilityService
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : Activity() {
 
@@ -55,6 +61,7 @@ class MainActivity : Activity() {
     private lateinit var qrcWatcherStatusTextView: TextView
     private lateinit var lyricCacheStatsTextView: TextView
     private lateinit var qrcCacheOverviewTextView: TextView
+    private lateinit var historyStatusTextView: TextView
     private lateinit var logTextView: TextView
     private lateinit var logScrollView: ScrollView
     private lateinit var logSectionBody: LinearLayout
@@ -242,6 +249,15 @@ class MainActivity : Activity() {
         currentAlbumArtTextView = statusValue("封面：未检测").also(playerCard::addView)
         currentSongTextView = statusValue("歌曲：未检测").also(playerCard::addView)
         currentLyricTextView = statusValue("当前歌词：暂无歌词").also(playerCard::addView)
+
+        val historyCard = collapsibleCard(content, "播放历史与收听统计", expanded = false)
+        historyStatusTextView = statusValue("播放历史：未刷新").also(historyCard::addView)
+        historyCard.addView(buttonGrid(listOf(
+            "刷新历史状态" to ::refreshHistoryStatus,
+            "显示最近 10 条" to ::showRecentHistory,
+            "显示今日统计" to ::showTodayHistoryStats,
+            "清空播放历史" to { confirmAction("清空 Sony 本地播放历史？", ::clearPlayHistory) }
+        )))
 
         val lyricCard = collapsibleCard(content, "歌词缓存与逐字时间", expanded = false)
         qrcCacheOverviewTextView = statusValue(qrcCacheOverviewText()).also(lyricCard::addView)
@@ -569,6 +585,140 @@ class MainActivity : Activity() {
             name = "MainAlbumArtRefreshThread"
             start()
         }
+    }
+
+    private fun refreshHistoryStatus() {
+        Thread {
+            val text = try {
+                val snapshot = PlaybackHistoryRepository(this).statusSnapshot()
+                val monitor = snapshot.monitorStatus
+                "Monitor running：${if (monitor.running) "是" else "否"}\n" +
+                    "Active session id：${monitor.activeSessionId ?: "-"}\n" +
+                    "Active title：${monitor.activeTitle.ifBlank { "-" }}\n" +
+                    "Active listenedMs：${formatDuration(monitor.activeListenedMs)}\n" +
+                    "Total tracks：${snapshot.totalTracks}\n" +
+                    "Total sessions：${snapshot.totalSessions}\n" +
+                    "Last session id：${snapshot.lastSessionId}\n" +
+                    "Today listen time：${formatDuration(snapshot.todayListenMs)}\n" +
+                    "Database path：${snapshot.databasePath}"
+            } catch (exception: Exception) {
+                "[History] status failed: ${exception.message}"
+            }
+            runOnUiThread {
+                historyStatusTextView.text = text
+                appendLog("[History] status refreshed")
+            }
+        }.apply {
+            name = "HistoryStatusThread"
+            start()
+        }
+    }
+
+    private fun showRecentHistory() {
+        Thread {
+            val text = try {
+                val rows = PlaybackHistoryRepository(this).getRecentSessions(limit = 10)
+                recentHistoryText(rows)
+            } catch (exception: Exception) {
+                "[History] recent failed: ${exception.message}"
+            }
+            runOnUiThread {
+                historyStatusTextView.text = text
+                appendLog("[History] recent 10 refreshed")
+            }
+        }.apply {
+            name = "HistoryRecentThread"
+            start()
+        }
+    }
+
+    private fun showTodayHistoryStats() {
+        Thread {
+            val text = try {
+                val stats = PlaybackHistoryRepository(this).stats(StatsRange.TODAY)
+                "今日统计\n" +
+                    "收听时长：${formatDuration(stats.totalListenMs)}\n" +
+                    "播放次数：${stats.playCount}\n" +
+                    "歌曲数：${stats.uniqueTrackCount}\n" +
+                    "完播数：${stats.completedCount}\n" +
+                    "跳过数：${stats.skippedCount}\n" +
+                    "完播率：${formatPercent(stats.completionRate)}\n" +
+                    "跳过率：${formatPercent(stats.skipRate)}\n\n" +
+                    "最常听歌曲\n" +
+                    stats.topTracks.joinToString("\n") {
+                        "${it.title.ifBlank { "-" }} · ${it.artist.ifBlank { "未知歌手" }} " +
+                            "${formatDuration(it.listenedMs)}"
+                    }.ifBlank { "暂无数据" }
+            } catch (exception: Exception) {
+                "[History] stats failed: ${exception.message}"
+            }
+            runOnUiThread {
+                historyStatusTextView.text = text
+                appendLog("[History] today stats refreshed")
+            }
+        }.apply {
+            name = "HistoryStatsThread"
+            start()
+        }
+    }
+
+    private fun clearPlayHistory() {
+        Thread {
+            val message = try {
+                PlaybackHistoryRepository(this).clearAll()
+                "[History] local playback history cleared"
+            } catch (exception: Exception) {
+                "[History] clear failed: ${exception.message}"
+            }
+            runOnUiThread {
+                historyStatusTextView.text = "播放历史：已清空"
+                appendLog(message)
+            }
+        }.apply {
+            name = "HistoryClearThread"
+            start()
+        }
+    }
+
+    private fun recentHistoryText(rows: List<HistorySessionRow>): String {
+        if (rows.isEmpty()) {
+            return "最近播放\n暂无记录"
+        }
+        return "最近播放\n" + rows.joinToString("\n\n") { row ->
+            val title = row.title.ifBlank { "-" }
+            val artist = row.artist.ifBlank { "未知歌手" }
+            val album = row.album.ifBlank { "未知专辑" }
+            val state = when {
+                row.completed -> "已完播"
+                row.skipped -> "已跳过"
+                row.countedPlay -> "已计播放"
+                else -> "未计播放"
+            }
+            "$title\n$artist · $album\n" +
+                "${formatDateTime(row.startedAt)} · 听了 ${formatDuration(row.listenedMs)}\n" +
+                state
+        }
+    }
+
+    private fun formatDuration(durationMs: Long): String {
+        val safe = durationMs.coerceAtLeast(0L)
+        val totalSeconds = safe / 1_000L
+        val hours = totalSeconds / 3_600L
+        val minutes = (totalSeconds % 3_600L) / 60L
+        val seconds = totalSeconds % 60L
+        return if (hours > 0L) {
+            "%d小时%02d分钟".format(hours, minutes)
+        } else {
+            "%02d:%02d".format(minutes, seconds)
+        }
+    }
+
+    private fun formatDateTime(timeMs: Long): String {
+        return SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(Date(timeMs))
+    }
+
+    private fun formatPercent(value: Double): String {
+        return "%.0f%%".format(value * 100.0)
     }
 
     private fun initializeBluetooth() {

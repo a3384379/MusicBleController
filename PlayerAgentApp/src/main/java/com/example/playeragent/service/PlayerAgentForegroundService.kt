@@ -21,6 +21,7 @@ import android.util.Log
 import com.example.playeragent.MainActivity
 import com.example.playeragent.ble.BleAdvertiserManager
 import com.example.playeragent.ble.BleGattServerManager
+import com.example.playeragent.history.PlaybackHistoryMonitor
 import com.example.playeragent.logging.LogConfig
 import com.example.playeragent.logging.LogBuffer
 import com.example.playeragent.media.QrcDirectoryWatcher
@@ -33,6 +34,7 @@ class PlayerAgentForegroundService : Service() {
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var advertiserManager: BleAdvertiserManager? = null
     private var gattServerManager: BleGattServerManager? = null
+    private var playbackHistoryMonitor: PlaybackHistoryMonitor? = null
     private var qrcIncrementalPrebuildManager: QrcIncrementalPrebuildManager? = null
     private var qrcDirectoryWatcher: QrcDirectoryWatcher? = null
     @Volatile
@@ -63,6 +65,7 @@ class PlayerAgentForegroundService : Service() {
             IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
         )
         log("Foreground service started")
+        startPlaybackHistoryMonitor()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -71,6 +74,7 @@ class PlayerAgentForegroundService : Service() {
             ACTION_START_QRC_WATCHER -> startQrcWatcher()
             ACTION_RECOVER_BLE_STACK -> recoverBleStack("manual debug")
             else -> {
+                startPlaybackHistoryMonitor()
                 ensureBleStackStarted("service start")
                 startQrcWatcher()
             }
@@ -82,6 +86,7 @@ class PlayerAgentForegroundService : Service() {
         serviceStopping = true
         mainHandler.removeCallbacksAndMessages(null)
         runCatching { unregisterReceiver(bluetoothStateReceiver) }
+        stopPlaybackHistoryMonitor()
         stopQrcWatcher()
         advertiserManager?.stopAdvertising()
         advertiserManager = null
@@ -96,6 +101,24 @@ class PlayerAgentForegroundService : Service() {
     private fun ensureBleStackStarted(reason: String, forceRebuild: Boolean = false) {
         log("[BLE-RECOVERY] ensure start reason=$reason")
         initializeBluetooth(reason = reason, forceRebuild = forceRebuild)
+    }
+
+    private fun startPlaybackHistoryMonitor() {
+        val existing = playbackHistoryMonitor
+        if (existing != null) {
+            return
+        }
+        playbackHistoryMonitor = PlaybackHistoryMonitor(
+            context = this,
+            logger = ::log
+        ).also {
+            it.start()
+        }
+    }
+
+    private fun stopPlaybackHistoryMonitor() {
+        playbackHistoryMonitor?.stop()
+        playbackHistoryMonitor = null
     }
 
     private fun initializeBluetooth(
