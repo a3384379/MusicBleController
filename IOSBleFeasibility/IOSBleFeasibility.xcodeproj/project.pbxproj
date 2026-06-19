@@ -22,6 +22,9 @@
 		A10000000000000000000013 /* PlayPauseLiveActivityIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000016 /* PlayPauseLiveActivityIntent.swift */; };
 		A10000000000000000000014 /* PreviousLiveActivityIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000017 /* PreviousLiveActivityIntent.swift */; };
 		A10000000000000000000015 /* NextLiveActivityIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000018 /* NextLiveActivityIntent.swift */; };
+		A10000000000000000000016 /* PlaybackHistoryModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000019 /* PlaybackHistoryModels.swift */; };
+		A10000000000000000000017 /* PlaybackHistoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000020 /* PlaybackHistoryStore.swift */; };
+		A10000000000000000000018 /* PlaybackHistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000021 /* PlaybackHistoryView.swift */; };
 		B10000000000000000000001 /* SonyMusicActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* SonyMusicActivityAttributes.swift */; };
 		B10000000000000000000002 /* LiveActivityManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000002 /* LiveActivityManager.swift */; };
 		B10000000000000000000003 /* SonyMusicLiveActivityExtensionBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000004 /* SonyMusicLiveActivityExtensionBundle.swift */; };
@@ -80,6 +83,9 @@
 		A20000000000000000000016 /* PlayPauseLiveActivityIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayPauseLiveActivityIntent.swift; sourceTree = "<group>"; };
 		A20000000000000000000017 /* PreviousLiveActivityIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviousLiveActivityIntent.swift; sourceTree = "<group>"; };
 		A20000000000000000000018 /* NextLiveActivityIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NextLiveActivityIntent.swift; sourceTree = "<group>"; };
+		A20000000000000000000019 /* PlaybackHistoryModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackHistoryModels.swift; sourceTree = "<group>"; };
+		A20000000000000000000020 /* PlaybackHistoryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackHistoryStore.swift; sourceTree = "<group>"; };
+		A20000000000000000000021 /* PlaybackHistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackHistoryView.swift; sourceTree = "<group>"; };
 		B20000000000000000000001 /* SonyMusicActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SonyMusicActivityAttributes.swift; sourceTree = "<group>"; };
 		B20000000000000000000002 /* LiveActivityManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityManager.swift; sourceTree = "<group>"; };
 		B20000000000000000000004 /* SonyMusicLiveActivityExtensionBundle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SonyMusicLiveActivityExtensionBundle.swift; sourceTree = "<group>"; };
@@ -133,6 +139,9 @@
 				A20000000000000000000016 /* PlayPauseLiveActivityIntent.swift */,
 				A20000000000000000000017 /* PreviousLiveActivityIntent.swift */,
 				A20000000000000000000018 /* NextLiveActivityIntent.swift */,
+				A20000000000000000000019 /* PlaybackHistoryModels.swift */,
+				A20000000000000000000020 /* PlaybackHistoryStore.swift */,
+				A20000000000000000000021 /* PlaybackHistoryView.swift */,
 				A20000000000000000000010 /* AppLogStore.swift */,
 				A20000000000000000000003 /* BLEUUIDs.swift */,
 				A20000000000000000000004 /* BLETestManager.swift */,
@@ -286,6 +295,9 @@
 				A10000000000000000000013 /* PlayPauseLiveActivityIntent.swift in Sources */,
 				A10000000000000000000014 /* PreviousLiveActivityIntent.swift in Sources */,
 				A10000000000000000000015 /* NextLiveActivityIntent.swift in Sources */,
+				A10000000000000000000016 /* PlaybackHistoryModels.swift in Sources */,
+				A10000000000000000000017 /* PlaybackHistoryStore.swift in Sources */,
+				A10000000000000000000018 /* PlaybackHistoryView.swift in Sources */,
 				A10000000000000000000008 /* AppLogStore.swift in Sources */,
 				A10000000000000000000003 /* BLEUUIDs.swift in Sources */,
 				A10000000000000000000004 /* BLETestManager.swift in Sources */,

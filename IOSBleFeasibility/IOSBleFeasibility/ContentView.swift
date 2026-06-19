@@ -5,6 +5,7 @@ struct ContentView: View {
     @State private var showVolumeDetails = false
     @State private var showFullLyrics = false
     @State private var showDebugPage = false
+    @State private var showPlaybackHistory = false
 
     var body: some View {
         NavigationStack {
@@ -31,6 +32,9 @@ struct ContentView: View {
             .toolbar(.hidden, for: .navigationBar)
             .sheet(isPresented: $showDebugPage) {
                 DebugToolsView(bleManager: bleManager)
+            }
+            .sheet(isPresented: $showPlaybackHistory) {
+                PlaybackHistoryView(bleManager: bleManager)
             }
             .fullScreenCover(isPresented: $showFullLyrics) {
                 FullLyricsView(
@@ -94,6 +98,12 @@ struct ContentView: View {
                     showDebugPage = true
                 } label: {
                     Label("调试工具", systemImage: "slider.horizontal.3")
+                }
+
+                Button {
+                    showPlaybackHistory = true
+                } label: {
+                    Label("播放历史", systemImage: "clock.arrow.circlepath")
                 }
             } label: {
                 Image(systemName: "ellipsis")

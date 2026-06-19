@@ -65,6 +65,10 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var karaokeOffsetMs: Int64 = 600
     @Published private(set) var localLogActionStatus = ""
     @Published private(set) var liveActivityControlStatus = LiveActivityControlStatus()
+    @Published private(set) var playbackHistorySessions: [PlaybackHistorySession] = []
+    @Published private(set) var playbackStats: [String: PlaybackStatsSnapshot] = [:]
+    @Published private(set) var isPlaybackHistorySyncing = false
+    @Published private(set) var playbackHistoryStatus = ""
 
     private lazy var centralManager = CBCentralManager(delegate: self, queue: nil)
     private lazy var peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
@@ -122,6 +126,10 @@ final class BLETestManager: NSObject, ObservableObject {
     private var mediaFieldDumpExpectedSize = 0
     private var mediaFieldDumpExpectedChunks = 0
     private var mediaFieldDumpChunks: [Int: Data] = [:]
+    private var historyPayloads: [String: HistoryPayloadAssembly] = [:]
+    private var pendingHistoryRequests: [String: HistoryRequestKind] = [:]
+    private var lastSyncedHistorySessionId: Int64 = 0
+    private var isLoadingMoreHistory = false
     private var trackInfoExpectedSize = 0
     private var trackInfoExpectedChunks = 0
     private var trackInfoChunks: [Int: Data] = [:]
@@ -142,6 +150,19 @@ final class BLETestManager: NSObject, ObservableObject {
         let writeCalledAtMs: Int64
     }
 
+    private enum HistoryRequestKind {
+        case since
+        case page
+        case stats(String)
+    }
+
+    private struct HistoryPayloadAssembly {
+        let responseType: String
+        let expectedSize: Int
+        let expectedChunks: Int
+        var chunks: [Int: Data] = [:]
+    }
+
     override init() {
         super.init()
         log("[BLE-iOS] app log store ready")
@@ -153,6 +174,7 @@ final class BLETestManager: NSObject, ObservableObject {
         registerAppLifecycleDiagnostics()
         startProgressTimer()
         startMainHeartbeatDiagnostics()
+        loadCachedPlaybackHistory()
     }
 
     deinit {
@@ -349,6 +371,106 @@ final class BLETestManager: NSObject, ObservableObject {
         guard !mediaFieldDumpText.isEmpty else { return }
         UIPasteboard.general.string = mediaFieldDumpText
         mediaFieldDumpCopyStatus = "已复制 Media Field Dump"
+    }
+
+    func loadCachedPlaybackHistory() {
+        PlaybackHistoryStore.shared.loadSessions { [weak self] sessions in
+            PlaybackHistoryStore.shared.loadSyncState { syncState in
+                PlaybackHistoryStore.shared.loadStats { stats in
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        self.playbackHistorySessions = sessions
+                        self.lastSyncedHistorySessionId = syncState.lastSyncedSessionId
+                        self.playbackStats = stats
+                        self.playbackHistoryStatus = sessions.isEmpty ? "暂无本地历史" : "已加载本地历史"
+                    }
+                }
+            }
+        }
+    }
+
+    func syncPlaybackHistory() {
+        guard connectionStatus == "已连接" else {
+            playbackHistoryStatus = "Sony 未连接"
+            log("[History-iOS] sync skipped reason=not connected")
+            return
+        }
+        guard !isPlaybackHistorySyncing else {
+            playbackHistoryStatus = "同步中..."
+            return
+        }
+        isPlaybackHistorySyncing = true
+        playbackHistoryStatus = "同步播放历史..."
+        requestPlaybackHistorySince(afterSessionId: lastSyncedHistorySessionId)
+        refreshPlaybackStats()
+    }
+
+    func loadMorePlaybackHistory() {
+        guard connectionStatus == "已连接" else {
+            playbackHistoryStatus = "Sony 未连接"
+            return
+        }
+        guard !isLoadingMoreHistory else { return }
+        let beforeSessionId = playbackHistorySessions.map(\.sessionId).min()
+        guard let beforeSessionId else {
+            syncPlaybackHistory()
+            return
+        }
+        isLoadingMoreHistory = true
+        let requestId = "history-page-\(currentTimeMs())"
+        pendingHistoryRequests[requestId] = .page
+        log("[HistorySync] request page requestId=\(requestId) before=\(beforeSessionId)")
+        sendCommand(
+            cmd: "GET_PLAY_HISTORY_PAGE",
+            extra: [
+                "requestId": requestId,
+                "beforeSessionId": beforeSessionId,
+                "limit": 10
+            ]
+        )
+    }
+
+    func refreshPlaybackStats() {
+        guard connectionStatus == "已连接" else { return }
+        for range in ["TODAY", "WEEK", "MONTH"] {
+            let requestId = "stats-\(range)-\(currentTimeMs())"
+            pendingHistoryRequests[requestId] = .stats(range)
+            log("[HistorySync] request stats requestId=\(requestId) range=\(range)")
+            sendCommand(
+                cmd: "GET_PLAY_STATS",
+                extra: [
+                    "requestId": requestId,
+                    "range": range
+                ]
+            )
+        }
+    }
+
+    func clearLocalPlaybackHistory() {
+        PlaybackHistoryStore.shared.clear { [weak self] in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.playbackHistorySessions = []
+                self.playbackStats = [:]
+                self.lastSyncedHistorySessionId = 0
+                self.playbackHistoryStatus = "已清空 iPhone 本地缓存"
+                self.log("[History-iOS] local cache cleared")
+            }
+        }
+    }
+
+    private func requestPlaybackHistorySince(afterSessionId: Int64) {
+        let requestId = "history-since-\(currentTimeMs())"
+        pendingHistoryRequests[requestId] = .since
+        log("[HistorySync] request since requestId=\(requestId) after=\(afterSessionId)")
+        sendCommand(
+            cmd: "GET_PLAY_HISTORY_SINCE",
+            extra: [
+                "requestId": requestId,
+                "afterSessionId": afterSessionId,
+                "limit": 20
+            ]
+        )
     }
 
     private func sendUserCommand(cmd: String, extra: [String: Any] = [:]) {
@@ -1073,6 +1195,9 @@ extension BLETestManager: CBPeripheralDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 self?.sendGetVolume()
             }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.syncPlaybackHistory()
+            }
         }
     }
 
@@ -1496,10 +1621,199 @@ extension BLETestManager: CBPeripheralDelegate {
                 self.mediaFieldDumpText = "Media field dump failed: \(message)"
                 self.failMediaFieldDump(message)
 
+            case "playHistoryPage", "playHistorySince", "playStats":
+                self.handleHistoryPayload(object)
+
+            case "historyPayloadStart":
+                self.handleHistoryPayloadStart(object)
+
+            case "historyPayloadChunk":
+                self.handleHistoryPayloadChunk(object)
+
+            case "historyPayloadEnd":
+                self.handleHistoryPayloadEnd(object)
+
+            case "playHistoryError":
+                let requestId = object["requestId"] as? String ?? ""
+                let message = object["message"] as? String ?? "unknown"
+                self.pendingHistoryRequests.removeValue(forKey: requestId)
+                self.isPlaybackHistorySyncing = false
+                self.isLoadingMoreHistory = false
+                self.playbackHistoryStatus = "同步失败：\(message)"
+                self.log("[HistorySync] error requestId=\(requestId) message=\(message)")
+
             default:
                 self.log("[Status] unsupported type=\(type)")
             }
         }
+    }
+
+    private func handleHistoryPayloadStart(_ object: [String: Any]) {
+        let requestId = object["requestId"] as? String ?? ""
+        let responseType = object["responseType"] as? String ?? ""
+        let size = Self.intValue(object["size"])
+        let chunks = Self.intValue(object["chunks"])
+        guard !requestId.isEmpty, !responseType.isEmpty, size > 0, chunks > 0 else {
+            log("[HistorySync] invalid payload start")
+            return
+        }
+        historyPayloads[requestId] = HistoryPayloadAssembly(
+            responseType: responseType,
+            expectedSize: size,
+            expectedChunks: chunks
+        )
+        log("[HistorySync] payload start requestId=\(requestId) chunks=\(chunks)")
+    }
+
+    private func handleHistoryPayloadChunk(_ object: [String: Any]) {
+        let requestId = object["requestId"] as? String ?? ""
+        let index = Self.intValue(object["index"])
+        guard var assembly = historyPayloads[requestId],
+              index >= 0,
+              index < assembly.expectedChunks,
+              let base64 = object["data"] as? String,
+              let chunk = Data(base64Encoded: base64) else {
+            log("[HistorySync] invalid payload chunk requestId=\(requestId) index=\(index)")
+            return
+        }
+        assembly.chunks[index] = chunk
+        historyPayloads[requestId] = assembly
+    }
+
+    private func handleHistoryPayloadEnd(_ object: [String: Any]) {
+        let requestId = object["requestId"] as? String ?? ""
+        guard let assembly = historyPayloads.removeValue(forKey: requestId),
+              assembly.chunks.count == assembly.expectedChunks else {
+            log("[HistorySync] payload end missing chunks requestId=\(requestId)")
+            return
+        }
+        var data = Data()
+        for index in 0..<assembly.expectedChunks {
+            guard let chunk = assembly.chunks[index] else {
+                log("[HistorySync] payload missing chunk requestId=\(requestId) index=\(index)")
+                return
+            }
+            data.append(chunk)
+        }
+        guard data.count == assembly.expectedSize,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            log("[HistorySync] payload decode failed requestId=\(requestId)")
+            return
+        }
+        log("[HistorySync] payload decoded requestId=\(requestId) bytes=\(data.count)")
+        handleHistoryPayload(object)
+    }
+
+    private func handleHistoryPayload(_ object: [String: Any]) {
+        let type = object["type"] as? String ?? ""
+        let requestId = object["requestId"] as? String ?? ""
+        switch type {
+        case "playHistoryPage", "playHistorySince":
+            let sessions = decodeHistorySessions(object["items"] as? [[String: Any]] ?? [])
+            PlaybackHistoryStore.shared.mergeSessions(sessions) { [weak self] merged in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.playbackHistorySessions = merged
+                    self.handleHistoryRequestCompletion(
+                        type: type,
+                        requestId: requestId,
+                        received: sessions.count,
+                        response: object
+                    )
+                }
+            }
+
+        case "playStats":
+            guard let stats = decodePlaybackStats(object) else {
+                playbackHistoryStatus = "统计解析失败"
+                log("[HistorySync] stats decode failed requestId=\(requestId)")
+                return
+            }
+            playbackStats[stats.range] = stats
+            PlaybackHistoryStore.shared.saveStats(stats)
+            pendingHistoryRequests.removeValue(forKey: requestId)
+            playbackHistoryStatus = "统计已更新"
+            log("[HistorySync] stats updated range=\(stats.range)")
+
+        default:
+            log("[HistorySync] unsupported payload type=\(type)")
+        }
+    }
+
+    private func handleHistoryRequestCompletion(
+        type: String,
+        requestId: String,
+        received: Int,
+        response: [String: Any]
+    ) {
+        let kind = pendingHistoryRequests.removeValue(forKey: requestId)
+        let hasMore = response["hasMore"] as? Bool ?? false
+        if type == "playHistorySince" {
+            let lastSessionId = Self.int64Value(response["lastSessionId"])
+            if lastSessionId > lastSyncedHistorySessionId {
+                lastSyncedHistorySessionId = lastSessionId
+                PlaybackHistoryStore.shared.saveSyncState(
+                    PlaybackHistorySyncState(lastSyncedSessionId: lastSessionId)
+                )
+            }
+            log(
+                "[HistorySync] since received=\(received) " +
+                    "lastSynced=\(lastSyncedHistorySessionId) hasMore=\(hasMore)"
+            )
+            if hasMore {
+                requestPlaybackHistorySince(afterSessionId: lastSyncedHistorySessionId)
+            } else {
+                isPlaybackHistorySyncing = false
+                playbackHistoryStatus = received == 0 ? "已是最新" : "同步完成"
+            }
+        } else if type == "playHistoryPage" {
+            isLoadingMoreHistory = false
+            playbackHistoryStatus = received == 0 ? "没有更多历史" : "已加载更多"
+            log("[HistorySync] page received=\(received) hasMore=\(hasMore)")
+        } else if kind == nil {
+            log("[HistorySync] response without pending requestId=\(requestId)")
+        }
+    }
+
+    private func decodeHistorySessions(_ items: [[String: Any]]) -> [PlaybackHistorySession] {
+        items.compactMap { item in
+            let sessionId = Self.int64Value(item["sessionId"])
+            guard sessionId > 0 else { return nil }
+            return PlaybackHistorySession(
+                sessionId: sessionId,
+                trackKey: item["trackKey"] as? String ?? "",
+                title: item["title"] as? String ?? "",
+                artist: item["artist"] as? String ?? "",
+                album: item["album"] as? String ?? "",
+                artworkId: item["artworkId"] as? String,
+                startedAt: Self.int64Value(item["startedAt"]),
+                endedAt: Self.optionalInt64Value(item["endedAt"]),
+                listenedMs: Self.int64Value(item["listenedMs"]),
+                durationMs: Self.int64Value(item["durationMs"]),
+                completed: item["completed"] as? Bool ?? false,
+                skipped: item["skipped"] as? Bool ?? false,
+                countedPlay: item["countedPlay"] as? Bool ?? false
+            )
+        }
+    }
+
+    private func decodePlaybackStats(_ object: [String: Any]) -> PlaybackStatsSnapshot? {
+        guard let range = object["range"] as? String else { return nil }
+        return PlaybackStatsSnapshot(
+            range: range,
+            rangeStart: Self.int64Value(object["rangeStart"]),
+            rangeEnd: Self.int64Value(object["rangeEnd"]),
+            totalListenMs: Self.int64Value(object["totalListenMs"]),
+            playCount: Self.intValue(object["playCount"]),
+            uniqueTrackCount: Self.intValue(object["uniqueTrackCount"]),
+            completedCount: Self.intValue(object["completedCount"]),
+            skippedCount: Self.intValue(object["skippedCount"]),
+            completionRate: Self.doubleValue(object["completionRate"]),
+            skipRate: Self.doubleValue(object["skipRate"]),
+            topTracks: decodeTopTracks(object["topTracks"] as? [[String: Any]] ?? []),
+            topArtists: decodeTopArtists(object["topArtists"] as? [[String: Any]] ?? []),
+            dailyTrend: decodeDailyTrend(object["dailyTrend"] as? [[String: Any]] ?? [])
+        )
     }
 
     private func finishAlbumArtTransfer(id: String, quality: String) {
@@ -2599,6 +2913,43 @@ extension BLETestManager: CBPeripheralDelegate {
         mediaFieldDumpChunks.removeAll()
     }
 
+    private func decodeTopTracks(_ items: [[String: Any]]) -> [PlaybackTopTrack] {
+        items.map { item in
+            PlaybackTopTrack(
+                trackKey: item["trackKey"] as? String ?? "",
+                title: item["title"] as? String ?? "",
+                artist: item["artist"] as? String ?? "",
+                album: item["album"] as? String ?? "",
+                artworkId: item["artworkId"] as? String,
+                listenedMs: Self.int64Value(item["listenedMs"]),
+                playCount: Self.intValue(item["playCount"]),
+                completedCount: Self.intValue(item["completedCount"]),
+                skippedCount: Self.intValue(item["skippedCount"])
+            )
+        }
+    }
+
+    private func decodeTopArtists(_ items: [[String: Any]]) -> [PlaybackTopArtist] {
+        items.map { item in
+            PlaybackTopArtist(
+                artist: item["artist"] as? String ?? "未知歌手",
+                listenedMs: Self.int64Value(item["listenedMs"]),
+                playCount: Self.intValue(item["playCount"]),
+                trackCount: Self.intValue(item["trackCount"])
+            )
+        }
+    }
+
+    private func decodeDailyTrend(_ items: [[String: Any]]) -> [DailyListenStat] {
+        items.map { item in
+            DailyListenStat(
+                dateKey: item["dateKey"] as? String ?? "",
+                listenedMs: Self.int64Value(item["listenedMs"]),
+                playCount: Self.intValue(item["playCount"])
+            )
+        }
+    }
+
     private static func int64Value(_ value: Any?) -> Int64 {
         if let number = value as? NSNumber {
             return number.int64Value
@@ -2606,9 +2957,26 @@ extension BLETestManager: CBPeripheralDelegate {
         return 0
     }
 
+    private static func optionalInt64Value(_ value: Any?) -> Int64? {
+        if value is NSNull {
+            return nil
+        }
+        if let number = value as? NSNumber {
+            return number.int64Value
+        }
+        return nil
+    }
+
     private static func intValue(_ value: Any?) -> Int {
         if let number = value as? NSNumber {
             return number.intValue
+        }
+        return 0
+    }
+
+    private static func doubleValue(_ value: Any?) -> Double {
+        if let number = value as? NSNumber {
+            return number.doubleValue
         }
         return 0
     }
