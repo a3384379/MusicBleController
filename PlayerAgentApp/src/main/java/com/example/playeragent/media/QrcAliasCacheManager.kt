@@ -50,6 +50,21 @@ class QrcAliasCacheManager(
         }
     }
 
+    @Synchronized
+    fun removeInvalidTargets(targetExists: (String) -> Boolean) {
+        ensureLoaded()
+        val invalidSources = aliases.values
+            .filterNot { targetExists(it.targetSongKey) }
+            .map { it.sourceSongKey }
+        invalidSources.forEach { source ->
+            aliases.remove(source)
+            logger("[QrcAlias] removed invalid source=$source")
+        }
+        if (invalidSources.isNotEmpty()) {
+            saveLocked()
+        }
+    }
+
     private fun ensureLoaded() {
         if (loaded) {
             return

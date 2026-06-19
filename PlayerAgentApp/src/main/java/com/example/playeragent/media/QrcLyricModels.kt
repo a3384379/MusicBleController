@@ -32,8 +32,34 @@ data class ParsedLyric(
     val album: String,
     val groupId: String,
     val qrcLastModified: Long,
-    val lines: List<QrcLyricLine>
+    val lines: List<QrcLyricLine>,
+    val schemaVersion: Int = QRC_CACHE_SCHEMA_V2,
+    val qrcPath: String = "",
+    val wordTimingStatus: QrcWordTimingStatus = QrcWordTimingStatus.fromLines(lines)
 )
+
+enum class QrcWordTimingStatus {
+    AVAILABLE,
+    UNAVAILABLE,
+    FAILED;
+
+    companion object {
+        fun fromLines(lines: List<QrcLyricLine>): QrcWordTimingStatus {
+            return if (lines.any { it.words.isNotEmpty() }) {
+                AVAILABLE
+            } else {
+                UNAVAILABLE
+            }
+        }
+
+        fun fromValue(value: String): QrcWordTimingStatus {
+            return values().firstOrNull { it.name == value } ?: UNAVAILABLE
+        }
+    }
+}
+
+const val QRC_CACHE_SCHEMA_V1 = 1
+const val QRC_CACHE_SCHEMA_V2 = 2
 
 data class LyricCacheStats(
     val l1Hit: Long = 0,
@@ -273,7 +299,10 @@ object QrcLyricUtils {
             album = album,
             groupId = group.groupId,
             qrcLastModified = group.qrcFile?.lastModified() ?: 0L,
-            lines = lines
+            lines = lines,
+            schemaVersion = QRC_CACHE_SCHEMA_V2,
+            qrcPath = group.qrcFile?.absolutePath.orEmpty(),
+            wordTimingStatus = QrcWordTimingStatus.fromLines(lines)
         )
     }
 

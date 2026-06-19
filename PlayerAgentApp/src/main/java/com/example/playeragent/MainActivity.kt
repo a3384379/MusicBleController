@@ -2,6 +2,7 @@ package com.example.playeragent
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.content.BroadcastReceiver
@@ -10,6 +11,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -18,6 +20,7 @@ import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
+import android.widget.GridLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -33,9 +36,9 @@ import com.example.playeragent.media.LyricSourceTestManager
 import com.example.playeragent.media.PlaybackStateReader
 import com.example.playeragent.media.QrcDumpManager
 import com.example.playeragent.media.QrcLyricCacheManager
-import com.example.playeragent.media.QrcLyricPrebuildManager
+import com.example.playeragent.media.QrcLyricV2RebuildManager
 import com.example.playeragent.media.QrcPersistentIndexManager
-import com.example.playeragent.media.QrcPrebuildProgress
+import com.example.playeragent.media.QrcV2RebuildProgress
 import com.example.playeragent.media.QrcWatcherStatus
 import com.example.playeragent.service.PlayerAgentForegroundService
 import com.example.playeragent.service.QQMusicLyricAccessibilityService
@@ -48,18 +51,17 @@ class MainActivity : Activity() {
     private lateinit var currentLyricTextView: TextView
     private lateinit var currentAlbumArtImageView: ImageView
     private lateinit var currentAlbumArtTextView: TextView
-    private lateinit var debugPanel: LinearLayout
-    private lateinit var debugToggleButton: Button
     private lateinit var qrcCacheBuildTextView: TextView
     private lateinit var qrcWatcherStatusTextView: TextView
     private lateinit var lyricCacheStatsTextView: TextView
+    private lateinit var qrcCacheOverviewTextView: TextView
     private lateinit var logTextView: TextView
     private lateinit var logScrollView: ScrollView
-    private lateinit var logToggleButton: Button
+    private lateinit var logSectionBody: LinearLayout
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var controllerScannerManager: ControllerScannerManager? = null
     private var rfcommClientManager: RfcommClientManager? = null
-    private var qrcLyricPrebuildManager: QrcLyricPrebuildManager? = null
+    private var qrcV2RebuildManager: QrcLyricV2RebuildManager? = null
     private var lastPlayerUiSongKey: String = ""
     private var lastPlayerUiLyric: String = ""
     private var albumArtRefreshGeneration = 0L
@@ -115,20 +117,13 @@ class MainActivity : Activity() {
             appendLog(message, storeInBuffer = false)
             when {
                 message.contains("Foreground service started") ->
-                    statusTextView.text = "BLE 服务运行中"
+                    statusTextView.text = "控制服务：运行中"
 
                 message.contains("Foreground service stopped") ->
-                    statusTextView.text = "BLE 服务已停止"
+                    statusTextView.text = "控制服务：已停止"
 
-                message.startsWith("[AccessibilityLyric] candidate=") -> {
-                    val candidate =
-                        QQMusicLyricAccessibilityService.latestCandidateLyric
-                    if (candidate.isNotBlank() &&
-                        currentLyricTextView.text.toString().isBlank()
-                    ) {
-                        currentLyricTextView.text = candidate
-                    }
-                }
+                message.startsWith("[AccessibilityLyric] candidate=") ->
+                    appendLog("[PlayerUI] 无障碍候选歌词已记录，当前歌词仍以播放状态为准")
             }
         }
     }
@@ -170,7 +165,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        qrcLyricPrebuildManager?.stop()
+        qrcV2RebuildManager?.stop()
         controllerScannerManager?.stopScan()
         rfcommClientManager?.close()
         super.onDestroy()
@@ -201,143 +196,109 @@ class MainActivity : Activity() {
     private fun setupUi() {
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.rgb(18, 18, 20))
             setPadding(dp(20), dp(24), dp(20), dp(32))
         }
 
         content.addView(TextView(this).apply {
             text = "PlayerAgent"
             textSize = 26f
-            setTextColor(Color.BLACK)
-            setPadding(0, 0, 0, dp(12))
+            setTextColor(Color.WHITE)
+            setPadding(0, 0, 0, dp(2))
+        })
+        content.addView(TextView(this).apply {
+            text = "索尼音乐播放器控制服务"
+            textSize = 14f
+            setTextColor(Color.rgb(165, 170, 178))
+            setPadding(0, 0, 0, dp(14))
         })
 
-        content.addView(actionButton("START PLAYERAGENT BLE SERVICE") {
-            startPlayerAgentService()
-        })
-        content.addView(actionButton("STOP PLAYERAGENT BLE SERVICE") {
-            stopPlayerAgentService()
-        })
+        val serviceCard = collapsibleCard(content, "服务状态", expanded = true)
+        statusTextView = statusValue("控制服务：未启动")
+        serviceCard.addView(statusTextView)
+        accessibilityStatusTextView = statusValue("通知读取权限：未知")
+        serviceCard.addView(accessibilityStatusTextView)
+        serviceCard.addView(buttonGrid(listOf(
+            "启动控制服务" to ::startPlayerAgentService,
+            "停止控制服务" to ::stopPlayerAgentService,
+            "恢复蓝牙服务" to ::recoverBleStack,
+            "打开通知读取权限" to ::openNotificationAccessSettings,
+            "打开无障碍设置" to ::openAccessibilitySettings
+        )))
 
-        statusTextView = valueSection(
-            content,
-            title = "Current Status",
-            initialValue = "未启动"
-        )
-        accessibilityStatusTextView = valueSection(
-            content,
-            title = "Accessibility状态",
-            initialValue = "disabled"
-        )
-        content.addView(
-            actionButton(
-                "OPEN ACCESSIBILITY SETTINGS",
-                ::openAccessibilitySettings
-            )
-        )
-        currentSongTextView = valueSection(
-            content,
-            title = "Current Song",
-            initialValue = "未检测"
-        )
-        currentLyricTextView = valueSection(
-            content,
-            title = "Current Lyric",
-            initialValue = "未检测"
-        )
-
-        content.addView(sectionTitle("Current Album Art"))
+        val playerCard = collapsibleCard(content, "当前播放", expanded = true)
         currentAlbumArtImageView = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
-            setBackgroundColor(Color.rgb(238, 238, 238))
+            background = roundedBackground(Color.rgb(42, 44, 50), dp(16))
             setImageResource(android.R.drawable.ic_media_play)
         }
-        content.addView(
+        playerCard.addView(
             currentAlbumArtImageView,
-            LinearLayout.LayoutParams(dp(160), dp(160)).apply {
+            LinearLayout.LayoutParams(dp(150), dp(150)).apply {
                 gravity = Gravity.CENTER_HORIZONTAL
+                bottomMargin = dp(10)
             }
         )
-        currentAlbumArtTextView = TextView(this).apply {
-            text = "未检测"
-            textSize = 13f
-            gravity = Gravity.CENTER
-            setPadding(0, dp(6), 0, dp(12))
-        }
-        content.addView(currentAlbumArtTextView)
+        currentAlbumArtTextView = statusValue("封面：未检测").also(playerCard::addView)
+        currentSongTextView = statusValue("歌曲：未检测").also(playerCard::addView)
+        currentLyricTextView = statusValue("当前歌词：暂无歌词").also(playerCard::addView)
 
-        debugToggleButton = actionButton("DEBUG TOOLS") {
-            val expanded = debugPanel.visibility != View.VISIBLE
-            debugPanel.visibility = if (expanded) View.VISIBLE else View.GONE
-            debugToggleButton.text =
-                if (expanded) "HIDE DEBUG TOOLS" else "DEBUG TOOLS"
-        }
-        content.addView(debugToggleButton)
+        val lyricCard = collapsibleCard(content, "歌词缓存与逐字时间", expanded = false)
+        qrcCacheOverviewTextView = statusValue(qrcCacheOverviewText()).also(lyricCard::addView)
+        qrcCacheBuildTextView = statusValue(QrcV2RebuildProgress().displayText()).also(lyricCard::addView)
+        qrcWatcherStatusTextView = statusValue(lastQrcWatcherStatus.displayText()).also(lyricCard::addView)
+        lyricCacheStatsTextView = statusValue(lyricCacheStatsText()).also(lyricCard::addView)
+        lyricCard.addView(buttonGrid(listOf(
+            "构建 V2 逐字歌词缓存" to { startQrcV2Build(clear = false) },
+            "暂停构建" to ::pauseQrcV2Build,
+            "继续构建" to ::resumeQrcV2Build,
+            "停止构建" to ::stopQrcV2Build,
+            "清空临时构建" to { confirmAction("清空临时构建结果？", ::clearQrcV2Building) },
+            "清空并重新构建" to { confirmAction("清空临时结果并重新构建？") { startQrcV2Build(clear = true) } },
+            "重建 QRC 索引" to ::forceRefreshQrcIndex,
+            "删除旧缓存备份" to { confirmAction("删除旧缓存备份？", ::deleteOldQrcBackup) }
+        )))
 
-        debugPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-            setBackgroundColor(Color.rgb(245, 245, 245))
-        }
-        qrcCacheBuildTextView = TextView(this).apply {
-            text = QrcPrebuildProgress(
-                running = false,
-                total = 0,
-                processed = 0,
-                success = 0,
-                failed = 0,
-                skipped = 0
-            ).displayText()
-            textSize = 13f
-            setTextIsSelectable(true)
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            setBackgroundColor(Color.WHITE)
-        }
-        debugPanel.addView(qrcCacheBuildTextView)
-        qrcWatcherStatusTextView = TextView(this).apply {
-            text = QrcWatcherStatus(
-                watcherRunning = false,
-                pendingGroups = 0,
-                incrementalRunning = false,
-                incrementalSuccess = 0,
-                incrementalFailed = 0,
-                incrementalSkipped = 0
-            ).displayText()
-            textSize = 13f
-            setTextIsSelectable(true)
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            setBackgroundColor(Color.WHITE)
-        }
-        debugPanel.addView(qrcWatcherStatusTextView)
-        lyricCacheStatsTextView = TextView(this).apply {
-            text = lyricCacheStatsText()
-            textSize = 13f
-            setTextIsSelectable(true)
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            setBackgroundColor(Color.WHITE)
-        }
-        debugPanel.addView(lyricCacheStatsTextView)
-        addDebugButtons(debugPanel)
-        content.addView(debugPanel)
+        val connectionCard = collapsibleCard(content, "连接与兼容", expanded = false)
+        connectionCard.addView(buttonGrid(listOf(
+            "扫描控制端" to ::startControllerScan,
+            "连接经典蓝牙控制端" to ::connectRfcommServer,
+            "恢复蓝牙服务" to ::recoverBleStack,
+            "启动 QRC 监听器" to ::startQrcWatcher,
+            "停止 QRC 监听器" to ::stopQrcWatcher
+        )))
 
-        logToggleButton = actionButton("SHOW LOGS") {
-            val expanded = logScrollView.visibility != View.VISIBLE
-            logScrollView.visibility = if (expanded) View.VISIBLE else View.GONE
-            logToggleButton.text = if (expanded) "HIDE LOGS" else "SHOW LOGS"
-        }
-        content.addView(logToggleButton)
+        val mediaCard = collapsibleCard(content, "媒体诊断", expanded = false)
+        mediaCard.addView(buttonGrid(listOf(
+            "扫描歌词文件" to ::scanLrcFiles,
+            "测试当前封面" to ::testAlbumArt,
+            "检测歌词来源" to ::testLyricSource,
+            "测试当前歌词" to ::testCurrentLyric,
+            "歌词解析诊断" to ::testLrcDebug,
+            "解析首个 QRC 文件" to ::dumpFirstQrc,
+            "无障碍节点诊断" to ::dumpAccessibilityTree,
+            "刷新歌词统计" to ::refreshLyricStats,
+            "重置歌词统计" to ::resetLyricStats
+        )))
 
+        logSectionBody = collapsibleCard(content, "日志", expanded = false)
+        logSectionBody.addView(buttonGrid(listOf(
+            "显示/隐藏日志" to ::toggleLogs,
+            "导出日志" to ::exportLog,
+            "清空日志" to ::clearLog
+        )))
         logTextView = TextView(this).apply {
             textSize = 12f
+            setTextColor(Color.rgb(215, 218, 224))
             setTextIsSelectable(true)
             setPadding(dp(10), dp(10), dp(10), dp(10))
         }
         logScrollView = ScrollView(this).apply {
             visibility = View.GONE
-            setBackgroundColor(Color.rgb(245, 245, 245))
+            background = roundedBackground(Color.rgb(24, 25, 29), dp(12))
             addView(logTextView)
         }
-        content.addView(
+        logSectionBody.addView(
             logScrollView,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -348,44 +309,6 @@ class MainActivity : Activity() {
         setContentView(ScrollView(this).apply { addView(content) })
     }
 
-    private fun addDebugButtons(panel: LinearLayout) {
-        panel.addView(actionButton("SCAN CONTROLLER", ::startControllerScan))
-        panel.addView(actionButton("CONNECT RFCOMM SERVER", ::connectRfcommServer))
-        panel.addView(actionButton("SCAN LRC FILES", ::scanLrcFiles))
-        panel.addView(actionButton("TEST ALBUM ART", ::testAlbumArt))
-        panel.addView(actionButton("TEST LYRIC SOURCE", ::testLyricSource))
-        panel.addView(actionButton("TEST CURRENT LYRIC", ::testCurrentLyric))
-        panel.addView(actionButton("TEST LRC DEBUG", ::testLrcDebug))
-        panel.addView(actionButton("DUMP FIRST QRC", ::dumpFirstQrc))
-        panel.addView(actionButton("START QRC CACHE BUILD", ::startQrcCacheBuild))
-        panel.addView(actionButton("STOP QRC CACHE BUILD", ::stopQrcCacheBuild))
-        panel.addView(actionButton("START QRC WATCHER", ::startQrcWatcher))
-        panel.addView(actionButton("STOP QRC WATCHER", ::stopQrcWatcher))
-        panel.addView(actionButton("RECOVER BLE STACK", ::recoverBleStack))
-        panel.addView(actionButton("REFRESH LYRIC STATS", ::refreshLyricStats))
-        panel.addView(actionButton("RESET LYRIC STATS", ::resetLyricStats))
-        panel.addView(
-            actionButton(
-                "FORCE REFRESH QRC INDEX",
-                ::forceRefreshQrcIndex
-            )
-        )
-        panel.addView(
-            actionButton(
-                "DUMP ACCESSIBILITY TREE",
-                ::dumpAccessibilityTree
-            )
-        )
-        panel.addView(
-            actionButton(
-                "OPEN NOTIFICATION ACCESS SETTINGS",
-                ::openNotificationAccessSettings
-            )
-        )
-        panel.addView(actionButton("EXPORT LOG", ::exportLog))
-        panel.addView(actionButton("CLEAR LOG", ::clearLog))
-    }
-
     private fun actionButton(
         label: String,
         action: () -> Unit
@@ -393,32 +316,83 @@ class MainActivity : Activity() {
         return Button(this).apply {
             text = label
             isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = roundedBackground(Color.rgb(50, 78, 122), dp(12))
             setOnClickListener { action() }
         }
     }
 
-    private fun valueSection(
+    private fun collapsibleCard(
         parent: LinearLayout,
         title: String,
-        initialValue: String
-    ): TextView {
-        parent.addView(sectionTitle(title))
-        return TextView(this).apply {
-            text = initialValue
-            textSize = 16f
-            setTextIsSelectable(true)
-            setPadding(dp(12), dp(8), dp(12), dp(14))
-            setBackgroundColor(Color.rgb(245, 245, 245))
-            parent.addView(this)
+        expanded: Boolean
+    ): LinearLayout {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundedBackground(Color.rgb(30, 31, 36), dp(18))
+            setPadding(dp(14), dp(12), dp(14), dp(14))
+        }
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = if (expanded) View.VISIBLE else View.GONE
+        }
+        val header = TextView(this).apply {
+            text = if (expanded) "▼ $title" else "▶ $title"
+            textSize = 17f
+            setTextColor(Color.WHITE)
+            setPadding(0, 0, 0, dp(10))
+            setOnClickListener {
+                val nowExpanded = body.visibility != View.VISIBLE
+                body.visibility = if (nowExpanded) View.VISIBLE else View.GONE
+                text = if (nowExpanded) "▼ $title" else "▶ $title"
+            }
+        }
+        card.addView(header)
+        card.addView(body)
+        parent.addView(
+            card,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dp(12)
+            }
+        )
+        return body
+    }
+
+    private fun buttonGrid(items: List<Pair<String, () -> Unit>>): GridLayout {
+        return GridLayout(this).apply {
+            columnCount = 2
+            items.forEach { (label, action) ->
+                addView(
+                    actionButton(label, action),
+                    GridLayout.LayoutParams().apply {
+                        width = 0
+                        height = GridLayout.LayoutParams.WRAP_CONTENT
+                        columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
+                        setMargins(dp(3), dp(3), dp(3), dp(3))
+                    }
+                )
+            }
         }
     }
 
-    private fun sectionTitle(value: String): TextView {
+    private fun statusValue(value: String): TextView {
         return TextView(this).apply {
             text = value
             textSize = 14f
-            setTextColor(Color.DKGRAY)
-            setPadding(0, dp(14), 0, dp(5))
+            setTextColor(Color.rgb(220, 224, 230))
+            setTextIsSelectable(true)
+            setPadding(dp(12), dp(9), dp(12), dp(9))
+            background = roundedBackground(Color.rgb(38, 40, 46), dp(12))
+        }
+    }
+
+    private fun roundedBackground(color: Int, radius: Int): GradientDrawable {
+        return GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = radius.toFloat()
         }
     }
 
@@ -433,13 +407,13 @@ class MainActivity : Activity() {
         } else {
             startService(intent)
         }
-        statusTextView.text = "BLE 服务启动请求已发送"
+        statusTextView.text = "控制服务：启动请求已发送"
         appendLog("[PlayerAgent] Start service requested")
     }
 
     private fun stopPlayerAgentService() {
         stopService(Intent(this, PlayerAgentForegroundService::class.java))
-        statusTextView.text = "BLE 服务已停止"
+        statusTextView.text = "控制服务：已停止"
         appendLog("[PlayerAgent] Stop service requested")
     }
 
@@ -483,11 +457,11 @@ class MainActivity : Activity() {
                 if (albumArt != null) {
                     currentAlbumArtImageView.setImageBitmap(albumArt.bitmap)
                     currentAlbumArtTextView.text =
-                        "${albumArt.bitmap.width} x ${albumArt.bitmap.height}"
+                        "封面：${albumArt.bitmap.width} x ${albumArt.bitmap.height}"
                 } else {
                     currentAlbumArtImageView
                         .setImageResource(android.R.drawable.ic_media_play)
-                    currentAlbumArtTextView.text = "未找到"
+                    currentAlbumArtTextView.text = "封面：未找到"
                 }
             }
         }.apply {
@@ -540,18 +514,15 @@ class MainActivity : Activity() {
             )
             if (allowAlbumArtRefresh) {
                 currentAlbumArtImageView.setImageResource(android.R.drawable.ic_media_play)
-                currentAlbumArtTextView.text = "加载中..."
+                    currentAlbumArtTextView.text = "封面：加载中..."
                 refreshCurrentAlbumArtForSong(songKey)
             }
         }
 
-        currentSongTextView.text = listOf(safeTitle, safeArtist, safeAlbum)
-            .filter { it.isNotBlank() && it != "-" }
-            .joinToString("\n")
-            .ifBlank { "未检测到当前歌曲" }
-
+        currentSongTextView.text = "歌曲名：$safeTitle\n歌手：$safeArtist\n专辑：$safeAlbum"
+            .replace("歌曲名：-\n歌手：-\n专辑：-", "歌曲：未检测")
         val lyricText = lyric.ifBlank { "暂无歌词" }
-        currentLyricTextView.text = lyricText
+        currentLyricTextView.text = "当前歌词：$lyricText"
         if (lyricText != lastPlayerUiLyric) {
             lastPlayerUiLyric = lyricText
             appendLog("[PlayerUI] lyric changed text=$lyricText")
@@ -581,7 +552,7 @@ class MainActivity : Activity() {
                 if (albumArt != null) {
                     currentAlbumArtImageView.setImageBitmap(albumArt.bitmap)
                     currentAlbumArtTextView.text =
-                        "${albumArt.bitmap.width} x ${albumArt.bitmap.height}"
+                        "封面：${albumArt.bitmap.width} x ${albumArt.bitmap.height}"
                     appendLog(
                         "[PlayerUI] album art changed exists=true " +
                             "width=${albumArt.bitmap.width} " +
@@ -590,7 +561,7 @@ class MainActivity : Activity() {
                 } else {
                     currentAlbumArtImageView
                         .setImageResource(android.R.drawable.ic_media_play)
-                    currentAlbumArtTextView.text = "未找到"
+                    currentAlbumArtTextView.text = "封面：未找到"
                     appendLog("[PlayerUI] album art changed exists=false")
                 }
             }
@@ -709,23 +680,15 @@ class MainActivity : Activity() {
     }
 
     private fun testCurrentLyric() {
-        currentLyricTextView.text = "探测中..."
+        appendLog("[LyricProbe] 探测当前歌词")
         Thread {
             try {
                 val result = CurrentLyricProbe.probeCurrentLyric(this)
-                runOnUiThread {
-                    currentLyricTextView.text =
-                        result.lyric.ifBlank { "未找到" } +
-                            "\nSource: ${result.source}\n${result.detail}"
-                }
                 appendThreadSafeLog(
                     "[LyricProbe] result lyric=${result.lyric.ifBlank { "未找到" }} " +
-                        "source=${result.source}"
+                        "source=${result.source} detail=${result.detail}"
                 )
             } catch (exception: Exception) {
-                runOnUiThread {
-                    currentLyricTextView.text = "未找到\n${exception.message}"
-                }
                 appendThreadSafeLog("[LyricProbe] failed=${exception.message}")
             }
         }.apply {
@@ -776,22 +739,58 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun startQrcCacheBuild() {
+    private fun startQrcV2Build(clear: Boolean) {
         if (!ensureLyricStorageAccess()) {
             return
         }
-        val manager = qrcLyricPrebuildManager ?: QrcLyricPrebuildManager(
+        val manager = qrcV2RebuildManager ?: QrcLyricV2RebuildManager(
             context = this,
             logger = ::appendThreadSafeLog,
-            progressListener = ::updateQrcCacheBuildProgress
+            progressListener = ::updateQrcV2BuildProgress
         ).also {
-            qrcLyricPrebuildManager = it
+            qrcV2RebuildManager = it
         }
-        manager.start()
+        manager.start(clearBuilding = clear)
     }
 
-    private fun stopQrcCacheBuild() {
-        qrcLyricPrebuildManager?.stop()
+    private fun pauseQrcV2Build() {
+        qrcV2RebuildManager?.pause()
+    }
+
+    private fun resumeQrcV2Build() {
+        val manager = qrcV2RebuildManager ?: QrcLyricV2RebuildManager(
+            context = this,
+            logger = ::appendThreadSafeLog,
+            progressListener = ::updateQrcV2BuildProgress
+        ).also {
+            qrcV2RebuildManager = it
+        }
+        manager.resume()
+    }
+
+    private fun stopQrcV2Build() {
+        qrcV2RebuildManager?.stop()
+    }
+
+    private fun clearQrcV2Building() {
+        val manager = qrcV2RebuildManager ?: QrcLyricV2RebuildManager(
+            context = this,
+            logger = ::appendThreadSafeLog,
+            progressListener = ::updateQrcV2BuildProgress
+        ).also {
+            qrcV2RebuildManager = it
+        }
+        manager.clearBuilding()
+    }
+
+    private fun deleteOldQrcBackup() {
+        val backup = QrcLyricCacheManager(this, ::appendThreadSafeLog).backupCacheRoot()
+        if (backup.exists()) {
+            backup.deleteRecursively()
+            appendLog("[QrcV2Rebuild] old backup deleted")
+        } else {
+            appendLog("[QrcV2Rebuild] old backup not found")
+        }
     }
 
     private fun startQrcWatcher() {
@@ -829,11 +828,12 @@ class MainActivity : Activity() {
         appendLog("[BLE-RECOVERY] manual recover requested")
     }
 
-    private fun updateQrcCacheBuildProgress(progress: QrcPrebuildProgress) {
+    private fun updateQrcV2BuildProgress(progress: QrcV2RebuildProgress) {
         runOnUiThread {
             if (::qrcCacheBuildTextView.isInitialized) {
                 qrcCacheBuildTextView.text = progress.displayText()
             }
+            refreshQrcCacheOverview()
         }
     }
 
@@ -844,6 +844,7 @@ class MainActivity : Activity() {
                 qrcWatcherStatusTextView.text = status.displayText()
             }
             refreshLyricStatsText()
+            refreshQrcCacheOverview()
         }
     }
 
@@ -886,6 +887,28 @@ class MainActivity : Activity() {
         if (::lyricCacheStatsTextView.isInitialized) {
             lyricCacheStatsTextView.text = lyricCacheStatsText()
         }
+        refreshQrcCacheOverview()
+    }
+
+    private fun refreshQrcCacheOverview() {
+        if (::qrcCacheOverviewTextView.isInitialized) {
+            qrcCacheOverviewTextView.text = qrcCacheOverviewText()
+        }
+    }
+
+    private fun qrcCacheOverviewText(): String {
+        val cacheRoot = QrcLyricCacheManager(this, ::appendThreadSafeLog).cacheRoot()
+        val files = cacheRoot.listFiles { file ->
+            file.isFile && file.extension.equals("json", ignoreCase = true)
+        }.orEmpty()
+        val indexStatus = QrcPersistentIndexManager(this, ::appendThreadSafeLog).status()
+        val rebuild = qrcV2RebuildManager?.status()
+        return "缓存版本：${if (rebuild?.status == com.example.playeragent.media.QrcV2RebuildStatus.COMPLETED) "V2" else "V1 / 混合"}\n" +
+            "活动缓存文件数：${files.size}\n" +
+            "含逐字时间歌曲数：${rebuild?.successWithWords ?: 0}\n" +
+            "仅行级歌词文件数：${rebuild?.successLineOnly ?: 0}\n" +
+            "索引条目数：${indexStatus.entries}\n" +
+            "Watcher：${if (lastQrcWatcherStatus.watcherRunning) "运行中" else "已停止"}"
     }
 
     private fun lyricCacheStatsText(): String {
@@ -897,24 +920,39 @@ class MainActivity : Activity() {
             context = this,
             logger = ::appendThreadSafeLog
         ).status()
-        return "Lyric Cache Stats\n" +
-            "L1 hit: ${stats.l1Hit}\n" +
-            "L2 hit: ${stats.l2Hit}\n" +
-            "Fuzzy hit: ${stats.l2FuzzyHit}\n" +
-            "Alias hit: ${stats.aliasHit}\n" +
-            "Negative hit: ${stats.negativeHit}\n" +
-            "QRC decrypt count: ${stats.qrcDecryptCount}\n" +
-            "QRC decrypt success: ${stats.qrcDecryptSuccess}\n" +
-            "QRC decrypt failed: ${stats.qrcDecryptFailed}\n" +
-            "Last source: ${stats.lastSource}\n" +
-            "QrcIndex loaded: ${indexStatus.loaded}\n" +
-            "QrcIndex dirty: ${indexStatus.dirty}\n" +
-            "QrcIndex entries: ${indexStatus.entries}\n" +
-            "QrcIndex builtAt: ${indexStatus.builtAt}\n" +
-            "QrcWatcher running: ${lastQrcWatcherStatus.watcherRunning}\n" +
-            "QrcWatcher pending groups: ${lastQrcWatcherStatus.pendingGroups}\n" +
-            "QrcIncremental success: ${lastQrcWatcherStatus.incrementalSuccess}\n" +
-            "QrcIncremental failed: ${lastQrcWatcherStatus.incrementalFailed}"
+        return "歌词缓存统计\n" +
+            "L1 命中：${stats.l1Hit}\n" +
+            "L2 命中：${stats.l2Hit}\n" +
+            "模糊命中：${stats.l2FuzzyHit}\n" +
+            "Alias 命中：${stats.aliasHit}\n" +
+            "Negative 命中：${stats.negativeHit}\n" +
+            "QRC 解密次数：${stats.qrcDecryptCount}\n" +
+            "QRC 解密成功：${stats.qrcDecryptSuccess}\n" +
+            "QRC 解密失败：${stats.qrcDecryptFailed}\n" +
+            "最近来源：${stats.lastSource}\n" +
+            "QrcIndex 已加载：${indexStatus.loaded}\n" +
+            "QrcIndex dirty：${indexStatus.dirty}\n" +
+            "QrcIndex builtAt：${indexStatus.builtAt}\n" +
+            "Watcher pending：${lastQrcWatcherStatus.pendingGroups}\n" +
+            "增量成功：${lastQrcWatcherStatus.incrementalSuccess}\n" +
+            "增量失败：${lastQrcWatcherStatus.incrementalFailed}"
+    }
+
+    private fun confirmAction(message: String, action: () -> Unit) {
+        AlertDialog.Builder(this)
+            .setTitle("确认操作")
+            .setMessage(message)
+            .setPositiveButton("确认") { _, _ -> action() }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun toggleLogs() {
+        logScrollView.visibility = if (logScrollView.visibility == View.VISIBLE) {
+            View.GONE
+        } else {
+            View.VISIBLE
+        }
     }
 
     private fun openNotificationAccessSettings() {
@@ -961,15 +999,9 @@ class MainActivity : Activity() {
         val enabled = QQMusicLyricAccessibilityService.isEnabled(this)
         val connected = QQMusicLyricAccessibilityService.isConnected()
         accessibilityStatusTextView.text = when {
-            connected -> "enabled"
-            enabled -> "enabled（等待服务连接）"
-            else -> "disabled"
-        }
-
-        val candidate =
-            QQMusicLyricAccessibilityService.latestCandidateLyric
-        if (candidate.isNotBlank()) {
-            currentLyricTextView.text = candidate
+            connected -> "通知读取权限：无障碍已连接"
+            enabled -> "通知读取权限：无障碍已授权，等待连接"
+            else -> "通知读取权限：未授权"
         }
     }
 

@@ -60,20 +60,6 @@ class QrcLyricManager(
         logger("[QrcLyric] findBestGroup start title=$title")
 
         cacheManager.get(title, artist, album)?.let { cached ->
-            if (cached.lines.none { it.words.isNotEmpty() }) {
-                val upgraded = upgradeCachedLyricsWithWords(
-                    songKey = songKey,
-                    cached = cached,
-                    normalizedTitle = normalizedTitle
-                )
-                if (upgraded) {
-                    logger(
-                        "[QrcLyric] parsed lines=${cachedLines.size} " +
-                            "totalCostMs=${System.currentTimeMillis() - startedAt}"
-                    )
-                    return cachedLines.isNotEmpty()
-                }
-            }
             cachedLines = cached.lines.map {
                 LyricLine(
                     timeMs = it.timeMs,
@@ -528,31 +514,6 @@ class QrcLyricManager(
             }
             trimSongCaches()
         }
-    }
-
-    private fun upgradeCachedLyricsWithWords(
-        songKey: String,
-        cached: ParsedLyric,
-        normalizedTitle: String
-    ): Boolean {
-        if (cached.groupId.isBlank()) {
-            return false
-        }
-        val entry = getIndexEntries(forceRefresh = false)
-            .firstOrNull { it.groupId == cached.groupId }
-            ?: return false
-        val parsed = decryptAndParseQrc(entry) ?: return false
-        if (!parsedMatchesTitle(parsed, normalizedTitle) ||
-            parsed.lines.none { it.words.isNotEmpty() }
-        ) {
-            return false
-        }
-        logger(
-            "[QrcLyric] upgrade cached lyrics with words " +
-                "songKey=$songKey groupId=${cached.groupId}"
-        )
-        applyParsedResult(songKey, entry, parsed)
-        return cachedLines.isNotEmpty()
     }
 
     private fun saveNegative(songKey: String) {

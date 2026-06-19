@@ -225,12 +225,11 @@ data class QrcWatcherStatus(
     val incrementalSkipped: Int
 ) {
     fun displayText(): String {
-        return "QRC Watcher:\n" +
-            (if (watcherRunning) "running" else "stopped") +
-            "\npending groups: $pendingGroups" +
-            "\nincremental: ${if (incrementalRunning) "running" else "idle"}" +
-            "\nsuccess: $incrementalSuccess" +
-            "\nfailed: $incrementalFailed" +
-            "\nskipped: $incrementalSkipped"
+        return "QRC 监听器：${if (watcherRunning) "运行中" else "已停止"}\n" +
+            "待处理 group：$pendingGroups\n" +
+            "增量解析：${if (incrementalRunning) "运行中" else "空闲"}\n" +
+            "成功：$incrementalSuccess\n" +
+            "失败：$incrementalFailed\n" +
+            "跳过：$incrementalSkipped"
     }
 }

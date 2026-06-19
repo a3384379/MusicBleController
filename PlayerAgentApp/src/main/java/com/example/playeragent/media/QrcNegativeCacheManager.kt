@@ -53,6 +53,14 @@ class QrcNegativeCacheManager(
         }
     }
 
+    @Synchronized
+    fun clear() {
+        ensureLoaded()
+        items.clear()
+        saveLocked()
+        logger("[QrcNegativeCache] cleared")
+    }
+
     private fun ensureLoaded() {
         if (loaded) {
             return

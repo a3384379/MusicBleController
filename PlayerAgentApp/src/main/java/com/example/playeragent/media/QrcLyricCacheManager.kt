@@ -4,6 +4,7 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.util.LinkedHashMap
 
 class QrcLyricCacheManager(
@@ -125,62 +126,45 @@ class QrcLyricCacheManager(
 
     @Synchronized
     fun save(parsed: ParsedLyric) {
+        saveToDirectory(parsed, cacheRoot(), updateMemory = true)
+    }
+
+    @Synchronized
+    fun saveToDirectory(
+        parsed: ParsedLyric,
+        directory: File,
+        updateMemory: Boolean = false
+    ) {
         if (parsed.lines.isEmpty()) {
             return
         }
-        val existing = readBySongKey(parsed.songKey)
+        directory.mkdirs()
+        val existing = readBySongKeyFromDirectory(parsed.songKey, directory)
         if (existing != null && shouldKeepExisting(existing, parsed)) {
             logger("[QrcPrebuild] duplicate songKey=${parsed.songKey} keep=existing")
             return
         }
 
-        val objectValue = JSONObject()
-            .put("version", CACHE_VERSION)
-            .put("songKey", parsed.songKey)
-            .put("title", parsed.title)
-            .put("artist", parsed.artist)
-            .put("album", parsed.album)
-            .put("groupId", parsed.groupId)
-            .put("qrcLastModified", parsed.qrcLastModified)
-            .put("createdAt", System.currentTimeMillis())
-            .put("lines", JSONArray().also { array ->
-                parsed.lines.forEach { line ->
-                    if (line.text.isNotBlank()) {
-                        array.put(
-                            JSONObject()
-                                .put("timeMs", line.timeMs)
-                                .put("text", line.text)
-                                .put("durationMs", line.durationMs)
-                                .also { lineObject ->
-                                    if (line.words.isNotEmpty()) {
-                                        lineObject.put(
-                                            "words",
-                                            JSONArray().also { wordsArray ->
-                                                line.words.forEach { word ->
-                                                    if (word.text.isNotBlank()) {
-                                                        wordsArray.put(
-                                                            JSONObject()
-                                                                .put("startMs", word.startMs)
-                                                                .put("durationMs", word.durationMs)
-                                                                .put("text", word.text)
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                        )
-                                    }
-                                }
-                        )
-                    }
-                }
-            })
+        val objectValue = toJson(parsed)
         val text = objectValue.toString()
-        val songFile = songCacheFile(parsed.songKey)
-        val groupFile = groupCacheFile(parsed.groupId)
-        songFile.writeText(text, Charsets.UTF_8)
-        groupFile.writeText(text, Charsets.UTF_8)
-        memoryCache[parsed.songKey] = parsed
+        val songFile = songCacheFile(parsed.songKey, directory)
+        val groupFile = groupCacheFile(parsed.groupId, directory)
+        writeAtomic(songFile, text)
+        writeAtomic(groupFile, text)
+        if (updateMemory) {
+            memoryCache[parsed.songKey] = parsed
+            indexEntries = emptyList()
+            indexFileCount = -1
+        }
         logger("[QrcCache] saved songKey=${parsed.songKey} lines=${parsed.lines.size}")
+    }
+
+    @Synchronized
+    fun clearMemory() {
+        memoryCache.clear()
+        indexEntries = emptyList()
+        indexBuiltAt = 0L
+        indexFileCount = -1
     }
 
     @Synchronized
@@ -230,11 +214,32 @@ class QrcLyricCacheManager(
         val cached = readByGroupId(group.groupId) ?: return false
         val qrc = group.qrcFile ?: return cached.lines.isNotEmpty()
         return cached.qrcLastModified == qrc.lastModified() &&
-            cached.lines.isNotEmpty()
+            cached.lines.isNotEmpty() &&
+            cached.schemaVersion >= QRC_CACHE_SCHEMA_V2
     }
 
     fun cacheRoot(): File {
         return QrcLyricUtils.cacheDirectory(appContext)
+    }
+
+    fun buildingCacheRoot(): File {
+        return File(appContext.getExternalFilesDir(null), "QrcLyricCacheV2_building")
+    }
+
+    fun backupCacheRoot(): File {
+        return File(appContext.getExternalFilesDir(null), "QrcLyricCacheV1_backup")
+    }
+
+    fun readBySongKeyFromDirectory(songKey: String, directory: File): ParsedLyric? {
+        val file = songCacheFile(songKey, directory)
+        if (!file.exists()) {
+            return null
+        }
+        return readCacheFileDetailed(
+            file = file,
+            expectedSongKey = songKey,
+            allowStale = true
+        ).parsed
     }
 
     private fun readCacheFile(
@@ -360,7 +365,8 @@ class QrcLyricCacheManager(
         }
         return try {
             val objectValue = JSONObject(file.readText(Charsets.UTF_8))
-            if (objectValue.optInt("version") != CACHE_VERSION) {
+            val schemaVersion = readSchemaVersion(objectValue)
+            if (schemaVersion !in QRC_CACHE_SCHEMA_V1..QRC_CACHE_SCHEMA_V2) {
                 return CacheReadResult(rejectReason = "version mismatch")
             }
             val songKey = objectValue.optString("songKey")
@@ -400,7 +406,15 @@ class QrcLyricCacheManager(
                     album = objectValue.optString("album"),
                     groupId = groupId,
                     qrcLastModified = qrcLastModified,
-                    lines = lines
+                    lines = lines,
+                    schemaVersion = schemaVersion,
+                    qrcPath = objectValue.optString("qrcPath"),
+                    wordTimingStatus = QrcWordTimingStatus.fromValue(
+                        objectValue.optString(
+                            "wordTimingStatus",
+                            QrcWordTimingStatus.fromLines(lines).name
+                        )
+                    )
                 ),
                 staleReason = staleReason
             )
@@ -562,7 +576,7 @@ class QrcLyricCacheManager(
     private fun readIndexEntry(file: File): CacheIndexEntry? {
         return try {
             val objectValue = JSONObject(file.readText(Charsets.UTF_8))
-            if (objectValue.optInt("version") != CACHE_VERSION) {
+            if (readSchemaVersion(objectValue) !in QRC_CACHE_SCHEMA_V1..QRC_CACHE_SCHEMA_V2) {
                 return null
             }
             val songKey = objectValue.optString("songKey")
@@ -608,15 +622,91 @@ class QrcLyricCacheManager(
     }
 
     private fun songCacheFile(songKey: String): File {
-        return File(cacheRoot(), "${QrcLyricUtils.cacheKey(songKey)}.json")
+        return songCacheFile(songKey, cacheRoot())
     }
 
     private fun groupCacheFile(groupId: String): File {
-        return File(cacheRoot(), "group_$groupId.json")
+        return groupCacheFile(groupId, cacheRoot())
+    }
+
+    private fun songCacheFile(songKey: String, directory: File): File {
+        return File(directory, "${QrcLyricUtils.cacheKey(songKey)}.json")
+    }
+
+    private fun groupCacheFile(groupId: String, directory: File): File {
+        return File(directory, "group_$groupId.json")
+    }
+
+    private fun toJson(parsed: ParsedLyric): JSONObject {
+        return JSONObject()
+            .put("schemaVersion", QRC_CACHE_SCHEMA_V2)
+            .put("version", QRC_CACHE_SCHEMA_V2)
+            .put("songKey", parsed.songKey)
+            .put("title", parsed.title)
+            .put("artist", parsed.artist)
+            .put("album", parsed.album)
+            .put("groupId", parsed.groupId)
+            .put("qrcPath", parsed.qrcPath)
+            .put("qrcLastModified", parsed.qrcLastModified)
+            .put("createdAt", System.currentTimeMillis())
+            .put("wordTimingStatus", parsed.wordTimingStatus.name)
+            .put("lines", JSONArray().also { array ->
+                parsed.lines
+                    .filter { it.text.isNotBlank() }
+                    .sortedBy(QrcLyricLine::timeMs)
+                    .forEach { line ->
+                        array.put(
+                            JSONObject()
+                                .put("timeMs", line.timeMs)
+                                .put("text", line.text)
+                                .put("durationMs", line.durationMs)
+                                .also { lineObject ->
+                                    if (line.words.isNotEmpty()) {
+                                        lineObject.put(
+                                            "words",
+                                            JSONArray().also { wordsArray ->
+                                                line.words
+                                                    .filter { it.text.isNotBlank() }
+                                                    .sortedBy(QrcLyricWord::startMs)
+                                                    .forEach { word ->
+                                                        wordsArray.put(
+                                                            JSONObject()
+                                                                .put("startMs", word.startMs)
+                                                                .put("durationMs", word.durationMs)
+                                                                .put("text", word.text)
+                                                        )
+                                                    }
+                                            }
+                                        )
+                                    }
+                                }
+                        )
+                    }
+            })
+    }
+
+    private fun writeAtomic(file: File, text: String) {
+        file.parentFile?.mkdirs()
+        val temp = File(file.parentFile, "${file.name}.tmp")
+        FileOutputStream(temp).use { output ->
+            val bytes = text.toByteArray(Charsets.UTF_8)
+            output.write(bytes)
+            output.fd.sync()
+        }
+        if (file.exists() && !file.delete()) {
+            throw IllegalStateException("failed to delete old cache file ${file.name}")
+        }
+        if (!temp.renameTo(file)) {
+            throw IllegalStateException("failed to rename cache file ${file.name}")
+        }
+    }
+
+    private fun readSchemaVersion(objectValue: JSONObject): Int {
+        val schema = objectValue.optInt("schemaVersion", 0)
+        return if (schema > 0) schema else objectValue.optInt("version")
     }
 
     companion object {
-        private const val CACHE_VERSION = 1
         private const val MAX_MEMORY_CACHE = 120
         private const val INDEX_TTL_MS = 5L * 60L * 1000L
         private const val MIN_FUZZY_TITLE_LENGTH = 2
