@@ -117,6 +117,27 @@ class BleNotifyQueue(
     }
 
     @Synchronized
+    fun cancelJobTypes(types: Set<String>, reason: String) {
+        val removedJobs = jobs.filter { it.type in types }
+        jobs.removeAll { it.type in types }
+        removedJobs.forEach { failJob(it, reason) }
+        val current = activeJob
+        if (current != null && current.type in types) {
+            failJob(current, reason)
+            activeJob = null
+            activePacketIndex = 0
+            activeJobStartedAtMs = 0L
+            notificationInFlight = false
+            interleavedPacketInFlight = false
+            interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
+        }
+        if (removedJobs.isNotEmpty() || current?.type in types) {
+            handler.removeCallbacksAndMessages(null)
+            sendNextPacket()
+        }
+    }
+
+    @Synchronized
     fun onNotificationSent(status: Int) {
         val job = activeJob ?: return
         if (!notificationInFlight) {
@@ -412,6 +433,8 @@ class BleNotifyQueue(
                 logger("[FullLyrics] send failed reason=$reason")
             "trackInfo" ->
                 logger("[TrackInfo] send failed reason=$reason")
+            "playHistory", "playStats" ->
+                logger("[HistoryBLE] cancelled reason=$reason")
         }
     }
 
@@ -424,7 +447,7 @@ class BleNotifyQueue(
         return when (jobType) {
             "albumArt" -> ALBUM_ART_INTERLEAVE_INTERVAL
             "fullLyrics" -> FULL_LYRICS_INTERLEAVE_INTERVAL
-            "remoteLog", "mediaFieldDump", "qrcDump" ->
+            "remoteLog", "mediaFieldDump", "qrcDump", "playHistory", "playStats" ->
                 OTHER_LONG_JOB_INTERLEAVE_INTERVAL
             else -> 0
         }
@@ -520,6 +543,7 @@ class BleNotifyQueue(
                     || it.type == "mediaFieldDumpChunk"
                     || it.type == "trackInfoChunk"
                     || it.type == "fullLyricsChunk"
+                    || it.type == "historyPayloadChunk"
             }
 
         val albumArtId: String

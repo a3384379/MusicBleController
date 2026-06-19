@@ -16,6 +16,10 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Base64
+import com.example.playeragent.history.HistorySessionRow
+import com.example.playeragent.history.PlaybackHistoryRepository
+import com.example.playeragent.history.PlaybackStatsSummary
+import com.example.playeragent.history.StatsRange
 import com.example.playeragent.media.AlbumArtTestManager
 import com.example.playeragent.logging.LogConfig
 import com.example.playeragent.logging.LogBuffer
@@ -70,6 +74,11 @@ class BleGattServerManager(
             Thread(runnable, "MediaFieldDumpThread")
         }
     private val mediaFieldDumpPreparing = AtomicBoolean(false)
+    private val historyExecutor =
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "PlaybackHistoryBleThread")
+        }
+    private val historyQueryPreparing = AtomicBoolean(false)
     private val albumArtHandler = Handler(Looper.getMainLooper())
 
     private var gattServer: BluetoothGattServer? = null
@@ -439,6 +448,7 @@ class BleGattServerManager(
         recentMtuCallbacks.clear()
         statusCharacteristic = null
         mediaFieldDumpExecutor.shutdownNow()
+        historyExecutor.shutdownNow()
 
         try {
             try {
@@ -524,9 +534,13 @@ class BleGattServerManager(
             "NEXT",
             "PREVIOUS",
             "VOLUME_UP",
-            "VOLUME_DOWN" -> mediaCommandExecutor.execute(command, seq)
+            "VOLUME_DOWN" -> {
+                cancelHistoryTransfersForControl(command)
+                mediaCommandExecutor.execute(command, seq)
+            }
 
             "SEEK_TO" -> {
+                cancelHistoryTransfersForControl(command)
                 val position = request.optLong("position").coerceAtLeast(0L)
                 logger("[BLE-A][Seek] position=$position")
                 mediaCommandExecutor.seekTo(position, seq)
@@ -534,6 +548,7 @@ class BleGattServerManager(
                 sendPlaybackState()
             }
             "SET_VOLUME" -> {
+                cancelHistoryTransfersForControl(command)
                 val requestedVolume = request.optInt("volume")
                 val volumeStartedAtMs = SystemClock.elapsedRealtime()
                 logger("[CTRL-Sony] volume begin seq=${seq ?: "unknown"} cmd=SET_VOLUME")
@@ -568,7 +583,22 @@ class BleGattServerManager(
             "CLIENT_CAPABILITIES" -> handleClientCapabilities(request)
             "DUMP_MEDIA_FIELDS" -> sendMediaFieldDump()
             "GET_FULL_LYRICS" -> sendFullLyrics(request)
+            "GET_PLAY_HISTORY_PAGE" -> sendPlayHistoryPage(request)
+            "GET_PLAY_HISTORY_SINCE" -> sendPlayHistorySince(request)
+            "GET_PLAY_STATS" -> sendPlayStats(request)
             else -> logger("[BLE-A] unknown command: $command")
+        }
+    }
+
+    private fun cancelHistoryTransfersForControl(command: String) {
+        if (notifyQueue.hasJobTypeActiveOrQueued(PLAY_HISTORY_JOB_TYPE) ||
+            notifyQueue.hasJobTypeActiveOrQueued(PLAY_STATS_JOB_TYPE)
+        ) {
+            logger("[HistoryBLE] cancelled reason=control command cmd=$command")
+            notifyQueue.cancelJobTypes(
+                setOf(PLAY_HISTORY_JOB_TYPE, PLAY_STATS_JOB_TYPE),
+                "control command"
+            )
         }
     }
 
@@ -1952,6 +1982,326 @@ class BleGattServerManager(
         )
     }
 
+    private fun sendPlayHistoryPage(request: JSONObject) {
+        val requestId = request.optString("requestId").ifBlank {
+            "history-${System.currentTimeMillis()}"
+        }
+        val beforeSessionId = if (request.has("beforeSessionId") &&
+            !request.isNull("beforeSessionId")
+        ) {
+            request.optLong("beforeSessionId")
+        } else {
+            null
+        }
+        val limit = request.optInt("limit", DEFAULT_HISTORY_PAGE_LIMIT)
+            .coerceIn(1, MAX_HISTORY_PAGE_LIMIT)
+        executeHistoryQuery(requestId, PLAY_HISTORY_JOB_TYPE, "playHistoryPage") {
+            val startedAtMs = SystemClock.elapsedRealtime()
+            val rowsWithLookahead = PlaybackHistoryRepository(appContext)
+                .getRecentSessions(beforeSessionId, limit + 1)
+            val rows = rowsWithLookahead.take(limit)
+            logger(
+                "[HistoryBLE] query end type=page requestId=$requestId " +
+                    "count=${rows.size} costMs=${SystemClock.elapsedRealtime() - startedAtMs}"
+            )
+            JSONObject()
+                .put("type", "playHistoryPage")
+                .put("requestId", requestId)
+                .put("items", historyRowsToJson(rows))
+                .put("nextBeforeSessionId", rows.lastOrNull()?.sessionId ?: JSONObject.NULL)
+                .put("hasMore", rowsWithLookahead.size > rows.size)
+        }
+    }
+
+    private fun sendPlayHistorySince(request: JSONObject) {
+        val requestId = request.optString("requestId").ifBlank {
+            "history-since-${System.currentTimeMillis()}"
+        }
+        val afterSessionId = request.optLong("afterSessionId", 0L).coerceAtLeast(0L)
+        val limit = request.optInt("limit", DEFAULT_HISTORY_PAGE_LIMIT)
+            .coerceIn(1, MAX_HISTORY_PAGE_LIMIT)
+        executeHistoryQuery(requestId, PLAY_HISTORY_JOB_TYPE, "playHistorySince") {
+            val startedAtMs = SystemClock.elapsedRealtime()
+            val rowsWithLookahead = PlaybackHistoryRepository(appContext)
+                .getSessionsAfterId(afterSessionId, limit + 1)
+            val rows = rowsWithLookahead.take(limit)
+            logger(
+                "[HistoryBLE] query end type=since requestId=$requestId " +
+                    "count=${rows.size} costMs=${SystemClock.elapsedRealtime() - startedAtMs}"
+            )
+            JSONObject()
+                .put("type", "playHistorySince")
+                .put("requestId", requestId)
+                .put("items", historyRowsToJson(rows))
+                .put("lastSessionId", rows.lastOrNull()?.sessionId ?: afterSessionId)
+                .put("hasMore", rowsWithLookahead.size > rows.size)
+        }
+    }
+
+    private fun sendPlayStats(request: JSONObject) {
+        val requestId = request.optString("requestId").ifBlank {
+            "stats-${System.currentTimeMillis()}"
+        }
+        val rangeValue = request.optString("range", StatsRange.WEEK.name)
+        val range = runCatching { StatsRange.valueOf(rangeValue.uppercase()) }.getOrNull()
+        if (range == null) {
+            sendHistoryError(requestId, "playStats", "invalid range=$rangeValue")
+            return
+        }
+        executeHistoryQuery(requestId, PLAY_STATS_JOB_TYPE, "playStats") {
+            val startedAtMs = SystemClock.elapsedRealtime()
+            val stats = PlaybackHistoryRepository(appContext).stats(range)
+            logger(
+                "[HistoryBLE] query end type=stats requestId=$requestId " +
+                    "range=${range.name} costMs=${SystemClock.elapsedRealtime() - startedAtMs}"
+            )
+            statsToJson(requestId, range, stats)
+        }
+    }
+
+    private fun executeHistoryQuery(
+        requestId: String,
+        jobType: String,
+        responseType: String,
+        buildPayload: () -> JSONObject
+    ) {
+        val device = subscribedDevices.values.firstOrNull() ?: run {
+            logger("[HistoryBLE] request skipped requestId=$requestId reason=no subscriber")
+            return
+        }
+        if (!historyQueryPreparing.compareAndSet(false, true)) {
+            logger("[HistoryBLE] request busy requestId=$requestId")
+            sendHistoryError(requestId, responseType, "history query already active")
+            return
+        }
+        logger("[HistoryBLE] request type=$responseType requestId=$requestId")
+        historyExecutor.execute {
+            try {
+                logger("[HistoryBLE] query start requestId=$requestId")
+                enqueueHistoryPayload(device, jobType, responseType, requestId, buildPayload())
+            } catch (throwable: Throwable) {
+                logger("[HistoryBLE] failed requestId=$requestId reason=${throwable.message}")
+                sendHistoryError(requestId, responseType, throwable.message ?: "query failed")
+            } finally {
+                historyQueryPreparing.set(false)
+            }
+        }
+    }
+
+    private fun enqueueHistoryPayload(
+        device: BluetoothDevice,
+        jobType: String,
+        responseType: String,
+        requestId: String,
+        payload: JSONObject
+    ) {
+        val bytes = payload.toString().toByteArray(Charsets.UTF_8)
+        logger("[HistoryBLE] payload bytes=${bytes.size} requestId=$requestId")
+        val maximumPayload = maximumPayloadFor(device)
+        if (bytes.size <= maximumPayload) {
+            notifyQueue.enqueueShort(
+                device = device,
+                type = responseType,
+                value = bytes,
+                delayAfterMs = HISTORY_NOTIFICATION_DELAY_MS
+            )
+            logger("[HistoryBLE] send end requestId=$requestId chunks=0")
+            return
+        }
+        val rawChunkSize = chooseHistoryChunkSize(maximumPayload, requestId)
+        if (rawChunkSize <= 0) {
+            sendHistoryError(requestId, responseType, "MTU too small")
+            return
+        }
+        val totalChunks = (bytes.size + rawChunkSize - 1) / rawChunkSize
+        val packets = mutableListOf<BleNotifyQueue.Packet>()
+        val start = JSONObject()
+            .put("type", "historyPayloadStart")
+            .put("requestId", requestId)
+            .put("responseType", responseType)
+            .put("size", bytes.size)
+            .put("chunks", totalChunks)
+            .toString()
+            .toByteArray(Charsets.UTF_8)
+        if (start.size > maximumPayload) {
+            sendHistoryError(requestId, responseType, "start packet exceeds MTU")
+            return
+        }
+        packets += BleNotifyQueue.Packet(
+            type = "historyPayloadStart",
+            value = start,
+            delayAfterMs = HISTORY_NOTIFICATION_DELAY_MS
+        )
+        for (index in 0 until totalChunks) {
+            val from = index * rawChunkSize
+            val to = minOf(from + rawChunkSize, bytes.size)
+            val chunk = JSONObject()
+                .put("type", "historyPayloadChunk")
+                .put("requestId", requestId)
+                .put("index", index)
+                .put(
+                    "data",
+                    Base64.encodeToString(bytes.copyOfRange(from, to), Base64.NO_WRAP)
+                )
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            if (chunk.size > maximumPayload) {
+                sendHistoryError(requestId, responseType, "chunk $index exceeds MTU")
+                return
+            }
+            packets += BleNotifyQueue.Packet(
+                type = "historyPayloadChunk",
+                value = chunk,
+                delayAfterMs = HISTORY_NOTIFICATION_DELAY_MS
+            )
+        }
+        val end = JSONObject()
+            .put("type", "historyPayloadEnd")
+            .put("requestId", requestId)
+            .put("responseType", responseType)
+            .toString()
+            .toByteArray(Charsets.UTF_8)
+        if (end.size > maximumPayload) {
+            sendHistoryError(requestId, responseType, "end packet exceeds MTU")
+            return
+        }
+        packets += BleNotifyQueue.Packet(
+            type = "historyPayloadEnd",
+            value = end,
+            delayAfterMs = HISTORY_NOTIFICATION_DELAY_MS
+        )
+        logger("[HistoryBLE] send start requestId=$requestId chunks=$totalChunks")
+        notifyQueue.enqueueLongJob(
+            type = jobType,
+            device = device,
+            packets = packets,
+            maxSendDurationMs = HISTORY_MAX_SEND_MS,
+            onComplete = {
+                logger("[HistoryBLE] send end requestId=$requestId chunks=$totalChunks")
+            },
+            onFailure = {
+                logger("[HistoryBLE] failed requestId=$requestId reason=transport failed")
+            }
+        )
+    }
+
+    private fun chooseHistoryChunkSize(maximumPayload: Int, requestId: String): Int {
+        for (candidate in MAX_HISTORY_CHUNK_RAW_BYTES downTo 1) {
+            val sample = JSONObject()
+                .put("type", "historyPayloadChunk")
+                .put("requestId", requestId)
+                .put("index", 9999)
+                .put("data", Base64.encodeToString(ByteArray(candidate), Base64.NO_WRAP))
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            if (sample.size <= maximumPayload) {
+                return candidate
+            }
+        }
+        return 0
+    }
+
+    private fun sendHistoryError(requestId: String, responseType: String, message: String) {
+        val device = subscribedDevices.values.firstOrNull() ?: return
+        val value = JSONObject()
+            .put("type", "playHistoryError")
+            .put("requestId", requestId)
+            .put("responseType", responseType)
+            .put("message", message.take(MAX_HISTORY_ERROR_CHARS))
+            .toString()
+            .toByteArray(Charsets.UTF_8)
+        if (value.size > maximumPayloadFor(device)) {
+            logger("[HistoryBLE] error packet exceeds MTU")
+            return
+        }
+        notifyQueue.enqueueShort(
+            device = device,
+            type = "playHistoryError",
+            value = value,
+            delayAfterMs = HISTORY_NOTIFICATION_DELAY_MS
+        )
+    }
+
+    private fun historyRowsToJson(rows: List<HistorySessionRow>): JSONArray {
+        return JSONArray().also { array ->
+            rows.forEach { row ->
+                array.put(
+                    JSONObject()
+                        .put("sessionId", row.sessionId)
+                        .put("trackKey", row.trackKey)
+                        .put("title", row.title)
+                        .put("artist", row.artist)
+                        .put("album", row.album)
+                        .put("artworkId", row.artworkId ?: JSONObject.NULL)
+                        .put("startedAt", row.startedAt)
+                        .put("endedAt", row.endedAt ?: JSONObject.NULL)
+                        .put("listenedMs", row.listenedMs)
+                        .put("durationMs", row.durationMs)
+                        .put("completed", row.completed)
+                        .put("skipped", row.skipped)
+                        .put("countedPlay", row.countedPlay)
+                )
+            }
+        }
+    }
+
+    private fun statsToJson(
+        requestId: String,
+        range: StatsRange,
+        stats: PlaybackStatsSummary
+    ): JSONObject {
+        return JSONObject()
+            .put("type", "playStats")
+            .put("requestId", requestId)
+            .put("range", range.name)
+            .put("rangeStart", stats.rangeStart)
+            .put("rangeEnd", stats.rangeEnd)
+            .put("totalListenMs", stats.totalListenMs)
+            .put("playCount", stats.playCount)
+            .put("uniqueTrackCount", stats.uniqueTrackCount)
+            .put("completedCount", stats.completedCount)
+            .put("skippedCount", stats.skippedCount)
+            .put("completionRate", stats.completionRate)
+            .put("skipRate", stats.skipRate)
+            .put("topTracks", JSONArray().also { array ->
+                stats.topTracks.forEach { track ->
+                    array.put(
+                        JSONObject()
+                            .put("trackKey", track.trackKey)
+                            .put("title", track.title)
+                            .put("artist", track.artist)
+                            .put("album", track.album)
+                            .put("artworkId", track.artworkId ?: JSONObject.NULL)
+                            .put("listenedMs", track.listenedMs)
+                            .put("playCount", track.playCount)
+                            .put("completedCount", track.completedCount)
+                            .put("skippedCount", track.skippedCount)
+                    )
+                }
+            })
+            .put("topArtists", JSONArray().also { array ->
+                stats.topArtists.forEach { artist ->
+                    array.put(
+                        JSONObject()
+                            .put("artist", artist.artist)
+                            .put("listenedMs", artist.listenedMs)
+                            .put("playCount", artist.playCount)
+                            .put("trackCount", artist.trackCount)
+                    )
+                }
+            })
+            .put("dailyTrend", JSONArray().also { array ->
+                stats.dailyTrend.forEach { day ->
+                    array.put(
+                        JSONObject()
+                            .put("dateKey", day.dateKey)
+                            .put("listenedMs", day.listenedMs)
+                            .put("playCount", day.playCount)
+                    )
+                }
+            })
+    }
+
     private fun sendFullLyrics(request: JSONObject) {
         val device = subscribedDevices.values.firstOrNull() ?: run {
             logger("[FullLyrics] send skipped: no iPhone subscriber")
@@ -2322,6 +2672,14 @@ class BleGattServerManager(
         private const val MAX_LYRIC_TEXT_LENGTH = 30
         private const val REMOTE_LOG_JOB_TYPE = "remoteLog"
         private const val MEDIA_FIELD_DUMP_JOB_TYPE = "mediaFieldDump"
+        private const val PLAY_HISTORY_JOB_TYPE = "playHistory"
+        private const val PLAY_STATS_JOB_TYPE = "playStats"
+        private const val DEFAULT_HISTORY_PAGE_LIMIT = 10
+        private const val MAX_HISTORY_PAGE_LIMIT = 20
+        private const val MAX_HISTORY_CHUNK_RAW_BYTES = 300
+        private const val HISTORY_NOTIFICATION_DELAY_MS = 20L
+        private const val HISTORY_MAX_SEND_MS = 8_000L
+        private const val MAX_HISTORY_ERROR_CHARS = 100
         private const val CALLBACK_LOG_DEDUP_WINDOW_MS = 500L
     }
 
