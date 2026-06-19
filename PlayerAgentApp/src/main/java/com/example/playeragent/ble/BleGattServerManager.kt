@@ -36,10 +36,13 @@ class BleGattServerManager(
     private val bluetoothManager: BluetoothManager,
     private val logger: (String) -> Unit,
     private val transientLogger: (String) -> Unit = logger,
-    private val verboseLogger: (String) -> Unit = logger
+    private val verboseLogger: (String) -> Unit = logger,
+    private val advertisingStateProvider: () -> String = { "unknown" },
+    private val onAllClientsDisconnected: (reason: String) -> Unit = {}
 ) {
 
     private val appContext = context.applicationContext
+    private val connectedDeviceAddresses = ConcurrentHashMap.newKeySet<String>()
     private val subscribedDevices = ConcurrentHashMap<String, BluetoothDevice>()
     private val mtuByAddress = ConcurrentHashMap<String, Int>()
     private val recentConnectionCallbacks = ConcurrentHashMap<String, Long>()
@@ -112,11 +115,22 @@ class BleGattServerManager(
             }
 
             if (newState == BluetoothProfile.STATE_CONNECTED && device != null) {
+                connectedDeviceAddresses.add(address)
                 mtuByAddress[address] = DEFAULT_MTU
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                subscribedDevices.remove(address)
-                mtuByAddress.remove(address)
-                notifyQueue.removeDevice(address)
+                val hasUsableAddress = address.isNotBlank() && address != "unknown"
+                if (hasUsableAddress) {
+                    connectedDeviceAddresses.remove(address)
+                    subscribedDevices.remove(address)
+                    mtuByAddress.remove(address)
+                    notifyQueue.removeDevice(address)
+                } else {
+                    logger("[BLE-A] disconnect address unavailable, clearing all notify state")
+                    connectedDeviceAddresses.clear()
+                    subscribedDevices.clear()
+                    mtuByAddress.clear()
+                    notifyQueue.clearAllForDisconnect("unknown disconnect address")
+                }
                 lastAlbumArtKey = null
                 currentAlbumArtId = null
                 albumArtRequestsInFlight.clear()
@@ -127,6 +141,10 @@ class BleGattServerManager(
                 lastAutoPushSongKey = null
                 lastAutoPushPlaying = null
                 stopAutoPushIfUnused()
+                logDisconnectDiagnostics(address)
+                if (connectedDeviceAddresses.isEmpty()) {
+                    onAllClientsDisconnected("gatt disconnected status=$status")
+                }
             }
         }
 
@@ -353,6 +371,7 @@ class BleGattServerManager(
         lastAutoPushSongKey = null
         lastAutoPushPlaying = null
         subscribedDevices.clear()
+        connectedDeviceAddresses.clear()
         mtuByAddress.clear()
         recentConnectionCallbacks.clear()
         recentMtuCallbacks.clear()
@@ -373,6 +392,19 @@ class BleGattServerManager(
     }
 
     fun isStarted(): Boolean = started && gattServer != null
+
+    private fun logDisconnectDiagnostics(address: String) {
+        val snapshot = notifyQueue.snapshot()
+        logger(
+            "[BLE-DIAG] disconnected address=$address " +
+                "connectedDevices=${connectedDeviceAddresses.joinToString(prefix = "[", postfix = "]")} " +
+                "advertisingState=${advertisingStateProvider()} " +
+                "notificationInFlight=${snapshot.notificationInFlight} " +
+                "pendingJobs=${snapshot.pendingJobCount} " +
+                "activeJob=${snapshot.activeJobType} " +
+                "pendingShortMessages=${snapshot.pendingShortMessageCount}"
+        )
+    }
 
     private fun shouldLogCallback(
         timestamps: ConcurrentHashMap<String, Long>,

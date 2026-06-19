@@ -12,7 +12,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import com.example.playeragent.MainActivity
 import com.example.playeragent.ble.BleAdvertiserManager
@@ -25,14 +27,18 @@ import com.example.playeragent.media.QrcWatcherStatus
 
 class PlayerAgentForegroundService : Service() {
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var advertiserManager: BleAdvertiserManager? = null
     private var gattServerManager: BleGattServerManager? = null
     private var qrcIncrementalPrebuildManager: QrcIncrementalPrebuildManager? = null
     private var qrcDirectoryWatcher: QrcDirectoryWatcher? = null
+    @Volatile
+    private var serviceStopping = false
 
     override fun onCreate() {
         super.onCreate()
+        serviceStopping = false
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification("PlayerAgent is running"))
         log("Foreground service started")
@@ -51,6 +57,8 @@ class PlayerAgentForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        serviceStopping = true
+        mainHandler.removeCallbacksAndMessages(null)
         stopQrcWatcher()
         advertiserManager?.stopAdvertising()
         advertiserManager = null
@@ -100,7 +108,11 @@ class PlayerAgentForegroundService : Service() {
                 bluetoothManager = bluetoothManager,
                 logger = ::log,
                 transientLogger = ::logLocalOnly,
-                verboseLogger = ::logVerbose
+                verboseLogger = ::logVerbose,
+                advertisingStateProvider = {
+                    advertiserManager?.getAdvertisingState()?.name ?: "none"
+                },
+                onAllClientsDisconnected = ::handleAllClientsDisconnected
             )
             if (manager.start()) {
                 gattServerManager = manager
@@ -130,6 +142,34 @@ class PlayerAgentForegroundService : Service() {
         } else {
             logVerbose("BLE advertising already running; initialization skipped")
         }
+    }
+
+    private fun handleAllClientsDisconnected(reason: String) {
+        val advertiser = advertiserManager
+        val snapshot = advertiser?.snapshot()
+        log(
+            "[BLE-DIAG] all clients disconnected reason=$reason " +
+                "advertisingState=${snapshot?.state ?: "none"} " +
+                "restartPending=${snapshot?.restartPending ?: false}"
+        )
+        if (serviceStopping) {
+            log("[BLE-ADV] restart skipped reason=service stopping")
+            return
+        }
+        if (advertiser == null) {
+            log("[BLE-ADV] restart skipped reason=advertiser unavailable")
+            return
+        }
+        advertiser.restartAdvertising(reason)
+        mainHandler.postDelayed(
+            {
+                log(
+                    "[BLE-DIAG] advertising restored " +
+                        "state=${advertiser.getAdvertisingState()}"
+                )
+            },
+            ADVERTISING_RESTORE_DIAG_DELAY_MS
+        )
     }
 
     private fun startQrcWatcher() {
@@ -276,5 +316,6 @@ class PlayerAgentForegroundService : Service() {
         private const val TAG = "PlayerAgent"
         private const val CHANNEL_ID = "player_agent_service"
         private const val NOTIFICATION_ID = 10001
+        private const val ADVERTISING_RESTORE_DIAG_DELAY_MS = 1_000L
     }
 }

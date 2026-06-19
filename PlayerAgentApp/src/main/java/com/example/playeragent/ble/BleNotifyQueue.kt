@@ -166,6 +166,22 @@ class BleNotifyQueue(
     }
 
     @Synchronized
+    fun clearAllForDisconnect(reason: String) {
+        logger("[BleNotifyQueue] clear all reason=$reason")
+        handler.removeCallbacksAndMessages(null)
+        activeJob?.let { failJob(it, reason) }
+        jobs.forEach { failJob(it, reason) }
+        jobs.clear()
+        latestInterleavedPacket = null
+        interleavedPacketInFlight = false
+        interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
+        activeJob = null
+        activePacketIndex = 0
+        activeJobStartedAtMs = 0L
+        notificationInFlight = false
+    }
+
+    @Synchronized
     fun clear() {
         handler.removeCallbacksAndMessages(null)
         activeJob?.let { failJob(it, "queue cleared") }
@@ -177,6 +193,17 @@ class BleNotifyQueue(
         activeJob = null
         activePacketIndex = 0
         notificationInFlight = false
+    }
+
+    @Synchronized
+    fun snapshot(): BleNotifyQueueSnapshot {
+        return BleNotifyQueueSnapshot(
+            notificationInFlight = notificationInFlight,
+            pendingJobCount = jobs.size,
+            activeJobType = activeJob?.type,
+            activeDeviceAddress = activeJob?.device?.address,
+            pendingShortMessageCount = if (latestInterleavedPacket == null) 0 else 1
+        )
     }
 
     @Synchronized
@@ -438,6 +465,14 @@ class BleNotifyQueue(
         val type: String,
         val value: ByteArray,
         val delayAfterMs: Long
+    )
+
+    data class BleNotifyQueueSnapshot(
+        val notificationInFlight: Boolean,
+        val pendingJobCount: Int,
+        val activeJobType: String?,
+        val activeDeviceAddress: String?,
+        val pendingShortMessageCount: Int
     )
 
     private data class InterleavedPacket(
