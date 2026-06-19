@@ -15,12 +15,16 @@
 		A10000000000000000000006 /* FullLyricsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000008 /* FullLyricsView.swift */; };
 		A10000000000000000000007 /* DebugToolsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* DebugToolsView.swift */; };
 		A10000000000000000000008 /* AppLogStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000010 /* AppLogStore.swift */; };
+		A10000000000000000000009 /* LiveActivitySharedConstants.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* LiveActivitySharedConstants.swift */; };
+		A10000000000000000000010 /* LiveActivityArtworkStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000012 /* LiveActivityArtworkStore.swift */; };
 		B10000000000000000000001 /* SonyMusicActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* SonyMusicActivityAttributes.swift */; };
 		B10000000000000000000002 /* LiveActivityManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000002 /* LiveActivityManager.swift */; };
 		B10000000000000000000003 /* SonyMusicLiveActivityExtensionBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000004 /* SonyMusicLiveActivityExtensionBundle.swift */; };
 		B10000000000000000000004 /* SonyMusicLiveActivityWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000005 /* SonyMusicLiveActivityWidget.swift */; };
 		B10000000000000000000005 /* SonyMusicActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* SonyMusicActivityAttributes.swift */; };
 		B10000000000000000000006 /* SonyMusicLiveActivityExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = B20000000000000000000007 /* SonyMusicLiveActivityExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		B10000000000000000000007 /* LiveActivityArtworkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000008 /* LiveActivityArtworkView.swift */; };
+		B10000000000000000000008 /* LiveActivitySharedConstants.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* LiveActivitySharedConstants.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -58,12 +62,17 @@
 		A20000000000000000000008 /* FullLyricsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FullLyricsView.swift; sourceTree = "<group>"; };
 		A20000000000000000000009 /* DebugToolsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugToolsView.swift; sourceTree = "<group>"; };
 		A20000000000000000000010 /* AppLogStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLogStore.swift; sourceTree = "<group>"; };
+		A20000000000000000000011 /* LiveActivitySharedConstants.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivitySharedConstants.swift; sourceTree = "<group>"; };
+		A20000000000000000000012 /* LiveActivityArtworkStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityArtworkStore.swift; sourceTree = "<group>"; };
+		A20000000000000000000013 /* IOSBleFeasibility.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = IOSBleFeasibility.entitlements; sourceTree = "<group>"; };
 		B20000000000000000000001 /* SonyMusicActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SonyMusicActivityAttributes.swift; sourceTree = "<group>"; };
 		B20000000000000000000002 /* LiveActivityManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityManager.swift; sourceTree = "<group>"; };
 		B20000000000000000000004 /* SonyMusicLiveActivityExtensionBundle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SonyMusicLiveActivityExtensionBundle.swift; sourceTree = "<group>"; };
 		B20000000000000000000005 /* SonyMusicLiveActivityWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SonyMusicLiveActivityWidget.swift; sourceTree = "<group>"; };
 		B20000000000000000000006 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B20000000000000000000007 /* SonyMusicLiveActivityExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = SonyMusicLiveActivityExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		B20000000000000000000008 /* LiveActivityArtworkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityArtworkView.swift; sourceTree = "<group>"; };
+		B20000000000000000000009 /* SonyMusicLiveActivityExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = SonyMusicLiveActivityExtension.entitlements; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -102,10 +111,13 @@
 				A20000000000000000000009 /* DebugToolsView.swift */,
 				B20000000000000000000001 /* SonyMusicActivityAttributes.swift */,
 				B20000000000000000000002 /* LiveActivityManager.swift */,
+				A20000000000000000000011 /* LiveActivitySharedConstants.swift */,
+				A20000000000000000000012 /* LiveActivityArtworkStore.swift */,
 				A20000000000000000000010 /* AppLogStore.swift */,
 				A20000000000000000000003 /* BLEUUIDs.swift */,
 				A20000000000000000000004 /* BLETestManager.swift */,
 				A20000000000000000000005 /* Info.plist */,
+				A20000000000000000000013 /* IOSBleFeasibility.entitlements */,
 				A20000000000000000000007 /* Assets.xcassets */,
 			);
 			path = IOSBleFeasibility;
@@ -125,7 +137,9 @@
 			children = (
 				B20000000000000000000004 /* SonyMusicLiveActivityExtensionBundle.swift */,
 				B20000000000000000000005 /* SonyMusicLiveActivityWidget.swift */,
+				B20000000000000000000008 /* LiveActivityArtworkView.swift */,
 				B20000000000000000000006 /* Info.plist */,
+				B20000000000000000000009 /* SonyMusicLiveActivityExtension.entitlements */,
 			);
 			path = SonyMusicLiveActivityExtension;
 			sourceTree = "<group>";
@@ -181,9 +195,19 @@
 				TargetAttributes = {
 					A50000000000000000000001 = {
 						CreatedOnToolsVersion = 16.2;
+						SystemCapabilities = {
+							com.apple.ApplicationGroups.iOS = {
+								enabled = 1;
+							};
+						};
 					};
 					B50000000000000000000001 = {
 						CreatedOnToolsVersion = 16.2;
+						SystemCapabilities = {
+							com.apple.ApplicationGroups.iOS = {
+								enabled = 1;
+							};
+						};
 					};
 				};
 			};
@@ -235,6 +259,8 @@
 				A10000000000000000000007 /* DebugToolsView.swift in Sources */,
 				B10000000000000000000001 /* SonyMusicActivityAttributes.swift in Sources */,
 				B10000000000000000000002 /* LiveActivityManager.swift in Sources */,
+				A10000000000000000000009 /* LiveActivitySharedConstants.swift in Sources */,
+				A10000000000000000000010 /* LiveActivityArtworkStore.swift in Sources */,
 				A10000000000000000000008 /* AppLogStore.swift in Sources */,
 				A10000000000000000000003 /* BLEUUIDs.swift in Sources */,
 				A10000000000000000000004 /* BLETestManager.swift in Sources */,
@@ -247,7 +273,9 @@
 			files = (
 				B10000000000000000000003 /* SonyMusicLiveActivityExtensionBundle.swift in Sources */,
 				B10000000000000000000004 /* SonyMusicLiveActivityWidget.swift in Sources */,
+				B10000000000000000000007 /* LiveActivityArtworkView.swift in Sources */,
 				B10000000000000000000005 /* SonyMusicActivityAttributes.swift in Sources */,
+				B10000000000000000000008 /* LiveActivitySharedConstants.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -350,6 +378,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CODE_SIGN_ENTITLEMENTS = IOSBleFeasibility/IOSBleFeasibility.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 98K7KHA6Z7;
@@ -376,6 +405,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CODE_SIGN_ENTITLEMENTS = IOSBleFeasibility/IOSBleFeasibility.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 98K7KHA6Z7;
@@ -400,6 +430,7 @@
 		B70000000000000000000001 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = SonyMusicLiveActivityExtension/SonyMusicLiveActivityExtension.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 98K7KHA6Z7;
@@ -426,6 +457,7 @@
 		B70000000000000000000002 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = SonyMusicLiveActivityExtension/SonyMusicLiveActivityExtension.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 98K7KHA6Z7;

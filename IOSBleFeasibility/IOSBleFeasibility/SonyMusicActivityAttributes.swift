@@ -3,16 +3,17 @@ import Foundation
 
 struct SonyMusicActivityAttributes: ActivityAttributes {
     public struct ContentState: Codable, Hashable {
+        var trackId: String
         var title: String
         var artist: String
-        var album: String
         var lyric: String
         var isPlaying: Bool
-        var positionMs: Int64
+        var positionAtAnchorMs: Int64
+        var anchorDate: Date
         var durationMs: Int64
-        var trackId: String
-        var albumArtCacheKey: String?
-        var albumArtThumbnailBase64: String?
+        var connectionState: String
+        var artworkKey: String?
+        var artworkRevision: Int
     }
 
     var name: String

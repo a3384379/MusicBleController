@@ -12,7 +12,11 @@ struct SonyMusicLiveActivityWidget: Widget {
         } dynamicIsland: { context in
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
-                    ArtworkView(state: context.state, size: 48)
+                    LiveActivityArtworkView(
+                        artworkKey: context.state.artworkKey,
+                        artworkRevision: context.state.artworkRevision,
+                        size: 48
+                    )
                 }
                 DynamicIslandExpandedRegion(.trailing) {
                     ExpandedPlaybackStatus(isPlaying: context.state.isPlaying)
@@ -21,16 +25,16 @@ struct SonyMusicLiveActivityWidget: Widget {
                     TrackSummaryView(state: context.state)
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    ProgressRow(
-                        positionMs: context.state.positionMs,
-                        durationMs: context.state.durationMs,
-                        progress: progressValue(context.state)
-                    )
+                    ProgressRow(state: context.state)
                     .padding(.horizontal, 16)
                     .padding(.top, 2)
                 }
             } compactLeading: {
-                ArtworkView(state: context.state, size: 24)
+                LiveActivityArtworkView(
+                    artworkKey: context.state.artworkKey,
+                    artworkRevision: context.state.artworkRevision,
+                    size: 24
+                )
             } compactTrailing: {
                 PlaybackIcon(isPlaying: context.state.isPlaying)
             } minimal: {
@@ -42,10 +46,6 @@ struct SonyMusicLiveActivityWidget: Widget {
         }
     }
 
-    private func progressValue(_ state: SonyMusicActivityAttributes.ContentState) -> Double {
-        guard state.durationMs > 0 else { return 0 }
-        return min(max(Double(state.positionMs) / Double(state.durationMs), 0), 1)
-    }
 }
 
 private struct LockScreenLiveActivityView: View {
@@ -53,7 +53,11 @@ private struct LockScreenLiveActivityView: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            ArtworkView(state: state, size: 58)
+            LiveActivityArtworkView(
+                artworkKey: state.artworkKey,
+                artworkRevision: state.artworkRevision,
+                size: 58
+            )
 
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
@@ -78,20 +82,11 @@ private struct LockScreenLiveActivityView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
 
-                ProgressRow(
-                    positionMs: state.positionMs,
-                    durationMs: state.durationMs,
-                    progress: progressValue
-                )
+                ProgressRow(state: state)
             }
         }
         .padding(.vertical, 7)
         .padding(.horizontal, 2)
-    }
-
-    private var progressValue: Double {
-        guard state.durationMs > 0 else { return 0 }
-        return min(max(Double(state.positionMs) / Double(state.durationMs), 0), 1)
     }
 }
 
@@ -119,54 +114,57 @@ private struct TrackSummaryView: View {
     }
 }
 
-private struct ArtworkView: View {
-    let state: SonyMusicActivityAttributes.ContentState
-    let size: CGFloat
-
-    var body: some View {
-        ZStack {
-            if let image = state.albumArtThumbnailImage {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-            } else {
-                RoundedRectangle(cornerRadius: size * 0.22, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color(red: 0.10, green: 0.24, blue: 0.42),
-                                Color(red: 0.20, green: 0.44, blue: 0.32)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                Image(systemName: "music.note")
-                    .font(.system(size: size * 0.42, weight: .semibold))
-                    .foregroundStyle(.white)
-            }
-        }
-        .frame(width: size, height: size)
-        .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
-    }
-}
-
 private struct ProgressRow: View {
-    let positionMs: Int64
-    let durationMs: Int64
-    let progress: Double
+    let state: SonyMusicActivityAttributes.ContentState
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(formatTime(positionMs))
+            currentTimeView
                 .frame(minWidth: 34, alignment: .leading)
-            ProgressView(value: progress)
-                .tint(.green)
-            Text(formatTime(durationMs))
+            progressView
+            Text(formatTime(state.durationMs))
                 .frame(minWidth: 34, alignment: .trailing)
         }
         .font(.caption2.monospacedDigit())
         .foregroundStyle(.white.opacity(0.62))
+    }
+
+    @ViewBuilder
+    private var progressView: some View {
+        if state.isPlaying, let interval = playbackInterval {
+            ProgressView(timerInterval: interval, countsDown: false)
+                .tint(.green)
+        } else {
+            ProgressView(value: progressValue)
+                .tint(.green)
+        }
+    }
+
+    @ViewBuilder
+    private var currentTimeView: some View {
+        if state.isPlaying, let interval = playbackInterval {
+            Text(timerInterval: interval, pauseTime: nil, countsDown: false, showsHours: false)
+        } else {
+            Text(formatTime(state.positionAtAnchorMs))
+        }
+    }
+
+    private var playbackInterval: ClosedRange<Date>? {
+        guard state.durationMs > 0 else { return nil }
+        let start = state.anchorDate.addingTimeInterval(
+            -Double(state.positionAtAnchorMs) / 1_000
+        )
+        let end = start.addingTimeInterval(Double(state.durationMs) / 1_000)
+        guard end > start else { return nil }
+        return start...end
+    }
+
+    private var progressValue: Double {
+        guard state.durationMs > 0 else { return 0 }
+        return min(
+            max(Double(state.positionAtAnchorMs) / Double(state.durationMs), 0),
+            1
+        )
     }
 }
 
@@ -204,16 +202,6 @@ private struct PlaybackIcon: View {
         Image(systemName: isPlaying ? "play.fill" : "pause.fill")
             .font(.caption.weight(.bold))
             .foregroundStyle(.white)
-    }
-}
-
-private extension SonyMusicActivityAttributes.ContentState {
-    var albumArtThumbnailImage: UIImage? {
-        guard let albumArtThumbnailBase64,
-              let data = Data(base64Encoded: albumArtThumbnailBase64) else {
-            return nil
-        }
-        return UIImage(data: data)
     }
 }
 

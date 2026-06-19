@@ -78,6 +78,8 @@ final class BLETestManager: NSObject, ObservableObject {
     private var currentAlbumArtID = ""
     private var currentTrackID = ""
     private var currentCachedAlbumArtQuality = ""
+    private var currentLiveArtworkKey: String?
+    private var currentLiveArtworkRevision = 0
     private var requestedAlbumArtKeys: Set<String> = []
     private var requestedHqAlbumArtIDs: Set<String> = []
     private var hqAlbumArtWorkItem: DispatchWorkItem?
@@ -819,7 +821,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 )
                 let updateReason: String
                 if oldLyric != self.lyric {
-                    updateReason = "lyric"
+                    updateReason = "lyricChanged"
                 } else if oldIsPlaying != self.isPlaying {
                     updateReason = "playState"
                 } else {
@@ -897,7 +899,11 @@ extension BLETestManager: CBPeripheralDelegate {
                     self.cancelHqAlbumArtRequest()
                     self.albumArtImage = cached.image
                     self.currentCachedAlbumArtQuality = cached.quality
-                    self.updateLiveActivity(force: true, reason: "albumArt")
+                    self.publishLiveArtworkIfCurrent(
+                        image: cached.image,
+                        key: id,
+                        reason: "cacheHit"
+                    )
                     let message = "[AlbumArtCache] hit id=\(id), skip request"
                     self.log(message)
                     self.albumArtConsoleLog(message)
@@ -912,7 +918,11 @@ extension BLETestManager: CBPeripheralDelegate {
                     self.cancelAlbumArtFallback()
                     self.albumArtImage = cached.image
                     self.currentCachedAlbumArtQuality = cached.quality
-                    self.updateLiveActivity(force: true, reason: "albumArt")
+                    self.publishLiveArtworkIfCurrent(
+                        image: cached.image,
+                        key: id,
+                        reason: "cacheHit"
+                    )
                     let message = "[AlbumArtCache] hit preview id=\(id), schedule hq"
                     self.log(message)
                     self.albumArtConsoleLog(message)
@@ -926,6 +936,7 @@ extension BLETestManager: CBPeripheralDelegate {
                     self.log(message)
                     self.albumArtConsoleLog(message)
                     self.currentCachedAlbumArtQuality = ""
+                    self.clearLiveArtwork(reason: "cacheMiss", shouldUpdate: false)
                     self.requestAlbumArt(id: id, quality: "preview")
                 }
 
@@ -1051,6 +1062,7 @@ extension BLETestManager: CBPeripheralDelegate {
                     self.cancelAlbumArtFallback()
                     self.albumArtImage = nil
                     self.currentCachedAlbumArtQuality = ""
+                    self.clearLiveArtwork(reason: "unavailable", shouldUpdate: false)
                     self.updateLiveActivity(force: true, reason: "albumArt")
                 }
                 self.log(
@@ -1188,6 +1200,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 cancelAlbumArtFallback()
                 albumArtImage = nil
                 currentCachedAlbumArtQuality = ""
+                clearLiveArtwork(reason: "placeholder", shouldUpdate: false)
                 updateLiveActivity(force: true, reason: "albumArt")
             }
             requestedAlbumArtKeys.remove("\(id)|\(quality)")
@@ -1202,7 +1215,11 @@ extension BLETestManager: CBPeripheralDelegate {
                 cancelAlbumArtFallback()
                 albumArtImage = image
                 currentCachedAlbumArtQuality = quality
-                updateLiveActivity(force: true, reason: "albumArt")
+                publishLiveArtworkIfCurrent(
+                    image: image,
+                    key: id,
+                    reason: quality
+                )
             }
         }
         requestedAlbumArtKeys.remove("\(id)|\(quality)")
@@ -1309,6 +1326,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 cancelAlbumArtFallback()
                 albumArtImage = nil
                 currentCachedAlbumArtQuality = ""
+                clearLiveArtwork(reason: "placeholder", shouldUpdate: false)
                 updateLiveActivity(force: true, reason: "albumArt")
             }
             requestedAlbumArtKeys.remove("\(id)|\(quality)")
@@ -1322,7 +1340,11 @@ extension BLETestManager: CBPeripheralDelegate {
                 cancelAlbumArtFallback()
                 albumArtImage = image
                 currentCachedAlbumArtQuality = quality
-                updateLiveActivity(force: true, reason: "albumArt")
+                publishLiveArtworkIfCurrent(
+                    image: image,
+                    key: id,
+                    reason: quality
+                )
             }
         }
         requestedAlbumArtKeys.remove("\(id)|\(quality)")
@@ -1380,19 +1402,21 @@ extension BLETestManager: CBPeripheralDelegate {
         let snapshotPositionMs = displayPositionMs
         let snapshotDurationMs = durationMs
         let snapshotTrackID = currentTrackID
-        let snapshotAlbumArtImage = albumArtImage
+        let snapshotArtworkKey = currentLiveArtworkKey
+        let snapshotArtworkRevision = currentLiveArtworkRevision
 
         Task { @MainActor in
             LiveActivityManager.shared.update(
                 title: snapshotTitle,
                 artist: snapshotArtist,
-                album: snapshotAlbum,
                 lyric: snapshotLyric,
                 isPlaying: snapshotIsPlaying,
                 positionMs: snapshotPositionMs,
                 durationMs: snapshotDurationMs,
                 trackId: snapshotTrackID,
-                albumArtImage: snapshotAlbumArtImage,
+                artworkKey: snapshotArtworkKey,
+                artworkRevision: snapshotArtworkRevision,
+                connectionState: "connected",
                 reason: reason,
                 force: force,
                 logger: { [weak self] message in
@@ -1409,19 +1433,21 @@ extension BLETestManager: CBPeripheralDelegate {
         let snapshotPositionMs = displayPositionMs
         let snapshotDurationMs = durationMs
         let snapshotTrackID = currentTrackID
-        let snapshotAlbumArtImage = albumArtImage
+        let snapshotArtworkKey = currentLiveArtworkKey
+        let snapshotArtworkRevision = currentLiveArtworkRevision
 
         Task { @MainActor in
             LiveActivityManager.shared.update(
                 title: snapshotTitle,
                 artist: snapshotArtist,
-                album: snapshotAlbum,
                 lyric: "连接已断开",
                 isPlaying: false,
                 positionMs: snapshotPositionMs,
                 durationMs: snapshotDurationMs,
                 trackId: snapshotTrackID,
-                albumArtImage: snapshotAlbumArtImage,
+                artworkKey: snapshotArtworkKey,
+                artworkRevision: snapshotArtworkRevision,
+                connectionState: "disconnected",
                 reason: "disconnect",
                 force: true,
                 logger: { [weak self] message in
@@ -1677,6 +1703,7 @@ extension BLETestManager: CBPeripheralDelegate {
 
         currentAlbumArtID = id
         currentCachedAlbumArtQuality = ""
+        clearLiveArtwork(reason: "track changed", shouldUpdate: false)
         requestedAlbumArtKeys.removeAll()
         requestedHqAlbumArtIDs.removeAll()
         albumArtPreviewRetryCount = 0
@@ -1688,7 +1715,11 @@ extension BLETestManager: CBPeripheralDelegate {
             cancelAlbumArtFallback()
             albumArtImage = cached.image
             currentCachedAlbumArtQuality = cached.quality
-            updateLiveActivity(force: true, reason: "albumArt")
+            publishLiveArtworkIfCurrent(
+                image: cached.image,
+                key: id,
+                reason: "cacheHit"
+            )
             let message = "[AlbumArtCache] hit id=\(id)"
             log(message)
             albumArtConsoleLog(message)
@@ -1697,6 +1728,54 @@ extension BLETestManager: CBPeripheralDelegate {
             log(message)
             albumArtConsoleLog(message)
             scheduleAlbumArtFallback(id: id)
+        }
+    }
+
+    private func publishLiveArtworkIfCurrent(
+        image: UIImage,
+        key: String,
+        reason: String
+    ) {
+        let trackAtStart = currentTrackID
+        let revision = currentLiveArtworkRevision + 1
+        log("[LiveArtwork] current main album key=\(key)")
+        let wrote = LiveActivityArtworkStore.shared.writeThumbnail(
+            image: image,
+            key: key,
+            revision: revision,
+            logger: { [weak self] message in
+                self?.log(message)
+            }
+        )
+        guard currentTrackID == trackAtStart,
+              currentAlbumArtID == key else {
+            log(
+                "[LiveArtwork] stale result ignored oldTrackId=\(trackAtStart) " +
+                    "currentTrackId=\(currentTrackID)"
+            )
+            return
+        }
+        guard wrote else {
+            log("[LiveArtwork] update skipped reason=write failed key=\(key)")
+            return
+        }
+
+        currentLiveArtworkKey = key
+        currentLiveArtworkRevision = revision
+        log(
+            "[LiveArtwork] update requested key=\(key) " +
+                "revision=\(revision) source=\(reason)"
+        )
+        updateLiveActivity(force: true, reason: "artworkReady")
+    }
+
+    private func clearLiveArtwork(reason: String, shouldUpdate: Bool) {
+        guard currentLiveArtworkKey != nil else { return }
+        currentLiveArtworkKey = nil
+        currentLiveArtworkRevision += 1
+        log("[LiveArtwork] update requested key=nil revision=\(currentLiveArtworkRevision) reason=\(reason)")
+        if shouldUpdate {
+            updateLiveActivity(force: true, reason: "artworkUnavailable")
         }
     }
 
@@ -1709,6 +1788,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 return
             }
             self.albumArtImage = nil
+            self.clearLiveArtwork(reason: "fallback default", shouldUpdate: false)
             self.updateLiveActivity(force: true, reason: "albumArt")
             self.log("[AlbumArt] fallback default id=\(id)")
         }
