@@ -7,6 +7,7 @@ struct SonyMusicLiveActivityWidget: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: SonyMusicActivityAttributes.self) { context in
             LockScreenLiveActivityView(state: context.state)
+                .widgetURL(URL(string: "sonymusic://nowplaying"))
                 .activityBackgroundTint(Color.black.opacity(0.78))
                 .activitySystemActionForegroundColor(.white)
         } dynamicIsland: { context in
@@ -15,7 +16,7 @@ struct SonyMusicLiveActivityWidget: Widget {
                     LiveActivityArtworkView(
                         artworkKey: context.state.artworkKey,
                         artworkRevision: context.state.artworkRevision,
-                        size: 48
+                        size: 46
                     )
                 }
                 DynamicIslandExpandedRegion(.trailing) {
@@ -26,23 +27,25 @@ struct SonyMusicLiveActivityWidget: Widget {
                 }
                 DynamicIslandExpandedRegion(.bottom) {
                     ProgressRow(state: context.state)
-                    .padding(.horizontal, 16)
-                    .padding(.top, 2)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 2)
                 }
             } compactLeading: {
                 LiveActivityArtworkView(
                     artworkKey: context.state.artworkKey,
                     artworkRevision: context.state.artworkRevision,
-                    size: 24
+                    size: 22
                 )
             } compactTrailing: {
                 PlaybackIcon(isPlaying: context.state.isPlaying)
+                    .font(.caption.weight(.bold))
             } minimal: {
                 Image(systemName: "music.note")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.white)
             }
             .keylineTint(.green)
+            .widgetURL(URL(string: "sonymusic://nowplaying"))
         }
     }
 
@@ -56,7 +59,7 @@ private struct LockScreenLiveActivityView: View {
             LiveActivityArtworkView(
                 artworkKey: state.artworkKey,
                 artworkRevision: state.artworkRevision,
-                size: 58
+                size: 56
             )
 
             VStack(alignment: .leading, spacing: 6) {
@@ -76,7 +79,7 @@ private struct LockScreenLiveActivityView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
 
-                Text(state.lyric)
+                Text(lyricText)
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.white.opacity(0.88))
                     .lineLimit(1)
@@ -88,13 +91,17 @@ private struct LockScreenLiveActivityView: View {
         .padding(.vertical, 7)
         .padding(.horizontal, 2)
     }
+
+    private var lyricText: String {
+        state.connectionState == "disconnected" ? "Sony 已断开" : state.lyric
+    }
 }
 
 private struct TrackSummaryView: View {
     let state: SonyMusicActivityAttributes.ContentState
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 3) {
             Text(state.title)
                 .font(.headline.weight(.bold))
                 .foregroundStyle(.white)
@@ -105,12 +112,17 @@ private struct TrackSummaryView: View {
                 .foregroundStyle(.white.opacity(0.68))
                 .lineLimit(1)
                 .truncationMode(.tail)
-            Text(state.lyric)
+            Text(lyricText)
                 .font(.caption2.weight(.medium))
                 .foregroundStyle(.white.opacity(0.55))
                 .lineLimit(1)
                 .truncationMode(.tail)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var lyricText: String {
+        state.connectionState == "disconnected" ? "Sony 已断开" : state.lyric
     }
 }
 
@@ -172,7 +184,7 @@ private struct PlaybackBadge: View {
     let isPlaying: Bool
 
     var body: some View {
-        Label(isPlaying ? "播放中" : "已暂停", systemImage: isPlaying ? "music.note" : "pause.fill")
+        Label(isPlaying ? "播放中" : "已暂停", systemImage: isPlaying ? "play.fill" : "pause.fill")
             .font(.caption2.weight(.semibold))
             .foregroundStyle(isPlaying ? .green : .white.opacity(0.72))
             .labelStyle(.titleAndIcon)
@@ -200,7 +212,6 @@ private struct PlaybackIcon: View {
 
     var body: some View {
         Image(systemName: isPlaying ? "play.fill" : "pause.fill")
-            .font(.caption.weight(.bold))
             .foregroundStyle(.white)
     }
 }

@@ -20,6 +20,13 @@ struct LyricLine: Identifiable, Equatable {
     var id: Int { index }
 }
 
+struct ResolvedLyric: Equatable {
+    let trackId: String
+    let lineIndex: Int
+    let text: String
+    let source: String
+}
+
 final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var mode = "BLE Central / GATT Client"
     @Published private(set) var connectionStatus = "未连接"
@@ -64,6 +71,8 @@ final class BLETestManager: NSObject, ObservableObject {
     private var commandWriteInflight: [CommandWriteInfo] = []
     private var mainHeartbeatWorkItem: DispatchWorkItem?
     private var lastMainHeartbeatAtMs: Int64 = 0
+    private var lastMainHeartbeatAppState = "active"
+    private var appLifecycleState = "active"
     private var lastKaraokeOffsetLogAtMs: Int64 = 0
     private var albumArtID = ""
     private var albumArtQuality = ""
@@ -80,6 +89,11 @@ final class BLETestManager: NSObject, ObservableObject {
     private var currentCachedAlbumArtQuality = ""
     private var currentLiveArtworkKey: String?
     private var currentLiveArtworkRevision = 0
+    private var lastLiveActivityRequestAt = Date.distantPast
+    private var lastLiveActivityRequestTrackID = ""
+    private var lastLiveActivityLyricTrackID = ""
+    private var lastLiveActivityLyricLineIndex = Int.min
+    private var lastLiveActivityLyricText = ""
     private var requestedAlbumArtKeys: Set<String> = []
     private var requestedHqAlbumArtIDs: Set<String> = []
     private var hqAlbumArtWorkItem: DispatchWorkItem?
@@ -120,6 +134,8 @@ final class BLETestManager: NSObject, ObservableObject {
     override init() {
         super.init()
         log("[BLE-iOS] app log store ready")
+        updateAppLifecycleState(UIApplication.shared.applicationState, emitLog: false)
+        registerAppLifecycleDiagnostics()
         startProgressTimer()
         startMainHeartbeatDiagnostics()
     }
@@ -127,6 +143,7 @@ final class BLETestManager: NSObject, ObservableObject {
     deinit {
         progressTimer?.invalidate()
         mainHeartbeatWorkItem?.cancel()
+        NotificationCenter.default.removeObserver(self)
     }
 
     func startPeripheral() {
@@ -227,6 +244,57 @@ final class BLETestManager: NSObject, ObservableObject {
 
     func karaokePositionMs(rawPositionMs: Int64) -> Int64 {
         rawPositionMs + karaokeOffsetMs
+    }
+
+    func resolveCurrentLyric(
+        positionMs: Int64,
+        fullLyrics: [LyricLine],
+        playbackStateLyric: String
+    ) -> ResolvedLyric {
+        let trackID = currentTrackID
+        let effectivePositionMs = karaokePositionMs(rawPositionMs: positionMs)
+        if fullLyricsTrackId == trackID,
+           !fullLyrics.isEmpty,
+           let index = currentLyricIndex(lines: fullLyrics, positionMs: effectivePositionMs),
+           fullLyrics.indices.contains(index) {
+            let text = fullLyrics[index].text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty {
+                return ResolvedLyric(
+                    trackId: trackID,
+                    lineIndex: fullLyrics[index].index,
+                    text: text,
+                    source: "fullLyrics"
+                )
+            }
+        }
+
+        let fallbackText = playbackStateLyric.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !fallbackText.isEmpty {
+            return ResolvedLyric(
+                trackId: trackID,
+                lineIndex: -1,
+                text: fallbackText,
+                source: "playbackState"
+            )
+        }
+
+        if trackID == lastLiveActivityLyricTrackID,
+           !lastLiveActivityLyricText.isEmpty,
+           lastLiveActivityLyricText != "暂无歌词" {
+            return ResolvedLyric(
+                trackId: trackID,
+                lineIndex: lastLiveActivityLyricLineIndex,
+                text: lastLiveActivityLyricText,
+                source: "previous"
+            )
+        }
+
+        return ResolvedLyric(
+            trackId: trackID,
+            lineIndex: -1,
+            text: "暂无歌词",
+            source: "none"
+        )
     }
 
     func logKaraokeOffset(rawPositionMs: Int64) {
@@ -342,6 +410,7 @@ final class BLETestManager: NSObject, ObservableObject {
         basePlaybackPositionMs = targetPosition
         playbackStateReceivedAt = Date()
         log("[iOS][Seek] lyric line position=\(targetPosition)")
+        updateLiveActivity(force: true, reason: "seek")
         seek(to: targetPosition)
         refreshPlaybackState(after: 0.5)
     }
@@ -368,6 +437,7 @@ final class BLETestManager: NSObject, ObservableObject {
         playbackStateReceivedAt = Date()
         isSeeking = false
         log("[iOS][Seek] user set position=\(targetPosition)")
+        updateLiveActivity(force: true, reason: "seek")
         seek(to: targetPosition)
         refreshPlaybackState(after: 0.5)
     }
@@ -539,14 +609,74 @@ final class BLETestManager: NSObject, ObservableObject {
             guard let self else { return }
             let now = self.currentTimeMs()
             let gapMs = now - self.lastMainHeartbeatAtMs
+            let currentAppState = self.appLifecycleState
             if gapMs > 2_000 {
-                self.ctrlLog("[CTRL-iOS] main stall detected gapMs=\(gapMs) timeMs=\(now)")
+                if currentAppState == "active", self.lastMainHeartbeatAppState == "active" {
+                    self.ctrlLog("[CTRL-iOS] main stall detected gapMs=\(gapMs) appState=\(currentAppState) timeMs=\(now)")
+                } else {
+                    self.ctrlLog("[APP-LIFECYCLE] execution gap gapMs=\(gapMs) appState=\(currentAppState) previousAppState=\(self.lastMainHeartbeatAppState)")
+                }
             }
             self.lastMainHeartbeatAtMs = now
+            self.lastMainHeartbeatAppState = currentAppState
             self.scheduleMainHeartbeatDiagnostics()
         }
         mainHeartbeatWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: item)
+    }
+
+    private func registerAppLifecycleDiagnostics() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appWillResignActive),
+            name: UIApplication.willResignActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+    }
+
+    @objc private func appDidBecomeActive() {
+        updateAppLifecycleState(.active, emitLog: true)
+    }
+
+    @objc private func appWillResignActive() {
+        updateAppLifecycleState(.inactive, emitLog: true)
+    }
+
+    @objc private func appDidEnterBackground() {
+        updateAppLifecycleState(.background, emitLog: true)
+    }
+
+    private func updateAppLifecycleState(
+        _ state: UIApplication.State,
+        emitLog: Bool
+    ) {
+        let value: String
+        switch state {
+        case .active:
+            value = "active"
+        case .inactive:
+            value = "inactive"
+        case .background:
+            value = "background"
+        @unknown default:
+            value = "unknown"
+        }
+        appLifecycleState = value
+        if emitLog {
+            ctrlLog("[APP-LIFECYCLE] \(value)")
+        }
     }
 
     private func albumArtConsoleLog(_ message: String) {
@@ -799,6 +929,7 @@ extension BLETestManager: CBPeripheralDelegate {
             case "playbackState":
                 let oldLyric = self.lyric
                 let oldIsPlaying = self.isPlaying
+                let oldPositionMs = self.positionMs
                 self.isPlaying = object["playing"] as? Bool ?? false
                 self.durationMs = Self.int64Value(object["duration"])
                 if let lyric = object["lyric"] as? String {
@@ -819,15 +950,25 @@ extension BLETestManager: CBPeripheralDelegate {
                     "[iOS][Status] playbackState " +
                         "position=\(self.positionMs) duration=\(self.durationMs)"
                 )
-                let updateReason: String
-                if oldLyric != self.lyric {
-                    updateReason = "lyricChanged"
-                } else if oldIsPlaying != self.isPlaying {
-                    updateReason = "playState"
-                } else {
-                    updateReason = "playbackState"
+                if self.appLifecycleState != "active",
+                   oldLyric != self.lyric,
+                   !self.lyric.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    self.log(
+                        "[BLE-BG] playbackState received appState=\(self.appLifecycleState) " +
+                            "position=\(self.positionMs) lyric=\(self.lyric)"
+                    )
                 }
-                self.updateLiveActivity(force: false, reason: updateReason)
+                if oldIsPlaying != self.isPlaying {
+                    self.updateLiveActivity(force: false, reason: "playState")
+                    _ = self.updateLiveActivityForCurrentLyricIfNeeded(reason: "playState")
+                } else if self.updateLiveActivityForCurrentLyricIfNeeded(reason: "playbackState") {
+                    // Lyric line updates are semantic Live Activity updates and are
+                    // intentionally independent of progress calibration.
+                } else if self.shouldRequestLiveActivityProgressUpdate(
+                    oldPositionMs: oldPositionMs
+                ) {
+                    self.updateLiveActivity(force: false, reason: "playbackState")
+                }
 
             case "trackInfo":
                 self.applyTrackInfo(object)
@@ -1396,20 +1537,26 @@ extension BLETestManager: CBPeripheralDelegate {
     private func updateLiveActivity(force: Bool, reason: String) {
         let snapshotTitle = title
         let snapshotArtist = artist
-        let snapshotAlbum = album
-        let snapshotLyric = lyric
         let snapshotIsPlaying = isPlaying
         let snapshotPositionMs = displayPositionMs
         let snapshotDurationMs = durationMs
         let snapshotTrackID = currentTrackID
         let snapshotArtworkKey = currentLiveArtworkKey
         let snapshotArtworkRevision = currentLiveArtworkRevision
+        let resolvedLyric = resolveCurrentLyric(
+            positionMs: snapshotPositionMs,
+            fullLyrics: fullLyrics,
+            playbackStateLyric: lyric
+        )
+        lastLiveActivityRequestAt = Date()
+        lastLiveActivityRequestTrackID = snapshotTrackID
 
         Task { @MainActor in
             LiveActivityManager.shared.update(
                 title: snapshotTitle,
                 artist: snapshotArtist,
-                lyric: snapshotLyric,
+                lyric: resolvedLyric.text,
+                lyricLineIndex: resolvedLyric.lineIndex,
                 isPlaying: snapshotIsPlaying,
                 positionMs: snapshotPositionMs,
                 durationMs: snapshotDurationMs,
@@ -1417,6 +1564,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 artworkKey: snapshotArtworkKey,
                 artworkRevision: snapshotArtworkRevision,
                 connectionState: "connected",
+                appState: self.appLifecycleState,
                 reason: reason,
                 force: force,
                 logger: { [weak self] message in
@@ -1426,10 +1574,80 @@ extension BLETestManager: CBPeripheralDelegate {
         }
     }
 
+    private func updateLiveActivityForCurrentLyricIfNeeded(reason: String) -> Bool {
+        let resolved = resolveCurrentLyric(
+            positionMs: displayPositionMs,
+            fullLyrics: fullLyrics,
+            playbackStateLyric: lyric
+        )
+        guard resolved.trackId != lastLiveActivityLyricTrackID ||
+            resolved.lineIndex != lastLiveActivityLyricLineIndex ||
+            resolved.text != lastLiveActivityLyricText else {
+            return false
+        }
+
+        lastLiveActivityLyricTrackID = resolved.trackId
+        lastLiveActivityLyricLineIndex = resolved.lineIndex
+        lastLiveActivityLyricText = resolved.text
+        log(
+            "[Lyrics-Live] line changed trackId=\(resolved.trackId) " +
+                "appState=\(appLifecycleState) index=\(resolved.lineIndex) text=\(resolved.text)"
+        )
+        log(
+            "[Lyrics-Live] source=\(resolved.source) " +
+                "rawPositionMs=\(displayPositionMs) " +
+                "effectivePositionMs=\(karaokePositionMs(rawPositionMs: displayPositionMs)) " +
+                "reason=\(reason)"
+        )
+        updateLiveActivity(force: false, reason: "lyricChanged")
+        return true
+    }
+
+    private func shouldRequestLiveActivityProgressUpdate(oldPositionMs: Int64) -> Bool {
+        let now = Date()
+        if currentTrackID != lastLiveActivityRequestTrackID {
+            return true
+        }
+
+        let secondsSinceLastRequest = now.timeIntervalSince(lastLiveActivityRequestAt)
+        let sonyJumpMs = abs(positionMs - oldPositionMs)
+        if sonyJumpMs > 2_500, secondsSinceLastRequest >= 3 {
+            log("[LiveActivityPerf] progress request reason=drift sonyJumpMs=\(sonyJumpMs)")
+            return true
+        }
+
+        if secondsSinceLastRequest >= 15 {
+            log("[LiveActivityPerf] progress request reason=interval")
+            return true
+        }
+
+        return false
+    }
+
+    private func currentLyricIndex(lines: [LyricLine], positionMs: Int64) -> Int? {
+        guard !lines.isEmpty else { return nil }
+        if positionMs < lines[0].timeMs {
+            return 0
+        }
+
+        var low = 0
+        var high = lines.count - 1
+        var result = 0
+        while low <= high {
+            let mid = (low + high) / 2
+            if lines[mid].timeMs <= positionMs {
+                result = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        return result
+    }
+
     private func updateLiveActivityDisconnected() {
         let snapshotTitle = title
         let snapshotArtist = artist
-        let snapshotAlbum = album
         let snapshotPositionMs = displayPositionMs
         let snapshotDurationMs = durationMs
         let snapshotTrackID = currentTrackID
@@ -1441,6 +1659,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 title: snapshotTitle,
                 artist: snapshotArtist,
                 lyric: "连接已断开",
+                lyricLineIndex: -1,
                 isPlaying: false,
                 positionMs: snapshotPositionMs,
                 durationMs: snapshotDurationMs,
@@ -1448,6 +1667,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 artworkKey: snapshotArtworkKey,
                 artworkRevision: snapshotArtworkRevision,
                 connectionState: "disconnected",
+                appState: self.appLifecycleState,
                 reason: "disconnect",
                 force: true,
                 logger: { [weak self] message in

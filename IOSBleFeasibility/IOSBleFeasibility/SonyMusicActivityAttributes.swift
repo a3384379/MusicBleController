@@ -7,6 +7,7 @@ struct SonyMusicActivityAttributes: ActivityAttributes {
         var title: String
         var artist: String
         var lyric: String
+        var lyricLineIndex: Int
         var isPlaying: Bool
         var positionAtAnchorMs: Int64
         var anchorDate: Date

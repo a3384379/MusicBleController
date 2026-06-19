@@ -19,6 +19,8 @@ final class LiveActivityManager {
     private var debounceTask: Task<Void, Never>?
     private var startInFlight = false
     private var startCooldownUntil = Date.distantPast
+    private var updateCounterWindowStart = Date()
+    private var updateCounterInWindow = 0
 
     private init() {}
 
@@ -26,6 +28,7 @@ final class LiveActivityManager {
         title: String,
         artist: String,
         lyric: String,
+        lyricLineIndex: Int = -1,
         isPlaying: Bool,
         positionMs: Int64,
         durationMs: Int64,
@@ -33,6 +36,7 @@ final class LiveActivityManager {
         artworkKey: String?,
         artworkRevision: Int,
         connectionState: String = "connected",
+        appState: String = "unknown",
         reason: String = "unknown",
         force: Bool = false,
         logger: ((String) -> Void)? = nil
@@ -46,6 +50,7 @@ final class LiveActivityManager {
             title: title,
             artist: artist,
             lyric: lyric,
+            lyricLineIndex: lyricLineIndex,
             isPlaying: isPlaying,
             positionMs: positionMs,
             durationMs: durationMs,
@@ -59,9 +64,13 @@ final class LiveActivityManager {
         let payloadBytes = payloadSize(merged)
         logger?(
             "[LiveActivity] update request reason=\(reason) " +
-                "title=\(merged.title) lyric=\(merged.lyric) trackId=\(merged.trackId)"
+                "appState=\(appState) title=\(merged.title) lyric=\(merged.lyric) " +
+                "lineIndex=\(merged.lyricLineIndex) trackId=\(merged.trackId)"
         )
         logger?("[LiveActivityPerf] payloadBytes=\(payloadBytes)")
+        if payloadBytes >= 1_024 {
+            logger?("[LiveActivityPerf] payload warning bytes=\(payloadBytes)")
+        }
 
         guard shouldUpdate(
             candidate: merged,
@@ -141,6 +150,7 @@ final class LiveActivityManager {
             merged.title = candidate.title
             merged.artist = candidate.artist
             merged.lyric = candidate.lyric
+            merged.lyricLineIndex = candidate.lyricLineIndex
             merged.isPlaying = candidate.isPlaying
             merged.positionAtAnchorMs = candidate.positionAtAnchorMs
             merged.anchorDate = candidate.anchorDate
@@ -171,6 +181,7 @@ final class LiveActivityManager {
         title: String,
         artist: String,
         lyric: String,
+        lyricLineIndex: Int,
         isPlaying: Bool,
         positionMs: Int64,
         durationMs: Int64,
@@ -215,6 +226,7 @@ final class LiveActivityManager {
             title: cleanTitle,
             artist: cleanArtist,
             lyric: cleanLyric,
+            lyricLineIndex: lyricLineIndex,
             isPlaying: isPlaying,
             positionAtAnchorMs: max(positionMs, 0),
             anchorDate: Date(),
@@ -331,11 +343,12 @@ final class LiveActivityManager {
                         self.lastSentState = state
                         self.lastSentVersion = version
                         self.lastCalibrationDate = Date()
+                        self.recordUpdateSent(logger: logger)
                     }
                     logger?(
                         "[LiveActivity] update sent reason=\(reason) " +
                             "title=\(state.title) lyric=\(state.lyric) " +
-                            "position=\(state.positionAtAnchorMs)"
+                            "lineIndex=\(state.lyricLineIndex) position=\(state.positionAtAnchorMs)"
                     )
                     logger?("[LiveActivityState] update success version=\(version)")
                 }
@@ -355,13 +368,13 @@ final class LiveActivityManager {
         for state: SonyMusicActivityAttributes.ContentState,
         logger: ((String) -> Void)?
     ) async -> Activity<SonyMusicActivityAttributes>? {
-        if let activity { return activity }
+        if let activity {
+            endDuplicateActivities(keeping: activity.id, logger: logger)
+            return activity
+        }
 
         logger?("[LiveActivity] activity missing, lookup existing")
-        if let existing = Activity<SonyMusicActivityAttributes>.activities.first {
-            activity = existing
-            observeStateUpdates(for: existing, logger: logger)
-            logger?("[LiveActivity] existing activity restored id=\(existing.id)")
+        if let existing = restoreExistingActivity(logger: logger) {
             return existing
         }
 
@@ -372,6 +385,9 @@ final class LiveActivityManager {
         state: SonyMusicActivityAttributes.ContentState,
         logger: ((String) -> Void)?
     ) async -> Activity<SonyMusicActivityAttributes>? {
+        if let existing = restoreExistingActivity(logger: logger) {
+            return existing
+        }
         if startInFlight {
             logger?("[LiveActivity] start skipped reason=start in flight")
             return nil
@@ -394,13 +410,39 @@ final class LiveActivityManager {
             activity = requested
             observeStateUpdates(for: requested, logger: logger)
             lastSentState = state
+            lastSentVersion = stateVersion
             lastCalibrationDate = Date()
-            logger?("[LiveActivity] start")
+            logger?("[LiveActivity] start id=\(requested.id)")
             return requested
         } catch {
             startCooldownUntil = Date().addingTimeInterval(5)
             logger?("[LiveActivity] error=\(error.localizedDescription)")
             return nil
+        }
+    }
+
+    private func restoreExistingActivity(
+        logger: ((String) -> Void)?
+    ) -> Activity<SonyMusicActivityAttributes>? {
+        let activities = Activity<SonyMusicActivityAttributes>.activities
+        guard let existing = activities.first else { return nil }
+        activity = existing
+        observeStateUpdates(for: existing, logger: logger)
+        endDuplicateActivities(keeping: existing.id, logger: logger)
+        logger?("[LiveActivity] existing restored id=\(existing.id)")
+        return existing
+    }
+
+    private func endDuplicateActivities(
+        keeping activityID: String?,
+        logger: ((String) -> Void)?
+    ) {
+        for duplicate in Activity<SonyMusicActivityAttributes>.activities
+            where duplicate.id != activityID {
+            logger?("[LiveActivity] duplicate activity ending id=\(duplicate.id)")
+            Task {
+                await duplicate.end(nil, dismissalPolicy: .immediate)
+            }
         }
     }
 
@@ -417,7 +459,10 @@ final class LiveActivityManager {
                     case .active, .stale:
                         self?.activity = activity
                     case .ended, .dismissed:
-                        self?.activity = nil
+                        if self?.activity?.id == activity.id {
+                            self?.activity = nil
+                        }
+                        self?.startCooldownUntil = Date().addingTimeInterval(5)
                     @unknown default:
                         break
                     }
@@ -434,6 +479,7 @@ final class LiveActivityManager {
             previous.title != current.title ||
             previous.artist != current.artist ||
             previous.lyric != current.lyric ||
+            previous.lyricLineIndex != current.lyricLineIndex ||
             previous.isPlaying != current.isPlaying ||
             previous.durationMs != current.durationMs ||
             previous.connectionState != current.connectionState ||
@@ -490,13 +536,26 @@ final class LiveActivityManager {
 
     private func staleDate(for state: SonyMusicActivityAttributes.ContentState) -> Date {
         if state.connectionState == "disconnected" {
-            return Date().addingTimeInterval(60)
+            return Date().addingTimeInterval(30)
         }
         return Date().addingTimeInterval(state.isPlaying ? 45 : 5 * 60)
     }
 
     private func payloadSize(_ state: SonyMusicActivityAttributes.ContentState) -> Int {
         (try? JSONEncoder().encode(state).count) ?? 0
+    }
+
+    private func recordUpdateSent(logger: ((String) -> Void)?) {
+        let now = Date()
+        if now.timeIntervalSince(updateCounterWindowStart) >= 60 {
+            logger?(
+                "[LiveActivityPerf] update count last60s=\(updateCounterInWindow)"
+            )
+            updateCounterWindowStart = now
+            updateCounterInWindow = 0
+        }
+        updateCounterInWindow += 1
+        logger?("[LiveActivityPerf] update count window=\(updateCounterInWindow)")
     }
 
     private func cleaned(_ value: String, fallback: String) -> String {
@@ -528,6 +587,7 @@ final class LiveActivityManager {
         let priority = [
             "unknown": 0,
             "playbackState": 1,
+            "albumArt": 1,
             "seek": 2,
             "playState": 3,
             "artworkUnavailable": 4,
