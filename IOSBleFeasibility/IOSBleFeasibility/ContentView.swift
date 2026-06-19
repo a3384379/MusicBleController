@@ -7,6 +7,7 @@ struct ContentView: View {
     @State private var showDebugTools = false
     @State private var showMediaFieldDump = false
     @State private var showVolumeDetails = false
+    @State private var showFullLyrics = false
 
     var body: some View {
         NavigationStack {
@@ -15,7 +16,7 @@ struct ContentView: View {
                     .ignoresSafeArea()
 
                 ScrollView(showsIndicators: false) {
-                    VStack(spacing: 12) {
+                    VStack(spacing: 13) {
                         connectionSection
                         nowPlayingSection
                         lyricCard
@@ -26,12 +27,26 @@ struct ContentView: View {
                     }
                     .frame(maxWidth: 390)
                     .padding(.horizontal, 24)
-                    .padding(.top, 20)
+                    .padding(.top, 18)
                     .padding(.bottom, 32)
                     .frame(maxWidth: .infinity)
                 }
             }
             .toolbar(.hidden, for: .navigationBar)
+            .fullScreenCover(isPresented: $showFullLyrics) {
+                FullLyricsView(
+                    title: nowPlayingInfo.title,
+                    artist: nowPlayingInfo.artist,
+                    albumArtImage: bleManager.albumArtImage,
+                    lyrics: bleManager.fullLyrics,
+                    currentIndex: currentFullLyricIndex,
+                    isPlaying: bleManager.isPlaying,
+                    onDismiss: { showFullLyrics = false },
+                    onPrevious: bleManager.sendPrevious,
+                    onPlayPause: bleManager.sendPlayPause,
+                    onNext: bleManager.sendNext
+                )
+            }
         }
     }
 
@@ -40,8 +55,8 @@ struct ContentView: View {
             HStack(spacing: 8) {
                 Circle()
                     .fill(connectionColor)
-                    .frame(width: 8, height: 8)
-                    .shadow(color: connectionColor.opacity(0.6), radius: 6)
+                    .frame(width: 9, height: 9)
+                    .shadow(color: connectionColor.opacity(0.78), radius: 8)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(bleManager.connectionStatus)
@@ -55,7 +70,10 @@ struct ContentView: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .background(.ultraThinMaterial, in: Capsule())
+            .background(.white.opacity(0.10), in: Capsule())
+            .overlay {
+                Capsule().stroke(.white.opacity(0.08), lineWidth: 1)
+            }
             .frame(maxWidth: .infinity, alignment: .leading)
 
             Spacer()
@@ -68,8 +86,11 @@ struct ContentView: View {
                     .font(.headline)
                     .frame(width: 44, height: 44)
             }
-            .buttonStyle(.plain)
-            .background(.ultraThinMaterial, in: Circle())
+            .buttonStyle(PressScaleButtonStyle(pressedScale: 0.96))
+            .background(.white.opacity(0.11), in: Circle())
+            .overlay {
+                Circle().stroke(.white.opacity(0.10), lineWidth: 1)
+            }
             .accessibilityLabel("扫描或重新连接")
         }
         .foregroundStyle(.white)
@@ -77,39 +98,47 @@ struct ContentView: View {
     }
 
     private var nowPlayingSection: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 9) {
             albumArtView
                 .id(albumArtIdentity)
                 .transition(.opacity.combined(with: .scale(scale: 0.98)))
                 .animation(.easeInOut(duration: 0.28), value: albumArtIdentity)
 
             VStack(spacing: 4) {
-                Text(displayText(bleManager.title, fallback: "Sony Music"))
-                    .font(.system(size: 24, weight: .bold, design: .rounded))
+                Text(nowPlayingInfo.title)
+                    .font(.system(size: 32, weight: .bold, design: .rounded))
                     .multilineTextAlignment(.center)
                     .lineLimit(2)
-                    .minimumScaleFactor(0.68)
+                    .minimumScaleFactor(0.58)
 
-                Text(displayText(bleManager.artist, fallback: "未知歌手"))
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.78))
+                Text(nowPlayingInfo.artist)
+                    .font(.system(size: 18, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.72))
                     .lineLimit(1)
+                    .padding(.top, 4)
 
-                Text(displayText(bleManager.album, fallback: "未知专辑"))
-                    .font(.caption)
-                    .foregroundStyle(.white.opacity(0.54))
+                Text(nowPlayingInfo.album)
+                    .font(.system(size: 15, weight: .regular, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.46))
                     .lineLimit(1)
             }
 
             HStack(spacing: 8) {
-                Image(systemName: bleManager.isPlaying ? "waveform" : "pause.fill")
+                Image(systemName: bleManager.isPlaying ? "music.note" : "pause.fill")
                 Text(bleManager.isPlaying ? "播放中" : "已暂停")
             }
             .font(.caption.weight(.semibold))
-            .foregroundStyle(bleManager.isPlaying ? .green : .white.opacity(0.62))
+            .foregroundStyle(
+                bleManager.isPlaying
+                    ? Color.green.opacity(0.95)
+                    : Color.white.opacity(0.62)
+            )
             .padding(.horizontal, 11)
             .padding(.vertical, 6)
-            .background(.white.opacity(0.12), in: Capsule())
+            .background(.white.opacity(0.095), in: Capsule())
+            .overlay {
+                Capsule().stroke(.white.opacity(0.08), lineWidth: 1)
+            }
             .animation(.spring(response: 0.28, dampingFraction: 0.78), value: bleManager.isPlaying)
         }
         .foregroundStyle(.white)
@@ -129,36 +158,68 @@ struct ContentView: View {
             }
         }
         .frame(width: albumArtSize, height: albumArtSize)
-        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(.white.opacity(0.16), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .stroke(.white.opacity(0.14), lineWidth: 1)
         }
-        .shadow(color: .black.opacity(0.34), radius: 24, y: 14)
+        .shadow(color: .black.opacity(0.28), radius: 22, y: 12)
         .accessibilityLabel("当前歌曲封面")
     }
 
     private var lyricCard: some View {
-        VStack(spacing: 6) {
-            Text(currentLyricText)
-                .font(.system(size: 18, weight: .semibold, design: .rounded))
-                .foregroundStyle(.white)
-                .multilineTextAlignment(.center)
-                .lineLimit(2)
-                .minimumScaleFactor(0.82)
-                .frame(maxWidth: .infinity, minHeight: 42)
-                .id(currentLyricText)
-                .transition(.opacity)
-                .animation(.easeInOut(duration: 0.22), value: currentLyricText)
+        Button {
+            if bleManager.fullLyrics.isEmpty {
+                bleManager.sendGetFullLyrics(force: true)
+            }
+            showFullLyrics = true
+        } label: {
+            VStack(spacing: 8) {
+                Text("当前歌词")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.46))
+                    .textCase(.uppercase)
+                    .tracking(1.2)
+
+                if bleManager.fullLyrics.isEmpty {
+                    Text(currentLyricText)
+                        .font(.system(size: 28, weight: .semibold, design: .rounded))
+                        .foregroundStyle(
+                            currentLyricText == "暂无歌词"
+                                ? Color.white.opacity(0.58)
+                                : Color.white.opacity(0.93)
+                        )
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.68)
+                        .frame(maxWidth: .infinity, minHeight: 62)
+                } else {
+                    VStack(spacing: 5) {
+                        Text(lyricPreviewLine(offset: -1))
+                            .font(.system(size: 17, weight: .medium, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.44))
+                            .lineLimit(1)
+                        Text(lyricPreviewLine(offset: 0))
+                            .font(.system(size: 24, weight: .bold, design: .rounded))
+                            .foregroundStyle(Color.green.opacity(0.96))
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.72)
+                        Text(lyricPreviewLine(offset: 1))
+                            .font(.system(size: 17, weight: .medium, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.44))
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 82)
+                }
+            }
+            .padding(.horizontal, 4)
+            .padding(.vertical, 4)
+            .id(lyricPreviewIdentity)
+            .transition(.opacity)
+            .animation(.easeInOut(duration: 0.22), value: lyricPreviewIdentity)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-        .frame(minHeight: 66)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(.white.opacity(0.12), lineWidth: 1)
-        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("打开完整歌词")
     }
 
     private var progressSection: some View {
@@ -169,7 +230,7 @@ struct ContentView: View {
                         Double(
                             bleManager.isSeeking
                                 ? bleManager.seekPositionMs
-                                : bleManager.positionMs
+                                : bleManager.displayPositionMs
                         )
                     },
                     set: { value in
@@ -185,7 +246,7 @@ struct ContentView: View {
                     }
                 }
             )
-            .tint(.white)
+            .tint(.white.opacity(0.94))
             .disabled(!isConnected || bleManager.durationMs <= 0)
 
             HStack {
@@ -193,8 +254,8 @@ struct ContentView: View {
                 Spacer()
                 Text(format(milliseconds: bleManager.durationMs))
             }
-            .font(.caption.monospacedDigit().weight(.medium))
-            .foregroundStyle(.white.opacity(0.64))
+            .font(.caption2.monospacedDigit().weight(.medium))
+            .foregroundStyle(.white.opacity(0.58))
         }
         .padding(.horizontal, 4)
         .animation(
@@ -219,10 +280,10 @@ struct ContentView: View {
                     .foregroundStyle(.black)
                     .frame(width: 70, height: 70)
                     .background(.white, in: Circle())
-                    .shadow(color: .black.opacity(0.28), radius: 14, y: 8)
+                    .shadow(color: .black.opacity(0.18), radius: 12, y: 7)
                     .scaleEffect(bleManager.isPlaying ? 1.0 : 0.96)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(PressScaleButtonStyle(pressedScale: 0.92))
             .accessibilityLabel("播放 / 暂停")
 
             playerControlButton(
@@ -286,10 +347,10 @@ struct ContentView: View {
                 }
                 .padding(13)
                 .foregroundStyle(.white)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .background(.white.opacity(0.062), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .overlay {
                     RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(.white.opacity(0.12), lineWidth: 1)
+                        .stroke(.white.opacity(0.08), lineWidth: 1)
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
@@ -315,22 +376,22 @@ struct ContentView: View {
                         value: Double(displayedVolume),
                         total: Double(max(bleManager.volumeMax, 1))
                     )
-                    .tint(.white)
+                    .tint(.white.opacity(0.86))
                 }
                 Spacer()
                 Image(systemName: showVolumeDetails ? "chevron.up" : "chevron.down")
                     .font(.caption.weight(.bold))
-                    .foregroundStyle(.white.opacity(0.62))
+                    .foregroundStyle(.white.opacity(0.56))
             }
             .padding(13)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .foregroundStyle(.white)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(.white.opacity(0.070), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(.white.opacity(0.12), lineWidth: 1)
+                .stroke(.white.opacity(0.08), lineWidth: 1)
         }
     }
 
@@ -340,19 +401,19 @@ struct ContentView: View {
 
             if showDebugTools {
                 VStack(alignment: .leading, spacing: 14) {
-                refreshControls
-                localLogSection
-                Divider().overlay(.white.opacity(0.18))
-                remoteLogSection
-                Divider().overlay(.white.opacity(0.18))
-                mediaFieldDumpSection
+                    refreshControls
+                    localLogSection
+                    Divider().overlay(.white.opacity(0.18))
+                    remoteLogSection
+                    Divider().overlay(.white.opacity(0.18))
+                    mediaFieldDumpSection
                 }
                 .padding(13)
                 .foregroundStyle(.white)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .overlay {
                     RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(.white.opacity(0.12), lineWidth: 1)
+                        .stroke(.white.opacity(0.08), lineWidth: 1)
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
@@ -367,7 +428,7 @@ struct ContentView: View {
         } label: {
             HStack {
                 Label("Debug Tools", systemImage: "wrench.and.screwdriver")
-                    .font(.headline)
+                    .font(.subheadline.weight(.semibold))
                 Spacer()
                 Image(systemName: showDebugTools ? "chevron.up" : "chevron.down")
                     .font(.caption.weight(.bold))
@@ -377,10 +438,10 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(.white)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(.white.opacity(0.050), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(.white.opacity(0.12), lineWidth: 1)
+                .stroke(.white.opacity(0.07), lineWidth: 1)
         }
     }
 
@@ -597,16 +658,59 @@ struct ContentView: View {
     }
 
     private var displayedPositionMs: Int64 {
-        bleManager.isSeeking ? bleManager.seekPositionMs : bleManager.positionMs
+        bleManager.isSeeking ? bleManager.seekPositionMs : bleManager.displayPositionMs
     }
 
     private var displayedVolume: Int {
         bleManager.isVolumeSeeking ? bleManager.volumeSeekValue : bleManager.volumeCurrent
     }
 
+    private var nowPlayingInfo: NowPlayingInfoProvider {
+        NowPlayingInfoProvider(
+            title: displayText(bleManager.title, fallback: "Sony Music"),
+            artist: displayText(bleManager.artist, fallback: "未知歌手"),
+            album: displayText(bleManager.album, fallback: "未知专辑"),
+            albumArt: bleManager.albumArtImage,
+            positionMs: displayedPositionMs,
+            durationMs: bleManager.durationMs,
+            isPlaying: bleManager.isPlaying
+        )
+    }
+
     private var currentLyricText: String {
         let trimmed = bleManager.lyric.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "暂无歌词" : trimmed
+    }
+
+    private var currentFullLyricIndex: Int {
+        guard !bleManager.fullLyrics.isEmpty else { return -1 }
+        let position = displayedPositionMs
+        var result = 0
+        for (index, line) in bleManager.fullLyrics.enumerated() {
+            if line.timeMs <= position {
+                result = index
+            } else {
+                break
+            }
+        }
+        return result
+    }
+
+    private var lyricPreviewIdentity: String {
+        if bleManager.fullLyrics.isEmpty {
+            return currentLyricText
+        }
+        return "\(bleManager.fullLyricsTrackId)-\(currentFullLyricIndex)"
+    }
+
+    private func lyricPreviewLine(offset: Int) -> String {
+        let index = currentFullLyricIndex + offset
+        guard bleManager.fullLyrics.indices.contains(index) else {
+            return offset == 0 ? currentLyricText : " "
+        }
+        let text = bleManager.fullLyrics[index].text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? " " : text
     }
 
     private var albumArtIdentity: String {
@@ -617,7 +721,7 @@ struct ContentView: View {
     }
 
     private var albumArtSize: CGFloat {
-        240
+        260
     }
 
     private var volumeIcon: String {
@@ -642,12 +746,12 @@ struct ContentView: View {
                 .font(.system(size: fontSize, weight: .bold))
                 .foregroundStyle(.white)
                 .frame(width: size, height: size)
-                .background(.white.opacity(0.14), in: Circle())
+                .background(.white.opacity(0.10), in: Circle())
                 .overlay {
-                    Circle().stroke(.white.opacity(0.16), lineWidth: 1)
+                    Circle().stroke(.white.opacity(0.10), lineWidth: 1)
                 }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressScaleButtonStyle(pressedScale: 0.92))
         .accessibilityLabel(title)
     }
 
@@ -662,10 +766,10 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 10)
         }
-        .buttonStyle(.plain)
-        .background(.white.opacity(0.12), in: Capsule())
+        .buttonStyle(PressScaleButtonStyle(pressedScale: 0.96))
+        .background(.white.opacity(0.10), in: Capsule())
         .overlay {
-            Capsule().stroke(.white.opacity(0.12), lineWidth: 1)
+            Capsule().stroke(.white.opacity(0.09), lineWidth: 1)
         }
     }
 
@@ -690,10 +794,12 @@ private struct PlayerBackgroundView: View {
                     Image(uiImage: image)
                         .resizable()
                         .scaledToFill()
+                        .saturation(1.15)
+                        .brightness(-0.08)
                         .frame(width: proxy.size.width, height: proxy.size.height)
                         .clipped()
                         .blur(radius: 34)
-                        .overlay(Color.black.opacity(0.42))
+                        .overlay(Color.black.opacity(0.28))
                 } else {
                     LinearGradient(
                         colors: [
@@ -709,9 +815,9 @@ private struct PlayerBackgroundView: View {
 
                 LinearGradient(
                     colors: [
-                        Color.black.opacity(0.18),
-                        Color.black.opacity(0.08),
-                        Color.black.opacity(0.72)
+                        Color.black.opacity(0.28),
+                        Color.black.opacity(0.12),
+                        Color.black.opacity(0.80)
                     ],
                     startPoint: .top,
                     endPoint: .bottom
@@ -719,6 +825,26 @@ private struct PlayerBackgroundView: View {
                 .frame(width: proxy.size.width, height: proxy.size.height)
             }
         }
+    }
+}
+
+private struct NowPlayingInfoProvider {
+    let title: String
+    let artist: String
+    let album: String
+    let albumArt: UIImage?
+    let positionMs: Int64
+    let durationMs: Int64
+    let isPlaying: Bool
+}
+
+private struct PressScaleButtonStyle: ButtonStyle {
+    var pressedScale: CGFloat = 0.96
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? pressedScale : 1.0)
+            .animation(.spring(response: 0.18, dampingFraction: 0.72), value: configuration.isPressed)
     }
 }
 
