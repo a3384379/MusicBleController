@@ -32,6 +32,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.security.MessageDigest
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -583,6 +584,7 @@ class BleGattServerManager(
             "CLIENT_CAPABILITIES" -> handleClientCapabilities(request)
             "DUMP_MEDIA_FIELDS" -> sendMediaFieldDump()
             "GET_FULL_LYRICS" -> sendFullLyrics(request)
+            "GET_LYRIC_SECONDARY" -> sendLyricSecondary(request)
             "GET_PLAY_HISTORY_PAGE" -> sendPlayHistoryPage(request)
             "GET_PLAY_HISTORY_SINCE" -> sendPlayHistorySince(request)
             "GET_PLAY_STATS" -> sendPlayStats(request)
@@ -592,11 +594,13 @@ class BleGattServerManager(
 
     private fun cancelHistoryTransfersForControl(command: String) {
         if (notifyQueue.hasJobTypeActiveOrQueued(PLAY_HISTORY_JOB_TYPE) ||
-            notifyQueue.hasJobTypeActiveOrQueued(PLAY_STATS_JOB_TYPE)
+            notifyQueue.hasJobTypeActiveOrQueued(PLAY_STATS_JOB_TYPE) ||
+            notifyQueue.hasJobTypeActiveOrQueued(LYRIC_SECONDARY_JOB_TYPE)
         ) {
             logger("[HistoryBLE] cancelled reason=control command cmd=$command")
+            logger("[LyricSecondary] cancelled reason=control command cmd=$command")
             notifyQueue.cancelJobTypes(
-                setOf(PLAY_HISTORY_JOB_TYPE, PLAY_STATS_JOB_TYPE),
+                setOf(PLAY_HISTORY_JOB_TYPE, PLAY_STATS_JOB_TYPE, LYRIC_SECONDARY_JOB_TYPE),
                 "control command"
             )
         }
@@ -1639,11 +1643,19 @@ class BleGattServerManager(
     }
 
     private fun buildAlbumArtProtocolId(playbackState: JSONObject): String {
-        val source = listOf(
-            playbackState.optString("title"),
-            playbackState.optString("artist"),
-            playbackState.optString("album")
-        ).joinToString("|").ifBlank { "unknown" }
+        return buildAlbumArtProtocolId(
+            title = playbackState.optString("title"),
+            artist = playbackState.optString("artist"),
+            album = playbackState.optString("album")
+        )
+    }
+
+    private fun buildAlbumArtProtocolId(
+        title: String,
+        artist: String,
+        album: String
+    ): String {
+        val source = listOf(title, artist, album).joinToString("|").ifBlank { "unknown" }
         return MessageDigest.getInstance("SHA-256")
             .digest(source.toByteArray(Charsets.UTF_8))
             .take(ALBUM_ART_ID_HASH_BYTES)
@@ -2333,6 +2345,9 @@ class BleGattServerManager(
         } else {
             emptySet()
         }
+        val debugLineIndexes = (wordLineIndexes + setOf(0, 1, 2))
+            .filter { it in lines.indices }
+            .toSet()
 
         if (lines.isEmpty()) {
             val unavailable = JSONObject()
@@ -2386,6 +2401,17 @@ class BleGattServerManager(
                 logger("[FullLyrics] send failed: chunk $index exceeds MTU")
                 return
             }
+            if (index in debugLineIndexes) {
+                val payload = runCatching { JSONObject(String(chunk, Charsets.UTF_8)) }
+                    .getOrNull()
+                logger(
+                    "[FullLyricsDebug] chunk index=$index " +
+                        "text=${line.text.take(24)} " +
+                        "translation=${line.translation?.take(24).orEmpty()} " +
+                        "romanization=${line.romanization?.take(24).orEmpty()} " +
+                        "payloadKeys=${payload?.keys()?.asSequence()?.toList().orEmpty()}"
+                )
+            }
             packets += BleNotifyQueue.Packet(
                 type = "fullLyricsChunk",
                 value = chunk,
@@ -2412,6 +2438,10 @@ class BleGattServerManager(
         }
         val wordsLines = wordLineIndexes.count { lines[it].words.isNotEmpty() }
         logger(
+            "[FullLyricsDebug] first line trans=${lines.firstOrNull()?.translation?.take(24).orEmpty()} " +
+                "roma=${lines.firstOrNull()?.romanization?.take(24).orEmpty()}"
+        )
+        logger(
             "[FullLyrics] mode=lineOnly wordsAroundCurrent=$includeWordsAroundCurrent " +
                 "wordLines=$wordsLines"
         )
@@ -2433,6 +2463,230 @@ class BleGattServerManager(
                 logger("[FullLyrics] send end trackId=$trackId")
             }
         )
+    }
+
+    private fun sendLyricSecondary(request: JSONObject) {
+        val device = subscribedDevices.values.firstOrNull() ?: run {
+            logger("[LyricSecondary] send skipped: no iPhone subscriber")
+            return
+        }
+        val mode = request.optString("mode")
+        if (mode != LYRIC_SECONDARY_MODE_TRANSLATION &&
+            mode != LYRIC_SECONDARY_MODE_ROMANIZATION
+        ) {
+            sendLyricSecondaryUnavailable(
+                device = device,
+                trackId = request.optString("trackId"),
+                mode = mode,
+                reason = "invalid mode"
+            )
+            return
+        }
+        val source = playbackStateReader.readPlaybackState()
+        val trackId = buildAlbumArtProtocolId(source)
+        val requestedTrackId = request.optString("trackId")
+        if (requestedTrackId.isNotBlank() && requestedTrackId != trackId) {
+            sendLyricSecondaryUnavailable(
+                device = device,
+                trackId = requestedTrackId,
+                mode = mode,
+                reason = "stale track"
+            )
+            return
+        }
+        val lines = playbackStateReader.lyricLinesSnapshot()
+            .filter { it.text.isNotBlank() }
+            .take(MAX_FULL_LYRICS_LINES)
+        if (lines.isEmpty()) {
+            sendLyricSecondaryUnavailable(
+                device = device,
+                trackId = trackId,
+                mode = mode,
+                reason = "lyrics loading"
+            )
+            return
+        }
+
+        var skippedPlaceholderCount = 0
+        val items: List<Pair<Int, String>> = lines.mapIndexedNotNull { index, line ->
+            val rawText = when (mode) {
+                LYRIC_SECONDARY_MODE_TRANSLATION -> line.translation
+                LYRIC_SECONDARY_MODE_ROMANIZATION -> line.romanization
+                else -> null
+            }
+            val text = sanitizeSecondaryLyricText(rawText)
+            if (!rawText.isNullOrBlank() && text == null) {
+                skippedPlaceholderCount += 1
+                if (skippedPlaceholderCount == 1 || LogConfig.DEBUG_VERBOSE_LOG) {
+                    logger("[LyricSecondary] skip placeholder line=$index mode=$mode")
+                }
+            }
+            text?.let { index to it }
+        }
+        if (skippedPlaceholderCount > 1 && !LogConfig.DEBUG_VERBOSE_LOG) {
+            logger("[LyricSecondary] skip placeholder count=$skippedPlaceholderCount mode=$mode")
+        }
+        if (items.isEmpty()) {
+            sendLyricSecondaryUnavailable(
+                device = device,
+                trackId = trackId,
+                mode = mode,
+                reason = "not available"
+            )
+            return
+        }
+
+        val maximumPayload = maximumPayloadFor(device)
+        val transferId = UUID.randomUUID().toString().take(8)
+        val packets = mutableListOf<BleNotifyQueue.Packet>()
+        val start = JSONObject()
+            .put("type", "lyricSecondaryStart")
+            .put("trackId", trackId)
+            .put("transferId", transferId)
+            .put("mode", mode)
+            .put("lineCount", lines.size)
+            .put("itemCount", items.size)
+            .toString()
+            .toByteArray(Charsets.UTF_8)
+        if (start.size > maximumPayload) {
+            sendLyricSecondaryUnavailable(
+                device = device,
+                trackId = trackId,
+                mode = mode,
+                reason = "start exceeds MTU"
+            )
+            return
+        }
+        packets += BleNotifyQueue.Packet(
+            type = "lyricSecondaryStart",
+            value = start,
+            delayAfterMs = FULL_LYRICS_NOTIFICATION_DELAY_MS
+        )
+
+        var partTotal = 0
+        items.forEach { (lineIndex, text) ->
+            val parts = splitLyricSecondaryText(
+                trackId = trackId,
+                transferId = transferId,
+                mode = mode,
+                lineIndex = lineIndex,
+                text = text,
+                maximumPayload = maximumPayload
+            )
+            if (parts.isEmpty()) {
+                logger("[LyricSecondary] line=$lineIndex skipped reason=part exceeds MTU")
+                return@forEach
+            }
+            logger(
+                "[LyricSecondary] line=$lineIndex chars=${text.length} " +
+                    "bytes=${text.toByteArray(Charsets.UTF_8).size} parts=${parts.size}"
+            )
+            parts.forEachIndexed { partIndex, partText ->
+                val part = buildLyricSecondaryPartJson(
+                    trackId = trackId,
+                    transferId = transferId,
+                    mode = mode,
+                    lineIndex = lineIndex,
+                    partIndex = partIndex,
+                    partCount = parts.size,
+                    text = partText
+                ).toByteArray(Charsets.UTF_8)
+                if (part.size <= maximumPayload) {
+                    packets += BleNotifyQueue.Packet(
+                        type = "lyricSecondaryPart",
+                        value = part,
+                        delayAfterMs = FULL_LYRICS_NOTIFICATION_DELAY_MS
+                    )
+                    partTotal += 1
+                } else {
+                    logger(
+                        "[LyricSecondary] part line=$lineIndex " +
+                            "index=$partIndex/${parts.size} exceeds MTU bytes=${part.size}"
+                    )
+                }
+            }
+        }
+
+        val end = JSONObject()
+            .put("type", "lyricSecondaryEnd")
+            .put("trackId", trackId)
+            .put("transferId", transferId)
+            .put("mode", mode)
+            .toString()
+            .toByteArray(Charsets.UTF_8)
+        if (end.size > maximumPayload || packets.size <= 1) {
+            sendLyricSecondaryUnavailable(
+                device = device,
+                trackId = trackId,
+                mode = mode,
+                reason = "payload unavailable"
+            )
+            return
+        }
+        packets += BleNotifyQueue.Packet(
+            type = "lyricSecondaryEnd",
+            value = end,
+            delayAfterMs = FULL_LYRICS_NOTIFICATION_DELAY_MS
+        )
+
+        val startedAtMs = SystemClock.elapsedRealtime()
+        logger(
+            "[LyricSecondary] mtu=${maximumPayload + ATT_HEADER_SIZE} " +
+                "maxPayload=$maximumPayload"
+        )
+        logger(
+            "[LyricSecondary] send start trackId=$trackId mode=$mode " +
+                "items=${items.size} parts=$partTotal"
+        )
+        notifyQueue.enqueueLongJob(
+            type = LYRIC_SECONDARY_JOB_TYPE,
+            device = device,
+            packets = packets,
+            shouldCancel = {
+                val currentTrackId = playbackStateReader.readFastPlaybackSnapshot()
+                    ?.let { snapshot ->
+                        buildAlbumArtProtocolId(
+                            title = snapshot.title,
+                            artist = snapshot.artist,
+                            album = snapshot.album
+                        )
+                    }
+                currentTrackId != trackId
+            },
+            onComplete = {
+                logger(
+                    "[LyricSecondary] send end mode=$mode parts=$partTotal " +
+                        "costMs=${SystemClock.elapsedRealtime() - startedAtMs}"
+                )
+            },
+            onFailure = {
+                logger("[LyricSecondary] cancelled reason=track changed")
+            }
+        )
+    }
+
+    private fun sendLyricSecondaryUnavailable(
+        device: BluetoothDevice,
+        trackId: String,
+        mode: String,
+        reason: String
+    ) {
+        val value = JSONObject()
+            .put("type", "lyricSecondaryUnavailable")
+            .put("trackId", trackId)
+            .put("mode", mode)
+            .put("reason", reason)
+            .toString()
+            .toByteArray(Charsets.UTF_8)
+        if (value.size <= maximumPayloadFor(device)) {
+            notifyQueue.enqueueShort(
+                device = device,
+                type = "lyricSecondaryUnavailable",
+                value = value,
+                delayAfterMs = SHORT_MESSAGE_DELAY_MS
+            )
+        }
+        logger("[LyricSecondary] unavailable mode=$mode reason=$reason")
     }
 
     private fun findCurrentLyricIndex(
@@ -2500,12 +2754,15 @@ class BleGattServerManager(
                 timeMs = timeMs,
                 durationMs = durationMs,
                 text = fittedText,
+                translation = null,
+                romanization = null,
                 words = words
             ).toByteArray(Charsets.UTF_8)
             if (withWords.size <= maximumPayload) {
                 if (LogConfig.DEBUG_VERBOSE_LOG) {
                     verboseLogger(
-                        "[FullLyrics] chunk index=$index words=${words.size} " +
+                        "[FullLyrics] chunk index=$index " +
+                            "words=${words.size} " +
                             "payloadBytes=${withWords.size}"
                     )
                 }
@@ -2513,6 +2770,7 @@ class BleGattServerManager(
             }
             logger("[FullLyrics] words omitted index=$index reason=payload too large")
         }
+
         while (true) {
             val value = buildFullLyricsChunkJson(
                 trackId = trackId,
@@ -2520,6 +2778,8 @@ class BleGattServerManager(
                 timeMs = timeMs,
                 durationMs = durationMs,
                 text = fittedText,
+                translation = null,
+                romanization = null,
                 words = emptyList()
             ).toByteArray(Charsets.UTF_8)
             if (value.size <= maximumPayload) {
@@ -2544,6 +2804,8 @@ class BleGattServerManager(
         timeMs: Long,
         durationMs: Long,
         text: String,
+        translation: String?,
+        romanization: String?,
         words: List<com.example.playeragent.media.QrcLyricWord>
     ): String {
         return JSONObject()
@@ -2554,6 +2816,12 @@ class BleGattServerManager(
             .put("durationMs", durationMs)
             .put("text", text)
             .also { objectValue ->
+                translation
+                    ?.takeIf(String::isNotBlank)
+                    ?.let { objectValue.put("translation", it) }
+                romanization
+                    ?.takeIf(String::isNotBlank)
+                    ?.let { objectValue.put("romanization", it) }
                 if (words.isNotEmpty()) {
                     objectValue.put(
                         "words",
@@ -2572,6 +2840,87 @@ class BleGattServerManager(
                     )
                 }
             }
+            .toString()
+    }
+
+    private fun sanitizeSecondaryLyricText(value: String?): String? {
+        val trimmed = value?.trim().orEmpty()
+        if (trimmed.isBlank()) return null
+        if (trimmed.all { it == '/' }) return null
+        if (SECONDARY_LYRIC_PLACEHOLDERS.contains(trimmed.lowercase())) return null
+        return trimmed
+    }
+
+    private fun splitLyricSecondaryText(
+        trackId: String,
+        transferId: String,
+        mode: String,
+        lineIndex: Int,
+        text: String,
+        maximumPayload: Int
+    ): List<String> {
+        val codePoints = text.codePoints()
+            .toArray()
+            .map { codePoint -> String(Character.toChars(codePoint)) }
+        val parts = mutableListOf<String>()
+        var current = ""
+        codePoints.forEach { unit ->
+            val candidate = current + unit
+            val candidatePayload = buildLyricSecondaryPartJson(
+                trackId = trackId,
+                transferId = transferId,
+                mode = mode,
+                lineIndex = lineIndex,
+                partIndex = parts.size,
+                partCount = LYRIC_SECONDARY_PART_COUNT_PLACEHOLDER,
+                text = candidate
+            ).toByteArray(Charsets.UTF_8)
+            if (candidatePayload.size <= maximumPayload) {
+                current = candidate
+            } else {
+                if (current.isBlank()) {
+                    return emptyList()
+                }
+                parts += current
+                current = unit
+                val singlePayload = buildLyricSecondaryPartJson(
+                    trackId = trackId,
+                    transferId = transferId,
+                    mode = mode,
+                    lineIndex = lineIndex,
+                    partIndex = parts.size,
+                    partCount = LYRIC_SECONDARY_PART_COUNT_PLACEHOLDER,
+                    text = current
+                ).toByteArray(Charsets.UTF_8)
+                if (singlePayload.size > maximumPayload) {
+                    return emptyList()
+                }
+            }
+        }
+        if (current.isNotBlank()) {
+            parts += current
+        }
+        return parts
+    }
+
+    private fun buildLyricSecondaryPartJson(
+        trackId: String,
+        transferId: String,
+        mode: String,
+        lineIndex: Int,
+        partIndex: Int,
+        partCount: Int,
+        text: String
+    ): String {
+        return JSONObject()
+            .put("type", "lyricSecondaryPart")
+            .put("trackId", trackId)
+            .put("transferId", transferId)
+            .put("mode", mode)
+            .put("lineIndex", lineIndex)
+            .put("partIndex", partIndex)
+            .put("partCount", partCount)
+            .put("text", text)
             .toString()
     }
 
@@ -2669,11 +3018,25 @@ class BleGattServerManager(
         private const val ALBUM_ART_JOB_TYPE = "albumArt"
         private const val TRACK_INFO_JOB_TYPE = "trackInfo"
         private const val FULL_LYRICS_JOB_TYPE = "fullLyrics"
+        private const val LYRIC_SECONDARY_JOB_TYPE = "lyricSecondary"
         private const val MAX_LYRIC_TEXT_LENGTH = 30
         private const val REMOTE_LOG_JOB_TYPE = "remoteLog"
         private const val MEDIA_FIELD_DUMP_JOB_TYPE = "mediaFieldDump"
         private const val PLAY_HISTORY_JOB_TYPE = "playHistory"
         private const val PLAY_STATS_JOB_TYPE = "playStats"
+        private const val LYRIC_SECONDARY_MODE_TRANSLATION = "translation"
+        private const val LYRIC_SECONDARY_MODE_ROMANIZATION = "romanization"
+        private const val LYRIC_SECONDARY_PART_COUNT_PLACEHOLDER = 999
+        private val SECONDARY_LYRIC_PLACEHOLDERS = setOf(
+            "--",
+            "---",
+            "null",
+            "nil",
+            "none",
+            "暂无",
+            "暂无翻译",
+            "暂无罗马音"
+        )
         private const val DEFAULT_HISTORY_PAGE_LIMIT = 10
         private const val MAX_HISTORY_PAGE_LIMIT = 20
         private const val MAX_HISTORY_CHUNK_RAW_BYTES = 300

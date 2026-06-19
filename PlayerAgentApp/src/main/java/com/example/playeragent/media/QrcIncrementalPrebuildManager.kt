@@ -103,11 +103,20 @@ class QrcIncrementalPrebuildManager(
         val shouldTryCurrentTrack = currentTrack != null &&
             !currentTrack.hasLyrics &&
             isRecentForCurrentTrack(group, currentTrack)
-        if (!shouldTryCurrentTrack && cacheManager.isGroupCacheValid(group)) {
-            logger("[QrcIncremental] skip cached groupId=$groupId")
-            persistentIndexManager.markDirty(groupId)
-            incrementSkipped()
-            return
+        if (!shouldTryCurrentTrack) {
+            val validation = cacheManager.validateGroupCache(group, requireComplete = true)
+            if (validation.valid) {
+                logger("[QrcIncremental] skip cached groupId=$groupId")
+                logger("[QrcIndex] not marked dirty for skip cached groupId=$groupId")
+                incrementSkipped()
+                return
+            }
+            if (validation.cached != null) {
+                logger(
+                    "[QrcIncremental] rebuild stale cache groupId=$groupId " +
+                        "reason=${validation.reason}"
+                )
+            }
         }
         val parsed = try {
             QrcLyricUtils.decryptAndParseGroup(group, logger)
@@ -176,7 +185,9 @@ class QrcIncrementalPrebuildManager(
         }
         logger(
             "[QrcIncremental] success groupId=$groupId " +
-                "title=${parsed.title} lines=${parsed.lines.size}"
+                "title=${parsed.title} lines=${parsed.lines.size} " +
+                "trans=${parsed.lines.count { !it.translation.isNullOrBlank() }} " +
+                "roma=${parsed.lines.count { !it.romanization.isNullOrBlank() }}"
         )
         incrementSuccess()
     }

@@ -447,6 +447,7 @@ class BleNotifyQueue(
         return when (jobType) {
             "albumArt" -> ALBUM_ART_INTERLEAVE_INTERVAL
             "fullLyrics" -> FULL_LYRICS_INTERLEAVE_INTERVAL
+            "lyricSecondary" -> LYRIC_SECONDARY_INTERLEAVE_INTERVAL
             "remoteLog", "mediaFieldDump", "qrcDump", "playHistory", "playStats" ->
                 OTHER_LONG_JOB_INTERLEAVE_INTERVAL
             else -> 0
@@ -570,6 +571,7 @@ class BleNotifyQueue(
         private const val CHUNK_PROGRESS_INTERVAL = 20
         private const val ALBUM_ART_INTERLEAVE_INTERVAL = 1
         private const val FULL_LYRICS_INTERLEAVE_INTERVAL = 10
+        private const val LYRIC_SECONDARY_INTERLEAVE_INTERVAL = 3
         private const val OTHER_LONG_JOB_INTERLEAVE_INTERVAL = 5
         private const val INTERLEAVED_LOG_THROTTLE_MS = 10_000L
     }

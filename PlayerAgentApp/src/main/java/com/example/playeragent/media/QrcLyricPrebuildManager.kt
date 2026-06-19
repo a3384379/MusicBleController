@@ -59,9 +59,19 @@ class QrcLyricPrebuildManager(
                 }
                 processed += 1
                 try {
-                    if (cacheManager.isGroupCacheValid(group)) {
+                    val validation = cacheManager.validateGroupCache(
+                        group = group,
+                        requireComplete = true
+                    )
+                    if (validation.valid) {
                         skipped += 1
                     } else {
+                        if (validation.cached != null) {
+                            logger(
+                                "[QrcPrebuild] rebuild stale cache " +
+                                    "groupId=${group.groupId} reason=${validation.reason}"
+                            )
+                        }
                         val parsed = QrcLyricUtils.decryptAndParseGroup(group)
                         if (parsed != null &&
                             parsed.title.isNotBlank() &&

@@ -6,6 +6,8 @@ struct ContentView: View {
     @State private var showFullLyrics = false
     @State private var showDebugPage = false
     @State private var showPlaybackHistory = false
+    @AppStorage(LyricDisplayMode.userDefaultsKey)
+    private var lyricDisplayModeRaw = LyricDisplayMode.originalTranslation.rawValue
 
     var body: some View {
         NavigationStack {
@@ -56,6 +58,17 @@ struct ContentView: View {
             .onChange(of: displayedPositionMs) { _, newValue in
                 bleManager.logKaraokeOffset(rawPositionMs: newValue)
             }
+            .onChange(of: lyricDisplayModeRaw) { _, _ in
+                requestOptionalLyricsIfNeeded()
+            }
+            .onChange(of: showFullLyrics) { _, isPresented in
+                if isPresented {
+                    requestOptionalLyricsIfNeeded()
+                }
+            }
+            .onChange(of: bleManager.fullLyrics) { _, _ in
+                requestOptionalLyricsIfNeeded()
+            }
         }
     }
 
@@ -104,6 +117,12 @@ struct ContentView: View {
                     showPlaybackHistory = true
                 } label: {
                     Label("播放历史", systemImage: "clock.arrow.circlepath")
+                }
+
+                Picker("歌词显示", selection: lyricDisplayModeBinding) {
+                    ForEach(LyricDisplayMode.allCases) { mode in
+                        Text(mode.menuTitle).tag(mode)
+                    }
                 }
             } label: {
                 Image(systemName: "ellipsis")
@@ -235,6 +254,13 @@ struct ContentView: View {
                             alignment: .center
                         )
                         .minimumScaleFactor(0.72)
+                        if let auxiliary = lyricPreviewAuxiliaryText(offset: 0) {
+                            Text(auxiliary)
+                                .font(.system(size: 14, weight: .medium, design: .rounded))
+                                .foregroundStyle(.white.opacity(0.52))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.72)
+                        }
                         Text(lyricPreviewLine(offset: 1))
                             .font(.system(size: 17, weight: .medium, design: .rounded))
                             .foregroundStyle(.white.opacity(0.44))
@@ -465,6 +491,21 @@ struct ContentView: View {
         )
     }
 
+    private var lyricDisplayMode: LyricDisplayMode {
+        LyricDisplayMode(rawValue: lyricDisplayModeRaw) ?? .originalTranslation
+    }
+
+    private func requestOptionalLyricsIfNeeded() {
+        bleManager.requestFullLyricsOptionalFieldsIfNeeded(displayMode: lyricDisplayMode)
+    }
+
+    private var lyricDisplayModeBinding: Binding<LyricDisplayMode> {
+        Binding(
+            get: { lyricDisplayMode },
+            set: { lyricDisplayModeRaw = $0.rawValue }
+        )
+    }
+
     private var currentLyricText: String {
         let trimmed = bleManager.lyric.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "暂无歌词" : trimmed
@@ -506,6 +547,19 @@ struct ContentView: View {
             return nil
         }
         return currentTrackFullLyrics[index]
+    }
+
+    private func lyricPreviewAuxiliaryText(offset: Int) -> String? {
+        guard let line = lyricPreviewLineModel(offset: offset) else { return nil }
+        if lyricDisplayMode.showsTranslation,
+           let translation = sanitizedSecondaryText(line.translation) {
+            return translation
+        }
+        if lyricDisplayMode.showsRomanization,
+           let romanization = sanitizedSecondaryText(line.romanization) {
+            return romanization
+        }
+        return nil
     }
 
     private var currentTrackFullLyrics: [LyricLine] {

@@ -21,6 +21,8 @@ struct FullLyricsView: View {
     @State private var lastAutoScrolledIndex: Int?
     @State private var isProgrammaticScroll = false
     @State private var browseResetWorkItem: DispatchWorkItem?
+    @AppStorage(LyricDisplayMode.userDefaultsKey)
+    private var displayModeRaw = LyricDisplayMode.originalTranslation.rawValue
 
     var body: some View {
         ZStack {
@@ -29,6 +31,8 @@ struct FullLyricsView: View {
 
             VStack(spacing: 18) {
                 header
+                displayModePicker
+                secondaryMissingHint
                 lyricsList
                 controls
             }
@@ -36,6 +40,47 @@ struct FullLyricsView: View {
             .padding(.top, 18)
             .padding(.bottom, 30)
         }
+    }
+
+    private var displayModeBinding: Binding<LyricDisplayMode> {
+        Binding(
+            get: { displayMode },
+            set: { displayModeRaw = $0.rawValue }
+        )
+    }
+
+    private var displayMode: LyricDisplayMode {
+        LyricDisplayMode(rawValue: displayModeRaw) ?? .originalTranslation
+    }
+
+    @ViewBuilder
+    private var secondaryMissingHint: some View {
+        if let message = secondaryMissingMessage {
+            Text(message)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.white.opacity(0.58))
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var secondaryMissingMessage: String? {
+        guard !lyrics.isEmpty else { return nil }
+        switch displayMode {
+        case .originalTranslation:
+            return hasAnyTranslation ? nil : "该歌曲暂无翻译"
+        case .originalRomanization:
+            return hasAnyRomanization ? nil : "该歌曲暂无罗马音"
+        case .original, .originalTranslationRomanization:
+            return nil
+        }
+    }
+
+    private var hasAnyTranslation: Bool {
+        lyrics.contains { sanitizedSecondaryText($0.translation) != nil }
+    }
+
+    private var hasAnyRomanization: Bool {
+        lyrics.contains { sanitizedSecondaryText($0.romanization) != nil }
     }
 
     private var header: some View {
@@ -64,6 +109,16 @@ struct FullLyricsView: View {
             .buttonStyle(FullLyricsPressStyle())
             .accessibilityLabel("关闭歌词")
         }
+    }
+
+    private var displayModePicker: some View {
+        Picker("歌词显示", selection: displayModeBinding) {
+            ForEach(LyricDisplayMode.allCases) { mode in
+                Text(mode.title).tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
+        .tint(.white)
     }
 
     private var lyricsList: some View {
@@ -208,30 +263,91 @@ struct FullLyricsView: View {
         isSelected: Bool
     ) -> some View {
         if isCurrent {
-            KaraokeLyricText(
-                text: line.text,
-                progress: lineProgress(index: index),
-                words: line.words,
-                positionMs: positionMs,
-                highlightColor: Color.green.opacity(0.98),
-                normalColor: Color.white.opacity(isSelected ? 0.58 : 0.36),
-                font: .system(size: 28, weight: .bold, design: .rounded),
-                lineLimit: 3,
-                alignment: .leading
-            )
-        } else {
-            Text(line.text)
-                .font(
-                    .system(
-                        size: isSelected ? 23 : 21,
-                        weight: isSelected ? .semibold : .medium,
-                        design: .rounded
-                    )
+            lyricStack(
+                line: line,
+                isCurrent: true,
+                isSelected: isSelected
+            ) {
+                KaraokeLyricText(
+                    text: line.text,
+                    progress: lineProgress(index: index),
+                    words: line.words,
+                    positionMs: positionMs,
+                    highlightColor: Color.green.opacity(0.98),
+                    normalColor: Color.white.opacity(isSelected ? 0.58 : 0.36),
+                    font: .system(size: 28, weight: .bold, design: .rounded),
+                    lineLimit: 3,
+                    alignment: .leading
                 )
-                .foregroundStyle(lyricColor(isCurrent: false, isSelected: isSelected))
-                .multilineTextAlignment(.leading)
-                .lineLimit(3)
+            }
+        } else {
+            lyricStack(
+                line: line,
+                isCurrent: false,
+                isSelected: isSelected
+            ) {
+                Text(line.text)
+                    .font(
+                        .system(
+                            size: isSelected ? 23 : 21,
+                            weight: isSelected ? .semibold : .medium,
+                            design: .rounded
+                        )
+                    )
+                    .foregroundStyle(lyricColor(isCurrent: false, isSelected: isSelected))
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(3)
+            }
         }
+    }
+
+    private func lyricStack<Original: View>(
+        line: LyricLine,
+        isCurrent: Bool,
+        isSelected: Bool,
+        @ViewBuilder original: () -> Original
+    ) -> some View {
+        VStack(alignment: .leading, spacing: isCurrent ? 5 : 4) {
+            original()
+            if displayMode.showsTranslation,
+               let translation = sanitizedSecondaryText(line.translation) {
+                auxiliaryLyricText(
+                    translation,
+                    isCurrent: isCurrent,
+                    isSelected: isSelected
+                )
+            }
+            if displayMode.showsRomanization,
+               let romanization = sanitizedSecondaryText(line.romanization) {
+                auxiliaryLyricText(
+                    romanization,
+                    isCurrent: isCurrent,
+                    isSelected: isSelected
+                )
+            }
+        }
+    }
+
+    private func auxiliaryLyricText(
+        _ text: String,
+        isCurrent: Bool,
+        isSelected: Bool
+    ) -> some View {
+        Text(text)
+            .font(
+                .system(
+                    size: isCurrent ? 17 : 15,
+                    weight: isSelected ? .semibold : .medium,
+                    design: .rounded
+                )
+            )
+            .foregroundStyle(
+                isCurrent
+                    ? Color.white.opacity(0.70)
+                    : Color.white.opacity(isSelected ? 0.62 : 0.34)
+            )
+            .multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private func lineProgress(index: Int) -> Double {

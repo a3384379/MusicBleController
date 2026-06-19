@@ -41,6 +41,8 @@ import com.example.playeragent.media.QrcDumpManager
 import com.example.playeragent.media.QrcLyricCacheManager
 import com.example.playeragent.media.QrcLyricV2RebuildManager
 import com.example.playeragent.media.QrcPersistentIndexManager
+import com.example.playeragent.media.QrcStaleCacheRebuildManager
+import com.example.playeragent.media.QrcStaleCacheRebuildProgress
 import com.example.playeragent.media.QrcV2RebuildProgress
 import com.example.playeragent.media.QrcWatcherStatus
 import com.example.playeragent.service.PlayerAgentForegroundService
@@ -58,6 +60,7 @@ class MainActivity : Activity() {
     private lateinit var currentAlbumArtImageView: ImageView
     private lateinit var currentAlbumArtTextView: TextView
     private lateinit var qrcCacheBuildTextView: TextView
+    private lateinit var qrcStaleCacheRebuildTextView: TextView
     private lateinit var qrcWatcherStatusTextView: TextView
     private lateinit var lyricCacheStatsTextView: TextView
     private lateinit var qrcCacheOverviewTextView: TextView
@@ -69,6 +72,7 @@ class MainActivity : Activity() {
     private var controllerScannerManager: ControllerScannerManager? = null
     private var rfcommClientManager: RfcommClientManager? = null
     private var qrcV2RebuildManager: QrcLyricV2RebuildManager? = null
+    private var qrcStaleCacheRebuildManager: QrcStaleCacheRebuildManager? = null
     private var lastPlayerUiSongKey: String = ""
     private var lastPlayerUiLyric: String = ""
     private var albumArtRefreshGeneration = 0L
@@ -173,6 +177,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         qrcV2RebuildManager?.stop()
+        qrcStaleCacheRebuildManager?.stop()
         controllerScannerManager?.stopScan()
         rfcommClientManager?.close()
         super.onDestroy()
@@ -262,6 +267,9 @@ class MainActivity : Activity() {
         val lyricCard = collapsibleCard(content, "歌词缓存与逐字时间", expanded = false)
         qrcCacheOverviewTextView = statusValue(qrcCacheOverviewText()).also(lyricCard::addView)
         qrcCacheBuildTextView = statusValue(QrcV2RebuildProgress().displayText()).also(lyricCard::addView)
+        qrcStaleCacheRebuildTextView = statusValue(
+            QrcStaleCacheRebuildProgress().displayText()
+        ).also(lyricCard::addView)
         qrcWatcherStatusTextView = statusValue(lastQrcWatcherStatus.displayText()).also(lyricCard::addView)
         lyricCacheStatsTextView = statusValue(lyricCacheStatsText()).also(lyricCard::addView)
         lyricCard.addView(buttonGrid(listOf(
@@ -272,6 +280,8 @@ class MainActivity : Activity() {
             "清空临时构建" to { confirmAction("清空临时构建结果？", ::clearQrcV2Building) },
             "清空并重新构建" to { confirmAction("清空临时结果并重新构建？") { startQrcV2Build(clear = true) } },
             "重建 QRC 索引" to ::forceRefreshQrcIndex,
+            "修复旧歌词缓存" to ::startQrcStaleCacheRebuild,
+            "停止旧缓存修复" to ::stopQrcStaleCacheRebuild,
             "删除旧缓存备份" to { confirmAction("删除旧缓存备份？", ::deleteOldQrcBackup) }
         )))
 
@@ -933,6 +943,24 @@ class MainActivity : Activity() {
         manager.clearBuilding()
     }
 
+    private fun startQrcStaleCacheRebuild() {
+        if (!ensureLyricStorageAccess()) {
+            return
+        }
+        val manager = qrcStaleCacheRebuildManager ?: QrcStaleCacheRebuildManager(
+            context = this,
+            logger = ::appendThreadSafeLog,
+            progressListener = ::updateQrcStaleCacheRebuildProgress
+        ).also {
+            qrcStaleCacheRebuildManager = it
+        }
+        manager.start()
+    }
+
+    private fun stopQrcStaleCacheRebuild() {
+        qrcStaleCacheRebuildManager?.stop()
+    }
+
     private fun deleteOldQrcBackup() {
         val backup = QrcLyricCacheManager(this, ::appendThreadSafeLog).backupCacheRoot()
         if (backup.exists()) {
@@ -982,6 +1010,15 @@ class MainActivity : Activity() {
         runOnUiThread {
             if (::qrcCacheBuildTextView.isInitialized) {
                 qrcCacheBuildTextView.text = progress.displayText()
+            }
+            refreshQrcCacheOverview()
+        }
+    }
+
+    private fun updateQrcStaleCacheRebuildProgress(progress: QrcStaleCacheRebuildProgress) {
+        runOnUiThread {
+            if (::qrcStaleCacheRebuildTextView.isInitialized) {
+                qrcStaleCacheRebuildTextView.text = progress.displayText()
             }
             refreshQrcCacheOverview()
         }

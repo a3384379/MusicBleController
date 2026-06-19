@@ -20,6 +20,8 @@ struct LyricLine: Identifiable, Equatable {
     let timeMs: Int64
     let durationMs: Int64
     let text: String
+    let translation: String?
+    let romanization: String?
     let words: [LyricWord]
 
     var id: Int { index }
@@ -30,6 +32,24 @@ struct ResolvedLyric: Equatable {
     let lineIndex: Int
     let text: String
     let source: String
+}
+
+private enum LyricSecondaryMode: String {
+    case translation
+    case romanization
+}
+
+private struct LyricSecondaryLineParts {
+    let partCount: Int
+    var parts: [Int: String]
+}
+
+private struct LyricSecondaryTransfer {
+    let trackId: String
+    let transferId: String
+    let mode: LyricSecondaryMode
+    let itemCount: Int
+    var lines: [Int: LyricSecondaryLineParts]
 }
 
 final class BLETestManager: NSObject, ObservableObject {
@@ -113,6 +133,12 @@ final class BLETestManager: NSObject, ObservableObject {
     private var requestedFullLyricsTrackIDs: Set<String> = []
     private var fullLyricsUnavailableTrackIDs: Set<String> = []
     private var fullLyricsDelayedRetryTrackIDs: Set<String> = []
+    private var fullLyricsOptionalRefreshTrackIDs: Set<String> = []
+    private var requestedLyricSecondaryKeys: Set<String> = []
+    private var completedLyricSecondaryKeys: Set<String> = []
+    private var ignoredLyricSecondaryPlaceholderKeys: Set<String> = []
+    private var pendingLyricSecondaryModes: [LyricSecondaryMode] = []
+    private var lyricSecondaryTransfer: LyricSecondaryTransfer?
     private var fullLyricsReceivingTrackID = ""
     private var fullLyricsExpectedCount = 0
     private var fullLyricsChunks: [Int: LyricLine] = [:]
@@ -551,6 +577,59 @@ final class BLETestManager: NSObject, ObservableObject {
         updateLiveActivity(force: true, reason: "seek")
         seek(to: targetPosition)
         refreshPlaybackState(after: 0.5)
+    }
+
+    func requestFullLyricsOptionalFieldsIfNeeded(displayMode: LyricDisplayMode) {
+        let trackID = currentTrackID
+        guard !trackID.isEmpty else { return }
+        guard fullLyricsTrackId == trackID, !fullLyrics.isEmpty else { return }
+        var modes: [LyricSecondaryMode] = []
+        if displayMode.showsTranslation {
+            modes.append(.translation)
+        }
+        if displayMode.showsRomanization {
+            modes.append(.romanization)
+        }
+        guard !modes.isEmpty else { return }
+        for mode in modes {
+            enqueueLyricSecondaryIfNeeded(mode: mode, trackID: trackID)
+        }
+        requestNextLyricSecondaryIfPossible()
+    }
+
+    private func enqueueLyricSecondaryIfNeeded(mode: LyricSecondaryMode, trackID: String) {
+        let key = lyricSecondaryKey(trackID: trackID, mode: mode)
+        guard !completedLyricSecondaryKeys.contains(key),
+              !requestedLyricSecondaryKeys.contains(key),
+              !pendingLyricSecondaryModes.contains(mode),
+              lyricSecondaryTransfer?.mode != mode else {
+            return
+        }
+        requestedLyricSecondaryKeys.insert(key)
+        pendingLyricSecondaryModes.append(mode)
+        log("[Lyrics-iOS] secondary queued mode=\(mode.rawValue) trackId=\(trackID)")
+    }
+
+    private func requestNextLyricSecondaryIfPossible() {
+        guard lyricSecondaryTransfer == nil else { return }
+        guard !pendingLyricSecondaryModes.isEmpty else { return }
+        let trackID = currentTrackID
+        guard !trackID.isEmpty,
+              fullLyricsTrackId == trackID,
+              !fullLyrics.isEmpty else { return }
+        let mode = pendingLyricSecondaryModes.removeFirst()
+        log("[Lyrics-iOS] secondary request mode=\(mode.rawValue) trackId=\(trackID)")
+        sendCommand(
+            cmd: "GET_LYRIC_SECONDARY",
+            extra: [
+                "trackId": trackID,
+                "mode": mode.rawValue
+            ]
+        )
+    }
+
+    private func lyricSecondaryKey(trackID: String, mode: LyricSecondaryMode) -> String {
+        "\(trackID)|\(mode.rawValue)"
     }
 
     func beginSeeking() {
@@ -1341,6 +1420,18 @@ extension BLETestManager: CBPeripheralDelegate {
             case "fullLyricsUnavailable":
                 self.handleFullLyricsUnavailable(object)
 
+            case "lyricSecondaryStart":
+                self.handleLyricSecondaryStart(object)
+
+            case "lyricSecondaryPart":
+                self.handleLyricSecondaryPart(object)
+
+            case "lyricSecondaryEnd":
+                self.handleLyricSecondaryEnd(object)
+
+            case "lyricSecondaryUnavailable", "lyricSecondaryError":
+                self.handleLyricSecondaryUnavailable(object)
+
             case "volumeState":
                 self.volumeMax = Self.intValue(object["max"])
                 if !self.isVolumeSeeking {
@@ -2039,6 +2130,12 @@ extension BLETestManager: CBPeripheralDelegate {
             requestedFullLyricsTrackIDs.removeAll()
             fullLyricsUnavailableTrackIDs.removeAll()
             fullLyricsDelayedRetryTrackIDs.removeAll()
+            fullLyricsOptionalRefreshTrackIDs.removeAll()
+            requestedLyricSecondaryKeys.removeAll()
+            completedLyricSecondaryKeys.removeAll()
+            ignoredLyricSecondaryPlaceholderKeys.removeAll()
+            pendingLyricSecondaryModes.removeAll()
+            lyricSecondaryTransfer = nil
             log("[Lyrics-iOS] keep previous lyrics until new chunks")
         }
         title = newTitle
@@ -2297,9 +2394,16 @@ extension BLETestManager: CBPeripheralDelegate {
             timeMs: Self.int64Value(object["timeMs"]),
             durationMs: Self.int64Value(object["durationMs"]),
             text: object["text"] as? String ?? "",
+            translation: sanitizedSecondaryText(object["translation"] as? String),
+            romanization: sanitizedSecondaryText(object["romanization"] as? String),
             words: words
         )
-        log("[Lyrics-iOS] chunk index=\(index) words=\(words.count)")
+        log(
+            "[Lyrics-iOS] chunk index=\(index) " +
+                "trans=\((object["translation"] as? String)?.isEmpty == false) " +
+                "roma=\((object["romanization"] as? String)?.isEmpty == false) " +
+                "words=\(words.count)"
+        )
         publishPartialFullLyricsIfNeeded(trackID: trackID)
     }
 
@@ -2346,6 +2450,183 @@ extension BLETestManager: CBPeripheralDelegate {
         log("[FullLyrics] unavailable reason=\(object["reason"] as? String ?? "")")
     }
 
+    private func handleLyricSecondaryStart(_ object: [String: Any]) {
+        let trackID = object["trackId"] as? String ?? ""
+        let transferID = object["transferId"] as? String ?? ""
+        let modeRaw = object["mode"] as? String ?? ""
+        guard trackID == currentTrackID,
+              fullLyricsTrackId == trackID,
+              let mode = LyricSecondaryMode(rawValue: modeRaw),
+              !transferID.isEmpty else {
+            log("[Lyrics-iOS] secondary discarded stale trackId=\(trackID)")
+            return
+        }
+        lyricSecondaryTransfer = LyricSecondaryTransfer(
+            trackId: trackID,
+            transferId: transferID,
+            mode: mode,
+            itemCount: Self.intValue(object["itemCount"]),
+            lines: [:]
+        )
+        log(
+            "[Lyrics-iOS] secondary start mode=\(mode.rawValue) " +
+                "items=\(Self.intValue(object["itemCount"]))"
+        )
+    }
+
+    private func handleLyricSecondaryPart(_ object: [String: Any]) {
+        let trackID = object["trackId"] as? String ?? ""
+        let transferID = object["transferId"] as? String ?? ""
+        let modeRaw = object["mode"] as? String ?? ""
+        guard trackID == currentTrackID,
+              var transfer = lyricSecondaryTransfer,
+              transfer.trackId == trackID,
+              transfer.transferId == transferID,
+              transfer.mode.rawValue == modeRaw else {
+            return
+        }
+        let lineIndex = Self.intValue(object["lineIndex"])
+        let partIndex = Self.intValue(object["partIndex"])
+        let partCount = Self.intValue(object["partCount"])
+        guard lineIndex >= 0,
+              partIndex >= 0,
+              partCount > 0,
+              let text = object["text"] as? String else {
+            return
+        }
+        var lineParts = transfer.lines[lineIndex] ?? LyricSecondaryLineParts(
+            partCount: partCount,
+            parts: [:]
+        )
+        guard lineParts.partCount == partCount else { return }
+        lineParts.parts[partIndex] = text
+        transfer.lines[lineIndex] = lineParts
+        lyricSecondaryTransfer = transfer
+        if lineParts.parts.count == partCount {
+            let assembled = (0..<partCount).compactMap { lineParts.parts[$0] }.joined()
+            log(
+                "[Lyrics-iOS] secondary line complete line=\(lineIndex) " +
+                    "chars=\(assembled.count) " +
+                    "bytes=\(assembled.data(using: .utf8)?.count ?? 0)"
+            )
+        }
+    }
+
+    private func handleLyricSecondaryEnd(_ object: [String: Any]) {
+        let trackID = object["trackId"] as? String ?? ""
+        let transferID = object["transferId"] as? String ?? ""
+        let modeRaw = object["mode"] as? String ?? ""
+        guard trackID == currentTrackID,
+              let transfer = lyricSecondaryTransfer,
+              transfer.trackId == trackID,
+              transfer.transferId == transferID,
+              transfer.mode.rawValue == modeRaw else {
+            log("[Lyrics-iOS] secondary end discarded stale trackId=\(trackID)")
+            return
+        }
+
+        var assembled: [Int: String] = [:]
+        var missing = 0
+        for (lineIndex, lineParts) in transfer.lines {
+            let hasAllParts = lineParts.parts.count == lineParts.partCount &&
+                (0..<lineParts.partCount).allSatisfy { lineParts.parts[$0] != nil }
+            if hasAllParts {
+                assembled[lineIndex] = (0..<lineParts.partCount)
+                    .compactMap { lineParts.parts[$0] }
+                    .joined()
+            } else {
+                missing += 1
+            }
+        }
+        let itemMissing = max(transfer.itemCount - assembled.count, 0) + missing
+        log(
+            "[Lyrics-iOS] secondary end mode=\(transfer.mode.rawValue) " +
+                "completed=\(assembled.count) missing=\(itemMissing)"
+        )
+        guard itemMissing == 0 else {
+            log(
+                "[Lyrics-iOS] secondary incomplete mode=\(transfer.mode.rawValue) " +
+                    "missingLines=\(itemMissing)"
+            )
+            lyricSecondaryTransfer = nil
+            requestNextLyricSecondaryIfPossible()
+            return
+        }
+        mergeLyricSecondary(
+            assembled,
+            mode: transfer.mode,
+            trackID: transfer.trackId
+        )
+        completedLyricSecondaryKeys.insert(
+            lyricSecondaryKey(trackID: transfer.trackId, mode: transfer.mode)
+        )
+        lyricSecondaryTransfer = nil
+        log(
+            "[Lyrics-iOS] secondary publish mode=\(transfer.mode.rawValue) " +
+                "lines=\(assembled.count)"
+        )
+        requestNextLyricSecondaryIfPossible()
+    }
+
+    private func handleLyricSecondaryUnavailable(_ object: [String: Any]) {
+        let trackID = object["trackId"] as? String ?? currentTrackID
+        let modeRaw = object["mode"] as? String ?? ""
+        if let mode = LyricSecondaryMode(rawValue: modeRaw) {
+            completedLyricSecondaryKeys.insert(lyricSecondaryKey(trackID: trackID, mode: mode))
+        }
+        lyricSecondaryTransfer = nil
+        log(
+            "[Lyrics-iOS] secondary unavailable mode=\(modeRaw) " +
+                "reason=\(object["reason"] as? String ?? object["message"] as? String ?? "")"
+        )
+        requestNextLyricSecondaryIfPossible()
+    }
+
+    private func mergeLyricSecondary(
+        _ values: [Int: String],
+        mode: LyricSecondaryMode,
+        trackID: String
+    ) {
+        guard trackID == currentTrackID,
+              fullLyricsTrackId == trackID else { return }
+        fullLyrics = fullLyrics.map { line in
+            let rawValue = values[line.index]
+            let value = sanitizedSecondaryText(rawValue)
+            if rawValue != nil, value == nil {
+                let key = "\(trackID)|\(mode.rawValue)|\(line.index)"
+                if !ignoredLyricSecondaryPlaceholderKeys.contains(key) {
+                    ignoredLyricSecondaryPlaceholderKeys.insert(key)
+                    log(
+                        "[Lyrics-iOS] secondary ignored placeholder " +
+                            "mode=\(mode.rawValue) line=\(line.index)"
+                    )
+                }
+            }
+            switch mode {
+            case .translation:
+                return LyricLine(
+                    index: line.index,
+                    timeMs: line.timeMs,
+                    durationMs: line.durationMs,
+                    text: line.text,
+                    translation: value ?? sanitizedSecondaryText(line.translation),
+                    romanization: sanitizedSecondaryText(line.romanization),
+                    words: line.words
+                )
+            case .romanization:
+                return LyricLine(
+                    index: line.index,
+                    timeMs: line.timeMs,
+                    durationMs: line.durationMs,
+                    text: line.text,
+                    translation: sanitizedSecondaryText(line.translation),
+                    romanization: value ?? sanitizedSecondaryText(line.romanization),
+                    words: line.words
+                )
+            }
+        }
+    }
+
     private func resetFullLyricsTransfer() {
         fullLyricsTimeoutWorkItem?.cancel()
         fullLyricsTimeoutWorkItem = nil
@@ -2383,16 +2664,22 @@ extension BLETestManager: CBPeripheralDelegate {
         fullLyricsTrackId = trackID
         isFullLyricsCurrent = true
         let wordsCount = sortedLines.reduce(0) { $0 + $1.words.count }
+        let transCount = sortedLines.filter { sanitizedSecondaryText($0.translation) != nil }.count
+        let romaCount = sortedLines.filter { sanitizedSecondaryText($0.romanization) != nil }.count
         if isFinal {
-            log("[FullLyrics] end count=\(fullLyrics.count)")
+            log(
+                "[FullLyrics] end count=\(fullLyrics.count) " +
+                    "transCount=\(transCount) romaCount=\(romaCount)"
+            )
             log(
                 "[LyricsPerf] final publish lines=\(sortedLines.count) " +
-                    "words=\(wordsCount)"
+                    "words=\(wordsCount) transCount=\(transCount) romaCount=\(romaCount)"
             )
         } else {
             log(
                 "[LyricsPerf] partial publish lines=\(sortedLines.count) " +
-                    "receiving=\(isFullLyricsReceiving)"
+                    "receiving=\(isFullLyricsReceiving) " +
+                    "transCount=\(transCount) romaCount=\(romaCount)"
             )
         }
     }

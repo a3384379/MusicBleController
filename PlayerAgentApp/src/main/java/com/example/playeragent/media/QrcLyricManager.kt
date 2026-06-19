@@ -65,7 +65,9 @@ class QrcLyricManager(
                     timeMs = it.timeMs,
                     text = it.text,
                     durationMs = it.durationMs,
-                    words = it.words
+                    words = it.words,
+                    translation = it.translation,
+                    romanization = it.romanization
                 )
             }
             cachedGroupId = cached.groupId
@@ -410,7 +412,15 @@ class QrcLyricManager(
 
     private fun decryptAndParseQrc(entry: QrcGroupIndexEntry): ParsedQrc? {
         val file = entry.qrcFile ?: return null
-        val cacheKey = "${entry.groupId}:${file.lastModified()}:${file.length()}"
+        val cacheKey = listOf(
+            entry.groupId,
+            file.lastModified(),
+            file.length(),
+            entry.translrcFile?.lastModified() ?: 0L,
+            entry.translrcFile?.length() ?: 0L,
+            entry.romaqrcFile?.lastModified() ?: 0L,
+            entry.romaqrcFile?.length() ?: 0L
+        ).joinToString(":")
         if (parsedQrcCache.containsKey(cacheKey)) {
             return parsedQrcCache[cacheKey]
         }
@@ -436,7 +446,7 @@ class QrcLyricManager(
                     parsedQrcCache[cacheKey] = null
                     return null
                 }
-            parseQrc(decrypted, entry.groupId).also {
+            parseQrc(decrypted, entry).also {
                 cacheManager.recordQrcDecrypt(success = it.lines.isNotEmpty())
                 parsedQrcCache[cacheKey] = it
                 trimParsedQrcCache()
@@ -476,7 +486,9 @@ class QrcLyricManager(
                             timeMs = it.timeMs,
                             text = it.text,
                             durationMs = it.durationMs,
-                            words = it.words
+                            words = it.words,
+                            translation = it.translation,
+                            romanization = it.romanization
                         )
                     }
                 )
@@ -505,7 +517,9 @@ class QrcLyricManager(
                                 timeMs = it.timeMs,
                                 text = it.text,
                                 durationMs = it.durationMs,
-                                words = it.words
+                                words = it.words,
+                                translation = it.translation,
+                                romanization = it.romanization
                             )
                         }
                     )
@@ -558,7 +572,7 @@ class QrcLyricManager(
         }
     }
 
-    private fun parseQrc(decrypted: String, groupId: String): ParsedQrc {
+    private fun parseQrc(decrypted: String, entry: QrcGroupIndexEntry): ParsedQrc {
         val lyricContent = QRC_LYRIC_CONTENT_REGEX.find(decrypted)
             ?.groupValues
             ?.getOrNull(1)
@@ -577,7 +591,7 @@ class QrcLyricManager(
                 markerStart = match.range.first
             )
         }.toList()
-        val lines = markers.mapIndexedNotNull { index, marker ->
+        val baseLines = markers.mapIndexedNotNull { index, marker ->
             val bodyEnd = markers.getOrNull(index + 1)?.markerStart
                 ?: lyricContent.length
             val parsedBody = QrcLyricUtils.parseQrcLineBody(
@@ -594,6 +608,29 @@ class QrcLyricManager(
             }
         }.distinctBy { it.timeMs to it.text }
             .sortedBy(LyricLine::timeMs)
+        val lines = QrcLyricUtils.applyAuxiliaryLyrics(
+            groupId = entry.groupId,
+            lines = baseLines.map {
+                QrcLyricLine(
+                    timeMs = it.timeMs,
+                    text = it.text,
+                    durationMs = it.durationMs,
+                    words = it.words
+                )
+            },
+            translrcFile = entry.translrcFile,
+            romaqrcFile = entry.romaqrcFile,
+            logger = logger
+        ).map {
+            LyricLine(
+                timeMs = it.timeMs,
+                text = it.text,
+                durationMs = it.durationMs,
+                words = it.words,
+                translation = it.translation,
+                romanization = it.romanization
+            )
+        }
         lines.withIndex()
             .filter { it.value.words.isNotEmpty() }
             .take(3)
@@ -609,7 +646,7 @@ class QrcLyricManager(
         return ParsedQrc(
             title = QrcLyricUtils.sanitizeMetadataTitle(
                 metadata["ti"].orEmpty(),
-                groupId,
+                entry.groupId,
                 logger
             ),
             artist = metadata["ar"].orEmpty(),
@@ -753,7 +790,9 @@ class QrcLyricManager(
         val timeMs: Long,
         val text: String,
         val durationMs: Long = 0L,
-        val words: List<QrcLyricWord> = emptyList()
+        val words: List<QrcLyricWord> = emptyList(),
+        val translation: String? = null,
+        val romanization: String? = null
     )
 
     private data class ParsedQrc(

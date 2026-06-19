@@ -211,11 +211,36 @@ class QrcLyricCacheManager(
     }
 
     fun isGroupCacheValid(group: QrcFileGroup): Boolean {
-        val cached = readByGroupId(group.groupId) ?: return false
-        val qrc = group.qrcFile ?: return cached.lines.isNotEmpty()
-        return cached.qrcLastModified == qrc.lastModified() &&
-            cached.lines.isNotEmpty() &&
-            cached.schemaVersion >= QRC_CACHE_SCHEMA_V2
+        return validateGroupCache(group, requireComplete = true).valid
+    }
+
+    @Synchronized
+    fun validateGroupCache(
+        group: QrcFileGroup,
+        requireComplete: Boolean = true
+    ): GroupCacheValidation {
+        val cached = readByGroupId(group.groupId)
+            ?: return GroupCacheValidation(valid = false, reason = "cache missing")
+        val reason = groupInvalidReason(
+            group = group,
+            cached = cached,
+            requireComplete = requireComplete
+        )
+        return if (reason == null) {
+            logger("[QrcCache] group valid groupId=${group.groupId}")
+            GroupCacheValidation(valid = true, cached = cached)
+        } else {
+            logger("[QrcCache] group invalid groupId=${group.groupId} reason=$reason")
+            GroupCacheValidation(valid = false, reason = reason, cached = cached)
+        }
+    }
+
+    fun groupCacheFiles(): List<File> {
+        return cacheRoot().listFiles { file ->
+            file.isFile &&
+                file.name.startsWith("group_") &&
+                file.extension.equals("json", ignoreCase = true)
+        }.orEmpty().sortedBy(File::getName)
     }
 
     fun cacheRoot(): File {
@@ -414,7 +439,31 @@ class QrcLyricCacheManager(
                             "wordTimingStatus",
                             QrcWordTimingStatus.fromLines(lines).name
                         )
-                    )
+                    ),
+                    groupFingerprint = readFingerprint(objectValue),
+                    cacheBuildVersion = objectValue.optInt("cacheBuildVersion", 0),
+                    translationParseFailed = objectValue.optBoolean(
+                        "translationParseFailed",
+                        false
+                    ),
+                    translationParseFailedReason = objectValue
+                        .optString("translationParseFailedReason")
+                        .takeIf(String::isNotBlank),
+                    translationSourceLastModified = objectValue.optLong(
+                        "translationSourceLastModified"
+                    ),
+                    translationSourceSize = objectValue.optLong("translationSourceSize"),
+                    romanizationParseFailed = objectValue.optBoolean(
+                        "romanizationParseFailed",
+                        false
+                    ),
+                    romanizationParseFailedReason = objectValue
+                        .optString("romanizationParseFailedReason")
+                        .takeIf(String::isNotBlank),
+                    romanizationSourceLastModified = objectValue.optLong(
+                        "romanizationSourceLastModified"
+                    ),
+                    romanizationSourceSize = objectValue.optLong("romanizationSourceSize")
                 ),
                 staleReason = staleReason
             )
@@ -442,7 +491,11 @@ class QrcLyricCacheManager(
                     timeMs = lineObject.optLong("timeMs"),
                     text = text,
                     durationMs = lineObject.optLong("durationMs"),
-                    words = readWords(lineObject.optJSONArray("words") ?: JSONArray())
+                    words = readWords(lineObject.optJSONArray("words") ?: JSONArray()),
+                    translation = lineObject.optString("translation")
+                        .takeIf(String::isNotBlank),
+                    romanization = lineObject.optString("romanization")
+                        .takeIf(String::isNotBlank)
                 )
             }
         }.sortedBy(QrcLyricLine::timeMs)
@@ -617,6 +670,16 @@ class QrcLyricCacheManager(
     ): Boolean {
         val existingWordCount = existing.lines.sumOf { it.words.size }
         val candidateWordCount = candidate.lines.sumOf { it.words.size }
+        val existingTranslationCount = existing.lines.count { !it.translation.isNullOrBlank() }
+        val candidateTranslationCount = candidate.lines.count { !it.translation.isNullOrBlank() }
+        val existingRomanizationCount = existing.lines.count { !it.romanization.isNullOrBlank() }
+        val candidateRomanizationCount = candidate.lines.count { !it.romanization.isNullOrBlank() }
+        if (candidateTranslationCount > existingTranslationCount) {
+            return false
+        }
+        if (candidateRomanizationCount > existingRomanizationCount) {
+            return false
+        }
         if (candidateWordCount > existingWordCount) {
             return false
         }
@@ -642,18 +705,55 @@ class QrcLyricCacheManager(
     }
 
     private fun toJson(parsed: ParsedLyric): JSONObject {
+        val fingerprint = parsed.groupFingerprint
+        val parsedTranslationCount = parsed.lines.count { !it.translation.isNullOrBlank() }
+        val parsedRomanizationCount = parsed.lines.count { !it.romanization.isNullOrBlank() }
+        val parsedWordLineCount = parsed.lines.count { it.words.isNotEmpty() }
         return JSONObject()
             .put("schemaVersion", QRC_CACHE_SCHEMA_V2)
             .put("version", QRC_CACHE_SCHEMA_V2)
+            .put("cacheBuildVersion", parsed.cacheBuildVersion)
             .put("songKey", parsed.songKey)
             .put("title", parsed.title)
             .put("artist", parsed.artist)
             .put("album", parsed.album)
             .put("groupId", parsed.groupId)
             .put("qrcPath", parsed.qrcPath)
-            .put("qrcLastModified", parsed.qrcLastModified)
+            .put("qrcLastModified", fingerprint?.qrcLastModified ?: parsed.qrcLastModified)
+            .put("qrcSize", fingerprint?.qrcSize ?: 0L)
+            .put("producerLastModified", fingerprint?.producerLastModified ?: 0L)
+            .put("producerSize", fingerprint?.producerSize ?: 0L)
+            .put("exLastModified", fingerprint?.exLastModified ?: 0L)
+            .put("exSize", fingerprint?.exSize ?: 0L)
+            .put("translrcLastModified", fingerprint?.translrcLastModified ?: 0L)
+            .put("translrcSize", fingerprint?.translrcSize ?: 0L)
+            .put("romaqrcLastModified", fingerprint?.romaqrcLastModified ?: 0L)
+            .put("romaqrcSize", fingerprint?.romaqrcSize ?: 0L)
+            .put("hasQrc", fingerprint?.hasQrc ?: false)
+            .put("hasProducer", fingerprint?.hasProducer ?: false)
+            .put("hasEx", fingerprint?.hasEx ?: false)
+            .put("hasTranslrc", fingerprint?.hasTranslrc ?: false)
+            .put("hasRomaqrc", fingerprint?.hasRomaqrc ?: false)
+            .put("parsedTranslationCount", parsedTranslationCount)
+            .put("parsedRomanizationCount", parsedRomanizationCount)
+            .put("parsedWordLineCount", parsedWordLineCount)
+            .put("parsedLineCount", parsed.lines.count { it.text.isNotBlank() })
+            .put("translationParseFailed", parsed.translationParseFailed)
+            .put("translationSourceLastModified", parsed.translationSourceLastModified)
+            .put("translationSourceSize", parsed.translationSourceSize)
+            .put("romanizationParseFailed", parsed.romanizationParseFailed)
+            .put("romanizationSourceLastModified", parsed.romanizationSourceLastModified)
+            .put("romanizationSourceSize", parsed.romanizationSourceSize)
             .put("createdAt", System.currentTimeMillis())
             .put("wordTimingStatus", parsed.wordTimingStatus.name)
+            .also { root ->
+                parsed.translationParseFailedReason
+                    ?.takeIf(String::isNotBlank)
+                    ?.let { root.put("translationParseFailedReason", it) }
+                parsed.romanizationParseFailedReason
+                    ?.takeIf(String::isNotBlank)
+                    ?.let { root.put("romanizationParseFailedReason", it) }
+            }
             .put("lines", JSONArray().also { array ->
                 parsed.lines
                     .filter { it.text.isNotBlank() }
@@ -665,6 +765,12 @@ class QrcLyricCacheManager(
                                 .put("text", line.text)
                                 .put("durationMs", line.durationMs)
                                 .also { lineObject ->
+                                    line.translation
+                                        ?.takeIf(String::isNotBlank)
+                                        ?.let { lineObject.put("translation", it) }
+                                    line.romanization
+                                        ?.takeIf(String::isNotBlank)
+                                        ?.let { lineObject.put("romanization", it) }
                                     if (line.words.isNotEmpty()) {
                                         lineObject.put(
                                             "words",
@@ -710,12 +816,101 @@ class QrcLyricCacheManager(
         return if (schema > 0) schema else objectValue.optInt("version")
     }
 
+    private fun readFingerprint(objectValue: JSONObject): QrcGroupFingerprint? {
+        if (!objectValue.has("cacheBuildVersion") ||
+            !objectValue.has("qrcSize") ||
+            !objectValue.has("hasQrc")
+        ) {
+            return null
+        }
+        return QrcGroupFingerprint(
+            qrcLastModified = objectValue.optLong("qrcLastModified"),
+            qrcSize = objectValue.optLong("qrcSize"),
+            producerLastModified = objectValue.optLong("producerLastModified"),
+            producerSize = objectValue.optLong("producerSize"),
+            exLastModified = objectValue.optLong("exLastModified"),
+            exSize = objectValue.optLong("exSize"),
+            translrcLastModified = objectValue.optLong("translrcLastModified"),
+            translrcSize = objectValue.optLong("translrcSize"),
+            romaqrcLastModified = objectValue.optLong("romaqrcLastModified"),
+            romaqrcSize = objectValue.optLong("romaqrcSize"),
+            hasQrc = objectValue.optBoolean("hasQrc"),
+            hasProducer = objectValue.optBoolean("hasProducer"),
+            hasEx = objectValue.optBoolean("hasEx"),
+            hasTranslrc = objectValue.optBoolean("hasTranslrc"),
+            hasRomaqrc = objectValue.optBoolean("hasRomaqrc")
+        )
+    }
+
+    private fun groupInvalidReason(
+        group: QrcFileGroup,
+        cached: ParsedLyric,
+        requireComplete: Boolean
+    ): String? {
+        if (cached.lines.isEmpty()) {
+            return "lines empty"
+        }
+        if (requireComplete && cached.cacheBuildVersion < QRC_CACHE_BUILD_VERSION) {
+            return "cacheBuildVersion ${cached.cacheBuildVersion} < $QRC_CACHE_BUILD_VERSION"
+        }
+        val currentFingerprint = QrcLyricUtils.buildFingerprint(group)
+        val cachedFingerprint = cached.groupFingerprint
+            ?: return "fingerprint missing"
+        if (cachedFingerprint != currentFingerprint) {
+            logger("[QrcCache] fingerprint changed groupId=${group.groupId}")
+            return "fingerprint changed"
+        }
+        val translationCount = cached.lines.count { !it.translation.isNullOrBlank() }
+        if (currentFingerprint.hasTranslrc &&
+            translationCount == 0 &&
+            !hasParseFailureForSameTranslation(cached, currentFingerprint)
+        ) {
+            logger("[QrcCache] translation missing groupId=${group.groupId}")
+            return "translation missing"
+        }
+        val romanizationCount = cached.lines.count { !it.romanization.isNullOrBlank() }
+        if (currentFingerprint.hasRomaqrc &&
+            romanizationCount == 0 &&
+            !hasParseFailureForSameRomanization(cached, currentFingerprint)
+        ) {
+            logger("[QrcCache] romanization missing groupId=${group.groupId}")
+            return "romanization missing"
+        }
+        if (requireComplete && cached.lines.size <= SUSPICIOUS_MIN_LINES) {
+            logger(
+                "[QrcCache] suspicious too few lines groupId=${group.groupId} " +
+                    "lines=${cached.lines.size}"
+            )
+            return "suspicious too few lines"
+        }
+        return null
+    }
+
+    private fun hasParseFailureForSameTranslation(
+        cached: ParsedLyric,
+        fingerprint: QrcGroupFingerprint
+    ): Boolean {
+        return cached.translationParseFailed &&
+            cached.translationSourceLastModified == fingerprint.translrcLastModified &&
+            cached.translationSourceSize == fingerprint.translrcSize
+    }
+
+    private fun hasParseFailureForSameRomanization(
+        cached: ParsedLyric,
+        fingerprint: QrcGroupFingerprint
+    ): Boolean {
+        return cached.romanizationParseFailed &&
+            cached.romanizationSourceLastModified == fingerprint.romaqrcLastModified &&
+            cached.romanizationSourceSize == fingerprint.romaqrcSize
+    }
+
     companion object {
         private const val MAX_MEMORY_CACHE = 120
         private const val INDEX_TTL_MS = 5L * 60L * 1000L
         private const val MIN_FUZZY_TITLE_LENGTH = 2
         private const val MIN_FUZZY_SCORE = 120
         private const val MIN_SCORE_GAP = 20
+        private const val SUSPICIOUS_MIN_LINES = 5
         private const val STATS_LOG_INTERVAL = 50L
         private var sharedStats = MutableLyricCacheStats()
         private var sharedQueryCount = 0L
@@ -753,6 +948,12 @@ class QrcLyricCacheManager(
         val linesCount: Int,
         val createdAt: Long,
         val groupId: String?
+    )
+
+    data class GroupCacheValidation(
+        val valid: Boolean,
+        val reason: String = "",
+        val cached: ParsedLyric? = null
     )
 
     private fun maybeLogStats() {

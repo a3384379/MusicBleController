@@ -244,7 +244,9 @@ class LyricManager(
                         timeMs = it.timeMs,
                         text = it.text,
                         durationMs = it.durationMs,
-                        words = it.words
+                        words = it.words,
+                        translation = it.translation,
+                        romanization = it.romanization
                     )
                 }
             } else {
@@ -351,7 +353,9 @@ class LyricManager(
                 timeMs = it.timeMs,
                 text = it.text,
                 durationMs = it.durationMs,
-                words = it.words
+                words = it.words,
+                translation = it.translation,
+                romanization = it.romanization
             )
         }
         if (lines.isEmpty()) {
@@ -692,7 +696,9 @@ class LyricManager(
         val timeMs: Long,
         val text: String,
         val durationMs: Long = 0L,
-        val words: List<QrcLyricWord> = emptyList()
+        val words: List<QrcLyricWord> = emptyList(),
+        val translation: String? = null,
+        val romanization: String? = null
     )
 
     private data class LyricCandidate(
