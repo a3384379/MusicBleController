@@ -17,6 +17,11 @@
 		A10000000000000000000008 /* AppLogStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000010 /* AppLogStore.swift */; };
 		A10000000000000000000009 /* LiveActivitySharedConstants.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* LiveActivitySharedConstants.swift */; };
 		A10000000000000000000010 /* LiveActivityArtworkStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000012 /* LiveActivityArtworkStore.swift */; };
+		A10000000000000000000011 /* LiveActivityControlModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000014 /* LiveActivityControlModels.swift */; };
+		A10000000000000000000012 /* LiveActivityCommandBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000015 /* LiveActivityCommandBridge.swift */; };
+		A10000000000000000000013 /* PlayPauseLiveActivityIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000016 /* PlayPauseLiveActivityIntent.swift */; };
+		A10000000000000000000014 /* PreviousLiveActivityIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000017 /* PreviousLiveActivityIntent.swift */; };
+		A10000000000000000000015 /* NextLiveActivityIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000018 /* NextLiveActivityIntent.swift */; };
 		B10000000000000000000001 /* SonyMusicActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* SonyMusicActivityAttributes.swift */; };
 		B10000000000000000000002 /* LiveActivityManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000002 /* LiveActivityManager.swift */; };
 		B10000000000000000000003 /* SonyMusicLiveActivityExtensionBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000004 /* SonyMusicLiveActivityExtensionBundle.swift */; };
@@ -25,6 +30,11 @@
 		B10000000000000000000006 /* SonyMusicLiveActivityExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = B20000000000000000000007 /* SonyMusicLiveActivityExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		B10000000000000000000007 /* LiveActivityArtworkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000008 /* LiveActivityArtworkView.swift */; };
 		B10000000000000000000008 /* LiveActivitySharedConstants.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* LiveActivitySharedConstants.swift */; };
+		B10000000000000000000009 /* LiveActivityControlModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000014 /* LiveActivityControlModels.swift */; };
+		B10000000000000000000010 /* LiveActivityCommandBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000015 /* LiveActivityCommandBridge.swift */; };
+		B10000000000000000000011 /* PlayPauseLiveActivityIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000016 /* PlayPauseLiveActivityIntent.swift */; };
+		B10000000000000000000012 /* PreviousLiveActivityIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000017 /* PreviousLiveActivityIntent.swift */; };
+		B10000000000000000000013 /* NextLiveActivityIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000018 /* NextLiveActivityIntent.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -65,6 +75,11 @@
 		A20000000000000000000011 /* LiveActivitySharedConstants.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivitySharedConstants.swift; sourceTree = "<group>"; };
 		A20000000000000000000012 /* LiveActivityArtworkStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityArtworkStore.swift; sourceTree = "<group>"; };
 		A20000000000000000000013 /* IOSBleFeasibility.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = IOSBleFeasibility.entitlements; sourceTree = "<group>"; };
+		A20000000000000000000014 /* LiveActivityControlModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityControlModels.swift; sourceTree = "<group>"; };
+		A20000000000000000000015 /* LiveActivityCommandBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityCommandBridge.swift; sourceTree = "<group>"; };
+		A20000000000000000000016 /* PlayPauseLiveActivityIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayPauseLiveActivityIntent.swift; sourceTree = "<group>"; };
+		A20000000000000000000017 /* PreviousLiveActivityIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviousLiveActivityIntent.swift; sourceTree = "<group>"; };
+		A20000000000000000000018 /* NextLiveActivityIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NextLiveActivityIntent.swift; sourceTree = "<group>"; };
 		B20000000000000000000001 /* SonyMusicActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SonyMusicActivityAttributes.swift; sourceTree = "<group>"; };
 		B20000000000000000000002 /* LiveActivityManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityManager.swift; sourceTree = "<group>"; };
 		B20000000000000000000004 /* SonyMusicLiveActivityExtensionBundle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SonyMusicLiveActivityExtensionBundle.swift; sourceTree = "<group>"; };
@@ -113,6 +128,11 @@
 				B20000000000000000000002 /* LiveActivityManager.swift */,
 				A20000000000000000000011 /* LiveActivitySharedConstants.swift */,
 				A20000000000000000000012 /* LiveActivityArtworkStore.swift */,
+				A20000000000000000000014 /* LiveActivityControlModels.swift */,
+				A20000000000000000000015 /* LiveActivityCommandBridge.swift */,
+				A20000000000000000000016 /* PlayPauseLiveActivityIntent.swift */,
+				A20000000000000000000017 /* PreviousLiveActivityIntent.swift */,
+				A20000000000000000000018 /* NextLiveActivityIntent.swift */,
 				A20000000000000000000010 /* AppLogStore.swift */,
 				A20000000000000000000003 /* BLEUUIDs.swift */,
 				A20000000000000000000004 /* BLETestManager.swift */,
@@ -261,6 +281,11 @@
 				B10000000000000000000002 /* LiveActivityManager.swift in Sources */,
 				A10000000000000000000009 /* LiveActivitySharedConstants.swift in Sources */,
 				A10000000000000000000010 /* LiveActivityArtworkStore.swift in Sources */,
+				A10000000000000000000011 /* LiveActivityControlModels.swift in Sources */,
+				A10000000000000000000012 /* LiveActivityCommandBridge.swift in Sources */,
+				A10000000000000000000013 /* PlayPauseLiveActivityIntent.swift in Sources */,
+				A10000000000000000000014 /* PreviousLiveActivityIntent.swift in Sources */,
+				A10000000000000000000015 /* NextLiveActivityIntent.swift in Sources */,
 				A10000000000000000000008 /* AppLogStore.swift in Sources */,
 				A10000000000000000000003 /* BLEUUIDs.swift in Sources */,
 				A10000000000000000000004 /* BLETestManager.swift in Sources */,
@@ -276,6 +301,11 @@
 				B10000000000000000000007 /* LiveActivityArtworkView.swift in Sources */,
 				B10000000000000000000005 /* SonyMusicActivityAttributes.swift in Sources */,
 				B10000000000000000000008 /* LiveActivitySharedConstants.swift in Sources */,
+				B10000000000000000000009 /* LiveActivityControlModels.swift in Sources */,
+				B10000000000000000000010 /* LiveActivityCommandBridge.swift in Sources */,
+				B10000000000000000000011 /* PlayPauseLiveActivityIntent.swift in Sources */,
+				B10000000000000000000012 /* PreviousLiveActivityIntent.swift in Sources */,
+				B10000000000000000000013 /* NextLiveActivityIntent.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

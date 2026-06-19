@@ -12,6 +12,7 @@ struct DebugToolsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     statusSection
+                    liveActivityControlSection
                     karaokeOffsetSection
                     actionSection
                     sonyLogSection
@@ -94,6 +95,28 @@ struct DebugToolsView: View {
                         disabled: !isConnected || bleManager.isMediaFieldDumpReceiving,
                         action: bleManager.sendDumpMediaFields
                     )
+                }
+            }
+        }
+    }
+
+    private var liveActivityControlSection: some View {
+        let status = bleManager.liveActivityControlStatus
+        return DebugCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Live Activity Control", systemImage: "playpause.circle")
+                    .font(.headline)
+
+                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
+                    debugRow("Bridge registered", status.bridgeRegistered ? "true" : "false")
+                    debugRow("BLE ready", status.bleReady ? "true" : "false")
+                    debugRow("Last intent seq", status.lastIntentSeq == 0 ? "-" : "\(status.lastIntentSeq)")
+                    debugRow("Last command", status.lastCommand?.rawValue ?? "-")
+                    debugRow("Last result", status.lastResult.rawValue)
+                    debugRow("Last cost", "\(status.lastCostMs)ms")
+                    debugRow("In flight", status.inFlight ? "true" : "false")
+                    debugRow("Dropped count", "\(status.droppedCount)")
+                    debugRow("Debounced count", "\(status.debouncedCount)")
                 }
             }
         }

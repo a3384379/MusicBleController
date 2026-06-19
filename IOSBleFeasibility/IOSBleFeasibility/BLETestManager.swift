@@ -3,6 +3,11 @@ import CryptoKit
 import Foundation
 import UIKit
 
+private let LIVE_ACTIVITY_PLAY_PAUSE_DEBOUNCE_MS: Int64 = 600
+private let LIVE_ACTIVITY_TRACK_SKIP_DEBOUNCE_MS: Int64 = 800
+private let LIVE_ACTIVITY_COMMAND_TTL_MS: Int64 = 1_500
+private let LIVE_ACTIVITY_WRITE_STALL_MS: Int64 = 2_000
+
 struct LyricWord: Identifiable, Equatable {
     let id: Int
     let startMs: Int64
@@ -59,6 +64,7 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var mediaFieldDumpProgressText = ""
     @Published private(set) var karaokeOffsetMs: Int64 = 600
     @Published private(set) var localLogActionStatus = ""
+    @Published private(set) var liveActivityControlStatus = LiveActivityControlStatus()
 
     private lazy var centralManager = CBCentralManager(delegate: self, queue: nil)
     private lazy var peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
@@ -69,6 +75,9 @@ final class BLETestManager: NSObject, ObservableObject {
     private var pendingWriteCommand = ""
     private var commandSeq: UInt64 = 0
     private var commandWriteInflight: [CommandWriteInfo] = []
+    private var liveActivityControlInFlightSeq: UInt64?
+    private var liveActivityControlWriteStartedAtMs: Int64 = 0
+    private var lastLiveActivityCommandAcceptedAtMs: [LiveActivityControlCommand: Int64] = [:]
     private var mainHeartbeatWorkItem: DispatchWorkItem?
     private var lastMainHeartbeatAtMs: Int64 = 0
     private var lastMainHeartbeatAppState = "active"
@@ -136,6 +145,10 @@ final class BLETestManager: NSObject, ObservableObject {
     override init() {
         super.init()
         log("[BLE-iOS] app log store ready")
+        LiveActivityCommandBridge.shared.register(self, logger: { [weak self] message in
+            self?.log(message)
+        })
+        refreshLiveActivityControlStatus()
         updateAppLifecycleState(UIApplication.shared.applicationState, emitLog: false)
         registerAppLifecycleDiagnostics()
         startProgressTimer()
@@ -143,6 +156,7 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     deinit {
+        LiveActivityCommandBridge.shared.unregister(self)
         progressTimer?.invalidate()
         mainHeartbeatWorkItem?.cancel()
         NotificationCenter.default.removeObserver(self)
@@ -686,6 +700,53 @@ final class BLETestManager: NSObject, ObservableObject {
         print(message)
     }
 
+    private var liveActivityBleReady: Bool {
+        centralManager.state == .poweredOn &&
+            sonyPeripheral?.state == .connected &&
+            sonyCommandCharacteristic != nil &&
+            connectionStatus == "已连接"
+    }
+
+    private func recordLiveActivityControlResult(
+        command: LiveActivityControlCommand,
+        seq: UInt64,
+        result: LiveActivityControlResult,
+        startedAtMs: Int64,
+        inFlight: Bool? = nil
+    ) -> LiveActivityControlResult {
+        liveActivityControlStatus.bridgeRegistered = LiveActivityCommandBridge.shared.isRegistered
+        liveActivityControlStatus.bleReady = liveActivityBleReady
+        liveActivityControlStatus.lastIntentSeq = seq
+        liveActivityControlStatus.lastCommand = command
+        liveActivityControlStatus.lastResult = result
+        liveActivityControlStatus.lastCostMs = currentTimeMs() - startedAtMs
+        if let inFlight {
+            liveActivityControlStatus.inFlight = inFlight
+        }
+        if result != .sent {
+            liveActivityControlStatus.droppedCount += 1
+        }
+        if result == .debounced {
+            liveActivityControlStatus.debouncedCount += 1
+        }
+        return result
+    }
+
+    private func refreshLiveActivityControlStatus() {
+        liveActivityControlStatus.bridgeRegistered = LiveActivityCommandBridge.shared.isRegistered
+        liveActivityControlStatus.bleReady = liveActivityBleReady
+        liveActivityControlStatus.inFlight = liveActivityControlInFlightSeq != nil
+    }
+
+    private func liveActivityDebounceMs(for command: LiveActivityControlCommand) -> Int64 {
+        switch command {
+        case .playPause:
+            return LIVE_ACTIVITY_PLAY_PAUSE_DEBOUNCE_MS
+        case .previous, .next:
+            return LIVE_ACTIVITY_TRACK_SKIP_DEBOUNCE_MS
+        }
+    }
+
     private func setMode(_ value: String) {
         DispatchQueue.main.async {
             self.mode = value
@@ -695,7 +756,132 @@ final class BLETestManager: NSObject, ObservableObject {
     private func setStatus(_ value: String) {
         DispatchQueue.main.async {
             self.connectionStatus = value
+            self.refreshLiveActivityControlStatus()
         }
+    }
+}
+
+extension BLETestManager: LiveActivityBLECommandSending {
+    func sendLiveActivityCommand(
+        _ command: LiveActivityControlCommand,
+        seq: UInt64,
+        issuedAt: Date
+    ) -> LiveActivityControlResult {
+        let startedAtMs = currentTimeMs()
+        let ageMs = Int64(Date().timeIntervalSince(issuedAt) * 1_000)
+        ctrlLog(
+            "[LA-CTRL] send check seq=\(seq) cmd=\(command.rawValue) " +
+                "ageMs=\(ageMs)"
+        )
+        ctrlLog(
+            "[LA-CTRL] connected=\(connectionStatus == "已连接") " +
+                "centralState=\(centralManager.state.rawValue)"
+        )
+        ctrlLog(
+            "[LA-CTRL] peripheralState=\(sonyPeripheral?.state.rawValue ?? -1) " +
+                "characteristicReady=\(sonyCommandCharacteristic != nil)"
+        )
+
+        guard ageMs <= LIVE_ACTIVITY_COMMAND_TTL_MS else {
+            ctrlLog("[LA-CTRL] command dropped seq=\(seq) reason=expired")
+            return recordLiveActivityControlResult(
+                command: command,
+                seq: seq,
+                result: .expired,
+                startedAtMs: startedAtMs
+            )
+        }
+        guard centralManager.state == .poweredOn else {
+            ctrlLog("[LA-CTRL] command dropped seq=\(seq) reason=bluetoothUnavailable")
+            return recordLiveActivityControlResult(
+                command: command,
+                seq: seq,
+                result: .bluetoothUnavailable,
+                startedAtMs: startedAtMs
+            )
+        }
+        guard connectionStatus == "已连接" else {
+            ctrlLog("[LA-CTRL] command dropped seq=\(seq) reason=disconnected")
+            return recordLiveActivityControlResult(
+                command: command,
+                seq: seq,
+                result: .disconnected,
+                startedAtMs: startedAtMs
+            )
+        }
+        guard sonyPeripheral?.state == .connected else {
+            ctrlLog("[LA-CTRL] command dropped seq=\(seq) reason=disconnected")
+            return recordLiveActivityControlResult(
+                command: command,
+                seq: seq,
+                result: .disconnected,
+                startedAtMs: startedAtMs
+            )
+        }
+        guard sonyCommandCharacteristic != nil else {
+            ctrlLog("[LA-CTRL] command dropped seq=\(seq) reason=characteristicNotReady")
+            return recordLiveActivityControlResult(
+                command: command,
+                seq: seq,
+                result: .characteristicNotReady,
+                startedAtMs: startedAtMs
+            )
+        }
+
+        let nowMs = currentTimeMs()
+        let debounceMs = liveActivityDebounceMs(for: command)
+        let lastAcceptedAtMs = lastLiveActivityCommandAcceptedAtMs[command] ?? 0
+        if nowMs - lastAcceptedAtMs < debounceMs {
+            ctrlLog(
+                "[LA-CTRL] command dropped seq=\(seq) cmd=\(command.rawValue) " +
+                    "reason=debounced debounceMs=\(debounceMs)"
+            )
+            return recordLiveActivityControlResult(
+                command: command,
+                seq: seq,
+                result: .debounced,
+                startedAtMs: startedAtMs
+            )
+        }
+        if let inFlightSeq = liveActivityControlInFlightSeq {
+            let inFlightAgeMs = nowMs - liveActivityControlWriteStartedAtMs
+            if inFlightAgeMs < LIVE_ACTIVITY_WRITE_STALL_MS {
+                ctrlLog(
+                    "[LA-CTRL] command dropped seq=\(seq) reason=writeInFlight " +
+                        "inFlightSeq=\(inFlightSeq)"
+                )
+                return recordLiveActivityControlResult(
+                    command: command,
+                    seq: seq,
+                    result: .writeInFlight,
+                    startedAtMs: startedAtMs,
+                    inFlight: true
+                )
+            }
+            ctrlLog(
+                "[LA-CTRL] stale in-flight released seq=\(inFlightSeq) " +
+                    "ageMs=\(inFlightAgeMs)"
+            )
+            liveActivityControlInFlightSeq = nil
+            liveActivityControlWriteStartedAtMs = 0
+        }
+
+        lastLiveActivityCommandAcceptedAtMs[command] = nowMs
+        liveActivityControlInFlightSeq = seq
+        liveActivityControlWriteStartedAtMs = nowMs
+        ctrlLog("[LA-CTRL] write requested seq=\(seq) cmd=\(command.rawValue)")
+        sendCommand(
+            cmd: command.rawValue,
+            extra: ["source": "liveActivity"],
+            seq: seq
+        )
+        return recordLiveActivityControlResult(
+            command: command,
+            seq: seq,
+            result: .sent,
+            startedAtMs: startedAtMs,
+            inFlight: true
+        )
     }
 }
 
@@ -827,6 +1013,16 @@ extension BLETestManager: CBPeripheralDelegate {
                 "[CTRL-iOS] didWrite seq=\(completed.seq) cmd=\(completed.cmd) " +
                     "timeMs=\(didWriteMs) costMs=\(costMs) error=\(errorText)"
             )
+            if completed.seq == liveActivityControlInFlightSeq {
+                liveActivityControlInFlightSeq = nil
+                liveActivityControlWriteStartedAtMs = 0
+                liveActivityControlStatus.inFlight = false
+                ctrlLog(
+                    "[LA-CTRL] write callback seq=\(completed.seq) " +
+                        "costMs=\(costMs) error=\(errorText)"
+                )
+                refreshLiveActivityControlStatus()
+            }
         } else {
             let errorText = error?.localizedDescription ?? "nil"
             ctrlLog(
