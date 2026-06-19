@@ -16,6 +16,10 @@ class LyricManager(
     private val appContext = context.applicationContext
     private var cachedKey: String? = null
     private var activeSongKey: String? = null
+    private var activeTitle: String = ""
+    private var activeArtist: String = ""
+    private var activeAlbum: String = ""
+    private var activeTrackChangedAtMs: Long = 0L
     private var loadedSongKey: String? = null
     private var loadingSongKey: String? = null
     private var pendingRequest: LyricLoadRequest? = null
@@ -92,15 +96,26 @@ class LyricManager(
     fun requestLyricLoadAsync(title: String, artist: String, album: String = "") {
         val key = lyricKey(title, artist, album)
         if (key == activeSongKey && key == loadedSongKey) {
+            activeTitle = title
+            activeArtist = artist
+            activeAlbum = album
             return
         }
 
         if (key != activeSongKey) {
             activeSongKey = key
+            activeTitle = title
+            activeArtist = artist
+            activeAlbum = album
+            activeTrackChangedAtMs = System.currentTimeMillis()
             cachedKey = key
             cachedLines = emptyList()
             loadedSongKey = null
             lastLoggedLine = null
+        } else {
+            activeTitle = title
+            activeArtist = artist
+            activeAlbum = album
         }
 
         if (title.isBlank() && artist.isBlank()) {
@@ -294,6 +309,67 @@ class LyricManager(
             return cachedLines.toList()
         }
         return emptyList()
+    }
+
+    @Synchronized
+    fun currentTrackSnapshot(trackId: String): CurrentTrackSnapshot? {
+        val activeKey = activeSongKey ?: return null
+        if (activeKey.isBlank()) {
+            return null
+        }
+        return CurrentTrackSnapshot(
+            trackId = trackId,
+            songKey = QrcLyricUtils.buildSongKey(activeTitle, activeArtist, activeAlbum),
+            title = activeTitle,
+            artist = activeArtist,
+            album = activeAlbum,
+            trackChangedAtMs = activeTrackChangedAtMs,
+            hasLyrics = activeSongKey == loadedSongKey && cachedLines.isNotEmpty()
+        )
+    }
+
+    @Synchronized
+    fun applyIncrementalLyrics(ready: IncrementalLyricsReady): Boolean {
+        val currentTrack = ready.currentTrack ?: return false
+        if (!ready.matchedCurrentTrack) {
+            return false
+        }
+        val activeKey = lyricKey(
+            currentTrack.title,
+            currentTrack.artist,
+            currentTrack.album
+        )
+        if (activeSongKey != activeKey) {
+            logger(
+                "[Lyric] incremental lyrics ignored reason=track changed " +
+                    "songKey=${currentTrack.songKey}"
+            )
+            return false
+        }
+        val lines = ready.parsed.lines.map {
+            LyricLine(
+                timeMs = it.timeMs,
+                text = it.text,
+                durationMs = it.durationMs,
+                words = it.words
+            )
+        }
+        if (lines.isEmpty()) {
+            return false
+        }
+        cachedKey = activeKey
+        cachedLines = lines
+        loadedSongKey = activeKey
+        lastLoggedLine = null
+        qrcLyricManager.removeUncertainCooldown(
+            currentTrack.songKey,
+            "incremental lyrics ready"
+        )
+        logger(
+            "[Lyric] incremental lyrics applied " +
+                "songKey=${currentTrack.songKey} lines=${lines.size}"
+        )
+        return true
     }
 
     private fun resolveLyricDirectory(): File {

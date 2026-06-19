@@ -308,7 +308,13 @@ class PlayerAgentForegroundService : Service() {
         val manager = qrcIncrementalPrebuildManager ?: QrcIncrementalPrebuildManager(
             context = this,
             logger = ::log,
-            statusListener = ::publishQrcWatcherStatus
+            statusListener = ::publishQrcWatcherStatus,
+            currentTrackProvider = {
+                gattServerManager?.currentTrackSnapshot()
+            },
+            onIncrementalLyricsReady = { ready ->
+                gattServerManager?.handleIncrementalLyricsReady(ready)
+            }
         ).also {
             qrcIncrementalPrebuildManager = it
         }

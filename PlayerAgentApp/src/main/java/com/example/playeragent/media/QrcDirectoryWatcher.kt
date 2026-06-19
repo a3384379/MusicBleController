@@ -84,7 +84,10 @@ class QrcDirectoryWatcher(
         val eventName = eventName(event)
         logger("[QrcWatcher] event=$eventName file=$fileName")
         synchronized(lock) {
-            pendingGroups += groupId
+            val firstPending = pendingGroups.add(groupId)
+            if (firstPending) {
+                QrcDirectoryGeneration.markChanged(groupId, eventName, logger)
+            }
             logger("[QrcWatcher] group changed groupId=$groupId")
             logger("[QrcWatcher] pending groupId=$groupId")
             scheduleDebounceLocked()
@@ -141,6 +144,8 @@ class QrcDirectoryWatcher(
             cleanEvent and FileObserver.CREATE != 0 -> "CREATE"
             cleanEvent and FileObserver.MOVED_TO != 0 -> "MOVED_TO"
             cleanEvent and FileObserver.CLOSE_WRITE != 0 -> "CLOSE_WRITE"
+            cleanEvent and FileObserver.DELETE != 0 -> "DELETE"
+            cleanEvent and FileObserver.DELETE_SELF != 0 -> "DELETE_SELF"
             cleanEvent and FileObserver.MODIFY != 0 -> "MODIFY"
             else -> cleanEvent.toString()
         }
@@ -150,11 +155,13 @@ class QrcDirectoryWatcher(
         private const val DEBOUNCE_MS = 5_000L
         private const val MAX_BATCH_GROUPS = 20
         private const val EVENT_MASK =
-            FileObserver.CREATE or
+                FileObserver.CREATE or
                 FileObserver.MOVED_TO or
                 FileObserver.CLOSE_WRITE or
+                FileObserver.DELETE or
+                FileObserver.DELETE_SELF or
                 FileObserver.MODIFY
         private val GROUP_FILE_REGEX =
-            Regex("""^(-?\d+)\.(qrc|producer|ex|translrc|romaqrc)$""")
+            Regex("""^(-?\d+)\.(qrc|producer|ex|translrc|romaqrc|lrc)$""")
     }
 }

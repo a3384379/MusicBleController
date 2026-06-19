@@ -10,6 +10,7 @@ import android.os.SystemClock
 import com.example.playeragent.logging.LogConfig
 import com.example.playeragent.service.PlayerNotificationListenerService
 import org.json.JSONObject
+import java.security.MessageDigest
 
 class PlaybackStateReader(
     context: Context,
@@ -27,6 +28,7 @@ class PlaybackStateReader(
     private var metadataMissingLogged = false
     private var durationMissingLogged = false
     private var lastLoggedLyric: String? = null
+    private var lastTrackId: String = ""
 
     fun readPlaybackState(): JSONObject {
         val startedAtMs = SystemClock.elapsedRealtime()
@@ -88,6 +90,7 @@ class PlaybackStateReader(
         val title = metadata?.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty()
         val artist = metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty()
         val album = metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM).orEmpty()
+        lastTrackId = buildTrackId(title, artist, album)
         val duration = metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
         if (duration <= 0L && !durationMissingLogged) {
             durationMissingLogged = true
@@ -142,6 +145,14 @@ class PlaybackStateReader(
         return lyricManager.lyricLinesSnapshot()
     }
 
+    fun currentTrackSnapshot(): CurrentTrackSnapshot? {
+        return lyricManager.currentTrackSnapshot(lastTrackId)
+    }
+
+    fun applyIncrementalLyrics(ready: IncrementalLyricsReady): Boolean {
+        return lyricManager.applyIncrementalLyrics(ready)
+    }
+
     private fun logController(index: Int, controller: MediaController) {
         val state = controller.playbackState?.state
         val metadata = controller.metadata
@@ -178,6 +189,18 @@ class PlaybackStateReader(
             .put("lyric", "")
     }
 
+    private fun buildTrackId(
+        title: String,
+        artist: String,
+        album: String
+    ): String {
+        val source = listOf(title, artist, album).joinToString("|").ifBlank { "unknown" }
+        return MessageDigest.getInstance("SHA-256")
+            .digest(source.toByteArray(Charsets.UTF_8))
+            .take(TRACK_ID_HASH_BYTES)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    }
+
     private fun calculatePosition(playbackState: PlaybackState?): Long {
         if (playbackState == null) {
             return 0L
@@ -195,5 +218,6 @@ class PlaybackStateReader(
 
     private companion object {
         private const val SLOW_PLAYBACK_READ_MS = 200L
+        private const val TRACK_ID_HASH_BYTES = 12
     }
 }

@@ -98,6 +98,8 @@ final class BLETestManager: NSObject, ObservableObject {
     private var requestedHqAlbumArtIDs: Set<String> = []
     private var hqAlbumArtWorkItem: DispatchWorkItem?
     private var requestedFullLyricsTrackIDs: Set<String> = []
+    private var fullLyricsUnavailableTrackIDs: Set<String> = []
+    private var fullLyricsDelayedRetryTrackIDs: Set<String> = []
     private var fullLyricsReceivingTrackID = ""
     private var fullLyricsExpectedCount = 0
     private var fullLyricsChunks: [Int: LyricLine] = [:]
@@ -934,7 +936,12 @@ extension BLETestManager: CBPeripheralDelegate {
                 self.durationMs = Self.int64Value(object["duration"])
                 if let lyric = object["lyric"] as? String {
                     self.lyric = lyric
-                    if !lyric.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                    let scheduledDelayedRetry = self.retryFullLyricsIfLyricsBecameAvailable(
+                        oldLyric: oldLyric,
+                        newLyric: lyric
+                    )
+                    if !scheduledDelayedRetry,
+                       !lyric.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                        self.fullLyrics.isEmpty {
                         self.requestFullLyricsIfNeeded(after: 0.1)
                     }
@@ -1520,6 +1527,8 @@ extension BLETestManager: CBPeripheralDelegate {
             fullLyricsTrackId = ""
             isFullLyricsCurrent = false
             requestedFullLyricsTrackIDs.removeAll()
+            fullLyricsUnavailableTrackIDs.removeAll()
+            fullLyricsDelayedRetryTrackIDs.removeAll()
             log("[Lyrics-iOS] keep previous lyrics until new chunks")
         }
         title = newTitle
@@ -1708,12 +1717,40 @@ extension BLETestManager: CBPeripheralDelegate {
         }
     }
 
+    private func retryFullLyricsIfLyricsBecameAvailable(
+        oldLyric: String,
+        newLyric: String
+    ) -> Bool {
+        let trackID = currentTrackID
+        guard !trackID.isEmpty else { return false }
+        guard fullLyrics.isEmpty else { return false }
+        guard fullLyricsUnavailableTrackIDs.contains(trackID) else { return false }
+        let oldText = oldLyric.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newText = newLyric.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard oldText.isEmpty, !newText.isEmpty else { return false }
+        guard !fullLyricsDelayedRetryTrackIDs.contains(trackID) else {
+            log("[Lyrics-iOS] retry skipped reason=already retried trackId=\(trackID)")
+            return false
+        }
+        fullLyricsDelayedRetryTrackIDs.insert(trackID)
+        log("[Lyrics-iOS] delayed lyrics became available trackId=\(trackID)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self else { return }
+            guard self.currentTrackID == trackID,
+                  self.fullLyrics.isEmpty else { return }
+            self.log("[Lyrics-iOS] retry GET_FULL_LYRICS trackId=\(trackID)")
+            self.requestFullLyricsIfNeeded(force: true)
+        }
+        return true
+    }
+
     private func handleFullLyricsStart(_ object: [String: Any]) {
         let trackID = object["trackId"] as? String ?? ""
         guard !trackID.isEmpty, trackID == currentTrackID else {
             log("[FullLyrics] stale start ignored trackId=\(trackID)")
             return
         }
+        fullLyricsUnavailableTrackIDs.remove(trackID)
         fullLyricsTimeoutWorkItem?.cancel()
         fullLyricsReceivingTrackID = trackID
         fullLyricsExpectedCount = Self.intValue(object["count"])
@@ -1774,6 +1811,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 trackID: trackID,
                 isFinal: true
             )
+            fullLyricsUnavailableTrackIDs.remove(trackID)
         } else {
             requestedFullLyricsTrackIDs.remove(trackID)
             log(
@@ -1788,6 +1826,7 @@ extension BLETestManager: CBPeripheralDelegate {
         let trackID = object["trackId"] as? String ?? ""
         guard trackID == currentTrackID else { return }
         requestedFullLyricsTrackIDs.remove(trackID)
+        fullLyricsUnavailableTrackIDs.insert(trackID)
         resetFullLyricsTransfer()
         if fullLyricsTrackId != trackID {
             fullLyrics = []

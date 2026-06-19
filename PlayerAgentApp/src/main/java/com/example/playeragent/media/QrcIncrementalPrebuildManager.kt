@@ -9,7 +9,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 class QrcIncrementalPrebuildManager(
     context: Context,
     private val logger: (String) -> Unit,
-    private val statusListener: (QrcWatcherStatus) -> Unit
+    private val statusListener: (QrcWatcherStatus) -> Unit,
+    private val currentTrackProvider: () -> CurrentTrackSnapshot? = { null },
+    private val onIncrementalLyricsReady: (IncrementalLyricsReady) -> Unit = {}
 ) {
 
     private val appContext = context.applicationContext
@@ -52,7 +54,7 @@ class QrcIncrementalPrebuildManager(
                     if (stopped.get()) {
                         return@forEachIndexed
                     }
-                    processGroup(groupId)
+                    processGroup(groupId, cleanGroupIds.size)
                     if ((index + 1) % THROTTLE_INTERVAL == 0) {
                         Thread.sleep(THROTTLE_SLEEP_MS)
                     }
@@ -88,7 +90,7 @@ class QrcIncrementalPrebuildManager(
         }
     }
 
-    private fun processGroup(groupId: String) {
+    private fun processGroup(groupId: String, batchSize: Int) {
         logger("[QrcIncremental] start groupId=$groupId")
         val group = findGroup(groupId)
         if (group.qrcFile == null) {
@@ -97,32 +99,153 @@ class QrcIncrementalPrebuildManager(
             incrementSkipped()
             return
         }
-        if (cacheManager.isGroupCacheValid(group)) {
+        val currentTrack = currentTrackProvider()
+        val shouldTryCurrentTrack = currentTrack != null &&
+            !currentTrack.hasLyrics &&
+            isRecentForCurrentTrack(group, currentTrack)
+        if (!shouldTryCurrentTrack && cacheManager.isGroupCacheValid(group)) {
             logger("[QrcIncremental] skip cached groupId=$groupId")
             persistentIndexManager.markDirty(groupId)
             incrementSkipped()
             return
         }
         val parsed = try {
-            QrcLyricUtils.decryptAndParseGroup(group)
+            QrcLyricUtils.decryptAndParseGroup(group, logger)
         } catch (exception: Exception) {
             logger("[QrcIncremental] failed groupId=$groupId reason=${exception.message}")
             null
         }
-        if (parsed == null || parsed.title.isBlank() || parsed.lines.isEmpty()) {
+        if (parsed == null || parsed.lines.isEmpty()) {
             logger("[QrcIncremental] failed groupId=$groupId reason=parse empty")
             persistentIndexManager.markDirty(groupId)
             incrementFailed()
             return
         }
-        cacheManager.save(parsed)
-        negativeCacheManager.removeNegative(parsed.songKey)
+
+        var savedAny = false
+        if (parsed.title.isNotBlank()) {
+            cacheManager.save(parsed)
+            negativeCacheManager.removeNegative(parsed.songKey)
+            savedAny = true
+        } else {
+            logger("[QrcIncremental] skip parsed songKey reason=unreliable title groupId=$groupId")
+        }
+
+        val matchedCurrent = evaluateCurrentTrackMatch(
+            group = group,
+            parsed = parsed,
+            currentTrack = currentTrack,
+            batchSize = batchSize
+        )
+        val ready = if (matchedCurrent && currentTrack != null) {
+            val currentParsed = parsed.copy(
+                songKey = currentTrack.songKey,
+                title = currentTrack.title,
+                artist = currentTrack.artist,
+                album = currentTrack.album,
+                qrcLastModified = group.qrcFile?.lastModified() ?: parsed.qrcLastModified,
+                qrcPath = group.qrcFile?.absolutePath.orEmpty()
+            )
+            cacheManager.save(currentParsed)
+            negativeCacheManager.removeNegative(
+                currentTrack.songKey,
+                "incremental lyrics ready"
+            )
+            logger(
+                "[QrcCache] incremental current-track saved " +
+                    "songKey=${currentTrack.songKey} groupId=$groupId lines=${parsed.lines.size}"
+            )
+            savedAny = true
+            IncrementalLyricsReady(
+                groupId = groupId,
+                parsed = currentParsed,
+                currentTrack = currentTrack,
+                matchedCurrentTrack = true
+            )
+        } else {
+            IncrementalLyricsReady(
+                groupId = groupId,
+                parsed = parsed,
+                currentTrack = currentTrack,
+                matchedCurrentTrack = false
+            )
+        }
         persistentIndexManager.markDirty(groupId)
+        if (savedAny) {
+            onIncrementalLyricsReady(ready)
+        }
         logger(
             "[QrcIncremental] success groupId=$groupId " +
                 "title=${parsed.title} lines=${parsed.lines.size}"
         )
         incrementSuccess()
+    }
+
+    private fun isRecentForCurrentTrack(
+        group: QrcFileGroup,
+        currentTrack: CurrentTrackSnapshot
+    ): Boolean {
+        val qrcModifiedAt = group.qrcFile?.lastModified() ?: group.lastModified
+        return qrcModifiedAt >= currentTrack.trackChangedAtMs ||
+            kotlin.math.abs(qrcModifiedAt - currentTrack.trackChangedAtMs) <= CURRENT_TRACK_MATCH_WINDOW_MS
+    }
+
+    private fun evaluateCurrentTrackMatch(
+        group: QrcFileGroup,
+        parsed: ParsedLyric,
+        currentTrack: CurrentTrackSnapshot?,
+        batchSize: Int
+    ): Boolean {
+        logger(
+            "[QrcIncrementalMatch] evaluate groupId=${group.groupId} " +
+                "currentSongKey=${currentTrack?.songKey.orEmpty()}"
+        )
+        if (currentTrack == null) {
+            logger("[QrcIncrementalMatch] rejected reason=no current track")
+            return false
+        }
+        if (currentTrack.hasLyrics) {
+            logger("[QrcIncrementalMatch] rejected reason=current lyrics already available")
+            return false
+        }
+        if (!isRecentForCurrentTrack(group, currentTrack)) {
+            logger("[QrcIncrementalMatch] rejected reason=not recent for current track")
+            return false
+        }
+
+        val currentArtistTokens = QrcLyricUtils.splitArtists(currentTrack.artist)
+        val parsedArtistTokens = QrcLyricUtils.splitArtists(parsed.artist)
+        val rawNormalized = QrcLyricUtils.normalizeForMatch(parsed.rawText)
+        val artistMatches = currentArtistTokens.isNotEmpty() &&
+            (currentArtistTokens.any(parsedArtistTokens::contains) ||
+                currentArtistTokens.any { rawNormalized.contains(it) })
+        if (!artistMatches) {
+            logger("[QrcIncrementalMatch] rejected reason=artist mismatch")
+            return false
+        }
+
+        val currentTitle = QrcLyricUtils.normalizeForMatch(currentTrack.title)
+        val parsedTitle = QrcLyricUtils.normalizeForMatch(parsed.title)
+        if (currentTitle.isNotBlank() && parsedTitle == currentTitle) {
+            logger("[QrcIncrementalMatch] matched reason=title_exact")
+            return true
+        }
+        if (currentTitle.isNotBlank() && rawNormalized.contains(currentTitle)) {
+            logger("[QrcIncrementalMatch] matched reason=raw_contains_current_title")
+            return true
+        }
+        val parsedTitleUnreliable = parsed.title.isBlank() ||
+            QrcLyricUtils.isInvalidMetadataTitle(parsed.title)
+        if (parsedTitleUnreliable && batchSize == 1) {
+            logger("[QrcIncrementalMatch] matched reason=recent_single_group_artist_match")
+            return true
+        }
+        if (parsedTitleUnreliable && batchSize > 1) {
+            logger("[QrcIncrementalMatch] ambiguous groups=$batchSize skip alias")
+        } else {
+            logger("[QrcIncrementalMatch] rejected reason=title mismatch")
+        }
+        return false
     }
 
     private fun findGroup(groupId: String): QrcFileGroup {
@@ -206,6 +329,7 @@ class QrcIncrementalPrebuildManager(
     companion object {
         private const val THROTTLE_INTERVAL = 10
         private const val THROTTLE_SLEEP_MS = 200L
+        private const val CURRENT_TRACK_MATCH_WINDOW_MS = 90_000L
         private val SUPPORTED_SUFFIXES = listOf(
             "qrc",
             "producer",

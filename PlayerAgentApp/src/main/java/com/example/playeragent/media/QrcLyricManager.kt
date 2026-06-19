@@ -31,7 +31,7 @@ class QrcLyricManager(
     private val songGroupCache = mutableMapOf<String, String>()
     private val songLinesCache = mutableMapOf<String, List<LyricLine>>()
     private val parsedQrcCache = mutableMapOf<String, ParsedQrc?>()
-    private val uncertainMissCooldown = mutableMapOf<String, Long>()
+    private val uncertainMissCooldown = mutableMapOf<String, QrcCooldownEntry>()
 
     @Synchronized
     fun load(title: String, artist: String, album: String): Boolean {
@@ -436,7 +436,7 @@ class QrcLyricManager(
                     parsedQrcCache[cacheKey] = null
                     return null
                 }
-            parseQrc(decrypted).also {
+            parseQrc(decrypted, entry.groupId).also {
                 cacheManager.recordQrcDecrypt(success = it.lines.isNotEmpty())
                 parsedQrcCache[cacheKey] = it
                 trimParsedQrcCache()
@@ -459,7 +459,7 @@ class QrcLyricManager(
     ) {
         cachedGroupId = entry.groupId
         cachedLines = parsed.lines
-        uncertainMissCooldown.remove(songKey)
+        removeUncertainCooldown(songKey, "qrc parsed")
         songGroupCache[songKey] = entry.groupId
         if (parsed.lines.isNotEmpty()) {
             songLinesCache[songKey] = parsed.lines
@@ -558,7 +558,7 @@ class QrcLyricManager(
         }
     }
 
-    private fun parseQrc(decrypted: String): ParsedQrc {
+    private fun parseQrc(decrypted: String, groupId: String): ParsedQrc {
         val lyricContent = QRC_LYRIC_CONTENT_REGEX.find(decrypted)
             ?.groupValues
             ?.getOrNull(1)
@@ -607,7 +607,11 @@ class QrcLyricManager(
             }
 
         return ParsedQrc(
-            title = metadata["ti"].orEmpty(),
+            title = QrcLyricUtils.sanitizeMetadataTitle(
+                metadata["ti"].orEmpty(),
+                groupId,
+                logger
+            ),
             artist = metadata["ar"].orEmpty(),
             album = metadata["al"].orEmpty(),
             lines = lines,
@@ -634,10 +638,19 @@ class QrcLyricManager(
     }
 
     private fun isUncertainCooldownActive(songKey: String): Boolean {
-        val retryAfterMs = uncertainMissCooldown[songKey] ?: return false
+        val entry = uncertainMissCooldown[songKey] ?: return false
+        val currentGeneration = QrcDirectoryGeneration.current()
+        if (entry.generation != currentGeneration) {
+            uncertainMissCooldown.remove(songKey)
+            logger(
+                "[QrcCooldown] invalidated songKey=$songKey " +
+                    "oldGeneration=${entry.generation} newGeneration=$currentGeneration"
+            )
+            return false
+        }
         val now = System.currentTimeMillis()
-        return if (now < retryAfterMs) {
-            logger("[QrcCooldown] hit songKey=$songKey skip qrc lookup")
+        return if (now < entry.retryAfterMs) {
+            logger("[QrcCooldown] hit songKey=$songKey generation=${entry.generation}")
             true
         } else {
             uncertainMissCooldown.remove(songKey)
@@ -650,8 +663,23 @@ class QrcLyricManager(
             return
         }
         val retryAfterMs = System.currentTimeMillis() + UNCERTAIN_MISS_COOLDOWN_MS
-        uncertainMissCooldown[songKey] = retryAfterMs
-        logger("[QrcCooldown] saved songKey=$songKey retryAfter=$retryAfterMs")
+        val generation = QrcDirectoryGeneration.current()
+        uncertainMissCooldown[songKey] = QrcCooldownEntry(
+            retryAfterMs = retryAfterMs,
+            generation = generation,
+            reason = "uncertain qrc match"
+        )
+        logger(
+            "[QrcCooldown] saved songKey=$songKey generation=$generation " +
+                "retryAfter=$retryAfterMs"
+        )
+    }
+
+    @Synchronized
+    fun removeUncertainCooldown(songKey: String, reason: String) {
+        if (uncertainMissCooldown.remove(songKey) != null) {
+            logger("[QrcCooldown] removed songKey=$songKey reason=$reason")
+        }
     }
 
     private fun isEncryptedQrcHex(value: String): Boolean {
@@ -734,6 +762,12 @@ class QrcLyricManager(
         val album: String,
         val lines: List<LyricLine>,
         val rawText: String
+    )
+
+    private data class QrcCooldownEntry(
+        val retryAfterMs: Long,
+        val generation: Long,
+        val reason: String
     )
 
     private data class ScoredGroup(

@@ -45,11 +45,12 @@ class QrcNegativeCacheManager(
     }
 
     @Synchronized
-    fun removeNegative(songKey: String) {
+    fun removeNegative(songKey: String, reason: String = "") {
         ensureLoaded()
         if (items.remove(songKey) != null) {
             saveLocked()
-            logger("[QrcNegativeCache] removed songKey=$songKey")
+            val suffix = if (reason.isBlank()) "" else " reason=$reason"
+            logger("[QrcNegativeCache] removed songKey=$songKey$suffix")
         }
     }
 

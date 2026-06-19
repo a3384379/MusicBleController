@@ -490,6 +490,10 @@ class QrcLyricCacheManager(
         if (entry.linesCount <= 0) {
             return null
         }
+        if (QrcLyricUtils.isInvalidMetadataTitle(entry.normalizedTitle)) {
+            logger("[QrcCache] invalid metadata cache ignored songKey=${entry.songKey}")
+            return null
+        }
         val titleExact = entry.normalizedTitle == currentTitle
         val titleContains = !titleExact &&
             (entry.normalizedTitle.contains(currentTitle) ||

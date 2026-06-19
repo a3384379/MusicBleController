@@ -35,7 +35,8 @@ data class ParsedLyric(
     val lines: List<QrcLyricLine>,
     val schemaVersion: Int = QRC_CACHE_SCHEMA_V2,
     val qrcPath: String = "",
-    val wordTimingStatus: QrcWordTimingStatus = QrcWordTimingStatus.fromLines(lines)
+    val wordTimingStatus: QrcWordTimingStatus = QrcWordTimingStatus.fromLines(lines),
+    val rawText: String = ""
 )
 
 enum class QrcWordTimingStatus {
@@ -126,6 +127,23 @@ data class QrcPersistentIndexStatus(
     val builtAt: Long
 )
 
+data class CurrentTrackSnapshot(
+    val trackId: String,
+    val songKey: String,
+    val title: String,
+    val artist: String,
+    val album: String,
+    val trackChangedAtMs: Long,
+    val hasLyrics: Boolean
+)
+
+data class IncrementalLyricsReady(
+    val groupId: String,
+    val parsed: ParsedLyric,
+    val currentTrack: CurrentTrackSnapshot?,
+    val matchedCurrentTrack: Boolean
+)
+
 object QrcLyricUtils {
 
     fun cacheDirectory(context: Context): File {
@@ -159,7 +177,10 @@ object QrcLyricUtils {
             .filter { it.qrcFile != null }
     }
 
-    fun decryptAndParseGroup(group: QrcFileGroup): ParsedLyric? {
+    fun decryptAndParseGroup(
+        group: QrcFileGroup,
+        logger: ((String) -> Unit)? = null
+    ): ParsedLyric? {
         val qrcFile = group.qrcFile ?: return null
         val encrypted = try {
             qrcFile.readText(Charsets.US_ASCII).filterNot(Char::isWhitespace)
@@ -172,7 +193,8 @@ object QrcLyricUtils {
         val decrypted = QrcDecrypter.decrypt(encrypted) ?: return null
         val parsed = parseDecryptedQrc(
             decrypted = decrypted,
-            group = group
+            group = group,
+            logger = logger
         )
         if (parsed.lines.isEmpty()) {
             return null
@@ -188,6 +210,27 @@ object QrcLyricUtils {
             .replace(MATCH_PUNCTUATION_REGEX, "")
             .replace(WHITESPACE_REGEX, "")
             .trim()
+    }
+
+    fun isInvalidMetadataTitle(value: String): Boolean {
+        val normalized = normalizeForMatch(value)
+        return normalized.isNotBlank() && normalized in INVALID_METADATA_TITLE_SET
+    }
+
+    fun sanitizeMetadataTitle(
+        value: String,
+        groupId: String,
+        logger: ((String) -> Unit)? = null
+    ): String {
+        val trimmed = value.trim()
+        if (trimmed.isBlank()) {
+            return ""
+        }
+        if (isInvalidMetadataTitle(trimmed)) {
+            logger?.invoke("[QrcMetadata] invalid title ignored value=$trimmed groupId=$groupId")
+            return ""
+        }
+        return trimmed
     }
 
     fun splitArtists(value: String): Set<String> {
@@ -249,7 +292,8 @@ object QrcLyricUtils {
 
     private fun parseDecryptedQrc(
         decrypted: String,
-        group: QrcFileGroup
+        group: QrcFileGroup,
+        logger: ((String) -> Unit)? = null
     ): ParsedLyric {
         val lyricContent = QRC_LYRIC_CONTENT_REGEX.find(decrypted)
             ?.groupValues
@@ -260,9 +304,13 @@ object QrcLyricUtils {
             .associate { match ->
                 match.groupValues[1].lowercase(Locale.ROOT) to
                     match.groupValues[2].trim()
-            }
+        }
         val producerMetadata = parseProducerMetadata(group.producerFile)
-        val title = metadata["ti"].orEmpty().ifBlank { producerMetadata.first }
+        val title = sanitizeMetadataTitle(
+            metadata["ti"].orEmpty().ifBlank { producerMetadata.first },
+            group.groupId,
+            logger
+        )
         val artist = metadata["ar"].orEmpty().ifBlank { producerMetadata.second }
         val album = metadata["al"].orEmpty().ifBlank { producerMetadata.third }
         val markers = QRC_LINE_REGEX.findAll(lyricContent).map { match ->
@@ -302,7 +350,8 @@ object QrcLyricUtils {
             lines = lines,
             schemaVersion = QRC_CACHE_SCHEMA_V2,
             qrcPath = group.qrcFile?.absolutePath.orEmpty(),
-            wordTimingStatus = QrcWordTimingStatus.fromLines(lines)
+            wordTimingStatus = QrcWordTimingStatus.fromLines(lines),
+            rawText = decrypted
         )
     }
 
@@ -423,6 +472,24 @@ object QrcLyricUtils {
     private val ARTIST_SPLIT_REGEX =
         Regex("""\s+|/|、|,|&|\+|feat\.|ft\.|和|与""", RegexOption.IGNORE_CASE)
     private val WHITESPACE_REGEX = Regex("""\s+""")
+    private val INVALID_METADATA_TITLE_SET = setOf(
+        "演唱",
+        "歌手",
+        "作词",
+        "作曲",
+        "编曲",
+        "制作",
+        "制作人",
+        "混音",
+        "录音",
+        "歌词",
+        "歌曲",
+        "music",
+        "singer",
+        "artist",
+        "composer",
+        "lyricist"
+    ).map(::normalizeForMatch).toSet()
     private val PRODUCER_TITLE_REGEX =
         Regex(""""Title"\s*:\s*"([^"]*)"""")
     private val PRODUCER_NAME_REGEX =

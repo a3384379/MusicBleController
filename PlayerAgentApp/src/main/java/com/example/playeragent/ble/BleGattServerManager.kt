@@ -21,6 +21,8 @@ import com.example.playeragent.logging.LogConfig
 import com.example.playeragent.logging.LogBuffer
 import com.example.playeragent.media.MediaCommandExecutor
 import com.example.playeragent.media.MediaFieldDumpManager
+import com.example.playeragent.media.CurrentTrackSnapshot
+import com.example.playeragent.media.IncrementalLyricsReady
 import com.example.playeragent.media.PlaybackStateReader
 import org.json.JSONArray
 import org.json.JSONObject
@@ -585,6 +587,24 @@ class BleGattServerManager(
         if (includeAlbumArt) {
             sendAlbumArtIfSongChanged(source)
         }
+    }
+
+    fun currentTrackSnapshot(): CurrentTrackSnapshot? {
+        return playbackStateReader.currentTrackSnapshot()
+    }
+
+    fun handleIncrementalLyricsReady(ready: IncrementalLyricsReady) {
+        if (!ready.matchedCurrentTrack) {
+            return
+        }
+        if (!playbackStateReader.applyIncrementalLyrics(ready)) {
+            return
+        }
+        logger(
+            "[Lyric] incremental playbackState refresh requested " +
+                "trackId=${ready.currentTrack?.trackId.orEmpty()}"
+        )
+        sendPlaybackState()
     }
 
     @SuppressLint("MissingPermission")
