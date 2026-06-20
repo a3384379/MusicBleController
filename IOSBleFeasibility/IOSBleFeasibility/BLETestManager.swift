@@ -7,6 +7,7 @@ private let LIVE_ACTIVITY_PLAY_PAUSE_DEBOUNCE_MS: Int64 = 600
 private let LIVE_ACTIVITY_TRACK_SKIP_DEBOUNCE_MS: Int64 = 800
 private let LIVE_ACTIVITY_COMMAND_TTL_MS: Int64 = 1_500
 private let LIVE_ACTIVITY_WRITE_STALL_MS: Int64 = 2_000
+private let DEBUG_ART_DIAGNOSTICS = true
 
 struct LyricWord: Identifiable, Equatable {
     let id: Int
@@ -52,6 +53,25 @@ private struct LyricSecondaryTransfer {
     var lines: [Int: LyricSecondaryLineParts]
 }
 
+private struct AlbumArtCacheMetadata: Codable {
+    let id: String
+    let quality: String
+    let pixelWidth: Int
+    let pixelHeight: Int
+    let bytes: Int
+    let createdAt: TimeInterval
+}
+
+private extension UIImage {
+    var pixelWidth: Int {
+        cgImage?.width ?? Int(size.width * scale)
+    }
+
+    var pixelHeight: Int {
+        cgImage?.height ?? Int(size.height * scale)
+    }
+}
+
 final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var mode = "BLE Central / GATT Client"
     @Published private(set) var connectionStatus = "未连接"
@@ -75,6 +95,10 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var volumeSeekValue = 0
     @Published private(set) var isVolumeSeeking = false
     @Published private(set) var albumArtImage: UIImage?
+    @Published private(set) var artworkDisplayQuality: ArtworkDisplayQuality = .placeholder
+    @Published private(set) var artworkEnhancementStatus = ArtworkEnhancementDebugStatus()
+    @Published private(set) var artworkEnhancementTargetPixelSize = 780
+    @Published private(set) var artworkEnhancementSharpness = 0.30
     @Published private(set) var remoteLogText = ""
     @Published private(set) var remoteLogCopyStatus = ""
     @Published private(set) var isRemoteLogTransferInProgress = false
@@ -146,6 +170,8 @@ final class BLETestManager: NSObject, ObservableObject {
     private var lastFullLyricsPartialPublishAtMs: Int64 = 0
     private var albumArtPreviewRetryCount = 0
     private var albumArtFallbackWorkItem: DispatchWorkItem?
+    private var artworkEnhancementEnabled = UserDefaults.standard.object(forKey: "artworkEnhancementEnabled") as? Bool ?? true
+    private var artworkEnhancementABOriginalMode = false
     private var remoteLogExpectedChunks = 0
     private var remoteLogExpectedLines = 0
     private var remoteLogChunks: [Int: Data] = [:]
@@ -201,6 +227,8 @@ final class BLETestManager: NSObject, ObservableObject {
         startProgressTimer()
         startMainHeartbeatDiagnostics()
         loadCachedPlaybackHistory()
+        loadArtworkEnhancementSettings()
+        updateArtworkEnhancementStatus(message: "ready")
     }
 
     deinit {
@@ -303,6 +331,102 @@ final class BLETestManager: NSObject, ObservableObject {
             guard let self else { return }
             self.logs.removeAll()
             self.localLogActionStatus = "已清空 iOS 日志"
+        }
+    }
+
+    func setArtworkEnhancementEnabled(_ enabled: Bool) {
+        artworkEnhancementEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "artworkEnhancementEnabled")
+        artworkEnhancementABOriginalMode = false
+        updateArtworkEnhancementStatus(message: enabled ? "enabled" : "disabled")
+        log("[ArtworkEnhance] enabled=\(enabled)")
+        guard enabled,
+              !currentAlbumArtID.isEmpty else { return }
+        if let cached = cachedEnhancedAlbumArt(id: currentAlbumArtID) {
+            setAlbumArtDisplay(
+                image: cached.image,
+                id: currentAlbumArtID,
+                quality: .enhanced,
+                reason: "enable cacheHit"
+            )
+        } else {
+            startArtworkEnhancementFromCachedHq(id: currentAlbumArtID, reason: "enable")
+        }
+    }
+
+    func setArtworkEnhancementTargetPixelSize(_ value: Int) {
+        let normalized = ArtworkEnhancementManager.shared.normalizedTargetPixelSize(value)
+        artworkEnhancementTargetPixelSize = normalized
+        UserDefaults.standard.set(normalized, forKey: "artworkEnhancementTargetPixelSize")
+        artworkEnhancementABOriginalMode = false
+        updateArtworkEnhancementStatus(message: "target=\(normalized)")
+        log("[ArtworkEnhance] targetPixelSize=\(normalized)")
+        if artworkEnhancementEnabled,
+           !currentAlbumArtID.isEmpty {
+            startArtworkEnhancementFromCachedHq(id: currentAlbumArtID, reason: "target changed")
+        }
+    }
+
+    func setArtworkEnhancementSharpness(_ value: Double) {
+        let normalized = ArtworkEnhancementManager.shared.normalizedSharpness(value)
+        artworkEnhancementSharpness = normalized
+        UserDefaults.standard.set(normalized, forKey: "artworkEnhancementSharpness")
+        artworkEnhancementABOriginalMode = false
+        updateArtworkEnhancementStatus(message: String(format: "sharpness=%.2f", normalized))
+        log("[ArtworkEnhance] sharpness=\(String(format: "%.2f", normalized))")
+        if artworkEnhancementEnabled,
+           !currentAlbumArtID.isEmpty {
+            startArtworkEnhancementFromCachedHq(id: currentAlbumArtID, reason: "sharpness changed")
+        }
+    }
+
+    func clearEnhancedArtworkCache() {
+        ArtworkEnhancementManager.shared.clearCache { [weak self] in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.updateArtworkEnhancementStatus(message: "cache cleared")
+                self.log("[ArtworkEnhance] cache cleared")
+            }
+        }
+    }
+
+    func rebuildCurrentEnhancedArtwork() {
+        guard !currentAlbumArtID.isEmpty else {
+            updateArtworkEnhancementStatus(message: "no current artwork")
+            return
+        }
+        artworkEnhancementABOriginalMode = false
+        startArtworkEnhancementFromCachedHq(id: currentAlbumArtID, reason: "debug rebuild")
+    }
+
+    func toggleArtworkEnhancementABComparison() {
+        guard !currentAlbumArtID.isEmpty else { return }
+        artworkEnhancementABOriginalMode.toggle()
+        if artworkEnhancementABOriginalMode,
+           let hq = validateCachedAlbumArt(id: currentAlbumArtID, preferredQuality: "hq") {
+            setAlbumArtDisplay(
+                image: hq.image,
+                id: currentAlbumArtID,
+                quality: .hq,
+                reason: "A/B original",
+                force: true
+            )
+            updateArtworkEnhancementStatus(message: "A/B original HQ")
+        } else if let cached = cachedEnhancedAlbumArt(
+            id: currentAlbumArtID,
+            allowLowGain: true
+        ) {
+            setAlbumArtDisplay(
+                image: cached.image,
+                id: currentAlbumArtID,
+                quality: .enhanced,
+                reason: "A/B enhanced",
+                force: true
+            )
+            updateArtworkEnhancementStatus(message: "A/B enhanced")
+        } else {
+            artworkEnhancementABOriginalMode = false
+            updateArtworkEnhancementStatus(message: "no enhanced cache")
         }
     }
 
@@ -1454,48 +1578,76 @@ extension BLETestManager: CBPeripheralDelegate {
                     "[AlbumArtOffer] id=\(id) currentTitle=\(self.title)"
                 )
                 self.handleAlbumArtIdentity(id)
-                if let cached = self.validateCachedAlbumArt(id: id, preferredQuality: "hq") {
+                if let cached = self.cachedEnhancedAlbumArt(id: id) {
                     self.cancelAlbumArtFallback()
                     self.cancelHqAlbumArtRequest()
-                    self.albumArtImage = cached.image
-                    self.currentCachedAlbumArtQuality = cached.quality
+                    self.setAlbumArtDisplay(
+                        image: cached.image,
+                        id: id,
+                        quality: .enhanced,
+                        reason: "offer cacheHit"
+                    )
+                    self.publishLiveArtworkIfCurrent(
+                        image: cached.image,
+                        key: id,
+                        reason: "enhancedCacheHit"
+                    )
+                    let message = "[AlbumArtCache] display quality=enhanced id=\(id), skip hq request"
+                    self.log(message)
+                    self.albumArtConsoleLog(message)
+                    self.sendCommand(
+                        cmd: "ALBUM_ART_SKIP",
+                        extra: ["id": id, "quality": "hq"]
+                    )
+                } else if let cached = self.validateCachedAlbumArt(id: id, preferredQuality: "hq") {
+                    self.cancelAlbumArtFallback()
+                    self.cancelHqAlbumArtRequest()
+                    self.setAlbumArtDisplay(
+                        image: cached.image,
+                        id: id,
+                        quality: .hq,
+                        reason: "offer cacheHit"
+                    )
                     self.publishLiveArtworkIfCurrent(
                         image: cached.image,
                         key: id,
                         reason: "cacheHit"
                     )
-                    let message = "[AlbumArtCache] hit id=\(id), skip request"
+                    self.startArtworkEnhancementFromCachedHq(id: id, reason: "hq cacheHit")
+                    let message = "[AlbumArtCache] display quality=hq id=\(id), enhance from cache"
                     self.log(message)
                     self.albumArtConsoleLog(message)
                     self.sendCommand(
                         cmd: "ALBUM_ART_SKIP",
-                        extra: ["id": id]
+                        extra: ["id": id, "quality": "hq"]
                     )
                 } else if let cached = self.validateCachedAlbumArt(
                     id: id,
                     preferredQuality: "preview"
                 ) {
                     self.cancelAlbumArtFallback()
-                    self.albumArtImage = cached.image
-                    self.currentCachedAlbumArtQuality = cached.quality
+                    self.setAlbumArtDisplay(
+                        image: cached.image,
+                        id: id,
+                        quality: .preview,
+                        reason: "offer cacheHit"
+                    )
                     self.publishLiveArtworkIfCurrent(
                         image: cached.image,
                         key: id,
                         reason: "cacheHit"
                     )
-                    let message = "[AlbumArtCache] hit preview id=\(id), schedule hq"
+                    let message = "[AlbumArtCache] display quality=preview id=\(id), schedule hq"
                     self.log(message)
                     self.albumArtConsoleLog(message)
-                    self.sendCommand(
-                        cmd: "ALBUM_ART_SKIP",
-                        extra: ["id": id]
-                    )
                     self.scheduleHqAlbumArtRequest(id: id)
                 } else {
                     let message = "[AlbumArtCache] invalid id=\(id), request preview"
                     self.log(message)
                     self.albumArtConsoleLog(message)
                     self.currentCachedAlbumArtQuality = ""
+                    self.artworkDisplayQuality = .placeholder
+                    self.updateArtworkEnhancementStatus(message: "cache miss")
                     self.clearLiveArtwork(reason: "cacheMiss", shouldUpdate: false)
                     self.requestAlbumArt(id: id, quality: "preview")
                 }
@@ -1622,6 +1774,8 @@ extension BLETestManager: CBPeripheralDelegate {
                     self.cancelAlbumArtFallback()
                     self.albumArtImage = nil
                     self.currentCachedAlbumArtQuality = ""
+                    self.artworkDisplayQuality = .placeholder
+                    self.updateArtworkEnhancementStatus(message: "album art unavailable")
                     self.clearLiveArtwork(reason: "unavailable", shouldUpdate: false)
                     self.updateLiveActivity(force: true, reason: "albumArt")
                 }
@@ -1949,6 +2103,8 @@ extension BLETestManager: CBPeripheralDelegate {
                 cancelAlbumArtFallback()
                 albumArtImage = nil
                 currentCachedAlbumArtQuality = ""
+                artworkDisplayQuality = .placeholder
+                updateArtworkEnhancementStatus(message: "placeholder")
                 clearLiveArtwork(reason: "placeholder", shouldUpdate: false)
                 updateLiveActivity(force: true, reason: "albumArt")
             }
@@ -1957,20 +2113,45 @@ extension BLETestManager: CBPeripheralDelegate {
             return
         }
 
-        saveAlbumArt(jpegData, id: id, quality: quality)
+        if quality == "hq",
+           !shouldAcceptHqAlbumArt(image: image, data: jpegData, id: id) {
+            requestedAlbumArtKeys.remove("\(id)|\(quality)")
+            resetAlbumArtTransfer()
+            return
+        }
+
+        saveAlbumArt(jpegData, id: id, quality: quality, image: image)
         if id == currentAlbumArtID {
             if quality == "hq" ||
-                currentCachedAlbumArtQuality != "hq" {
+                artworkDisplayQuality < .hq {
                 cancelAlbumArtFallback()
-                albumArtImage = image
-                currentCachedAlbumArtQuality = quality
+                setAlbumArtDisplay(
+                    image: image,
+                    id: id,
+                    quality: artworkQuality(from: quality),
+                    reason: "transfer \(quality)"
+                )
                 publishLiveArtworkIfCurrent(
                     image: image,
                     key: id,
                     reason: quality
                 )
             }
+            if quality == "hq" {
+                startArtworkEnhancementIfNeeded(
+                    id: id,
+                    sourceData: jpegData,
+                    sourceImage: image,
+                    reason: "hq received"
+                )
+            }
         }
+        writeAlbumArtDiagnostics(
+            id: id,
+            quality: quality,
+            data: jpegData,
+            image: image
+        )
         requestedAlbumArtKeys.remove("\(id)|\(quality)")
         let pixelWidth = image.cgImage?.width ?? Int(image.size.width)
         let pixelHeight = image.cgImage?.height ?? Int(image.size.height)
@@ -2075,6 +2256,8 @@ extension BLETestManager: CBPeripheralDelegate {
                 cancelAlbumArtFallback()
                 albumArtImage = nil
                 currentCachedAlbumArtQuality = ""
+                artworkDisplayQuality = .placeholder
+                updateArtworkEnhancementStatus(message: "placeholder")
                 clearLiveArtwork(reason: "placeholder", shouldUpdate: false)
                 updateLiveActivity(force: true, reason: "albumArt")
             }
@@ -2082,20 +2265,45 @@ extension BLETestManager: CBPeripheralDelegate {
             resetBinaryAlbumArtTransfer()
             return
         }
-        saveAlbumArt(jpegData, id: id, quality: quality)
+        if quality == "hq",
+           !shouldAcceptHqAlbumArt(image: image, data: jpegData, id: id) {
+            requestedAlbumArtKeys.remove("\(id)|\(quality)")
+            resetBinaryAlbumArtTransfer()
+            return
+        }
+
+        saveAlbumArt(jpegData, id: id, quality: quality, image: image)
         if id == currentAlbumArtID {
             if quality == "hq" ||
-                currentCachedAlbumArtQuality != "hq" {
+                artworkDisplayQuality < .hq {
                 cancelAlbumArtFallback()
-                albumArtImage = image
-                currentCachedAlbumArtQuality = quality
+                setAlbumArtDisplay(
+                    image: image,
+                    id: id,
+                    quality: artworkQuality(from: quality),
+                    reason: "binary transfer \(quality)"
+                )
                 publishLiveArtworkIfCurrent(
                     image: image,
                     key: id,
                     reason: quality
                 )
             }
+            if quality == "hq" {
+                startArtworkEnhancementIfNeeded(
+                    id: id,
+                    sourceData: jpegData,
+                    sourceImage: image,
+                    reason: "binary hq received"
+                )
+            }
         }
+        writeAlbumArtDiagnostics(
+            id: id,
+            quality: quality,
+            data: jpegData,
+            image: image
+        )
         requestedAlbumArtKeys.remove("\(id)|\(quality)")
         let message = "[AlbumArtBinary] decode success bytes=\(jpegData.count)"
         log(message)
@@ -2757,8 +2965,14 @@ extension BLETestManager: CBPeripheralDelegate {
     private func handleAlbumArtIdentity(_ id: String) {
         guard !id.isEmpty, id != currentAlbumArtID else { return }
 
+        if !currentAlbumArtID.isEmpty {
+            ArtworkEnhancementManager.shared.cancel(artworkId: currentAlbumArtID)
+        }
         currentAlbumArtID = id
         currentCachedAlbumArtQuality = ""
+        artworkDisplayQuality = .placeholder
+        artworkEnhancementABOriginalMode = false
+        updateArtworkEnhancementStatus(message: "track changed")
         clearLiveArtwork(reason: "track changed", shouldUpdate: false)
         requestedAlbumArtKeys.removeAll()
         requestedHqAlbumArtIDs.removeAll()
@@ -2769,13 +2983,20 @@ extension BLETestManager: CBPeripheralDelegate {
 
         if let cached = loadCachedAlbumArt(id: id) {
             cancelAlbumArtFallback()
-            albumArtImage = cached.image
-            currentCachedAlbumArtQuality = cached.quality
+            setAlbumArtDisplay(
+                image: cached.image,
+                id: id,
+                quality: artworkQuality(from: cached.quality),
+                reason: "identity cacheHit"
+            )
             publishLiveArtworkIfCurrent(
                 image: cached.image,
                 key: id,
                 reason: "cacheHit"
             )
+            if cached.quality == "hq" {
+                startArtworkEnhancementFromCachedHq(id: id, reason: "identity hq cacheHit")
+            }
             let message = "[AlbumArtCache] hit id=\(id)"
             log(message)
             albumArtConsoleLog(message)
@@ -2840,10 +3061,12 @@ extension BLETestManager: CBPeripheralDelegate {
         let workItem = DispatchWorkItem { [weak self] in
             guard let self,
                   self.currentAlbumArtID == id,
-                  self.currentCachedAlbumArtQuality.isEmpty else {
+                  self.artworkDisplayQuality == .placeholder else {
                 return
             }
             self.albumArtImage = nil
+            self.currentCachedAlbumArtQuality = ""
+            self.updateArtworkEnhancementStatus(message: "fallback default")
             self.clearLiveArtwork(reason: "fallback default", shouldUpdate: false)
             self.updateLiveActivity(force: true, reason: "albumArt")
             self.log("[AlbumArt] fallback default id=\(id)")
@@ -2857,17 +3080,20 @@ extension BLETestManager: CBPeripheralDelegate {
         albumArtFallbackWorkItem = nil
     }
 
-    private func scheduleHqAlbumArtRequest(id: String) {
+    private func scheduleHqAlbumArtRequest(
+        id: String,
+        delay: TimeInterval = 1.8
+    ) {
         guard id == currentAlbumArtID else { return }
-        guard currentCachedAlbumArtQuality != "hq" else { return }
+        guard artworkDisplayQuality < .hq else { return }
         guard !requestedHqAlbumArtIDs.contains(id) else { return }
         cancelHqAlbumArtRequest()
         let workItem = DispatchWorkItem { [weak self] in
             self?.requestHqAlbumArt(id: id)
         }
         hqAlbumArtWorkItem = workItem
-        log("[AlbumArtHQ] scheduled id=\(id)")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8, execute: workItem)
+        log("[AlbumArtHQ] scheduled id=\(id) delayMs=\(Int(delay * 1_000))")
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
     private func cancelHqAlbumArtRequest() {
@@ -2877,17 +3103,19 @@ extension BLETestManager: CBPeripheralDelegate {
 
     private func requestHqAlbumArt(id: String) {
         guard id == currentAlbumArtID else { return }
-        guard currentCachedAlbumArtQuality != "hq" else { return }
+        guard artworkDisplayQuality < .hq else { return }
         guard connectionStatus == "已连接" else {
             log("[AlbumArtHQ] request skipped not connected")
             return
         }
         guard !isFullLyricsReceiving,
+              lyricSecondaryTransfer == nil,
               !isRemoteLogTransferInProgress,
               !isMediaFieldDumpReceiving,
               albumArtExpectedChunks == 0,
               binaryAlbumArtExpectedChunks == 0 else {
             log("[AlbumArtHQ] request skipped busy")
+            scheduleHqAlbumArtRequest(id: id, delay: 2.0)
             return
         }
         guard requestedHqAlbumArtIDs.insert(id).inserted else { return }
@@ -2925,9 +3153,236 @@ extension BLETestManager: CBPeripheralDelegate {
     private func loadCachedAlbumArt(
         id: String
     ) -> (image: UIImage, quality: String)? {
-        validateCachedAlbumArt(id: id, preferredQuality: "hq") ??
+        if let cached = cachedEnhancedAlbumArt(id: id) {
+            return (cached.image, "enhanced")
+        }
+        return validateCachedAlbumArt(id: id, preferredQuality: "hq") ??
             validateCachedAlbumArt(id: id, preferredQuality: "preview") ??
             validateCachedAlbumArt(id: id, preferredQuality: nil)
+    }
+
+    private func cachedEnhancedAlbumArt(
+        id: String,
+        allowLowGain: Bool = false
+    ) -> ArtworkEnhancementResult? {
+        guard artworkEnhancementEnabled else { return nil }
+        guard let result = ArtworkEnhancementManager.shared.cachedEnhancedArtwork(
+            artworkId: id,
+            targetPixelSize: artworkEnhancementTargetPixelSize,
+            sharpness: artworkEnhancementSharpness,
+            logger: { [weak self] message in
+                self?.log(message)
+                self?.albumArtConsoleLog(message)
+            }
+        ) else {
+            return nil
+        }
+        if !allowLowGain, !result.shouldAutoDisplay {
+            log(
+                "[ArtworkEnhance] cache ignored reason=edge gain < 5% " +
+                    "id=\(id) gain=\(String(format: "%.2f", result.edgeGainPercent))"
+            )
+            return nil
+        }
+        return result
+    }
+
+    private func setAlbumArtDisplay(
+        image: UIImage,
+        id: String,
+        quality: ArtworkDisplayQuality,
+        reason: String,
+        force: Bool = false
+    ) {
+        guard id == currentAlbumArtID else {
+            log("[ArtworkDisplay] stale image ignored id=\(id) current=\(currentAlbumArtID)")
+            return
+        }
+        if !force, quality < artworkDisplayQuality {
+            log(
+                "[ArtworkDisplay] downgrade ignored current=\(artworkDisplayQuality.label) " +
+                    "incoming=\(quality.label) reason=\(reason)"
+            )
+            return
+        }
+
+        let previous = artworkDisplayQuality
+        albumArtImage = image
+        artworkDisplayQuality = quality
+        currentCachedAlbumArtQuality = quality.label
+        updateArtworkEnhancementStatus(message: reason)
+        if previous != quality {
+            log(
+                "[ArtworkDisplay] id=\(id) upgrade \(previous.label) -> \(quality.label) " +
+                    "reason=\(reason)"
+            )
+        }
+    }
+
+    private func artworkQuality(from quality: String) -> ArtworkDisplayQuality {
+        switch quality {
+        case "enhanced":
+            return .enhanced
+        case "hq", "full":
+            return .hq
+        case "preview":
+            return .preview
+        default:
+            return .hq
+        }
+    }
+
+    private var albumArtDisplayWidthPoints: CGFloat {
+        260
+    }
+
+    private func loadArtworkEnhancementSettings() {
+        let savedTarget = UserDefaults.standard.integer(forKey: "artworkEnhancementTargetPixelSize")
+        artworkEnhancementTargetPixelSize = ArtworkEnhancementManager.shared.normalizedTargetPixelSize(
+            savedTarget == 0 ? ArtworkEnhancementManager.defaultTargetPixelSize : savedTarget
+        )
+        let savedSharpness = UserDefaults.standard.object(forKey: "artworkEnhancementSharpness") as? Double
+        artworkEnhancementSharpness = ArtworkEnhancementManager.shared.normalizedSharpness(
+            savedSharpness ?? ArtworkEnhancementManager.defaultSharpness
+        )
+    }
+
+    private func startArtworkEnhancementFromCachedHq(id: String, reason: String) {
+        guard let data = try? Data(contentsOf: albumArtCacheURL(id: id, quality: "hq")),
+              let image = UIImage(data: data) else {
+            updateArtworkEnhancementStatus(message: "HQ cache missing")
+            return
+        }
+        startArtworkEnhancementIfNeeded(
+            id: id,
+            sourceData: data,
+            sourceImage: image,
+            reason: reason
+        )
+    }
+
+    private func startArtworkEnhancementIfNeeded(
+        id: String,
+        sourceData: Data,
+        sourceImage: UIImage,
+        reason: String
+    ) {
+        guard artworkEnhancementEnabled else {
+            updateArtworkEnhancementStatus(message: "disabled")
+            return
+        }
+        guard id == currentAlbumArtID else {
+            log("[ArtworkEnhance] stale request ignored id=\(id)")
+            return
+        }
+        guard !isLikelyPlaceholderAlbumArt(sourceImage, dataSize: sourceData.count) else {
+            updateArtworkEnhancementStatus(message: "placeholder skipped")
+            log("[ArtworkEnhance] skipped reason=placeholder")
+            return
+        }
+
+        let target = artworkEnhancementTargetPixelSize
+        let sourceWidth = sourceImage.pixelWidth
+        let sourceHeight = sourceImage.pixelHeight
+        artworkEnhancementStatus.currentSource = "\(sourceWidth)x\(sourceHeight)"
+        artworkEnhancementStatus.target = "\(target)x\(target)"
+        updateArtworkEnhancementStatus(message: reason)
+
+        guard sourceWidth >= 220, sourceHeight >= 220 else {
+            log("[ArtworkEnhance] skipped reason=source too small")
+            updateArtworkEnhancementStatus(message: "source too small")
+            return
+        }
+        guard sourceWidth < target || sourceHeight < target else {
+            log("[ArtworkEnhance] skipped reason=source already large enough")
+            return
+        }
+        if cachedEnhancedAlbumArt(id: id) != nil {
+            return
+        }
+
+        let request = ArtworkEnhancementRequest(
+            artworkId: id,
+            sourceData: sourceData,
+            sourcePixelWidth: sourceWidth,
+            sourcePixelHeight: sourceHeight,
+            targetPixelSize: target,
+            sharpness: artworkEnhancementSharpness,
+            screenScale: UIScreen.main.scale
+        )
+        ArtworkEnhancementManager.shared.enhance(
+            request: request,
+            logger: { [weak self] message in
+                self?.log(message)
+                self?.albumArtConsoleLog(message)
+            },
+            completion: { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let enhanced):
+                    guard self.currentAlbumArtID == id else {
+                        self.log("[ArtworkEnhance] stale result ignored id=\(id)")
+                        return
+                    }
+                    self.artworkEnhancementStatus.lastProcessingCostMs = enhanced.processingTimeMs
+                    self.artworkEnhancementStatus.lastEdgeGainPercent = enhanced.edgeGainPercent
+                    self.updateArtworkEnhancementStatus(message: "success")
+                    self.adaptArtworkEnhancementTargetIfNeeded(costMs: enhanced.processingTimeMs)
+                    guard enhanced.shouldAutoDisplay else {
+                        self.log(
+                            "[ArtworkEnhance] auto display skipped reason=edge gain < 5% " +
+                                "gain=\(String(format: "%.2f", enhanced.edgeGainPercent))"
+                        )
+                        self.updateArtworkEnhancementStatus(message: "edge gain < 5%")
+                        return
+                    }
+                    guard !self.artworkEnhancementABOriginalMode else {
+                        self.log("[ArtworkEnhance] A/B original active, enhanced display held")
+                        return
+                    }
+                    self.setAlbumArtDisplay(
+                        image: enhanced.image,
+                        id: id,
+                        quality: .enhanced,
+                        reason: "enhancement complete"
+                    )
+                case .failure(let error):
+                    self.updateArtworkEnhancementStatus(message: error.localizedDescription)
+                }
+            }
+        )
+    }
+
+    private func updateArtworkEnhancementStatus(message: String? = nil) {
+        let stats = ArtworkEnhancementManager.shared.cacheStats()
+        artworkEnhancementStatus.enabled = artworkEnhancementEnabled
+        artworkEnhancementStatus.targetPixelSize = artworkEnhancementTargetPixelSize
+        artworkEnhancementStatus.sharpness = artworkEnhancementSharpness
+        artworkEnhancementStatus.displayQuality = artworkDisplayQuality
+        artworkEnhancementStatus.cacheHit = artworkDisplayQuality == .enhanced
+        artworkEnhancementStatus.enhancedCacheFiles = stats.files
+        artworkEnhancementStatus.enhancedCacheBytes = stats.bytes
+        artworkEnhancementStatus.target = "\(artworkEnhancementTargetPixelSize)x\(artworkEnhancementTargetPixelSize)"
+        if let message {
+            artworkEnhancementStatus.lastMessage = message
+        }
+    }
+
+    private func adaptArtworkEnhancementTargetIfNeeded(costMs: Int) {
+        guard costMs > 1_200 else { return }
+        let options = ArtworkEnhancementManager.targetPixelSizeOptions.sorted()
+        guard let index = options.firstIndex(of: artworkEnhancementTargetPixelSize),
+              index > 0 else {
+            return
+        }
+        let nextTarget = options[index - 1]
+        artworkEnhancementTargetPixelSize = nextTarget
+        UserDefaults.standard.set(nextTarget, forKey: "artworkEnhancementTargetPixelSize")
+        updateArtworkEnhancementStatus(message: "auto target down to \(nextTarget)")
+        log(
+            "[ArtworkEnhance] target auto downgraded reason=cost " +
+                "costMs=\(costMs) target=\(nextTarget)"
+        )
     }
 
     private func validateCachedAlbumArt(
@@ -2935,14 +3390,19 @@ extension BLETestManager: CBPeripheralDelegate {
         preferredQuality: String? = nil
     ) -> (image: UIImage, quality: String)? {
         let imageURL = albumArtCacheURL(id: id, quality: preferredQuality)
+        let metadataURL = albumArtMetadataURL(id: id, quality: preferredQuality)
         let exists = FileManager.default.fileExists(atPath: imageURL.path)
         let data = try? Data(contentsOf: imageURL)
         let size = data?.count ?? 0
         let image = data.flatMap(UIImage.init(data:))
         let decoded = image != nil
+        let metadata = readAlbumArtMetadata(from: metadataURL)
+        let pixelWidth = metadata?.pixelWidth ?? image?.pixelWidth ?? 0
+        let pixelHeight = metadata?.pixelHeight ?? image?.pixelHeight ?? 0
         let validateMessage =
             "[AlbumArtCache] validate id=\(id) exists=\(exists) " +
-            "quality=\(preferredQuality ?? "legacy") size=\(size) decode=\(decoded)"
+            "quality=\(preferredQuality ?? "legacy") size=\(size) " +
+            "pixelSize=\(pixelWidth)x\(pixelHeight) decode=\(decoded)"
         log(validateMessage)
         albumArtConsoleLog(validateMessage)
 
@@ -2970,8 +3430,10 @@ extension BLETestManager: CBPeripheralDelegate {
     private func removeCorruptedAlbumArt(id: String, quality: String? = nil) {
         let imageURL = albumArtCacheURL(id: id, quality: quality)
         let qualityURL = albumArtQualityURL(id: id, quality: quality)
+        let metadataURL = albumArtMetadataURL(id: id, quality: quality)
         try? FileManager.default.removeItem(at: imageURL)
         try? FileManager.default.removeItem(at: qualityURL)
+        try? FileManager.default.removeItem(at: metadataURL)
         let message = "[AlbumArtCache] corrupted removed id=\(id)"
         log(message)
         albumArtConsoleLog(message)
@@ -2980,8 +3442,10 @@ extension BLETestManager: CBPeripheralDelegate {
     private func removePlaceholderAlbumArt(id: String, quality: String? = nil) {
         let imageURL = albumArtCacheURL(id: id, quality: quality)
         let qualityURL = albumArtQualityURL(id: id, quality: quality)
+        let metadataURL = albumArtMetadataURL(id: id, quality: quality)
         try? FileManager.default.removeItem(at: imageURL)
         try? FileManager.default.removeItem(at: qualityURL)
+        try? FileManager.default.removeItem(at: metadataURL)
         let message = "[AlbumArtCache] placeholder removed id=\(id)"
         log(message)
         albumArtConsoleLog(message)
@@ -3041,7 +3505,36 @@ extension BLETestManager: CBPeripheralDelegate {
             colorfulPixels * 20 <= visiblePixels
     }
 
-    private func saveAlbumArt(_ data: Data, id: String, quality: String) {
+    private func shouldAcceptHqAlbumArt(
+        image: UIImage,
+        data: Data,
+        id: String
+    ) -> Bool {
+        guard let preview = cachedAlbumArtMetadata(id: id, quality: "preview") else {
+            return true
+        }
+        let hqWidth = image.pixelWidth
+        let hqHeight = image.pixelHeight
+        let hqArea = hqWidth * hqHeight
+        let previewArea = preview.pixelWidth * preview.pixelHeight
+        guard hqArea > previewArea else {
+            let message =
+                "[AlbumArtHQ] ignored reason=no visual upgrade " +
+                "hq=\(hqWidth)x\(hqHeight) preview=\(preview.pixelWidth)x\(preview.pixelHeight) " +
+                "bytes=\(data.count)"
+            log(message)
+            albumArtConsoleLog(message)
+            return false
+        }
+        return true
+    }
+
+    private func saveAlbumArt(
+        _ data: Data,
+        id: String,
+        quality: String,
+        image: UIImage
+    ) {
         do {
             let directory = albumArtCacheDirectory()
             try FileManager.default.createDirectory(
@@ -3057,7 +3550,23 @@ extension BLETestManager: CBPeripheralDelegate {
                 atomically: true,
                 encoding: .utf8
             )
-            let message = "[AlbumArtCache] saved id=\(id) quality=\(quality)"
+            let metadata = AlbumArtCacheMetadata(
+                id: id,
+                quality: quality,
+                pixelWidth: image.pixelWidth,
+                pixelHeight: image.pixelHeight,
+                bytes: data.count,
+                createdAt: Date().timeIntervalSince1970
+            )
+            let metadataData = try JSONEncoder().encode(metadata)
+            try metadataData.write(
+                to: albumArtMetadataURL(id: id, quality: quality),
+                options: .atomic
+            )
+            let message =
+                "[AlbumArtCache] saved id=\(id) quality=\(quality) " +
+                "pixelSize=\(metadata.pixelWidth)x\(metadata.pixelHeight) " +
+                "bytes=\(metadata.bytes)"
             log(message)
             albumArtConsoleLog(message)
         } catch {
@@ -3069,6 +3578,119 @@ extension BLETestManager: CBPeripheralDelegate {
         }
     }
 
+    private func writeAlbumArtDiagnostics(
+        id: String,
+        quality: String,
+        data: Data,
+        image: UIImage
+    ) {
+        guard DEBUG_ART_DIAGNOSTICS else { return }
+        do {
+            let directory = albumArtDiagnosticsDirectory()
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+            let receivedURL = directory
+                .appendingPathComponent("\(id)_received_\(quality)")
+                .appendingPathExtension("jpg")
+            try data.write(to: receivedURL, options: .atomic)
+
+            let metadataURL = directory
+                .appendingPathComponent("\(id)_ios_metadata")
+                .appendingPathExtension("json")
+            var metadata = readAlbumArtDiagnosticsMetadata(from: metadataURL)
+            let keyPrefix = quality == "hq" ? "receivedHq" : "receivedPreview"
+            let displayWidthPoints = 260.0
+            let displayHeightPoints = 260.0
+            let screenScale = Double(UIScreen.main.scale)
+            let requiredDisplayPixelsWidth = displayWidthPoints * screenScale
+            let requiredDisplayPixelsHeight = displayHeightPoints * screenScale
+            let upscaleRatio = image.pixelWidth > 0
+                ? requiredDisplayPixelsWidth / Double(image.pixelWidth)
+                : 0.0
+
+            metadata["id"] = id
+            metadata["\(keyPrefix)Sha256"] = Self.sha256Data(data)
+            metadata["\(keyPrefix)Width"] = image.pixelWidth
+            metadata["\(keyPrefix)Height"] = image.pixelHeight
+            metadata["\(keyPrefix)Bytes"] = data.count
+            metadata["\(keyPrefix)UIImageScale"] = Double(image.scale)
+            metadata["\(keyPrefix)UIImageWidthPoints"] = Double(image.size.width)
+            metadata["\(keyPrefix)UIImageHeightPoints"] = Double(image.size.height)
+            metadata["displayedQuality"] = currentCachedAlbumArtQuality
+            metadata["displayedPixelWidth"] = image.pixelWidth
+            metadata["displayedPixelHeight"] = image.pixelHeight
+            metadata["displayWidthPoints"] = displayWidthPoints
+            metadata["displayHeightPoints"] = displayHeightPoints
+            metadata["screenScale"] = screenScale
+            metadata["requiredDisplayPixelsWidth"] = requiredDisplayPixelsWidth
+            metadata["requiredDisplayPixelsHeight"] = requiredDisplayPixelsHeight
+            metadata["upscaleRatio"] = upscaleRatio
+            if let cacheData = try? Data(
+                contentsOf: albumArtCacheURL(id: id, quality: quality)
+            ) {
+                metadata["\(quality)CacheSha256"] = Self.sha256Data(cacheData)
+                metadata["\(quality)CacheBytes"] = cacheData.count
+                metadata["\(quality)CacheMatchesReceived"] = cacheData == data
+            }
+            metadata["updatedAt"] = Date().timeIntervalSince1970
+
+            let metadataData = try JSONSerialization.data(
+                withJSONObject: metadata,
+                options: [.prettyPrinted, .sortedKeys]
+            )
+            try metadataData.write(to: metadataURL, options: .atomic)
+            let message =
+                "[ArtDiag-iOS] id=\(id) quality=\(quality) " +
+                "received=\(image.pixelWidth)x\(image.pixelHeight) " +
+                "bytes=\(data.count) displayedQuality=\(currentCachedAlbumArtQuality) " +
+                "upscaleRatio=\(String(format: "%.2f", upscaleRatio))"
+            log(message)
+            albumArtConsoleLog(message)
+        } catch {
+            log("[ArtDiag-iOS] export failed id=\(id) error=\(error.localizedDescription)")
+        }
+    }
+
+    private func readAlbumArtDiagnosticsMetadata(from url: URL) -> [String: Any] {
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dictionary = object as? [String: Any] else {
+            return [:]
+        }
+        return dictionary
+    }
+
+    private func cachedAlbumArtMetadata(
+        id: String,
+        quality: String
+    ) -> AlbumArtCacheMetadata? {
+        if let metadata = readAlbumArtMetadata(
+            from: albumArtMetadataURL(id: id, quality: quality)
+        ) {
+            return metadata
+        }
+        let imageURL = albumArtCacheURL(id: id, quality: quality)
+        guard let data = try? Data(contentsOf: imageURL),
+              let image = UIImage(data: data) else {
+            return nil
+        }
+        return AlbumArtCacheMetadata(
+            id: id,
+            quality: quality,
+            pixelWidth: image.pixelWidth,
+            pixelHeight: image.pixelHeight,
+            bytes: data.count,
+            createdAt: 0
+        )
+    }
+
+    private func readAlbumArtMetadata(from url: URL) -> AlbumArtCacheMetadata? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(AlbumArtCacheMetadata.self, from: data)
+    }
+
     private func albumArtCacheDirectory() -> URL {
         let documents = FileManager.default.urls(
             for: .documentDirectory,
@@ -3076,6 +3698,17 @@ extension BLETestManager: CBPeripheralDelegate {
         )[0]
         return documents.appendingPathComponent(
             "AlbumArtCache",
+            isDirectory: true
+        )
+    }
+
+    private func albumArtDiagnosticsDirectory() -> URL {
+        let documents = FileManager.default.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        )[0]
+        return documents.appendingPathComponent(
+            "AlbumArtDiagnostics",
             isDirectory: true
         )
     }
@@ -3106,8 +3739,27 @@ extension BLETestManager: CBPeripheralDelegate {
             .appendingPathExtension("quality")
     }
 
+    private func albumArtMetadataURL(id: String, quality: String? = nil) -> URL {
+        let baseName = Self.sha256(id)
+        let fileName: String
+        if let quality, quality == "preview" || quality == "hq" {
+            fileName = "\(baseName)_\(quality)"
+        } else {
+            fileName = baseName
+        }
+        return albumArtCacheDirectory()
+            .appendingPathComponent(fileName)
+            .appendingPathExtension("json")
+    }
+
     private static func sha256(_ value: String) -> String {
         SHA256.hash(data: Data(value.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    private static func sha256Data(_ data: Data) -> String {
+        SHA256.hash(data: data)
             .map { String(format: "%02x", $0) }
             .joined()
     }

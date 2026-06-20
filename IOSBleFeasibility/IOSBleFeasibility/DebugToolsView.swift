@@ -12,6 +12,7 @@ struct DebugToolsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     statusSection
+                    artworkEnhancementSection
                     liveActivityControlSection
                     karaokeOffsetSection
                     actionSection
@@ -94,6 +95,116 @@ struct DebugToolsView: View {
                         systemImage: "list.bullet.clipboard",
                         disabled: !isConnected || bleManager.isMediaFieldDumpReceiving,
                         action: bleManager.sendDumpMediaFields
+                    )
+                }
+            }
+        }
+    }
+
+    private var artworkEnhancementSection: some View {
+        let status = bleManager.artworkEnhancementStatus
+        return DebugCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Artwork Enhancement", systemImage: "photo.on.rectangle.angled")
+                    .font(.headline)
+
+                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
+                    debugRow("Enabled", status.enabled ? "true" : "false")
+                    debugRow("Current source", status.currentSource)
+                    debugRow("Target", status.target)
+                    debugRow("Display quality", status.displayQuality.label)
+                    debugRow("Cache hit", status.cacheHit ? "true" : "false")
+                    debugRow("Last cost", "\(status.lastProcessingCostMs)ms")
+                    debugRow("Edge gain", String(format: "%.1f%%", status.lastEdgeGainPercent))
+                    debugRow("Enhanced files", "\(status.enhancedCacheFiles)")
+                    debugRow("Enhanced size", formatBytes(status.enhancedCacheBytes))
+                    debugRow("Status", status.lastMessage)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Target Size")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    LazyVGrid(
+                        columns: [
+                            GridItem(.flexible(), spacing: 8),
+                            GridItem(.flexible(), spacing: 8),
+                            GridItem(.flexible(), spacing: 8)
+                        ],
+                        spacing: 8
+                    ) {
+                        ForEach([560, 680, 780], id: \.self) { value in
+                            Button {
+                                bleManager.setArtworkEnhancementTargetPixelSize(value)
+                            } label: {
+                                Text("\(value)")
+                                    .font(.caption.monospacedDigit().weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(status.targetPixelSize == value ? .green : .gray.opacity(0.35))
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Sharpness")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    LazyVGrid(
+                        columns: [
+                            GridItem(.flexible(), spacing: 8),
+                            GridItem(.flexible(), spacing: 8),
+                            GridItem(.flexible(), spacing: 8)
+                        ],
+                        spacing: 8
+                    ) {
+                        ForEach([0.20, 0.30, 0.40], id: \.self) { value in
+                            Button {
+                                bleManager.setArtworkEnhancementSharpness(value)
+                            } label: {
+                                Text(String(format: "%.2f", value))
+                                    .font(.caption.monospacedDigit().weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(abs(status.sharpness - value) < 0.001 ? .green : .gray.opacity(0.35))
+                        }
+                    }
+                }
+
+                LazyVGrid(
+                    columns: [
+                        GridItem(.flexible(), spacing: 10),
+                        GridItem(.flexible(), spacing: 10)
+                    ],
+                    spacing: 10
+                ) {
+                    debugActionButton(
+                        title: status.enabled ? "关闭增强" : "开启增强",
+                        systemImage: status.enabled ? "eye.slash" : "eye",
+                        disabled: false,
+                        action: {
+                            bleManager.setArtworkEnhancementEnabled(!status.enabled)
+                        }
+                    )
+                    debugActionButton(
+                        title: "清除增强缓存",
+                        systemImage: "trash",
+                        disabled: false,
+                        action: bleManager.clearEnhancedArtworkCache
+                    )
+                    debugActionButton(
+                        title: "重建当前封面",
+                        systemImage: "wand.and.stars",
+                        disabled: false,
+                        action: bleManager.rebuildCurrentEnhancedArtwork
+                    )
+                    debugActionButton(
+                        title: "A/B 原图/增强",
+                        systemImage: "rectangle.split.2x1",
+                        disabled: false,
+                        action: bleManager.toggleArtworkEnhancementABComparison
                     )
                 }
             }
@@ -415,6 +526,16 @@ struct DebugToolsView: View {
         guard milliseconds > 0 else { return "00:00" }
         let totalSeconds = max(milliseconds, 0) / 1_000
         return String(format: "%02lld:%02lld", totalSeconds / 60, totalSeconds % 60)
+    }
+
+    private func formatBytes(_ bytes: Int64) -> String {
+        if bytes < 1_024 {
+            return "\(bytes) B"
+        }
+        if bytes < 1_024 * 1_024 {
+            return String(format: "%.1f KB", Double(bytes) / 1_024.0)
+        }
+        return String(format: "%.1f MB", Double(bytes) / 1_024.0 / 1_024.0)
     }
 }
 

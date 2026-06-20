@@ -570,7 +570,7 @@ struct ContentView: View {
         if bleManager.albumArtImage == nil {
             return "default-\(bleManager.title)-\(bleManager.artist)"
         }
-        return "art-\(bleManager.title)-\(bleManager.artist)-\(bleManager.album)"
+        return "art-\(bleManager.title)-\(bleManager.artist)-\(bleManager.album)-\(bleManager.artworkDisplayQuality.label)"
     }
 
     private var albumArtSize: CGFloat {
