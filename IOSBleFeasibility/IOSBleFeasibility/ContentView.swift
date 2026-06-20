@@ -2,7 +2,6 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var bleManager = BLETestManager()
-    @State private var showVolumeDetails = false
     @State private var showFullLyrics = false
     @State private var showDebugPage = false
     @State private var showPlaybackHistory = false
@@ -21,8 +20,8 @@ struct ContentView: View {
                         nowPlayingSection
                         lyricCard
                         progressSection
-                        playbackControls
                         volumeSection
+                        playbackControls
                     }
                     .frame(maxWidth: 390)
                     .padding(.horizontal, 24)
@@ -358,98 +357,54 @@ struct ContentView: View {
     }
 
     private var volumeSection: some View {
-        VStack(spacing: 12) {
-            volumeHeader
+        HStack(spacing: 12) {
+            Image(systemName: volumeIcon)
+                .font(.headline)
+                .frame(width: 24)
 
-            if showVolumeDetails {
-                VStack(spacing: 12) {
-                    Slider(
-                        value: Binding(
-                            get: {
-                                Double(
-                                    bleManager.isVolumeSeeking
-                                        ? bleManager.volumeSeekValue
-                                        : bleManager.volumeCurrent
-                                )
-                            },
-                            set: { value in
-                                bleManager.updateVolumeSeekValue(value)
-                            }
-                        ),
-                        in: 0...Double(max(bleManager.volumeMax, 1)),
-                        step: 1,
-                        onEditingChanged: { editing in
-                            if editing {
-                                bleManager.beginVolumeSeeking()
-                            } else {
-                                bleManager.finishVolumeSeeking()
-                            }
-                        }
-                    )
-                    .tint(.white)
-                    .disabled(bleManager.volumeMax <= 0)
-
-                    HStack(spacing: 12) {
-                        compactButton(
-                            title: "音量减",
-                            systemImage: "speaker.minus.fill",
-                            action: bleManager.sendVolumeDown
+            Slider(
+                value: Binding(
+                    get: {
+                        Double(
+                            bleManager.isVolumeSeeking
+                                ? bleManager.volumeSeekValue
+                                : bleManager.volumeCurrent
                         )
-                        compactButton(
-                            title: "音量加",
-                            systemImage: "speaker.plus.fill",
-                            action: bleManager.sendVolumeUp
-                        )
+                    },
+                    set: { value in
+                        bleManager.updateVolumeSeekValue(value)
+                    }
+                ),
+                in: 0...Double(max(bleManager.volumeMax, 1)),
+                step: 1,
+                onEditingChanged: { editing in
+                    if editing {
+                        bleManager.beginVolumeSeeking()
+                    } else {
+                        bleManager.finishVolumeSeeking()
                     }
                 }
-                .padding(13)
-                .foregroundStyle(.white)
-                .background(.white.opacity(0.062), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(.white.opacity(0.08), lineWidth: 1)
-                }
-                .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-        }
-        .disabled(!isConnected)
-        .opacity(isConnected ? 1 : 0.52)
-    }
+            )
+            .tint(.white.opacity(0.92))
+            .disabled(!isConnected || bleManager.volumeMax <= 0)
 
-    private var volumeHeader: some View {
-        Button {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
-                showVolumeDetails.toggle()
-            }
-        } label: {
-            HStack(spacing: 10) {
-                Image(systemName: volumeIcon)
-                    .font(.headline)
-                    .frame(width: 24)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("音量 \(displayedVolume) / \(bleManager.volumeMax)")
-                        .font(.subheadline.weight(.semibold))
-                    ProgressView(
-                        value: Double(displayedVolume),
-                        total: Double(max(bleManager.volumeMax, 1))
-                    )
-                    .tint(.white.opacity(0.86))
-                }
-                Spacer()
-                Image(systemName: showVolumeDetails ? "chevron.up" : "chevron.down")
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(.white.opacity(0.56))
-            }
-            .padding(13)
-            .contentShape(Rectangle())
+            Text("\(displayedVolume) / \(bleManager.volumeMax)")
+                .font(.caption.monospacedDigit().weight(.semibold))
+                .foregroundStyle(.white.opacity(0.76))
+                .frame(width: 58, alignment: .trailing)
+                .contentTransition(.numericText())
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
         .foregroundStyle(.white)
         .background(.white.opacity(0.070), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .stroke(.white.opacity(0.08), lineWidth: 1)
         }
+        .disabled(!isConnected)
+        .opacity(isConnected ? 1 : 0.52)
+        .animation(.easeInOut(duration: 0.16), value: displayedVolume)
     }
 
     private var connectionColor: Color {

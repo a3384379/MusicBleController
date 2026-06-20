@@ -8,6 +8,8 @@ private let LIVE_ACTIVITY_TRACK_SKIP_DEBOUNCE_MS: Int64 = 800
 private let LIVE_ACTIVITY_COMMAND_TTL_MS: Int64 = 1_500
 private let LIVE_ACTIVITY_WRITE_STALL_MS: Int64 = 2_000
 private let DEBUG_ART_DIAGNOSTICS = true
+private let VOLUME_SEND_THROTTLE_MS: Int64 = 120
+private let VOLUME_PENDING_TTL_MS: Int64 = 1_000
 
 struct LyricWord: Identifiable, Equatable {
     let id: Int
@@ -123,6 +125,15 @@ final class BLETestManager: NSObject, ObservableObject {
     private var pendingWriteCommand = ""
     private var commandSeq: UInt64 = 0
     private var commandWriteInflight: [CommandWriteInfo] = []
+    private var volumeWriteInFlightSeq: UInt64?
+    private var lastVolumeSendAtMs: Int64 = 0
+    private var lastVolumeRequestedValue: Int?
+    private var latestPendingVolumeValue: Int?
+    private var latestPendingVolumeReason = ""
+    private var latestPendingVolumeIsFinal = false
+    private var latestPendingVolumeCreatedAtMs: Int64 = 0
+    private var pendingRemoteVolumeValue: Int?
+    private var volumeThrottleWorkItem: DispatchWorkItem?
     private var liveActivityControlInFlightSeq: UInt64?
     private var liveActivityControlWriteStartedAtMs: Int64 = 0
     private var lastLiveActivityCommandAcceptedAtMs: [LiveActivityControlCommand: Int64] = [:]
@@ -787,15 +798,21 @@ final class BLETestManager: NSObject, ObservableObject {
         guard volumeMax > 0 else { return }
         if !isVolumeSeeking {
             volumeSeekValue = volumeCurrent
+            pendingRemoteVolumeValue = nil
         }
         isVolumeSeeking = true
+        log("[VOL-iOS] drag begin value=\(volumeSeekValue)")
     }
 
     func updateVolumeSeekValue(_ value: Double) {
         if !isVolumeSeeking {
-            isVolumeSeeking = true
+            beginVolumeSeeking()
         }
-        volumeSeekValue = Int(value.rounded()).clamped(to: 0...max(volumeMax, 0))
+        let targetVolume = Int(value.rounded()).clamped(to: 0...max(volumeMax, 0))
+        guard targetVolume != volumeSeekValue else { return }
+        volumeSeekValue = targetVolume
+        log("[VOL-iOS] drag value=\(targetVolume)")
+        requestSetVolume(targetVolume, reason: "drag", forceFinal: false)
     }
 
     func finishVolumeSeeking() {
@@ -803,8 +820,172 @@ final class BLETestManager: NSObject, ObservableObject {
         let targetVolume = volumeSeekValue.clamped(to: 0...volumeMax)
         volumeCurrent = targetVolume
         isVolumeSeeking = false
-        log("[iOS][Volume] user set volume=\(targetVolume)")
-        sendUserCommand(cmd: "SET_VOLUME", extra: ["volume": targetVolume])
+        log("[VOL-iOS] drag end value=\(targetVolume)")
+        requestSetVolume(targetVolume, reason: "final", forceFinal: true)
+        refreshVolume(after: 0.3)
+    }
+
+    private func requestSetVolume(_ value: Int, reason: String, forceFinal: Bool) {
+        guard volumeMax > 0 else {
+            log("[VOL-iOS] dropped reason=no volume max value=\(value)")
+            return
+        }
+        let targetVolume = value.clamped(to: 0...volumeMax)
+        let nowMs = currentTimeMs()
+        if !forceFinal, lastVolumeRequestedValue == targetVolume {
+            return
+        }
+        lastVolumeRequestedValue = targetVolume
+
+        guard sonyPeripheral?.state == .connected else {
+            clearPendingVolume()
+            log("[VOL-iOS] dropped reason=not connected value=\(targetVolume)")
+            return
+        }
+        guard sonyCommandCharacteristic != nil else {
+            clearPendingVolume()
+            log("[VOL-iOS] dropped reason=characteristic not ready value=\(targetVolume)")
+            return
+        }
+
+        let throttleRemainingMs = VOLUME_SEND_THROTTLE_MS - (nowMs - lastVolumeSendAtMs)
+        if !forceFinal, throttleRemainingMs > 0 {
+            setPendingVolume(targetVolume, reason: reason, isFinal: false, nowMs: nowMs)
+            log("[VOL-iOS] send throttled value=\(targetVolume)")
+            schedulePendingVolumeFlush(afterMs: throttleRemainingMs)
+            return
+        }
+
+        if volumeWriteInFlightSeq != nil || !commandWriteInflight.isEmpty {
+            setPendingVolume(targetVolume, reason: reason, isFinal: forceFinal, nowMs: nowMs)
+            log(
+                "[VOL-iOS] send throttled value=\(targetVolume) " +
+                    "reason=\(volumeWriteInFlightSeq == nil ? "command in flight" : "volume in flight")"
+            )
+            return
+        }
+
+        sendSetVolumeNow(value: targetVolume, reason: reason, forceFinal: forceFinal)
+    }
+
+    private func sendSetVolumeNow(value: Int, reason: String, forceFinal: Bool) {
+        let seq = nextCommandSeq()
+        let startMs = currentTimeMs()
+        let payload: [String: Any] = [
+            "cmd": "SET_VOLUME",
+            "volume": value,
+            "time": startMs,
+            "seq": seq
+        ]
+
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload),
+              let text = String(data: data, encoding: .utf8) else {
+            log("[VOL-iOS] dropped reason=encode failed value=\(value)")
+            return
+        }
+        guard let sonyPeripheral,
+              sonyPeripheral.state == .connected else {
+            log("[VOL-iOS] dropped reason=not connected value=\(value)")
+            return
+        }
+        guard let sonyCommandCharacteristic else {
+            log("[VOL-iOS] dropped reason=characteristic not ready value=\(value)")
+            return
+        }
+
+        pendingWriteCommand = "SET_VOLUME"
+        volumeWriteInFlightSeq = seq
+        lastVolumeSendAtMs = startMs
+        commandWriteInflight.append(
+            CommandWriteInfo(
+                seq: seq,
+                cmd: "SET_VOLUME",
+                writeCalledAtMs: startMs
+            )
+        )
+        ctrlLog("[CTRL-iOS] write begin seq=\(seq) cmd=SET_VOLUME timeMs=\(startMs)")
+        sonyPeripheral.writeValue(data, for: sonyCommandCharacteristic, type: .withResponse)
+        ctrlLog("[CTRL-iOS] write called seq=\(seq) cmd=SET_VOLUME timeMs=\(currentTimeMs())")
+        log("[VOL-iOS] send SET_VOLUME value=\(value) reason=\(forceFinal ? "final" : reason)")
+        log("[BLE] write requested \(text)")
+    }
+
+    private func setPendingVolume(_ value: Int, reason: String, isFinal: Bool, nowMs: Int64) {
+        latestPendingVolumeValue = value
+        latestPendingVolumeReason = reason
+        latestPendingVolumeIsFinal = isFinal
+        latestPendingVolumeCreatedAtMs = nowMs
+    }
+
+    private func clearPendingVolume() {
+        latestPendingVolumeValue = nil
+        latestPendingVolumeReason = ""
+        latestPendingVolumeIsFinal = false
+        latestPendingVolumeCreatedAtMs = 0
+        volumeThrottleWorkItem?.cancel()
+        volumeThrottleWorkItem = nil
+    }
+
+    private func schedulePendingVolumeFlush(afterMs: Int64) {
+        volumeThrottleWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.flushPendingVolumeIfPossible()
+        }
+        volumeThrottleWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Double(max(afterMs, 0)) / 1_000.0,
+            execute: workItem
+        )
+    }
+
+    private func flushPendingVolumeIfPossible() {
+        guard let value = latestPendingVolumeValue else { return }
+        let nowMs = currentTimeMs()
+        guard nowMs - latestPendingVolumeCreatedAtMs <= VOLUME_PENDING_TTL_MS else {
+            log("[VOL-iOS] dropped reason=pending expired value=\(value)")
+            clearPendingVolume()
+            return
+        }
+        guard sonyPeripheral?.state == .connected else {
+            log("[VOL-iOS] dropped reason=not connected value=\(value)")
+            clearPendingVolume()
+            return
+        }
+        guard sonyCommandCharacteristic != nil else {
+            log("[VOL-iOS] dropped reason=characteristic not ready value=\(value)")
+            clearPendingVolume()
+            return
+        }
+        guard volumeWriteInFlightSeq == nil, commandWriteInflight.isEmpty else {
+            return
+        }
+        if !latestPendingVolumeIsFinal {
+            let throttleRemainingMs = VOLUME_SEND_THROTTLE_MS - (nowMs - lastVolumeSendAtMs)
+            if throttleRemainingMs > 0 {
+                schedulePendingVolumeFlush(afterMs: throttleRemainingMs)
+                return
+            }
+            guard isVolumeSeeking else {
+                log("[VOL-iOS] dropped reason=drag ended value=\(value)")
+                clearPendingVolume()
+                return
+            }
+        }
+
+        let reason = latestPendingVolumeReason.isEmpty ? "drag" : latestPendingVolumeReason
+        let isFinal = latestPendingVolumeIsFinal
+        clearPendingVolume()
+        sendSetVolumeNow(value: value, reason: reason, forceFinal: isFinal)
+    }
+
+    private func handleVolumeWriteCompletion(seq: UInt64, error: Error?, costMs: Int64) {
+        if volumeWriteInFlightSeq == seq {
+            volumeWriteInFlightSeq = nil
+        }
+        let errorText = error?.localizedDescription ?? "nil"
+        log("[VOL-iOS] didWrite seq=\(seq) costMs=\(costMs) error=\(errorText)")
+        flushPendingVolumeIfPossible()
     }
 
     private func beginSonyScan() {
@@ -1348,6 +1529,11 @@ extension BLETestManager: CBPeripheralDelegate {
                 )
                 refreshLiveActivityControlStatus()
             }
+            if completed.cmd == "SET_VOLUME" {
+                handleVolumeWriteCompletion(seq: completed.seq, error: error, costMs: costMs)
+            } else {
+                flushPendingVolumeIfPossible()
+            }
         } else {
             let errorText = error?.localizedDescription ?? "nil"
             ctrlLog(
@@ -1558,9 +1744,15 @@ extension BLETestManager: CBPeripheralDelegate {
 
             case "volumeState":
                 self.volumeMax = Self.intValue(object["max"])
+                let remoteVolume = Self.intValue(object["current"])
                 if !self.isVolumeSeeking {
-                    self.volumeCurrent = Self.intValue(object["current"])
+                    self.volumeCurrent = remoteVolume
                     self.volumeSeekValue = self.volumeCurrent
+                    self.pendingRemoteVolumeValue = nil
+                    self.log("[VOL-iOS] remote volume received value=\(remoteVolume)")
+                } else {
+                    self.pendingRemoteVolumeValue = remoteVolume
+                    self.log("[VOL-iOS] remote ignored during drag value=\(remoteVolume)")
                 }
                 self.log(
                     "[Status] volumeState current=\(self.volumeCurrent) " +
