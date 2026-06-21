@@ -65,6 +65,18 @@ class QrcAliasCacheManager(
         }
     }
 
+    @Synchronized
+    fun warmup(): Int {
+        ensureLoaded()
+        return aliases.size
+    }
+
+    @Synchronized
+    fun itemCount(): Int {
+        ensureLoaded()
+        return aliases.size
+    }
+
     private fun ensureLoaded() {
         if (loaded) {
             return

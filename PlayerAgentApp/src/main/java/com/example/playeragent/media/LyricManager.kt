@@ -138,6 +138,9 @@ class LyricManager(
             album = album
         )
         logger("[LyricAsync] scheduled songKey=$key")
+        if (loadingSongKey != null && loadingSongKey != key) {
+            logger("[LyricAsync] latest song promoted songKey=$key")
+        }
         startNextLyricLoadLocked()
     }
 
@@ -237,6 +240,17 @@ class LyricManager(
         val matchedFile = findMatchedFile(directory, title, artist)
         if (matchedFile == null) {
             logger("[Lyric] no lyric file matched")
+            if (!isLatestRequest(request)) {
+                logger(
+                    "[LyricAsync] stale task cancelled songKey=${request.key} " +
+                        "latest=${activeSongKey.orEmpty()}"
+                )
+                return LyricLoadResult(
+                    lines = emptyList(),
+                    lineCount = 0,
+                    source = LyricSource.NONE
+                )
+            }
             val qrcLoaded = qrcLyricManager.load(title, artist, album)
             val qrcLines = if (qrcLoaded) {
                 qrcLyricManager.lyricLinesSnapshot().map {
@@ -260,6 +274,17 @@ class LyricManager(
         }
 
         logger("[Lyric] matched file=${matchedFile.absolutePath}")
+        if (!isLatestRequest(request)) {
+            logger(
+                "[LyricAsync] stale task cancelled songKey=${request.key} " +
+                    "latest=${activeSongKey.orEmpty()}"
+            )
+            return LyricLoadResult(
+                lines = emptyList(),
+                lineCount = 0,
+                source = LyricSource.NONE
+            )
+        }
         val parsedLines = parseLrc(matchedFile)
         logger("[Lyric] parsed lines count=${parsedLines.size}")
         return LyricLoadResult(
@@ -267,6 +292,11 @@ class LyricManager(
             lineCount = parsedLines.size,
             source = LyricSource.LRC
         )
+    }
+
+    @Synchronized
+    private fun isLatestRequest(request: LyricLoadRequest): Boolean {
+        return activeSongKey == request.key
     }
 
     @Synchronized

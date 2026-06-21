@@ -44,7 +44,11 @@ class QrcPersistentIndexManager(
         }
 
         val startedAt = System.currentTimeMillis()
-        val loaded = if (!forceRefresh && !isDirty()) loadFromDisk(snapshot) else null
+        val loaded = if (!forceRefresh && !isDirty()) {
+            loadFromDisk(snapshot)
+        } else {
+            null
+        }
         if (loaded != null) {
             synchronized(lock) {
                 entries = loaded.entries
@@ -56,6 +60,23 @@ class QrcPersistentIndexManager(
                     "costMs=${System.currentTimeMillis() - startedAt}"
             )
             return loaded.entries
+        }
+
+        if (!forceRefresh) {
+            val staleReason = staleReason(snapshot)
+            val stale = loadFromDiskAllowStale()
+            if (stale != null) {
+                synchronized(lock) {
+                    entries = stale.entries
+                    metadata = stale.metadata
+                }
+                logger("[QrcIndex] stale index used reason=$staleReason")
+                rebuildAsync(staleReason)
+                return stale.entries
+            }
+            logger("[QrcIndex] unavailable reason=$staleReason")
+            rebuildAsync(staleReason)
+            return emptyList()
         }
 
         val reason = when {
@@ -78,9 +99,14 @@ class QrcPersistentIndexManager(
     }
 
     fun rebuildAsync() {
+        rebuildAsync("requested")
+    }
+
+    fun rebuildAsync(reason: String) {
         if (!rebuilding.compareAndSet(false, true)) {
             return
         }
+        logger("[QrcIndex] rebuild scheduled background reason=$reason")
         rebuildExecutor.execute {
             try {
                 getIndex(forceRefresh = true)
@@ -121,6 +147,66 @@ class QrcPersistentIndexManager(
             IndexSummary(
                 entries = objectValue.optJSONArray("entries")?.length() ?: 0,
                 builtAt = objectValue.optLong("builtAt")
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun staleReason(snapshot: DirectorySnapshot): String {
+        if (!indexFile.exists()) {
+            return "index missing"
+        }
+        if (!directory.exists()) {
+            return "qrc directory missing"
+        }
+        if (isDirty()) {
+            return "dirty"
+        }
+        return try {
+            val objectValue = JSONObject(indexFile.readText(Charsets.UTF_8))
+            if (objectValue.optInt("version") != INDEX_VERSION) {
+                return "version mismatch"
+            }
+            val fileCount = objectValue.optInt("fileCount")
+            val latestFileModified = objectValue.optLong("latestFileModified")
+            when {
+                fileCount != snapshot.fileCount ->
+                    "fileCount changed old=$fileCount new=${snapshot.fileCount}"
+                latestFileModified != snapshot.latestFileModified ->
+                    "latestFileModified changed"
+                else -> "snapshot changed"
+            }
+        } catch (exception: Exception) {
+            "read failed ${exception.message}"
+        }
+    }
+
+    private fun loadFromDiskAllowStale(): LoadedIndex? {
+        if (!indexFile.exists()) {
+            return null
+        }
+        return try {
+            val objectValue = JSONObject(indexFile.readText(Charsets.UTF_8))
+            if (objectValue.optInt("version") != INDEX_VERSION) {
+                return null
+            }
+            val entriesArray = objectValue.optJSONArray("entries") ?: JSONArray()
+            val parsedEntries = (0 until entriesArray.length()).mapNotNull { index ->
+                entriesArray.optJSONObject(index)?.toEntry()
+            }
+            if (parsedEntries.isEmpty()) {
+                return null
+            }
+            LoadedIndex(
+                metadata = IndexMetadata(
+                    dirPath = objectValue.optString("dirPath"),
+                    dirLastModified = objectValue.optLong("dirLastModified"),
+                    latestFileModified = objectValue.optLong("latestFileModified"),
+                    fileCount = objectValue.optInt("fileCount"),
+                    builtAt = objectValue.optLong("builtAt")
+                ),
+                entries = parsedEntries
             )
         } catch (_: Exception) {
             null
@@ -251,6 +337,10 @@ class QrcPersistentIndexManager(
         saveIndex(metadata, builtEntries)
         logger(
             "[QrcIndex] saved entries=${builtEntries.size} " +
+                "costMs=${System.currentTimeMillis() - startedAt}"
+        )
+        logger(
+            "[QrcIndex] rebuild complete entries=${builtEntries.size} " +
                 "costMs=${System.currentTimeMillis() - startedAt}"
         )
         return builtEntries

@@ -36,10 +36,15 @@ import com.example.playeragent.media.CurrentLyricProbe
 import com.example.playeragent.media.LrcDebugManager
 import com.example.playeragent.media.LyricManager
 import com.example.playeragent.media.LyricSourceTestManager
+import com.example.playeragent.media.LyricWarmupManager
 import com.example.playeragent.media.PlaybackStateReader
+import com.example.playeragent.media.QQMusicArtworkDiscoveryManager
+import com.example.playeragent.media.ArtworkDiscoveryStatus
+import com.example.playeragent.media.QrcAliasCacheManager
 import com.example.playeragent.media.QrcDumpManager
 import com.example.playeragent.media.QrcLyricCacheManager
 import com.example.playeragent.media.QrcLyricV2RebuildManager
+import com.example.playeragent.media.QrcNegativeCacheManager
 import com.example.playeragent.media.QrcPersistentIndexManager
 import com.example.playeragent.media.QrcStaleCacheRebuildManager
 import com.example.playeragent.media.QrcStaleCacheRebuildProgress
@@ -48,6 +53,7 @@ import com.example.playeragent.media.QrcWatcherStatus
 import com.example.playeragent.service.PlayerAgentForegroundService
 import com.example.playeragent.service.QQMusicLyricAccessibilityService
 import java.text.SimpleDateFormat
+import java.security.MessageDigest
 import java.util.Date
 import java.util.Locale
 
@@ -59,6 +65,7 @@ class MainActivity : Activity() {
     private lateinit var currentLyricTextView: TextView
     private lateinit var currentAlbumArtImageView: ImageView
     private lateinit var currentAlbumArtTextView: TextView
+    private lateinit var artworkDiscoveryStatusTextView: TextView
     private lateinit var qrcCacheBuildTextView: TextView
     private lateinit var qrcStaleCacheRebuildTextView: TextView
     private lateinit var qrcWatcherStatusTextView: TextView
@@ -71,8 +78,10 @@ class MainActivity : Activity() {
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var controllerScannerManager: ControllerScannerManager? = null
     private var rfcommClientManager: RfcommClientManager? = null
+    private var artworkDiscoveryManager: QQMusicArtworkDiscoveryManager? = null
     private var qrcV2RebuildManager: QrcLyricV2RebuildManager? = null
     private var qrcStaleCacheRebuildManager: QrcStaleCacheRebuildManager? = null
+    private var lyricWarmupManager: LyricWarmupManager? = null
     private var lastPlayerUiSongKey: String = ""
     private var lastPlayerUiLyric: String = ""
     private var albumArtRefreshGeneration = 0L
@@ -178,6 +187,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         qrcV2RebuildManager?.stop()
         qrcStaleCacheRebuildManager?.stop()
+        artworkDiscoveryManager?.shutdown()
         controllerScannerManager?.stopScan()
         rfcommClientManager?.close()
         super.onDestroy()
@@ -280,6 +290,9 @@ class MainActivity : Activity() {
             "清空临时构建" to { confirmAction("清空临时构建结果？", ::clearQrcV2Building) },
             "清空并重新构建" to { confirmAction("清空临时结果并重新构建？") { startQrcV2Build(clear = true) } },
             "重建 QRC 索引" to ::forceRefreshQrcIndex,
+            "预热歌词缓存" to ::warmupLyricCache,
+            "重建歌词模糊索引" to ::rebuildFuzzyLyricIndex,
+            "刷新缓存统计" to ::refreshLyricStatsText,
             "修复旧歌词缓存" to ::startQrcStaleCacheRebuild,
             "停止旧缓存修复" to ::stopQrcStaleCacheRebuild,
             "删除旧缓存备份" to { confirmAction("删除旧缓存备份？", ::deleteOldQrcBackup) }
@@ -295,9 +308,14 @@ class MainActivity : Activity() {
         )))
 
         val mediaCard = collapsibleCard(content, "媒体诊断", expanded = false)
+        artworkDiscoveryStatusTextView = statusValue(
+            ArtworkDiscoveryStatus().displayText()
+        ).also(mediaCard::addView)
         mediaCard.addView(buttonGrid(listOf(
             "扫描歌词文件" to ::scanLrcFiles,
             "测试当前封面" to ::testAlbumArt,
+            "发现高清封面" to ::discoverHqArtwork,
+            "停止封面发现" to ::stopArtworkDiscovery,
             "检测歌词来源" to ::testLyricSource,
             "测试当前歌词" to ::testCurrentLyric,
             "歌词解析诊断" to ::testLrcDebug,
@@ -825,6 +843,82 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun discoverHqArtwork() {
+        Thread {
+            try {
+                val playbackState = PlaybackStateReader(
+                    context = this,
+                    logger = ::appendThreadSafeLog,
+                    includeLyric = false
+                ).readPlaybackState()
+                val title = playbackState.optString("title")
+                val artist = playbackState.optString("artist")
+                val album = playbackState.optString("album")
+                val albumArt = AlbumArtTestManager(
+                    this,
+                    ::appendThreadSafeLog
+                ).readCurrentNotificationAlbumArt()
+                if (albumArt == null) {
+                    appendThreadSafeLog("[ArtworkDiscovery] skipped reason=no notification artwork")
+                    return@Thread
+                }
+                val albumArtId = buildArtworkDiscoveryId(title, artist, album)
+                runOnUiThread {
+                    artworkDiscoveryStatusTextView.text = ArtworkDiscoveryStatus(
+                        status = "running",
+                        currentTitle = title
+                    ).displayText()
+                }
+                val manager = artworkDiscoveryManager ?: QQMusicArtworkDiscoveryManager(
+                    context = this,
+                    logger = ::appendThreadSafeLog,
+                    onStatus = ::updateArtworkDiscoveryStatus
+                ).also {
+                    artworkDiscoveryManager = it
+                }
+                manager.discoverCurrentTrackArtwork(
+                    title = title,
+                    artist = artist,
+                    album = album,
+                    albumArtId = albumArtId,
+                    referenceBitmap = albumArt.bitmap
+                )
+            } catch (exception: Exception) {
+                appendThreadSafeLog("[ArtworkDiscovery] failed=${exception.message}")
+            }
+        }.apply {
+            name = "ArtworkDiscoveryStartThread"
+            start()
+        }
+    }
+
+    private fun stopArtworkDiscovery() {
+        artworkDiscoveryManager?.cancel()
+        updateArtworkDiscoveryStatus(ArtworkDiscoveryStatus(status = "stopped"))
+    }
+
+    private fun updateArtworkDiscoveryStatus(status: ArtworkDiscoveryStatus) {
+        runOnUiThread {
+            if (::artworkDiscoveryStatusTextView.isInitialized) {
+                artworkDiscoveryStatusTextView.text = status.displayText()
+            }
+        }
+    }
+
+    private fun buildArtworkDiscoveryId(
+        title: String,
+        artist: String,
+        album: String
+    ): String {
+        val source = listOf(title, artist, album)
+            .joinToString("|")
+            .ifBlank { "unknown" }
+        return MessageDigest.getInstance("SHA-256")
+            .digest(source.toByteArray(Charsets.UTF_8))
+            .take(12)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    }
+
     private fun testLyricSource() {
         val manager = LyricSourceTestManager(this, ::appendThreadSafeLog)
         Thread {
@@ -1070,6 +1164,47 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun warmupLyricCache() {
+        if (!ensureLyricStorageAccess()) {
+            return
+        }
+        appendLog("[LyricWarmup] manual requested")
+        val manager = lyricWarmupManager ?: LyricWarmupManager(
+            context = this,
+            logger = ::appendThreadSafeLog
+        ).also {
+            lyricWarmupManager = it
+        }
+        manager.warmupNow()
+        Thread {
+            Thread.sleep(1_000L)
+            runOnUiThread {
+                refreshLyricStatsText()
+            }
+        }.apply {
+            name = "LyricWarmupUiRefreshThread"
+            start()
+        }
+    }
+
+    private fun rebuildFuzzyLyricIndex() {
+        if (!ensureLyricStorageAccess()) {
+            return
+        }
+        appendLog("[QrcCacheIndex] manual rebuild requested")
+        QrcLyricCacheManager(this, ::appendThreadSafeLog)
+            .preloadFuzzyIndexAsync(force = true)
+        Thread {
+            Thread.sleep(1_000L)
+            runOnUiThread {
+                refreshLyricStatsText()
+            }
+        }.apply {
+            name = "QrcFuzzyIndexUiRefreshThread"
+            start()
+        }
+    }
+
     private fun refreshLyricStatsText() {
         if (::lyricCacheStatsTextView.isInitialized) {
             lyricCacheStatsTextView.text = lyricCacheStatsText()
@@ -1085,16 +1220,23 @@ class MainActivity : Activity() {
 
     private fun qrcCacheOverviewText(): String {
         val cacheRoot = QrcLyricCacheManager(this, ::appendThreadSafeLog).cacheRoot()
+        val cacheManager = QrcLyricCacheManager(this, ::appendThreadSafeLog)
         val files = cacheRoot.listFiles { file ->
             file.isFile && file.extension.equals("json", ignoreCase = true)
         }.orEmpty()
         val indexStatus = QrcPersistentIndexManager(this, ::appendThreadSafeLog).status()
+        val fuzzyStatus = cacheManager.fuzzyIndexStatus()
+        val aliasItems = QrcAliasCacheManager(this, ::appendThreadSafeLog).itemCount()
+        val negativeItems = QrcNegativeCacheManager(this, ::appendThreadSafeLog).itemCount()
         val rebuild = qrcV2RebuildManager?.status()
         return "缓存版本：${if (rebuild?.status == com.example.playeragent.media.QrcV2RebuildStatus.COMPLETED) "V2" else "V1 / 混合"}\n" +
             "活动缓存文件数：${files.size}\n" +
-            "含逐字时间歌曲数：${rebuild?.successWithWords ?: 0}\n" +
-            "仅行级歌词文件数：${rebuild?.successLineOnly ?: 0}\n" +
+            "V2构建含逐字：${rebuild?.successWithWords ?: 0}\n" +
+            "V2构建仅行级：${rebuild?.successLineOnly ?: 0}\n" +
             "索引条目数：${indexStatus.entries}\n" +
+            "Alias 条目数：$aliasItems\n" +
+            "Negative 条目数：$negativeItems\n" +
+            "Fuzzy Index：${if (fuzzyStatus.ready) "就绪" else if (fuzzyStatus.warming) "预热中" else "未预热"} entries=${fuzzyStatus.entries} files=${fuzzyStatus.files}\n" +
             "Watcher：${if (lastQrcWatcherStatus.watcherRunning) "运行中" else "已停止"}"
     }
 

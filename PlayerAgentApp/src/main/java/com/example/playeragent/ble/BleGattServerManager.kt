@@ -31,6 +31,7 @@ import com.example.playeragent.media.PlaybackStateReader
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -102,6 +103,8 @@ class BleGattServerManager(
     private var pendingAlbumArt: PendingAlbumArt? = null
     @Volatile
     private var albumArtScheduleGeneration = 0L
+    @Volatile
+    private var currentAlbumArtPlaybackState: JSONObject? = null
     private var lastAutoPushSongKey: String? = null
     private var lastAutoPushPlaying: Boolean? = null
     @Volatile
@@ -595,12 +598,19 @@ class BleGattServerManager(
     private fun cancelHistoryTransfersForControl(command: String) {
         if (notifyQueue.hasJobTypeActiveOrQueued(PLAY_HISTORY_JOB_TYPE) ||
             notifyQueue.hasJobTypeActiveOrQueued(PLAY_STATS_JOB_TYPE) ||
-            notifyQueue.hasJobTypeActiveOrQueued(LYRIC_SECONDARY_JOB_TYPE)
+            notifyQueue.hasJobTypeActiveOrQueued(LYRIC_SECONDARY_JOB_TYPE) ||
+            notifyQueue.hasJobTypeActiveOrQueued(ALBUM_ART_JOB_TYPE)
         ) {
             logger("[HistoryBLE] cancelled reason=control command cmd=$command")
             logger("[LyricSecondary] cancelled reason=control command cmd=$command")
+            logger("[AlbumArtHQ] cancelled reason=control command cmd=$command")
             notifyQueue.cancelJobTypes(
-                setOf(PLAY_HISTORY_JOB_TYPE, PLAY_STATS_JOB_TYPE, LYRIC_SECONDARY_JOB_TYPE),
+                setOf(
+                    PLAY_HISTORY_JOB_TYPE,
+                    PLAY_STATS_JOB_TYPE,
+                    LYRIC_SECONDARY_JOB_TYPE,
+                    ALBUM_ART_JOB_TYPE
+                ),
                 "control command"
             )
         }
@@ -999,6 +1009,7 @@ class BleGattServerManager(
             return
         }
         lastAlbumArtKey = cacheKey
+        currentAlbumArtPlaybackState = JSONObject(pending.playbackState.toString())
         logger("[AlbumArt] offer id=$protocolId")
         logger("[AlbumArtDebug] offer sent id=$protocolId")
         notifyQueue.enqueueShort(
@@ -1055,6 +1066,7 @@ class BleGattServerManager(
                 return
             }
             if (notifyQueue.hasJobTypeActiveOrQueued(FULL_LYRICS_JOB_TYPE) ||
+                notifyQueue.hasJobTypeActiveOrQueued(LYRIC_SECONDARY_JOB_TYPE) ||
                 notifyQueue.hasJobTypeActiveOrQueued(REMOTE_LOG_JOB_TYPE) ||
                 notifyQueue.hasJobTypeActiveOrQueued(MEDIA_FIELD_DUMP_JOB_TYPE)
             ) {
@@ -1152,6 +1164,15 @@ class BleGattServerManager(
         val compressedAlbumArt = preparedAlbumArt.compressed
         val albumPackets = preparedAlbumArt.packets
         val totalChunks = albumPackets.totalChunks
+        exportAlbumArtDiagnostics(
+            protocolId = protocolId,
+            playbackState = currentAlbumArtPlaybackState,
+            selectedSource = albumArt.source,
+            sourceBitmap = bitmap,
+            compressed = compressedAlbumArt,
+            quality = quality,
+            totalChunks = totalChunks
+        )
         if (quality == AlbumArtQuality.HQ) {
             logger(
                 "[AlbumArtHQ] selected scale=${compressedAlbumArt.width} " +
@@ -1238,21 +1259,42 @@ class BleGattServerManager(
     ): AlbumArtPreparation {
         val attempts = when (quality) {
             AlbumArtQuality.PREVIEW -> listOf(
-                CompressionAttempt(192, 192, 55, PREVIEW_MAX_JPEG_BYTES),
-                CompressionAttempt(176, 176, 52, PREVIEW_MAX_JPEG_BYTES),
                 CompressionAttempt(160, 160, 50, PREVIEW_MAX_JPEG_BYTES),
                 CompressionAttempt(144, 144, 45, PREVIEW_MAX_JPEG_BYTES),
                 CompressionAttempt(128, 128, 45, PREVIEW_MAX_JPEG_BYTES),
-                CompressionAttempt(112, 112, 40, PREVIEW_MAX_JPEG_BYTES),
-                CompressionAttempt(96, 96, 35, PREVIEW_MAX_JPEG_BYTES)
+                CompressionAttempt(112, 112, 40, PREVIEW_MAX_JPEG_BYTES)
             )
-            AlbumArtQuality.HQ -> listOf(
-                CompressionAttempt(280, 280, 85, HQ_MAX_JPEG_BYTES),
-                CompressionAttempt(256, 256, 82, HQ_MAX_JPEG_BYTES),
-                CompressionAttempt(240, 240, 80, HQ_MAX_JPEG_BYTES),
-                CompressionAttempt(220, 220, 78, HQ_MAX_JPEG_BYTES),
-                CompressionAttempt(200, 200, 75, HQ_MAX_JPEG_BYTES)
-            )
+            AlbumArtQuality.HQ -> listOfNotNull(
+                CompressionAttempt(bitmap.width, bitmap.height, 92, HQ_MAX_JPEG_BYTES),
+                CompressionAttempt(bitmap.width, bitmap.height, 88, HQ_MAX_JPEG_BYTES),
+                CompressionAttempt(
+                    minOf(bitmap.width, 280),
+                    minOf(bitmap.height, 280),
+                    88,
+                    HQ_MAX_JPEG_BYTES
+                ),
+                CompressionAttempt(
+                    minOf(bitmap.width, 256),
+                    minOf(bitmap.height, 256),
+                    88,
+                    HQ_MAX_JPEG_BYTES
+                ),
+                CompressionAttempt(
+                    minOf(bitmap.width, 240),
+                    minOf(bitmap.height, 240),
+                    85,
+                    HQ_MAX_JPEG_BYTES
+                )
+            ).distinctBy {
+                "${it.width}x${it.height}@${it.quality}"
+            }.also {
+                if (bitmap.width < 240 || bitmap.height < 240) {
+                    logger(
+                        "[AlbumArtHQ] source resolution limited " +
+                            "width=${bitmap.width} height=${bitmap.height}"
+                    )
+                }
+            }
             AlbumArtQuality.FULL -> listOf(
                 CompressionAttempt(160, 160, 55, FULL_MAX_JPEG_BYTES),
                 CompressionAttempt(144, 144, 50, FULL_MAX_JPEG_BYTES),
@@ -1326,7 +1368,7 @@ class BleGattServerManager(
                     "[AlbumArt][BLE]"
                 }
                 logger(
-                    "$prefix candidate scale=${attempt.width} " +
+                    "$prefix candidate scale=${compressed.width} " +
                         "quality=${attempt.quality} bytes=${compressed.bytes.size} " +
                         "chunks=0 accepted=false reason=chunks_exceed"
                 )
@@ -1346,7 +1388,7 @@ class BleGattServerManager(
                     else -> ""
                 }
                 logger(
-                    "$prefix candidate scale=${attempt.width} " +
+                    "$prefix candidate scale=${compressed.width} " +
                         "quality=${attempt.quality} bytes=${compressed.bytes.size} " +
                         "chunks=${packets.totalChunks} accepted=$accepted" +
                         if (accepted) "" else " reason=$rejectReason"
@@ -1363,7 +1405,7 @@ class BleGattServerManager(
                         "[AlbumArt]"
                     }
                     logger(
-                        "$prefix selected scale=${attempt.width} " +
+                        "$prefix selected scale=${compressed.width} " +
                             "quality=${attempt.quality} bytes=${compressed.bytes.size} " +
                             "chunks=${packets.totalChunks}"
                     )
@@ -1382,7 +1424,7 @@ class BleGattServerManager(
             }
 
             logger(
-                "[AlbumArt][BLE] candidate scale=${attempt.width} " +
+                "[AlbumArt][BLE] candidate scale=${compressed.width} " +
                     "quality=${attempt.quality} bytes=${compressed.bytes.size} " +
                     "chunks=${packets.totalChunks} exceeds " +
                     "${attempt.maximumBytes} bytes or $maximumChunks chunks"
@@ -1402,18 +1444,26 @@ class BleGattServerManager(
         bitmap: Bitmap,
         attempt: CompressionAttempt
     ): CompressedAlbumArt? {
-        val scaled = Bitmap.createScaledBitmap(
-            bitmap,
-            attempt.width,
-            attempt.height,
-            true
+        val scale = minOf(
+            attempt.width.toFloat() / bitmap.width.toFloat(),
+            attempt.height.toFloat() / bitmap.height.toFloat(),
+            1f
         )
+        val targetWidth = (bitmap.width * scale).toInt().coerceAtLeast(1)
+        val targetHeight = (bitmap.height * scale).toInt().coerceAtLeast(1)
+        val scaled = if (targetWidth == bitmap.width && targetHeight == bitmap.height) {
+            bitmap
+        } else {
+            Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
+        }
         val output = ByteArrayOutputStream()
         val compressed = scaled.compress(
             Bitmap.CompressFormat.JPEG,
             attempt.quality,
             output
         )
+        val compressedWidth = scaled.width
+        val compressedHeight = scaled.height
         if (scaled !== bitmap) {
             scaled.recycle()
         }
@@ -1427,10 +1477,72 @@ class BleGattServerManager(
         }
         return CompressedAlbumArt(
             bytes = bytes,
-            width = scaled.width,
-            height = scaled.height,
+            width = compressedWidth,
+            height = compressedHeight,
             quality = attempt.quality
         )
+    }
+
+    private fun exportAlbumArtDiagnostics(
+        protocolId: String,
+        playbackState: JSONObject?,
+        selectedSource: String,
+        sourceBitmap: Bitmap,
+        compressed: CompressedAlbumArt,
+        quality: AlbumArtQuality,
+        totalChunks: Int
+    ) {
+        if (!DEBUG_ART_DIAGNOSTICS) return
+        try {
+            val directory = appContext.getExternalFilesDir("AlbumArtDiagnostics") ?: return
+            if (!directory.exists()) {
+                directory.mkdirs()
+            }
+            val sourceBytes = ByteArrayOutputStream().use { output ->
+                sourceBitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+                output.toByteArray()
+            }
+            File(directory, "${protocolId}_source.png").writeBytes(sourceBytes)
+            File(directory, "${protocolId}_${quality.wireValue}.jpg")
+                .writeBytes(compressed.bytes)
+
+            val metadataFile = File(directory, "${protocolId}_metadata.json")
+            val metadata = if (metadataFile.exists()) {
+                runCatching {
+                    JSONObject(metadataFile.readText(Charsets.UTF_8))
+                }.getOrElse { JSONObject() }
+            } else {
+                JSONObject()
+            }
+            metadata
+                .put("id", protocolId)
+                .put("title", playbackState?.optString("title").orEmpty())
+                .put("artist", playbackState?.optString("artist").orEmpty())
+                .put("album", playbackState?.optString("album").orEmpty())
+                .put("selectedSource", selectedSource)
+                .put("sourceWidth", sourceBitmap.width)
+                .put("sourceHeight", sourceBitmap.height)
+                .put("sourceConfig", sourceBitmap.config?.name ?: "unknown")
+                .put("sourceAllocationByteCount", sourceBitmap.allocationByteCount)
+                .put("sourcePngBytes", sourceBytes.size)
+                .put("sourceSha256", sha256(sourceBytes))
+                .put("${quality.wireValue}Width", compressed.width)
+                .put("${quality.wireValue}Height", compressed.height)
+                .put("${quality.wireValue}Bytes", compressed.bytes.size)
+                .put("${quality.wireValue}Quality", compressed.quality)
+                .put("${quality.wireValue}Chunks", totalChunks)
+                .put("${quality.wireValue}Sha256", sha256(compressed.bytes))
+                .put("updatedAt", System.currentTimeMillis())
+            metadataFile.writeText(metadata.toString(2), Charsets.UTF_8)
+            logger(
+                "[ArtDiag-Sony] id=$protocolId quality=${quality.wireValue} " +
+                    "source=${sourceBitmap.width}x${sourceBitmap.height} " +
+                    "encoded=${compressed.width}x${compressed.height} " +
+                    "bytes=${compressed.bytes.size} sha256=${sha256(compressed.bytes)}"
+            )
+        } catch (exception: Exception) {
+            logger("[ArtDiag-Sony] export failed id=$protocolId error=${exception.message}")
+        }
     }
 
     private fun buildAlbumArtPackets(
@@ -1656,9 +1768,13 @@ class BleGattServerManager(
         album: String
     ): String {
         val source = listOf(title, artist, album).joinToString("|").ifBlank { "unknown" }
-        return MessageDigest.getInstance("SHA-256")
-            .digest(source.toByteArray(Charsets.UTF_8))
+        return sha256(source.toByteArray(Charsets.UTF_8))
             .take(ALBUM_ART_ID_HASH_BYTES)
+    }
+
+    private fun sha256(bytes: ByteArray): String {
+        return MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
             .joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 
@@ -2984,7 +3100,8 @@ class BleGattServerManager(
         private const val ASSUMED_IOS_ALBUM_ART_PAYLOAD_BYTES = 182
         private const val AUTO_PUSH_INTERVAL_MS = 1000L
         private const val ALBUM_ART_ENABLED = true
-        private const val ALBUM_ART_PREVIEW_MAX_CHUNKS = 35
+        private const val DEBUG_ART_DIAGNOSTICS = true
+        private const val ALBUM_ART_PREVIEW_MAX_CHUNKS = 32
         private const val ALBUM_ART_HQ_MAX_CHUNKS = 95
         private const val ALBUM_ART_FULL_MAX_CHUNKS = 90
         private const val ALBUM_ART_PREVIEW_MAX_SEND_MS = 1200L
@@ -2998,7 +3115,7 @@ class BleGattServerManager(
         private const val ALBUM_ART_BINARY_MAGIC = 0xA1
         private const val ALBUM_ART_BINARY_HEADER_BYTES = 6
         private const val ALBUM_ART_ID_HASH_BYTES = 12
-        private const val PREVIEW_MAX_JPEG_BYTES = 6200
+        private const val PREVIEW_MAX_JPEG_BYTES = 5000
         private const val HQ_MAX_JPEG_BYTES = 16000
         private const val FULL_MAX_JPEG_BYTES = 5200
         private const val SHORT_MESSAGE_DELAY_MS = 20L

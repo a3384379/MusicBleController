@@ -27,6 +27,7 @@ import com.example.playeragent.logging.LogBuffer
 import com.example.playeragent.media.QrcDirectoryWatcher
 import com.example.playeragent.media.QrcIncrementalPrebuildManager
 import com.example.playeragent.media.QrcWatcherStatus
+import com.example.playeragent.media.LyricWarmupManager
 
 class PlayerAgentForegroundService : Service() {
 
@@ -35,6 +36,7 @@ class PlayerAgentForegroundService : Service() {
     private var advertiserManager: BleAdvertiserManager? = null
     private var gattServerManager: BleGattServerManager? = null
     private var playbackHistoryMonitor: PlaybackHistoryMonitor? = null
+    private var lyricWarmupManager: LyricWarmupManager? = null
     private var qrcIncrementalPrebuildManager: QrcIncrementalPrebuildManager? = null
     private var qrcDirectoryWatcher: QrcDirectoryWatcher? = null
     @Volatile
@@ -77,6 +79,7 @@ class PlayerAgentForegroundService : Service() {
                 startPlaybackHistoryMonitor()
                 ensureBleStackStarted("service start")
                 startQrcWatcher()
+                scheduleLyricWarmup()
             }
         }
         return START_STICKY
@@ -86,6 +89,7 @@ class PlayerAgentForegroundService : Service() {
         serviceStopping = true
         mainHandler.removeCallbacksAndMessages(null)
         runCatching { unregisterReceiver(bluetoothStateReceiver) }
+        stopLyricWarmup()
         stopPlaybackHistoryMonitor()
         stopQrcWatcher()
         advertiserManager?.stopAdvertising()
@@ -119,6 +123,21 @@ class PlayerAgentForegroundService : Service() {
     private fun stopPlaybackHistoryMonitor() {
         playbackHistoryMonitor?.stop()
         playbackHistoryMonitor = null
+    }
+
+    private fun scheduleLyricWarmup() {
+        val manager = lyricWarmupManager ?: LyricWarmupManager(
+            context = this,
+            logger = ::log
+        ).also {
+            lyricWarmupManager = it
+        }
+        manager.schedule()
+    }
+
+    private fun stopLyricWarmup() {
+        lyricWarmupManager?.shutdown()
+        lyricWarmupManager = null
     }
 
     private fun initializeBluetooth(

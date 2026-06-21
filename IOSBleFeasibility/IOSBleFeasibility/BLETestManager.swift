@@ -141,6 +141,7 @@ final class BLETestManager: NSObject, ObservableObject {
     private var lastMainHeartbeatAtMs: Int64 = 0
     private var lastMainHeartbeatAppState = "active"
     private var appLifecycleState = "active"
+    private var firstConnectionReadyAtMs: Int64 = 0
     private var lastKaraokeOffsetLogAtMs: Int64 = 0
     private var albumArtID = ""
     private var albumArtQuality = ""
@@ -752,6 +753,14 @@ final class BLETestManager: NSObject, ObservableObject {
         guard !trackID.isEmpty,
               fullLyricsTrackId == trackID,
               !fullLyrics.isEmpty else { return }
+        if isInStartupLoadWindow() {
+            let delay = startupLoadRemainingDelay()
+            log("[StartupLoad] defer request=GET_LYRIC_SECONDARY reason=first connection warmup delayMs=\(Int(delay * 1_000))")
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.requestNextLyricSecondaryIfPossible()
+            }
+            return
+        }
         let mode = pendingLyricSecondaryModes.removeFirst()
         log("[Lyrics-iOS] secondary request mode=\(mode.rawValue) trackId=\(trackID)")
         sendCommand(
@@ -1003,6 +1012,7 @@ final class BLETestManager: NSObject, ObservableObject {
         sonyPeripheral = nil
         sonyCommandCharacteristic = nil
         sonyStatusCharacteristic = nil
+        firstConnectionReadyAtMs = 0
         resetAlbumArtTransfer()
         resetBinaryAlbumArtTransfer()
         requestedAlbumArtKeys.removeAll()
@@ -1118,6 +1128,17 @@ final class BLETestManager: NSObject, ObservableObject {
 
     private func currentTimeMs() -> Int64 {
         Int64(Date().timeIntervalSince1970 * 1_000)
+    }
+
+    private func isInStartupLoadWindow() -> Bool {
+        guard firstConnectionReadyAtMs > 0 else { return false }
+        return currentTimeMs() - firstConnectionReadyAtMs < 3_000
+    }
+
+    private func startupLoadRemainingDelay() -> TimeInterval {
+        guard firstConnectionReadyAtMs > 0 else { return 0 }
+        let elapsedMs = currentTimeMs() - firstConnectionReadyAtMs
+        return TimeInterval(max(0, 3_000 - elapsedMs)) / 1_000
     }
 
     private func startMainHeartbeatDiagnostics() {
@@ -1572,6 +1593,7 @@ extension BLETestManager: CBPeripheralDelegate {
             setStatus(characteristic.isNotifying ? "已连接" : "连接中")
             log("[BLE] status notify subscribed")
             guard characteristic.isNotifying else { return }
+            firstConnectionReadyAtMs = currentTimeMs()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
                 self?.sendCommand(
                     cmd: "CLIENT_CAPABILITIES",
@@ -1584,7 +1606,8 @@ extension BLETestManager: CBPeripheralDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 self?.sendGetVolume()
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) { [weak self] in
+                self?.log("[StartupLoad] deferred request=historyStats delayMs=6000")
                 self?.syncPlaybackHistory()
             }
         }
@@ -2544,7 +2567,7 @@ extension BLETestManager: CBPeripheralDelegate {
         if !trackID.isEmpty {
             currentTrackID = trackID
             handleAlbumArtIdentity(trackID)
-            requestFullLyricsIfNeeded(after: 0.3)
+            requestFullLyricsIfNeeded(after: isInStartupLoadWindow() ? 0.9 : 0.3)
         }
         log("[TrackInfo] updated title=\(title) artist=\(artist)")
         updateLiveActivity(force: true, reason: "trackInfo")
@@ -3280,12 +3303,16 @@ extension BLETestManager: CBPeripheralDelegate {
         guard artworkDisplayQuality < .hq else { return }
         guard !requestedHqAlbumArtIDs.contains(id) else { return }
         cancelHqAlbumArtRequest()
+        let effectiveDelay = isInStartupLoadWindow() ? max(delay, startupLoadRemainingDelay() + 1.0) : delay
         let workItem = DispatchWorkItem { [weak self] in
             self?.requestHqAlbumArt(id: id)
         }
         hqAlbumArtWorkItem = workItem
-        log("[AlbumArtHQ] scheduled id=\(id) delayMs=\(Int(delay * 1_000))")
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+        log("[AlbumArtHQ] scheduled id=\(id) delayMs=\(Int(effectiveDelay * 1_000))")
+        if effectiveDelay > delay {
+            log("[StartupLoad] defer request=AlbumArtHQ delayMs=\(Int(effectiveDelay * 1_000))")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + effectiveDelay, execute: workItem)
     }
 
     private func cancelHqAlbumArtRequest() {

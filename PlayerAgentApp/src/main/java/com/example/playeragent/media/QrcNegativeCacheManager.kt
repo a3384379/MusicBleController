@@ -62,6 +62,18 @@ class QrcNegativeCacheManager(
         logger("[QrcNegativeCache] cleared")
     }
 
+    @Synchronized
+    fun warmup(): Int {
+        ensureLoaded()
+        return items.size
+    }
+
+    @Synchronized
+    fun itemCount(): Int {
+        ensureLoaded()
+        return items.size
+    }
+
     private fun ensureLoaded() {
         if (loaded) {
             return

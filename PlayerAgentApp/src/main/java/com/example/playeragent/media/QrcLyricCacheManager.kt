@@ -6,6 +6,8 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.util.LinkedHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 class QrcLyricCacheManager(
     context: Context,
@@ -153,8 +155,7 @@ class QrcLyricCacheManager(
         writeAtomic(groupFile, text)
         if (updateMemory) {
             memoryCache[parsed.songKey] = parsed
-            indexEntries = emptyList()
-            indexFileCount = -1
+            clearSharedFuzzyIndex()
         }
         logger("[QrcCache] saved songKey=${parsed.songKey} lines=${parsed.lines.size}")
     }
@@ -162,9 +163,7 @@ class QrcLyricCacheManager(
     @Synchronized
     fun clearMemory() {
         memoryCache.clear()
-        indexEntries = emptyList()
-        indexBuiltAt = 0L
-        indexFileCount = -1
+        clearSharedFuzzyIndex()
     }
 
     @Synchronized
@@ -241,6 +240,75 @@ class QrcLyricCacheManager(
                 file.name.startsWith("group_") &&
                 file.extension.equals("json", ignoreCase = true)
         }.orEmpty().sortedBy(File::getName)
+    }
+
+    fun warmupFuzzyIndex(force: Boolean = false): QrcFuzzyIndexStatus {
+        val files = cacheJsonFiles()
+        val now = System.currentTimeMillis()
+        synchronized(sharedIndexLock) {
+            if (!force &&
+                sharedIndexEntries.isNotEmpty() &&
+                now - sharedIndexBuiltAt < INDEX_TTL_MS &&
+                files.size == sharedIndexFileCount
+            ) {
+                return QrcFuzzyIndexStatus(
+                    ready = true,
+                    warming = sharedIndexWarming.get(),
+                    entries = sharedIndexEntries.size,
+                    files = sharedIndexFileCount,
+                    builtAt = sharedIndexBuiltAt
+                )
+            }
+        }
+
+        val startedAt = System.currentTimeMillis()
+        logger("[QrcCacheIndex] warmup start files=${files.size}")
+        val entries = buildFuzzyIndex(files)
+        synchronized(sharedIndexLock) {
+            sharedIndexEntries = entries
+            sharedIndexBuiltAt = System.currentTimeMillis()
+            sharedIndexFileCount = files.size
+        }
+        logger(
+            "[QrcCacheIndex] warmup done entries=${entries.size} " +
+                "costMs=${System.currentTimeMillis() - startedAt}"
+        )
+        return QrcFuzzyIndexStatus(
+            ready = entries.isNotEmpty(),
+            warming = sharedIndexWarming.get(),
+            entries = entries.size,
+            files = files.size,
+            builtAt = sharedIndexBuiltAt
+        )
+    }
+
+    fun preloadFuzzyIndexAsync(force: Boolean = false) {
+        val status = fuzzyIndexStatus()
+        if (!force && status.ready && !status.warming) {
+            return
+        }
+        if (!sharedIndexWarming.compareAndSet(false, true)) {
+            return
+        }
+        fuzzyIndexExecutor.execute {
+            try {
+                warmupFuzzyIndex(force = force)
+            } finally {
+                sharedIndexWarming.set(false)
+            }
+        }
+    }
+
+    fun fuzzyIndexStatus(): QrcFuzzyIndexStatus {
+        synchronized(sharedIndexLock) {
+            return QrcFuzzyIndexStatus(
+                ready = sharedIndexEntries.isNotEmpty(),
+                warming = sharedIndexWarming.get(),
+                entries = sharedIndexEntries.size,
+                files = sharedIndexFileCount.coerceAtLeast(0),
+                builtAt = sharedIndexBuiltAt
+            )
+        }
     }
 
     fun cacheRoot(): File {
@@ -600,17 +668,33 @@ class QrcLyricCacheManager(
     }
 
     private fun ensureIndex(): List<CacheIndexEntry> {
-        val files = cacheRoot().listFiles { file ->
-            file.isFile && file.extension.equals("json", ignoreCase = true)
-        }.orEmpty()
+        val files = cacheJsonFiles()
         val now = System.currentTimeMillis()
-        if (indexEntries.isNotEmpty() &&
-            now - indexBuiltAt < INDEX_TTL_MS &&
-            files.size == indexFileCount
-        ) {
-            return indexEntries
+        synchronized(sharedIndexLock) {
+            if (sharedIndexEntries.isNotEmpty() &&
+                now - sharedIndexBuiltAt < INDEX_TTL_MS &&
+                files.size == sharedIndexFileCount
+            ) {
+                return sharedIndexEntries
+            }
         }
 
+        if (!sharedIndexWarming.compareAndSet(false, true)) {
+            logger("[QrcCacheIndex] fuzzy skipped reason=index warming")
+            return emptyList()
+        }
+        logger("[QrcCacheIndex] fuzzy skipped reason=index warming")
+        fuzzyIndexExecutor.execute {
+            try {
+                warmupFuzzyIndex(force = true)
+            } finally {
+                sharedIndexWarming.set(false)
+            }
+        }
+        return emptyList()
+    }
+
+    private fun buildFuzzyIndex(files: List<File>): List<CacheIndexEntry> {
         val deduped = linkedMapOf<String, CacheIndexEntry>()
         files.forEach { file ->
             val entry = readIndexEntry(file) ?: return@forEach
@@ -623,11 +707,15 @@ class QrcLyricCacheManager(
                 deduped[entry.songKey] = entry
             }
         }
-        indexEntries = deduped.values.toList()
-        indexBuiltAt = now
-        indexFileCount = files.size
-        logger("[QrcCache] fuzzy index built entries=${indexEntries.size} files=${files.size}")
-        return indexEntries
+        val entries = deduped.values.toList()
+        logger("[QrcCache] fuzzy index built entries=${entries.size} files=${files.size}")
+        return entries
+    }
+
+    private fun cacheJsonFiles(): List<File> {
+        return cacheRoot().listFiles { file ->
+            file.isFile && file.extension.equals("json", ignoreCase = true)
+        }.orEmpty().toList()
     }
 
     private fun readIndexEntry(file: File): CacheIndexEntry? {
@@ -914,6 +1002,16 @@ class QrcLyricCacheManager(
         private const val STATS_LOG_INTERVAL = 50L
         private var sharedStats = MutableLyricCacheStats()
         private var sharedQueryCount = 0L
+        private val sharedIndexLock = Any()
+        private var sharedIndexEntries: List<CacheIndexEntry> = emptyList()
+        private var sharedIndexBuiltAt: Long = 0L
+        private var sharedIndexFileCount: Int = -1
+        private val sharedIndexWarming = AtomicBoolean(false)
+        private val fuzzyIndexExecutor = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "QrcCacheFuzzyIndexWarmupThread").apply {
+                priority = Thread.MIN_PRIORITY
+            }
+        }
         private val GENERIC_TITLES = setOf(
             "intro",
             "outro",
@@ -921,6 +1019,14 @@ class QrcLyricCacheManager(
             "remix",
             "live"
         )
+
+        private fun clearSharedFuzzyIndex() {
+            synchronized(sharedIndexLock) {
+                sharedIndexEntries = emptyList()
+                sharedIndexBuiltAt = 0L
+                sharedIndexFileCount = -1
+            }
+        }
     }
 
     private data class FuzzyMatch(

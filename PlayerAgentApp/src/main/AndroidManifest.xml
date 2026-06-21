@@ -76,6 +76,14 @@
                 android:resource="@xml/accessibility_service_config" />
         </service>
 
+        <receiver
+            android:name=".media.ArtworkDiscoveryDebugReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.example.playeragent.action.DISCOVER_HQ_ARTWORK" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

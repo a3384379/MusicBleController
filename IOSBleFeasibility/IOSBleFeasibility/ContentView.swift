@@ -73,29 +73,30 @@ struct ContentView: View {
 
     private var connectionSection: some View {
         HStack(spacing: 12) {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(connectionColor)
-                    .frame(width: 9, height: 9)
-                    .shadow(color: connectionColor.opacity(0.78), radius: 8)
+            Button {
+                bleManager.scanSonyFromMenu()
+            } label: {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(connectionColor)
+                        .frame(width: 8, height: 8)
+                        .shadow(color: connectionColor.opacity(0.42), radius: 5)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(bleManager.connectionStatus)
-                        .font(.subheadline.weight(.semibold))
-                        .lineLimit(1)
-                    Text(bleManager.mode)
-                        .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.66))
+                    Text(connectionStatusTitle)
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.88))
                         .lineLimit(1)
                 }
+                .padding(.horizontal, 14)
+                .frame(height: 42)
+                .contentShape(Capsule())
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(.white.opacity(0.10), in: Capsule())
+            .buttonStyle(PressScaleButtonStyle(pressedScale: 0.97))
+            .background(.white.opacity(0.070), in: Capsule())
             .overlay {
-                Capsule().stroke(.white.opacity(0.08), lineWidth: 1)
+                Capsule().stroke(.white.opacity(0.070), lineWidth: 1)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityLabel("连接状态，点按扫描或重连")
 
             Spacer()
 
@@ -126,12 +127,12 @@ struct ContentView: View {
             } label: {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 19, weight: .bold))
-                    .frame(width: 44, height: 44)
+                    .frame(width: 42, height: 42)
             }
             .buttonStyle(PressScaleButtonStyle(pressedScale: 0.96))
-            .background(.white.opacity(0.09), in: Circle())
+            .background(.white.opacity(0.075), in: Circle())
             .overlay {
-                Circle().stroke(.white.opacity(0.09), lineWidth: 1)
+                Circle().stroke(.white.opacity(0.075), lineWidth: 1)
             }
             .accessibilityLabel("更多操作")
         }
@@ -415,6 +416,17 @@ struct ContentView: View {
             return .orange
         default:
             return .secondary
+        }
+    }
+
+    private var connectionStatusTitle: String {
+        switch bleManager.connectionStatus {
+        case "已连接":
+            return "Sony 已连接"
+        case "扫描中", "连接中":
+            return "正在连接"
+        default:
+            return "未连接"
         }
     }
 

@@ -170,6 +170,14 @@ data class QrcPersistentIndexStatus(
     val builtAt: Long
 )
 
+data class QrcFuzzyIndexStatus(
+    val ready: Boolean,
+    val warming: Boolean,
+    val entries: Int,
+    val files: Int,
+    val builtAt: Long
+)
+
 data class CurrentTrackSnapshot(
     val trackId: String,
     val songKey: String,
