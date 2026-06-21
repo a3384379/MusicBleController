@@ -48,10 +48,20 @@ class QrcIncrementalPrebuildManager(
             if (stopped.get()) {
                 return@execute
             }
+            val token = QrcMaintenanceCoordinator.tryStart(
+                MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD,
+                "groups=${cleanGroupIds.size}",
+                logger
+            )
+            if (token == null) {
+                logger("[QrcIncremental] skipped reason=maintenance busy groups=${cleanGroupIds.size}")
+                cleanGroupIds.forEach { incrementSkipped() }
+                return@execute
+            }
             setRunning(true)
             try {
                 cleanGroupIds.forEachIndexed { index, groupId ->
-                    if (stopped.get()) {
+                    if (stopped.get() || token.cancelled) {
                         return@forEachIndexed
                     }
                     processGroup(groupId, cleanGroupIds.size)
@@ -62,7 +72,10 @@ class QrcIncrementalPrebuildManager(
             } catch (exception: Exception) {
                 logger("[QrcIncremental] failed reason=${exception.message}")
                 incrementFailed()
+                QrcMaintenanceCoordinator.fail(token, exception, logger)
+                return@execute
             } finally {
+                QrcMaintenanceCoordinator.finish(token, logger)
                 setRunning(false)
             }
         }

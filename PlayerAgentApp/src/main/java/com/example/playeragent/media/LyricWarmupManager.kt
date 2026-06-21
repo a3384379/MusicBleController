@@ -47,9 +47,22 @@ class LyricWarmupManager(
             return
         }
         executor.execute {
+            val token = QrcMaintenanceCoordinator.tryStart(
+                MaintenanceTaskType.LYRIC_WARMUP,
+                "manual",
+                logger
+            )
+            if (token == null) {
+                running.set(false)
+                return@execute
+            }
             try {
                 runWarmup()
+            } catch (exception: Exception) {
+                QrcMaintenanceCoordinator.fail(token, exception, logger)
+                return@execute
             } finally {
+                QrcMaintenanceCoordinator.finish(token, logger)
                 running.set(false)
             }
         }
@@ -64,9 +77,23 @@ class LyricWarmupManager(
         if (!running.compareAndSet(false, true)) {
             return
         }
+        val token = QrcMaintenanceCoordinator.tryStart(
+            MaintenanceTaskType.LYRIC_WARMUP,
+            "scheduled",
+            logger
+        )
+        if (token == null) {
+            logger("[LyricWarmup] skipped reason=maintenance busy")
+            running.set(false)
+            return
+        }
         try {
             runWarmup()
+        } catch (exception: Exception) {
+            QrcMaintenanceCoordinator.fail(token, exception, logger)
+            return
         } finally {
+            QrcMaintenanceCoordinator.finish(token, logger)
             running.set(false)
         }
     }
@@ -74,6 +101,7 @@ class LyricWarmupManager(
     private fun runWarmup() {
         val totalStartedAt = System.currentTimeMillis()
         logger("[LyricWarmup] start")
+        val token = QrcMaintenanceCoordinator.currentToken()
 
         val aliasStartedAt = System.currentTimeMillis()
         val aliasItems = QrcAliasCacheManager(appContext, logger).warmup()
@@ -88,6 +116,10 @@ class LyricWarmupManager(
             "[LyricWarmup] negative loaded items=$negativeItems " +
                 "costMs=${System.currentTimeMillis() - negativeStartedAt}"
         )
+        if (token?.cancelled == true) {
+            logger("[LyricWarmup] cancelled after negative cache")
+            return
+        }
 
         val indexStartedAt = System.currentTimeMillis()
         val indexEntries = QrcPersistentIndexManager(appContext, logger).getIndex(
@@ -97,6 +129,10 @@ class LyricWarmupManager(
             "[LyricWarmup] qrcIndex loaded entries=${indexEntries.size} " +
                 "costMs=${System.currentTimeMillis() - indexStartedAt}"
         )
+        if (token?.cancelled == true) {
+            logger("[LyricWarmup] cancelled after qrc index")
+            return
+        }
 
         val fuzzyStartedAt = System.currentTimeMillis()
         val fuzzyStatus = QrcLyricCacheManager(appContext, logger).warmupFuzzyIndex()

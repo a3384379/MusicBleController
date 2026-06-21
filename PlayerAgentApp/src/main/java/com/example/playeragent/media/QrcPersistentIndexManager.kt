@@ -106,11 +106,26 @@ class QrcPersistentIndexManager(
         if (!rebuilding.compareAndSet(false, true)) {
             return
         }
+        val token = QrcMaintenanceCoordinator.tryStart(
+            MaintenanceTaskType.QRC_INDEX_REBUILD,
+            reason,
+            logger
+        )
+        if (token == null) {
+            rebuilding.set(false)
+            return
+        }
         logger("[QrcIndex] rebuild scheduled background reason=$reason")
         rebuildExecutor.execute {
             try {
-                getIndex(forceRefresh = true)
+                if (!token.cancelled) {
+                    getIndex(forceRefresh = true)
+                }
+            } catch (exception: Exception) {
+                QrcMaintenanceCoordinator.fail(token, exception, logger)
+                return@execute
             } finally {
+                QrcMaintenanceCoordinator.finish(token, logger)
                 rebuilding.set(false)
             }
         }

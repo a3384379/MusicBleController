@@ -42,21 +42,42 @@ class QQMusicArtworkDiscoveryManager(
         val taskGeneration = generation + 1
         generation = taskGeneration
         cancelled.set(false)
+        val token = QrcMaintenanceCoordinator.tryStart(
+            MaintenanceTaskType.ARTWORK_DISCOVERY,
+            "title=$title",
+            logger
+        )
+        if (token == null) {
+            onStatus(ArtworkDiscoveryStatus(status = "busy", currentTitle = title))
+            return
+        }
         runningTask = executor.submit {
-            runDiscovery(
-                generation = taskGeneration,
-                title = title,
-                artist = artist,
-                album = album,
-                albumArtId = albumArtId,
-                referenceBitmap = referenceBitmap
-            )
+            try {
+                if (!token.cancelled) {
+                    runDiscovery(
+                        generation = taskGeneration,
+                        title = title,
+                        artist = artist,
+                        album = album,
+                        albumArtId = albumArtId,
+                        referenceBitmap = referenceBitmap
+                    )
+                }
+            } catch (exception: Exception) {
+                QrcMaintenanceCoordinator.fail(token, exception, logger)
+                return@submit
+            } finally {
+                QrcMaintenanceCoordinator.finish(token, logger)
+            }
         }
     }
 
     fun cancel() {
         generation += 1
         cancelled.set(true)
+        if (QrcMaintenanceCoordinator.currentToken()?.type == MaintenanceTaskType.ARTWORK_DISCOVERY) {
+            QrcMaintenanceCoordinator.cancelCurrent("artwork discovery cancelled", logger)
+        }
         runningTask?.cancel(true)
         runningTask = null
         onStatus(ArtworkDiscoveryStatus(status = "stopped"))

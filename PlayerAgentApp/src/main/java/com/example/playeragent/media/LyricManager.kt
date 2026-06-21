@@ -251,6 +251,14 @@ class LyricManager(
                     source = LyricSource.NONE
                 )
             }
+            if (QrcMaintenanceCoordinator.isRunning()) {
+                logger("[LyricAsync] maintenance busy, skip heavy fallback songKey=${request.key}")
+                return LyricLoadResult(
+                    lines = emptyList(),
+                    lineCount = 0,
+                    source = LyricSource.NONE
+                )
+            }
             val qrcLoaded = qrcLyricManager.load(title, artist, album)
             val qrcLines = if (qrcLoaded) {
                 qrcLyricManager.lyricLinesSnapshot().map {

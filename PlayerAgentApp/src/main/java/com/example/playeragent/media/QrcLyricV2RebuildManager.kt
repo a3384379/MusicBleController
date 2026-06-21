@@ -34,6 +34,16 @@ class QrcLyricV2RebuildManager(
             logger("[QrcV2Rebuild] already running")
             return
         }
+        val token = QrcMaintenanceCoordinator.tryStart(
+            MaintenanceTaskType.QRC_V2_REBUILD,
+            if (clearBuilding) "clear rebuild" else "build",
+            logger
+        )
+        if (token == null) {
+            running.set(false)
+            publish(progress.copy(running = false))
+            return
+        }
         stopRequested = false
         pauseRequested = false
         executor.execute {
@@ -41,8 +51,14 @@ class QrcLyricV2RebuildManager(
                 if (clearBuilding) {
                     clearBuildingDirectory()
                 }
-                runRebuild()
+                if (!token.cancelled) {
+                    runRebuild()
+                }
+            } catch (exception: Exception) {
+                QrcMaintenanceCoordinator.fail(token, exception, logger)
+                return@execute
             } finally {
+                QrcMaintenanceCoordinator.finish(token, logger)
                 running.set(false)
                 publish(progress.copy(running = false))
             }

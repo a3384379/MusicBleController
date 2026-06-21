@@ -20,8 +20,26 @@ class QrcStaleCacheRebuildManager(
             logger("[QrcStaleRebuild] already running")
             return
         }
+        val token = QrcMaintenanceCoordinator.tryStart(
+            MaintenanceTaskType.CACHE_REPAIR,
+            "stale cache rebuild",
+            logger
+        )
+        if (token == null) {
+            running.set(false)
+            return
+        }
         stopRequested = false
-        Thread(::runRebuild, "QrcStaleCacheRebuildThread").apply {
+        Thread({
+            try {
+                runRebuild(token)
+            } catch (exception: Exception) {
+                QrcMaintenanceCoordinator.fail(token, exception, logger)
+                return@Thread
+            } finally {
+                QrcMaintenanceCoordinator.finish(token, logger)
+            }
+        }, "QrcStaleCacheRebuildThread").apply {
             priority = Thread.MIN_PRIORITY
             start()
         }
@@ -38,7 +56,7 @@ class QrcStaleCacheRebuildManager(
         return progress.copy(running = running.get())
     }
 
-    private fun runRebuild() {
+    private fun runRebuild(token: MaintenanceToken) {
         val groupIds = cacheManager.groupCacheFiles()
             .mapNotNull { file ->
                 GROUP_CACHE_FILE_REGEX.matchEntire(file.name)
@@ -58,7 +76,7 @@ class QrcStaleCacheRebuildManager(
 
         try {
             groupIds.forEachIndexed { index, groupId ->
-                if (stopRequested) {
+                if (stopRequested || token.cancelled) {
                     progress = progress.copy(status = "stopped")
                     publish()
                     return@forEachIndexed

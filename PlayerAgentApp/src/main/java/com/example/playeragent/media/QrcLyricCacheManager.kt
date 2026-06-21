@@ -290,10 +290,25 @@ class QrcLyricCacheManager(
         if (!sharedIndexWarming.compareAndSet(false, true)) {
             return
         }
+        val token = QrcMaintenanceCoordinator.tryStart(
+            MaintenanceTaskType.FUZZY_INDEX_REBUILD,
+            if (force) "force" else "preload",
+            logger
+        )
+        if (token == null) {
+            sharedIndexWarming.set(false)
+            return
+        }
         fuzzyIndexExecutor.execute {
             try {
-                warmupFuzzyIndex(force = force)
+                if (!token.cancelled) {
+                    warmupFuzzyIndex(force = force)
+                }
+            } catch (exception: Exception) {
+                QrcMaintenanceCoordinator.fail(token, exception, logger)
+                return@execute
             } finally {
+                QrcMaintenanceCoordinator.finish(token, logger)
                 sharedIndexWarming.set(false)
             }
         }

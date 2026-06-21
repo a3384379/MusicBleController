@@ -16,6 +16,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
@@ -44,6 +46,7 @@ import com.example.playeragent.media.QrcAliasCacheManager
 import com.example.playeragent.media.QrcDumpManager
 import com.example.playeragent.media.QrcLyricCacheManager
 import com.example.playeragent.media.QrcLyricV2RebuildManager
+import com.example.playeragent.media.QrcMaintenanceCoordinator
 import com.example.playeragent.media.QrcNegativeCacheManager
 import com.example.playeragent.media.QrcPersistentIndexManager
 import com.example.playeragent.media.QrcStaleCacheRebuildManager
@@ -71,6 +74,7 @@ class MainActivity : Activity() {
     private lateinit var qrcWatcherStatusTextView: TextView
     private lateinit var lyricCacheStatsTextView: TextView
     private lateinit var qrcCacheOverviewTextView: TextView
+    private lateinit var maintenanceStatusTextView: TextView
     private lateinit var historyStatusTextView: TextView
     private lateinit var logTextView: TextView
     private lateinit var logScrollView: ScrollView
@@ -82,6 +86,9 @@ class MainActivity : Activity() {
     private var qrcV2RebuildManager: QrcLyricV2RebuildManager? = null
     private var qrcStaleCacheRebuildManager: QrcStaleCacheRebuildManager? = null
     private var lyricWarmupManager: LyricWarmupManager? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile private var debugStatsLoading = false
+    @Volatile private var lastDebugStatsLoadAt = 0L
     private var lastPlayerUiSongKey: String = ""
     private var lastPlayerUiLyric: String = ""
     private var albumArtRefreshGeneration = 0L
@@ -149,11 +156,16 @@ class MainActivity : Activity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        val startedAt = System.currentTimeMillis()
         super.onCreate(savedInstanceState)
+        appendLog("[UI] MainActivity onCreate start")
         setupUi()
+        appendLog("[UI] setContent complete costMs=${System.currentTimeMillis() - startedAt}")
         initializeBluetooth()
         requestRequiredPermissions()
         appendLog("[PlayerAgent] UI ready")
+        appendLog("[UI] first lightweight render ready costMs=${System.currentTimeMillis() - startedAt}")
+        scheduleDebugStatsLoad()
         refreshCurrentMedia()
     }
 
@@ -275,13 +287,16 @@ class MainActivity : Activity() {
         )))
 
         val lyricCard = collapsibleCard(content, "歌词缓存与逐字时间", expanded = false)
-        qrcCacheOverviewTextView = statusValue(qrcCacheOverviewText()).also(lyricCard::addView)
+        maintenanceStatusTextView = statusValue(
+            QrcMaintenanceCoordinator.snapshot().displayText()
+        ).also(lyricCard::addView)
+        qrcCacheOverviewTextView = statusValue("缓存统计：loading...").also(lyricCard::addView)
         qrcCacheBuildTextView = statusValue(QrcV2RebuildProgress().displayText()).also(lyricCard::addView)
         qrcStaleCacheRebuildTextView = statusValue(
             QrcStaleCacheRebuildProgress().displayText()
         ).also(lyricCard::addView)
         qrcWatcherStatusTextView = statusValue(lastQrcWatcherStatus.displayText()).also(lyricCard::addView)
-        lyricCacheStatsTextView = statusValue(lyricCacheStatsText()).also(lyricCard::addView)
+        lyricCacheStatsTextView = statusValue("歌词统计：loading...").also(lyricCard::addView)
         lyricCard.addView(buttonGrid(listOf(
             "构建 V2 逐字歌词缓存" to { startQrcV2Build(clear = false) },
             "暂停构建" to ::pauseQrcV2Build,
@@ -295,6 +310,7 @@ class MainActivity : Activity() {
             "刷新缓存统计" to ::refreshLyricStatsText,
             "修复旧歌词缓存" to ::startQrcStaleCacheRebuild,
             "停止旧缓存修复" to ::stopQrcStaleCacheRebuild,
+            "取消当前维护任务" to ::cancelCurrentMaintenance,
             "删除旧缓存备份" to { confirmAction("删除旧缓存备份？", ::deleteOldQrcBackup) }
         )))
 
@@ -1055,6 +1071,24 @@ class MainActivity : Activity() {
         qrcStaleCacheRebuildManager?.stop()
     }
 
+    private fun cancelCurrentMaintenance() {
+        val cancelled = QrcMaintenanceCoordinator.cancelCurrent(
+            "debug button",
+            ::appendThreadSafeLog
+        )
+        qrcV2RebuildManager?.stop()
+        qrcStaleCacheRebuildManager?.stop()
+        if (QrcMaintenanceCoordinator.currentToken()?.type == com.example.playeragent.media.MaintenanceTaskType.ARTWORK_DISCOVERY) {
+            artworkDiscoveryManager?.cancel()
+        }
+        if (cancelled) {
+            appendLog("[QrcMaintenance] cancel requested from UI")
+        } else {
+            appendLog("[QrcMaintenance] cancel skipped reason=no active task")
+        }
+        refreshMaintenanceStatus()
+    }
+
     private fun deleteOldQrcBackup() {
         val backup = QrcLyricCacheManager(this, ::appendThreadSafeLog).backupCacheRoot()
         if (backup.exists()) {
@@ -1124,8 +1158,7 @@ class MainActivity : Activity() {
             if (::qrcWatcherStatusTextView.isInitialized) {
                 qrcWatcherStatusTextView.text = status.displayText()
             }
-            refreshLyricStatsText()
-            refreshQrcCacheOverview()
+            refreshMaintenanceStatus()
         }
     }
 
@@ -1206,15 +1239,81 @@ class MainActivity : Activity() {
     }
 
     private fun refreshLyricStatsText() {
-        if (::lyricCacheStatsTextView.isInitialized) {
-            lyricCacheStatsTextView.text = lyricCacheStatsText()
-        }
-        refreshQrcCacheOverview()
+        scheduleDebugStatsLoad(force = true)
     }
 
     private fun refreshQrcCacheOverview() {
+        scheduleDebugStatsLoad(force = true)
+    }
+
+    private fun scheduleDebugStatsLoad(force: Boolean = false) {
+        appendLog("[UI] debug stats load scheduled")
+        mainHandler.postDelayed({
+            loadDebugStatsAsync(force)
+        }, DEBUG_STATS_INITIAL_DELAY_MS)
+    }
+
+    private fun loadDebugStatsAsync(force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (!force && now - lastDebugStatsLoadAt < DEBUG_STATS_THROTTLE_MS) {
+            appendLog("[DebugStats] skipped reason=throttled")
+            return
+        }
+        if (debugStatsLoading) {
+            appendLog("[DebugStats] skipped reason=already loading")
+            return
+        }
+        debugStatsLoading = true
+        lastDebugStatsLoadAt = now
         if (::qrcCacheOverviewTextView.isInitialized) {
-            qrcCacheOverviewTextView.text = qrcCacheOverviewText()
+            qrcCacheOverviewTextView.text = "缓存统计：loading..."
+        }
+        if (::lyricCacheStatsTextView.isInitialized) {
+            lyricCacheStatsTextView.text = "歌词统计：loading..."
+        }
+        Thread {
+            val startedAt = System.currentTimeMillis()
+            appendThreadSafeLog("[DebugStats] load start")
+            val result = runCatching {
+                DebugStatsText(
+                    qrcOverview = qrcCacheOverviewText(),
+                    lyricStats = lyricCacheStatsText(),
+                    maintenance = QrcMaintenanceCoordinator.snapshot().displayText()
+                )
+            }
+            runOnUiThread {
+                debugStatsLoading = false
+                result.onSuccess { stats ->
+                    if (::qrcCacheOverviewTextView.isInitialized) {
+                        qrcCacheOverviewTextView.text = stats.qrcOverview
+                    }
+                    if (::lyricCacheStatsTextView.isInitialized) {
+                        lyricCacheStatsTextView.text = stats.lyricStats
+                    }
+                    if (::maintenanceStatusTextView.isInitialized) {
+                        maintenanceStatusTextView.text = stats.maintenance
+                    }
+                    appendLog("[DebugStats] load done costMs=${System.currentTimeMillis() - startedAt}")
+                }.onFailure { exception ->
+                    if (::qrcCacheOverviewTextView.isInitialized) {
+                        qrcCacheOverviewTextView.text = "缓存统计：加载失败 ${exception.message}"
+                    }
+                    if (::lyricCacheStatsTextView.isInitialized) {
+                        lyricCacheStatsTextView.text = "歌词统计：加载失败 ${exception.message}"
+                    }
+                    appendLog("[DebugStats] failed error=${exception.message}")
+                }
+            }
+        }.apply {
+            name = "DebugStatsLoadThread"
+            priority = Thread.MIN_PRIORITY
+            start()
+        }
+    }
+
+    private fun refreshMaintenanceStatus() {
+        if (::maintenanceStatusTextView.isInitialized) {
+            maintenanceStatusTextView.text = QrcMaintenanceCoordinator.snapshot().displayText()
         }
     }
 
@@ -1426,6 +1525,10 @@ class MainActivity : Activity() {
         if (storeInBuffer) {
             LogBuffer.append(message)
         }
+        if (!::logTextView.isInitialized || !::logScrollView.isInitialized) {
+            android.util.Log.i("PlayerAgent", message)
+            return
+        }
         logTextView.append("$message\n")
         logScrollView.post {
             logScrollView.fullScroll(View.FOCUS_DOWN)
@@ -1448,8 +1551,16 @@ class MainActivity : Activity() {
         return (value * resources.displayMetrics.density).toInt()
     }
 
+    private data class DebugStatsText(
+        val qrcOverview: String,
+        val lyricStats: String,
+        val maintenance: String
+    )
+
     companion object {
         private const val REQUEST_PERMISSIONS = 1001
         private const val REQUEST_EXPORT_LOG = 1002
+        private const val DEBUG_STATS_INITIAL_DELAY_MS = 700L
+        private const val DEBUG_STATS_THROTTLE_MS = 2_000L
     }
 }
