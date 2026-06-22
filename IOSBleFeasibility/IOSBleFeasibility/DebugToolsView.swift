@@ -12,6 +12,7 @@ struct DebugToolsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     statusSection
+                    autoReconnectSection
                     artworkEnhancementSection
                     liveActivityControlSection
                     karaokeOffsetSection
@@ -95,6 +96,56 @@ struct DebugToolsView: View {
                         systemImage: "list.bullet.clipboard",
                         disabled: !isConnected || bleManager.isMediaFieldDumpReceiving,
                         action: bleManager.sendDumpMediaFields
+                    )
+                }
+            }
+        }
+    }
+
+    private var autoReconnectSection: some View {
+        DebugCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Auto Reconnect", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.headline)
+
+                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
+                    debugRow("Enabled", bleManager.autoReconnectEnabled ? "true" : "false")
+                    debugRow("State", bleManager.autoReconnectState)
+                    debugRow("Attempt", "\(bleManager.autoReconnectAttempt)")
+                    debugRow("Next retry", reconnectRetryText)
+                    debugRow("Last peripheral", bleManager.autoReconnectLastPeripheralId)
+                    debugRow("Last error", bleManager.autoReconnectLastDisconnectError)
+                    debugRow("Last cost", "\(bleManager.autoReconnectLastCostMs)ms")
+                    debugRow("Manual count", "\(bleManager.manualReconnectCount)")
+                    debugRow("Auto count", "\(bleManager.autoReconnectCount)")
+                }
+
+                LazyVGrid(
+                    columns: [
+                        GridItem(.flexible(), spacing: 10),
+                        GridItem(.flexible(), spacing: 10)
+                    ],
+                    spacing: 10
+                ) {
+                    debugActionButton(
+                        title: bleManager.autoReconnectEnabled ? "Disable Auto" : "Enable Auto",
+                        systemImage: bleManager.autoReconnectEnabled ? "pause.circle" : "play.circle",
+                        disabled: false,
+                        action: {
+                            bleManager.setAutoReconnectEnabled(!bleManager.autoReconnectEnabled)
+                        }
+                    )
+                    debugActionButton(
+                        title: "Force Reconnect",
+                        systemImage: "bolt.horizontal.circle",
+                        disabled: false,
+                        action: bleManager.forceReconnect
+                    )
+                    debugActionButton(
+                        title: "Forget Last Sony",
+                        systemImage: "trash.circle",
+                        disabled: false,
+                        action: bleManager.forgetLastSonyDevice
                     )
                 }
             }
@@ -452,6 +503,12 @@ struct DebugToolsView: View {
 
     private var karaokeOffsetOptions: [Int64] {
         [-300, -100, 0, 300, 600, 900]
+    }
+
+    private var reconnectRetryText: String {
+        guard let retryAt = bleManager.autoReconnectNextRetryAt else { return "-" }
+        let remaining = max(0, retryAt.timeIntervalSinceNow)
+        return String(format: "%.1fs", remaining)
     }
 
     private func offsetLabel(_ value: Int64) -> String {
