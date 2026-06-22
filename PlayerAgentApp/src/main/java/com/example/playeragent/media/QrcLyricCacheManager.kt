@@ -7,6 +7,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.LinkedHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 
 class QrcLyricCacheManager(
@@ -273,6 +274,7 @@ class QrcLyricCacheManager(
             "[QrcCacheIndex] warmup done entries=${entries.size} " +
                 "costMs=${System.currentTimeMillis() - startedAt}"
         )
+        notifyFuzzyIndexReady(entries.size)
         return QrcFuzzyIndexStatus(
             ready = entries.isNotEmpty(),
             warming = sharedIndexWarming.get(),
@@ -312,6 +314,10 @@ class QrcLyricCacheManager(
                 sharedIndexWarming.set(false)
             }
         }
+    }
+
+    fun isFuzzyIndexWarming(): Boolean {
+        return sharedIndexWarming.get()
     }
 
     fun fuzzyIndexStatus(): QrcFuzzyIndexStatus {
@@ -1022,6 +1028,26 @@ class QrcLyricCacheManager(
         private var sharedIndexBuiltAt: Long = 0L
         private var sharedIndexFileCount: Int = -1
         private val sharedIndexWarming = AtomicBoolean(false)
+        private val fuzzyIndexReadyListeners = CopyOnWriteArrayList<(QrcFuzzyIndexStatus) -> Unit>()
+
+        fun addFuzzyIndexReadyListener(listener: (QrcFuzzyIndexStatus) -> Unit) {
+            fuzzyIndexReadyListeners += listener
+        }
+
+        private fun notifyFuzzyIndexReady(entries: Int) {
+            val status = synchronized(sharedIndexLock) {
+                QrcFuzzyIndexStatus(
+                    ready = entries > 0,
+                    warming = sharedIndexWarming.get(),
+                    entries = entries,
+                    files = sharedIndexFileCount.coerceAtLeast(0),
+                    builtAt = sharedIndexBuiltAt
+                )
+            }
+            fuzzyIndexReadyListeners.forEach { listener ->
+                runCatching { listener(status) }
+            }
+        }
         private val fuzzyIndexExecutor = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "QrcCacheFuzzyIndexWarmupThread").apply {
                 priority = Thread.MIN_PRIORITY

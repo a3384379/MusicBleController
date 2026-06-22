@@ -86,7 +86,9 @@ class QrcDirectoryWatcher(
         synchronized(lock) {
             val firstPending = pendingGroups.add(groupId)
             if (firstPending) {
-                QrcDirectoryGeneration.markChanged(groupId, eventName, logger)
+                val oldGeneration = QrcDirectoryGeneration.current()
+                val newGeneration = QrcDirectoryGeneration.markChanged(groupId, eventName, logger)
+                logger("[QrcWatcher] generation changed old=$oldGeneration new=$newGeneration")
             }
             logger("[QrcWatcher] group changed groupId=$groupId")
             logger("[QrcWatcher] pending groupId=$groupId")

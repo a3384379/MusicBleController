@@ -35,6 +35,11 @@ class QrcLyricManager(
 
     @Synchronized
     fun load(title: String, artist: String, album: String): Boolean {
+        return loadWithResult(title, artist, album).success
+    }
+
+    @Synchronized
+    fun loadWithResult(title: String, artist: String, album: String): QrcLoadResult {
         val normalizedTitle = normalizeForMatch(title)
         val normalizedArtist = normalizeForMatch(artist)
         val normalizedAlbum = normalizeForMatch(album)
@@ -44,14 +49,23 @@ class QrcLyricManager(
             normalizedAlbum
         )
         if (songKey == cachedSongKey && cachedLines.isNotEmpty()) {
-            return true
+            return QrcLoadResult(
+                success = true,
+                lines = cachedLines,
+                retryable = false,
+                reason = "memory cache"
+            )
         }
 
         if (songKey != cachedSongKey) {
             clearCacheIfSongChanged(title, artist, album)
         }
         if (normalizedTitle.isBlank() && normalizedArtist.isBlank()) {
-            return false
+            return QrcLoadResult(
+                success = false,
+                retryable = false,
+                reason = "empty metadata"
+            )
         }
         clearUncertainCooldownIfIndexDirty()
 
@@ -75,7 +89,12 @@ class QrcLyricManager(
                 "[QrcLyric] parsed lines=${cachedLines.size} " +
                     "totalCostMs=${System.currentTimeMillis() - startedAt}"
             )
-            return cachedLines.isNotEmpty()
+            return QrcLoadResult(
+                success = cachedLines.isNotEmpty(),
+                lines = cachedLines,
+                retryable = false,
+                reason = "cache hit"
+            )
         }
 
         songLinesCache[songKey]?.let { lines ->
@@ -86,17 +105,30 @@ class QrcLyricManager(
                 "[QrcLyric] parsed lines=${lines.size} " +
                     "totalCostMs=${System.currentTimeMillis() - startedAt}"
             )
-            return lines.isNotEmpty()
+            return QrcLoadResult(
+                success = lines.isNotEmpty(),
+                lines = lines,
+                retryable = false,
+                reason = "song memory cache"
+            )
         }
 
         if (negativeCacheManager.isNegative(songKey)) {
             cacheManager.recordNegativeHit()
             logger("[QrcLyric] best group=none score=0")
-            return false
+            return QrcLoadResult(
+                success = false,
+                retryable = false,
+                reason = "negative cache hit"
+            )
         }
         if (isUncertainCooldownActive(songKey)) {
             logger("[QrcLyric] best group=none score=0")
-            return false
+            return QrcLoadResult(
+                success = false,
+                retryable = true,
+                reason = "qrc cooldown retry pending"
+            )
         }
 
         val entries = getIndexEntries(forceRefresh = false)
@@ -104,7 +136,12 @@ class QrcLyricManager(
         if (entries.isEmpty()) {
             logger("[QrcLyric] best group=none score=0")
             logger("[QrcLyric] skip negative cache reason=no qrc entries")
-            return false
+            val retryable = cacheManager.isFuzzyIndexWarming()
+            return QrcLoadResult(
+                success = false,
+                retryable = retryable,
+                reason = if (retryable) "fuzzy index warming" else "no qrc entries"
+            )
         }
 
         songGroupCache[songKey]?.let { groupId ->
@@ -119,7 +156,12 @@ class QrcLyricManager(
                         "[QrcLyric] parsed lines=${cachedLines.size} " +
                             "totalCostMs=${System.currentTimeMillis() - startedAt}"
                     )
-                    return cachedLines.isNotEmpty()
+                    return QrcLoadResult(
+                        success = cachedLines.isNotEmpty(),
+                        lines = cachedLines,
+                        retryable = false,
+                        reason = "group memory cache"
+                    )
                 }
             }
         }
@@ -152,14 +194,28 @@ class QrcLyricManager(
             )
             logger("[QrcLyric] skip negative cache reason=uncertain qrc match")
             saveUncertainCooldown(songKey)
-            return false
+            val retryable = searchResult.producerCandidateCount == 0 ||
+                cacheManager.isFuzzyIndexWarming()
+            return QrcLoadResult(
+                success = false,
+                retryable = retryable,
+                reason = if (retryable && searchResult.producerCandidateCount == 0) {
+                    "waiting qqmusic lyric cache"
+                } else {
+                    "no safe qrc candidate"
+                }
+            )
         }
 
         val parsed = best.parsed ?: decryptAndParseQrc(best.entry)
         if (parsed == null || !parsedMatchesTitle(parsed, normalizedTitle)) {
             logger("[QrcLyric] best group=none score=0")
             logger("[QrcLyric] skip negative cache reason=decrypt unconfirmed")
-            return false
+            return QrcLoadResult(
+                success = false,
+                retryable = false,
+                reason = "decrypt unconfirmed"
+            )
         }
 
         applyParsedResult(songKey, best.entry, parsed)
@@ -175,7 +231,12 @@ class QrcLyricManager(
             "[QrcLyric] parsed lines=${cachedLines.size} " +
                 "totalCostMs=${System.currentTimeMillis() - startedAt}"
         )
-        return cachedLines.isNotEmpty()
+        return QrcLoadResult(
+            success = cachedLines.isNotEmpty(),
+            lines = cachedLines,
+            retryable = false,
+            reason = "qrc parsed"
+        )
     }
 
     @Synchronized
@@ -687,7 +748,10 @@ class QrcLyricManager(
         }
         val now = System.currentTimeMillis()
         return if (now < entry.retryAfterMs) {
-            logger("[QrcCooldown] hit songKey=$songKey generation=${entry.generation}")
+            logger(
+                "[QrcCooldown] hit songKey=$songKey generation=${entry.generation} " +
+                    "retryable=true retryAfter=${entry.retryAfterMs}"
+            )
             true
         } else {
             uncertainMissCooldown.remove(songKey)
@@ -699,7 +763,18 @@ class QrcLyricManager(
         if (songKey.isBlank()) {
             return
         }
-        val retryAfterMs = System.currentTimeMillis() + UNCERTAIN_MISS_COOLDOWN_MS
+        val now = System.currentTimeMillis()
+        val originalRetryAfterMs = now + UNCERTAIN_MISS_COOLDOWN_MS
+        val retryAfterMs = minOf(
+            originalRetryAfterMs,
+            now + ACTIVE_SONG_UNCERTAIN_MISS_COOLDOWN_MS
+        )
+        if (retryAfterMs != originalRetryAfterMs) {
+            logger(
+                "[QrcCooldown] active song cooldown capped " +
+                    "oldRetryAfter=$originalRetryAfterMs newRetryAfter=$retryAfterMs"
+            )
+        }
         val generation = QrcDirectoryGeneration.current()
         uncertainMissCooldown[songKey] = QrcCooldownEntry(
             retryAfterMs = retryAfterMs,
@@ -809,6 +884,13 @@ class QrcLyricManager(
         val reason: String
     )
 
+    data class QrcLoadResult(
+        val success: Boolean,
+        val lines: List<LyricLine> = emptyList(),
+        val retryable: Boolean,
+        val reason: String
+    )
+
     private data class ScoredGroup(
         val entry: QrcGroupIndexEntry,
         val score: Int,
@@ -838,6 +920,7 @@ class QrcLyricManager(
         private const val MAX_SONG_CACHE_SIZE = 80
         private const val MIN_HEX_LENGTH = 128
         private const val UNCERTAIN_MISS_COOLDOWN_MS = 10 * 60_000L
+        private const val ACTIVE_SONG_UNCERTAIN_MISS_COOLDOWN_MS = 2 * 60_000L
 
         private val QRC_LYRIC_CONTENT_REGEX =
             Regex("""LyricContent\s*=\s*"([\s\S]*?)"""")

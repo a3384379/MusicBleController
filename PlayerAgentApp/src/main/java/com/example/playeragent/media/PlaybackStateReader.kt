@@ -140,10 +140,19 @@ class PlaybackStateReader(
             .put("position", position)
             .put("duration", duration)
             .put("lyric", lyric)
+            .put("lyricStatus", lyricManager.currentStatusText())
     }
 
     fun lyricLinesSnapshot(): List<LyricManager.LyricLine> {
         return lyricManager.lyricLinesSnapshot()
+    }
+
+    fun lyricUnavailableReason(): String {
+        return lyricManager.currentUnavailableReason()
+    }
+
+    fun lyricStatusText(): String {
+        return lyricManager.currentStatusText()
     }
 
     fun readFastPlaybackSnapshot(): FastPlaybackSnapshot? {
@@ -200,6 +209,14 @@ class PlaybackStateReader(
 
     fun applyIncrementalLyrics(ready: IncrementalLyricsReady): Boolean {
         return lyricManager.applyIncrementalLyrics(ready)
+    }
+
+    fun retryActiveLyricsFromWatcher(reason: String): Boolean {
+        return lyricManager.retryActiveSongFromWatcher(reason)
+    }
+
+    fun manualRefreshCurrentLyric(): Boolean {
+        return lyricManager.manualRefreshCurrentLyric()
     }
 
     private fun logController(index: Int, controller: MediaController) {

@@ -11,7 +11,8 @@ class QrcIncrementalPrebuildManager(
     private val logger: (String) -> Unit,
     private val statusListener: (QrcWatcherStatus) -> Unit,
     private val currentTrackProvider: () -> CurrentTrackSnapshot? = { null },
-    private val onIncrementalLyricsReady: (IncrementalLyricsReady) -> Unit = {}
+    private val onIncrementalLyricsReady: (IncrementalLyricsReady) -> Unit = {},
+    private val onBatchProcessed: (Set<String>) -> Unit = {}
 ) {
 
     private val appContext = context.applicationContext
@@ -77,6 +78,9 @@ class QrcIncrementalPrebuildManager(
             } finally {
                 QrcMaintenanceCoordinator.finish(token, logger)
                 setRunning(false)
+                if (cleanGroupIds.isNotEmpty()) {
+                    onBatchProcessed(cleanGroupIds.toSet())
+                }
             }
         }
     }

@@ -75,6 +75,7 @@ class PlayerAgentForegroundService : Service() {
             ACTION_STOP_QRC_WATCHER -> stopQrcWatcher()
             ACTION_START_QRC_WATCHER -> startQrcWatcher()
             ACTION_RECOVER_BLE_STACK -> recoverBleStack("manual debug")
+            ACTION_REFRESH_CURRENT_LYRIC -> refreshCurrentLyric()
             else -> {
                 startPlaybackHistoryMonitor()
                 ensureBleStackStarted("service start")
@@ -356,6 +357,18 @@ class PlayerAgentForegroundService : Service() {
             },
             onIncrementalLyricsReady = { ready ->
                 gattServerManager?.handleIncrementalLyricsReady(ready)
+            },
+            onBatchProcessed = { groups ->
+                if (groups.isNotEmpty()) {
+                    val handled = gattServerManager?.retryCurrentLyricsFromWatcher(
+                        "qrc watcher generation changed"
+                    ) == true
+                    if (handled) {
+                        log("[LyricRetry] watcher retry requested groups=${groups.size}")
+                    } else {
+                        log("[LyricRetry] watcher retry skipped groups=${groups.size}")
+                    }
+                }
             }
         ).also {
             qrcIncrementalPrebuildManager = it
@@ -385,6 +398,15 @@ class PlayerAgentForegroundService : Service() {
                 incrementalSkipped = 0
             )
         )
+    }
+
+    private fun refreshCurrentLyric() {
+        val handled = gattServerManager?.manualRefreshCurrentLyric() == true
+        if (handled) {
+            log("[LyricRetry] manual refresh requested from service")
+        } else {
+            log("[LyricRetry] manual refresh request not started")
+        }
     }
 
     private fun hasBluetoothRuntimePermissions(): Boolean {
@@ -485,6 +507,7 @@ class PlayerAgentForegroundService : Service() {
                 .putExtra(EXTRA_UI_ARTIST, state.optString("artist"))
                 .putExtra(EXTRA_UI_ALBUM, state.optString("album"))
                 .putExtra(EXTRA_UI_LYRIC, state.optString("lyric"))
+                .putExtra(EXTRA_UI_LYRIC_STATUS, state.optString("lyricStatus"))
                 .putExtra(EXTRA_UI_POSITION, state.optLong("position"))
                 .putExtra(EXTRA_UI_DURATION, state.optLong("duration"))
         )
@@ -502,6 +525,8 @@ class PlayerAgentForegroundService : Service() {
             "com.example.playeragent.ACTION_STOP_QRC_WATCHER"
         const val ACTION_RECOVER_BLE_STACK =
             "com.example.playeragent.ACTION_RECOVER_BLE_STACK"
+        const val ACTION_REFRESH_CURRENT_LYRIC =
+            "com.example.playeragent.ACTION_REFRESH_CURRENT_LYRIC"
         const val EXTRA_LOG_MESSAGE = "extra_log_message"
         const val EXTRA_QRC_WATCHER_RUNNING = "extra_qrc_watcher_running"
         const val EXTRA_QRC_WATCHER_PENDING = "extra_qrc_watcher_pending"
@@ -513,6 +538,7 @@ class PlayerAgentForegroundService : Service() {
         const val EXTRA_UI_ARTIST = "extra_ui_artist"
         const val EXTRA_UI_ALBUM = "extra_ui_album"
         const val EXTRA_UI_LYRIC = "extra_ui_lyric"
+        const val EXTRA_UI_LYRIC_STATUS = "extra_ui_lyric_status"
         const val EXTRA_UI_POSITION = "extra_ui_position"
         const val EXTRA_UI_DURATION = "extra_ui_duration"
 

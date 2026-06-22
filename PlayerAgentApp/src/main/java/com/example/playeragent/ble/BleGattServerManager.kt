@@ -651,6 +651,14 @@ class BleGattServerManager(
         sendPlaybackState()
     }
 
+    fun retryCurrentLyricsFromWatcher(reason: String): Boolean {
+        return playbackStateReader.retryActiveLyricsFromWatcher(reason)
+    }
+
+    fun manualRefreshCurrentLyric(): Boolean {
+        return playbackStateReader.manualRefreshCurrentLyric()
+    }
+
     @SuppressLint("MissingPermission")
     private fun sendStatusMessage(message: String): Boolean {
         if (gattServer == null || statusCharacteristic == null) {
@@ -2466,10 +2474,11 @@ class BleGattServerManager(
             .toSet()
 
         if (lines.isEmpty()) {
+            val unavailableReason = playbackStateReader.lyricUnavailableReason()
             val unavailable = JSONObject()
                 .put("type", "fullLyricsUnavailable")
                 .put("trackId", trackId)
-                .put("reason", "no parsed lyrics")
+                .put("reason", unavailableReason)
                 .toString()
                 .toByteArray(Charsets.UTF_8)
             if (unavailable.size <= maximumPayloadFor(device)) {
@@ -2480,7 +2489,10 @@ class BleGattServerManager(
                     delayAfterMs = SHORT_MESSAGE_DELAY_MS
                 )
             }
-            logger("[FullLyrics] unavailable trackId=$trackId reason=no parsed lyrics")
+            logger(
+                "[FullLyrics] unavailable trackId=$trackId " +
+                    "reason=$unavailableReason"
+            )
             return
         }
 

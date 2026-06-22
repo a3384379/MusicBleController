@@ -12,6 +12,8 @@ private let VOLUME_SEND_THROTTLE_MS: Int64 = 120
 private let VOLUME_PENDING_TTL_MS: Int64 = 1_000
 private let AUTO_RECONNECT_LAST_PERIPHERAL_KEY = "lastSonyPeripheralIdentifier"
 private let AUTO_RECONNECT_ENABLED_KEY = "autoReconnectEnabled"
+private let FAST_RETRIEVE_CONNECT_TIMEOUT_MS: Int64 = 1_800
+private let DEFAULT_CONNECT_TIMEOUT_MS: Int64 = 8_000
 
 struct LyricWord: Identifiable, Equatable {
     let id: Int
@@ -138,6 +140,10 @@ final class BLETestManager: NSObject, ObservableObject {
         UserDefaults.standard.string(forKey: AUTO_RECONNECT_LAST_PERIPHERAL_KEY) ?? "-"
     @Published private(set) var autoReconnectLastDisconnectError = "-"
     @Published private(set) var autoReconnectLastCostMs: Int64 = 0
+    @Published private(set) var autoReconnectLastRetrieveCostMs: Int64 = 0
+    @Published private(set) var autoReconnectLastScanCostMs: Int64 = 0
+    @Published private(set) var autoReconnectLastConnectCostMs: Int64 = 0
+    @Published private(set) var autoReconnectLastSubscribeCostMs: Int64 = 0
     @Published private(set) var manualReconnectCount = 0
     @Published private(set) var autoReconnectCount = 0
 
@@ -235,9 +241,13 @@ final class BLETestManager: NSObject, ObservableObject {
     private var reconnectWorkItem: DispatchWorkItem?
     private var connectTimeoutWorkItem: DispatchWorkItem?
     private var reconnectStartedAtMs: Int64 = 0
+    private var scanStartedAtMs: Int64 = 0
+    private var connectStartedAtMs: Int64 = 0
+    private var subscribeStartedAtMs: Int64 = 0
     private var isConnectingToSony = false
     private var currentScanIsAutoReconnect = false
     private var currentConnectIsAutoReconnect = false
+    private var currentConnectIsRetrievedPeripheral = false
 
     private struct CommandWriteInfo {
         let seq: UInt64
@@ -1081,6 +1091,12 @@ final class BLETestManager: NSObject, ObservableObject {
             connectTimeoutWorkItem = nil
             isConnectingToSony = false
         }
+        if reason.hasPrefix("foreground") {
+            reconnectStartedAtMs = currentTimeMs()
+        }
+        if sonyPeripheral?.state == .disconnected {
+            sonyPeripheral = nil
+        }
 
         if !force,
            let sonyPeripheral,
@@ -1126,20 +1142,23 @@ final class BLETestManager: NSObject, ObservableObject {
         mediaFieldDumpProgressText = ""
         scanTimeoutWorkItem?.cancel()
         currentScanIsAutoReconnect = isAutoReconnect
+        scanStartedAtMs = currentTimeMs()
         setAutoReconnectState(.scanning)
         centralManager.scanForPeripherals(
             withServices: [BLEUUIDs.service],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
         )
-        setStatus("扫描中")
+        setStatus("正在搜索 Sony")
         log("[BLE] scan started")
         log("[BLE-Reconnect] scan start services=\(BLEUUIDs.service.uuidString) reason=\(reason)")
         log("[BLE-iOS] start scan services=\(BLEUUIDs.service.uuidString)")
 
         let timeoutWorkItem = DispatchWorkItem { [weak self] in
-            guard let self, self.sonyPeripheral == nil else { return }
+            guard let self,
+                  self.sonyPeripheral == nil || self.sonyPeripheral?.state == .disconnected else { return }
             self.centralManager.stopScan()
-            self.setStatus(self.autoReconnectEnabled ? "正在连接" : "未连接")
+            self.autoReconnectLastScanCostMs = self.currentTimeMs() - self.scanStartedAtMs
+            self.setStatus(self.autoReconnectEnabled ? "未找到，稍后重试" : "未连接")
             self.setAutoReconnectState(.failed)
             self.log("[BLE] scan timeout: SonyPlayerAgent not found")
             self.log("[BLE-Reconnect] scan timeout attempt=\(self.autoReconnectAttempt)")
@@ -1316,57 +1335,92 @@ final class BLETestManager: NSObject, ObservableObject {
             syncAfterReconnect(reason: "auto already connected")
             return
         }
+        if shouldUseScanFirstReconnect(reason: reason) {
+            log("[BLE-Reconnect] foreground strategy=scanFirst")
+            log("[BLE-Reconnect] start scan immediately")
+            log("[BLE-Reconnect] retrieve also attempted=false")
+            beginSonyScan(reason: "scan first \(reason)", isAutoReconnect: true, force: false)
+            return
+        }
         if connectLastSonyPeripheralIfAvailable() {
             return
         }
         beginSonyScan(reason: "auto fallback scan", isAutoReconnect: true, force: false)
     }
 
+    private func shouldUseScanFirstReconnect(reason: String) -> Bool {
+        reason == "central poweredOn" ||
+            reason == "app foreground" ||
+            reason.hasPrefix("enabled")
+    }
+
     private func connectLastSonyPeripheralIfAvailable() -> Bool {
+        let retrieveStartedAtMs = currentTimeMs()
         guard let identifierText = UserDefaults.standard.string(forKey: AUTO_RECONNECT_LAST_PERIPHERAL_KEY),
               let identifier = UUID(uuidString: identifierText) else {
+            autoReconnectLastRetrieveCostMs = currentTimeMs() - retrieveStartedAtMs
             log("[BLE-Reconnect] retrieve last id=nil found=false")
             return false
         }
         let peripherals = centralManager.retrievePeripherals(withIdentifiers: [identifier])
+        autoReconnectLastRetrieveCostMs = currentTimeMs() - retrieveStartedAtMs
         log("[BLE-Reconnect] retrieve last id=\(identifierText) found=\(!peripherals.isEmpty)")
         guard let peripheral = peripherals.first else {
             log("[BLE-Reconnect] fallback scan reason=retrieve empty")
             return false
         }
         currentConnectIsAutoReconnect = true
-        connectSonyPeripheral(peripheral, reason: "retrieved peripheral")
+        log("[BLE-Reconnect] retrieve connect start id=\(peripheral.identifier.uuidString)")
+        connectSonyPeripheral(peripheral, reason: "retrieved peripheral", isRetrieved: true)
         log("[BLE-Reconnect] connect retrieved peripheral")
         return true
     }
 
-    private func connectSonyPeripheral(_ peripheral: CBPeripheral, reason: String) {
+    private func connectSonyPeripheral(
+        _ peripheral: CBPeripheral,
+        reason: String,
+        isRetrieved: Bool = false
+    ) {
         guard !isConnectingToSony else {
             log("[BLE-Reconnect] connect skipped reason=connect in flight")
             return
         }
         isConnectingToSony = true
         connectTimeoutWorkItem?.cancel()
+        connectStartedAtMs = currentTimeMs()
+        currentConnectIsRetrievedPeripheral = isRetrieved
         sonyPeripheral = peripheral
         peripheral.delegate = self
         setAutoReconnectState(.connecting)
-        setStatus("连接中")
+        setStatus("正在连接 Sony")
         log("[BLE-Reconnect] connect id=\(peripheral.identifier.uuidString) reason=\(reason)")
         centralManager.connect(peripheral)
+        let timeoutMs = isRetrieved ? FAST_RETRIEVE_CONNECT_TIMEOUT_MS : DEFAULT_CONNECT_TIMEOUT_MS
         let timeout = DispatchWorkItem { [weak self, weak peripheral] in
             guard let self,
                   let peripheral,
                   self.isConnectingToSony,
                   self.sonyPeripheral?.identifier == peripheral.identifier else { return }
-            self.log("[BLE-Reconnect] connect timeout id=\(peripheral.identifier.uuidString)")
+            let costMs = self.currentTimeMs() - self.connectStartedAtMs
+            self.autoReconnectLastConnectCostMs = costMs
+            if isRetrieved {
+                self.log("[BLE-Reconnect] retrieve connect fast timeout costMs=\(costMs)")
+                self.log("[BLE-Reconnect] fallback scan reason=retrieve fast timeout")
+            } else {
+                self.log("[BLE-Reconnect] connect timeout id=\(peripheral.identifier.uuidString) costMs=\(costMs)")
+            }
             self.isConnectingToSony = false
             self.centralManager.cancelPeripheralConnection(peripheral)
             self.sonyPeripheral = nil
             self.setAutoReconnectState(.failed)
-            self.beginSonyScan(reason: "connect timeout fallback", isAutoReconnect: true, force: true)
+            self.beginSonyScan(
+                reason: isRetrieved ? "retrieve fast timeout fallback" : "connect timeout fallback",
+                isAutoReconnect: true,
+                force: true
+            )
         }
         connectTimeoutWorkItem = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0, execute: timeout)
+        DispatchQueue.main.asyncAfter(deadline: .now() + TimeInterval(timeoutMs) / 1_000, execute: timeout)
     }
 
     private func saveLastSonyPeripheral(_ peripheral: CBPeripheral) {
@@ -1510,9 +1564,30 @@ final class BLETestManager: NSObject, ObservableObject {
         log("[BLE-Reconnect] app foreground check connected=\(connected) ready=\(ready)")
         guard centralManager.state == .poweredOn else { return }
         if !connected {
+            if AutoReconnectState(rawValue: autoReconnectState) == .connecting,
+               currentConnectIsRetrievedPeripheral,
+               let sonyPeripheral {
+                log("[BLE-Reconnect] foreground abandon retrieved connect")
+                connectTimeoutWorkItem?.cancel()
+                connectTimeoutWorkItem = nil
+                isConnectingToSony = false
+                centralManager.cancelPeripheralConnection(sonyPeripheral)
+                self.sonyPeripheral = nil
+                beginSonyScan(reason: "foreground abandon retrieve", isAutoReconnect: true, force: true)
+                return
+            }
+            if AutoReconnectState(rawValue: autoReconnectState) == .scanning {
+                log("[BLE-Reconnect] foreground strategy=restartActiveScan")
+                beginSonyScan(reason: "foreground active scan", isAutoReconnect: true, force: true)
+                return
+            }
             log("[BLE-Reconnect] foreground reconnect reason=not connected")
             scheduleReconnect(reason: "app foreground", immediate: true)
         } else if !ready, let sonyPeripheral {
+            if isReconnectInProgress {
+                log("[BLE-Reconnect] foreground restore skipped reason=in progress state=\(autoReconnectState)")
+                return
+            }
             log("[BLE-Reconnect] foreground rediscover services reason=characteristic missing")
             setAutoReconnectState(.serviceDiscovering)
             sonyPeripheral.discoverServices([BLEUUIDs.service])
@@ -1753,19 +1828,25 @@ extension BLETestManager: CBCentralManagerDelegate {
 
         scanTimeoutWorkItem?.cancel()
         central.stopScan()
+        autoReconnectLastScanCostMs = currentTimeMs() - scanStartedAtMs
         log("[BLE] connecting \(name) id=\(peripheral.identifier)")
         log("[BLE-iOS] connect peripheral=\(peripheral.identifier)")
         currentConnectIsAutoReconnect = currentScanIsAutoReconnect
-        connectSonyPeripheral(peripheral, reason: currentScanIsAutoReconnect ? "auto scan" : "manual scan")
+        connectSonyPeripheral(
+            peripheral,
+            reason: currentScanIsAutoReconnect ? "auto scan" : "manual scan",
+            isRetrieved: false
+        )
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         isConnectingToSony = false
         connectTimeoutWorkItem?.cancel()
         connectTimeoutWorkItem = nil
+        autoReconnectLastConnectCostMs = currentTimeMs() - connectStartedAtMs
         saveLastSonyPeripheral(peripheral)
         setAutoReconnectState(.serviceDiscovering)
-        setStatus("连接中")
+        setStatus("正在恢复服务")
         log("[BLE] connected")
         log("[BLE-iOS] didConnect")
         log("[BLE-Reconnect] restore services")
@@ -1857,6 +1938,7 @@ extension BLETestManager: CBPeripheralDelegate {
             } else if characteristic.uuid == BLEUUIDs.status {
                 sonyStatusCharacteristic = characteristic
                 setAutoReconnectState(.subscribing)
+                subscribeStartedAtMs = currentTimeMs()
                 peripheral.setNotifyValue(true, for: characteristic)
                 log("[BLE] status characteristic found")
             }
@@ -1937,6 +2019,7 @@ extension BLETestManager: CBPeripheralDelegate {
             log("[BLE] status notify subscribed")
             log("[BLE-Reconnect] notify subscribed")
             guard characteristic.isNotifying else { return }
+            autoReconnectLastSubscribeCostMs = currentTimeMs() - subscribeStartedAtMs
             setAutoReconnectState(.syncing)
             autoReconnectLastCostMs = reconnectStartedAtMs > 0 ? currentTimeMs() - reconnectStartedAtMs : 0
             log("[BLE-Reconnect] success reset attempts costMs=\(autoReconnectLastCostMs)")

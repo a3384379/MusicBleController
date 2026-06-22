@@ -412,7 +412,7 @@ struct ContentView: View {
         switch bleManager.connectionStatus {
         case "已连接":
             return .green
-        case "扫描中", "连接中":
+        case "扫描中", "连接中", "正在搜索 Sony", "正在连接 Sony", "正在恢复服务", "未找到，稍后重试":
             return .orange
         default:
             return .secondary
@@ -423,8 +423,12 @@ struct ContentView: View {
         switch bleManager.connectionStatus {
         case "已连接":
             return "Sony 已连接"
-        case "扫描中", "连接中":
+        case "正在搜索 Sony", "扫描中":
+            return "正在搜索"
+        case "正在连接 Sony", "连接中", "正在恢复服务":
             return "正在连接"
+        case "未找到，稍后重试":
+            return "继续重试"
         default:
             return "未连接"
         }

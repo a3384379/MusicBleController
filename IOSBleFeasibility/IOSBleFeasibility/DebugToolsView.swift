@@ -116,6 +116,10 @@ struct DebugToolsView: View {
                     debugRow("Last peripheral", bleManager.autoReconnectLastPeripheralId)
                     debugRow("Last error", bleManager.autoReconnectLastDisconnectError)
                     debugRow("Last cost", "\(bleManager.autoReconnectLastCostMs)ms")
+                    debugRow("Retrieve cost", "\(bleManager.autoReconnectLastRetrieveCostMs)ms")
+                    debugRow("Scan cost", "\(bleManager.autoReconnectLastScanCostMs)ms")
+                    debugRow("Connect cost", "\(bleManager.autoReconnectLastConnectCostMs)ms")
+                    debugRow("Subscribe cost", "\(bleManager.autoReconnectLastSubscribeCostMs)ms")
                     debugRow("Manual count", "\(bleManager.manualReconnectCount)")
                     debugRow("Auto count", "\(bleManager.autoReconnectCount)")
                 }

@@ -307,6 +307,7 @@ class MainActivity : Activity() {
             "重建 QRC 索引" to ::forceRefreshQrcIndex,
             "预热歌词缓存" to ::warmupLyricCache,
             "重建歌词模糊索引" to ::rebuildFuzzyLyricIndex,
+            "刷新当前歌词" to ::refreshCurrentLyric,
             "刷新缓存统计" to ::refreshLyricStatsText,
             "修复旧歌词缓存" to ::startQrcStaleCacheRebuild,
             "停止旧缓存修复" to ::stopQrcStaleCacheRebuild,
@@ -540,6 +541,9 @@ class MainActivity : Activity() {
                 .orEmpty(),
             lyric = intent.getStringExtra(PlayerAgentForegroundService.EXTRA_UI_LYRIC)
                 .orEmpty(),
+            lyricStatus = intent.getStringExtra(
+                PlayerAgentForegroundService.EXTRA_UI_LYRIC_STATUS
+            ).orEmpty(),
             positionMs = intent.getLongExtra(
                 PlayerAgentForegroundService.EXTRA_UI_POSITION,
                 0L
@@ -557,6 +561,7 @@ class MainActivity : Activity() {
         artist: String,
         album: String,
         lyric: String,
+        lyricStatus: String = "",
         positionMs: Long,
         durationMs: Long,
         allowAlbumArtRefresh: Boolean
@@ -582,7 +587,13 @@ class MainActivity : Activity() {
         currentSongTextView.text = "歌曲名：$safeTitle\n歌手：$safeArtist\n专辑：$safeAlbum"
             .replace("歌曲名：-\n歌手：-\n专辑：-", "歌曲：未检测")
         val lyricText = lyric.ifBlank { "暂无歌词" }
-        currentLyricTextView.text = "当前歌词：$lyricText"
+        val statusText = lyricStatus.ifBlank { "unknown" }
+        val hint = if (statusText == "waiting QQMusic lyric cache") {
+            "\n提示：QQ音乐可能尚未生成歌词缓存，可在 QQ音乐中打开歌词/桌面歌词后稍等。"
+        } else {
+            ""
+        }
+        currentLyricTextView.text = "当前歌词：$lyricText\nLyric status：$statusText$hint"
         if (lyricText != lastPlayerUiLyric) {
             lastPlayerUiLyric = lyricText
             appendLog("[PlayerUI] lyric changed text=$lyricText")
@@ -1121,6 +1132,19 @@ class MainActivity : Activity() {
                 .setAction(PlayerAgentForegroundService.ACTION_STOP_QRC_WATCHER)
         )
         appendLog("[QrcWatcher] stop requested")
+    }
+
+    private fun refreshCurrentLyric() {
+        val intent = Intent(
+            this,
+            PlayerAgentForegroundService::class.java
+        ).setAction(PlayerAgentForegroundService.ACTION_REFRESH_CURRENT_LYRIC)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+        appendLog("[LyricRetry] manual refresh requested")
     }
 
     private fun recoverBleStack() {
