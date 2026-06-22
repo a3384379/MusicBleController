@@ -409,6 +409,16 @@ struct ContentView: View {
     }
 
     private var connectionColor: Color {
+        switch bleManager.connectionHealthState {
+        case "healthy":
+            return .green
+        case "suspect":
+            return .orange
+        case "stale":
+            return .orange
+        default:
+            break
+        }
         switch bleManager.connectionStatus {
         case "已连接":
             return .green
@@ -420,6 +430,16 @@ struct ContentView: View {
     }
 
     private var connectionStatusTitle: String {
+        switch bleManager.connectionHealthState {
+        case "healthy":
+            return "Sony 已连接"
+        case "suspect":
+            return "连接不稳定"
+        case "stale":
+            return "正在重连"
+        default:
+            break
+        }
         switch bleManager.connectionStatus {
         case "已连接":
             return "Sony 已连接"
@@ -435,7 +455,8 @@ struct ContentView: View {
     }
 
     private var isConnected: Bool {
-        bleManager.connectionStatus == "已连接"
+        bleManager.connectionStatus == "已连接" &&
+            bleManager.connectionHealthState == "healthy"
     }
 
     private var displayedPositionMs: Int64 {

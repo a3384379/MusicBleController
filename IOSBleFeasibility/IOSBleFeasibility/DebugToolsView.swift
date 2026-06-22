@@ -122,6 +122,14 @@ struct DebugToolsView: View {
                     debugRow("Subscribe cost", "\(bleManager.autoReconnectLastSubscribeCostMs)ms")
                     debugRow("Manual count", "\(bleManager.manualReconnectCount)")
                     debugRow("Auto count", "\(bleManager.autoReconnectCount)")
+                    debugRow("Health", bleManager.connectionHealthState)
+                    debugRow("Last notify age", healthNotifyAgeText)
+                    debugRow("Probe in flight", bleManager.connectionHealthProbeInFlight ? "true" : "false")
+                    debugRow("Last probe", bleManager.connectionHealthLastProbeAtText)
+                    debugRow("Hard reconnect", bleManager.connectionHealthLastHardReconnectReason)
+                    debugRow("Attempt id", bleManager.connectionHealthAttemptId)
+                    debugRow("Peripheral state", bleManager.connectionHealthPeripheralState)
+                    debugRow("Characteristic ready", bleManager.connectionHealthCharacteristicReady ? "true" : "false")
                 }
 
                 LazyVGrid(
@@ -513,6 +521,15 @@ struct DebugToolsView: View {
         guard let retryAt = bleManager.autoReconnectNextRetryAt else { return "-" }
         let remaining = max(0, retryAt.timeIntervalSinceNow)
         return String(format: "%.1fs", remaining)
+    }
+
+    private var healthNotifyAgeText: String {
+        let ageMs = bleManager.connectionHealthLastNotifyAgeMs
+        guard ageMs >= 0 else { return "-" }
+        if ageMs < 1_000 {
+            return "\(ageMs)ms"
+        }
+        return String(format: "%.1fs", Double(ageMs) / 1_000.0)
     }
 
     private func offsetLabel(_ value: Int64) -> String {
