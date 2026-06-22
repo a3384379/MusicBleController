@@ -6,6 +6,7 @@ struct DebugToolsView: View {
     @State private var showIOSLogs = true
     @State private var showSonyLogs = true
     @State private var showMediaFieldDump = true
+    @State private var showLyricDiagnostic = false
 
     var body: some View {
         NavigationStack {
@@ -36,6 +37,12 @@ struct DebugToolsView: View {
         }
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
+        .sheet(isPresented: $showLyricDiagnostic) {
+            LyricDiagnosticView(
+                bleManager: bleManager,
+                onDismiss: { showLyricDiagnostic = false }
+            )
+        }
     }
 
     private var statusSection: some View {
@@ -96,6 +103,15 @@ struct DebugToolsView: View {
                         systemImage: "list.bullet.clipboard",
                         disabled: !isConnected || bleManager.isMediaFieldDumpReceiving,
                         action: bleManager.sendDumpMediaFields
+                    )
+                    debugActionButton(
+                        title: "歌词诊断中心",
+                        systemImage: "text.magnifyingglass",
+                        disabled: !isConnected,
+                        action: {
+                            bleManager.requestLyricDiagnostic(manual: true)
+                            showLyricDiagnostic = true
+                        }
                     )
                 }
             }

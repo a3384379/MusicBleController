@@ -141,6 +141,8 @@ class PlaybackStateReader(
             .put("duration", duration)
             .put("lyric", lyric)
             .put("lyricStatus", lyricManager.currentStatusText())
+            .put("lyricReason", lyricManager.currentUnavailableReason())
+            .put("lyricSuggestion", lyricManager.diagnosticSnapshot(lastTrackId).suggestion)
     }
 
     fun lyricLinesSnapshot(): List<LyricManager.LyricLine> {
@@ -153,6 +155,10 @@ class PlaybackStateReader(
 
     fun lyricStatusText(): String {
         return lyricManager.currentStatusText()
+    }
+
+    fun lyricDiagnosticSnapshot(): LyricManager.LyricDiagnosticSnapshot {
+        return lyricManager.diagnosticSnapshot(lastTrackId)
     }
 
     fun readFastPlaybackSnapshot(): FastPlaybackSnapshot? {

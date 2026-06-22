@@ -588,6 +588,7 @@ class BleGattServerManager(
             "DUMP_MEDIA_FIELDS" -> sendMediaFieldDump()
             "GET_FULL_LYRICS" -> sendFullLyrics(request)
             "GET_LYRIC_SECONDARY" -> sendLyricSecondary(request)
+            "GET_LYRIC_DIAGNOSTIC" -> sendLyricDiagnostic(request)
             "GET_PLAY_HISTORY_PAGE" -> sendPlayHistoryPage(request)
             "GET_PLAY_HISTORY_SINCE" -> sendPlayHistorySince(request)
             "GET_PLAY_STATS" -> sendPlayStats(request)
@@ -637,6 +638,68 @@ class BleGattServerManager(
         return playbackStateReader.currentTrackSnapshot()
     }
 
+    private fun sendLyricDiagnostic(request: JSONObject) {
+        val device = subscribedDevices.values.firstOrNull() ?: run {
+            logger("[LyricDiag] send skipped: no iPhone subscriber")
+            return
+        }
+        val startedAtMs = SystemClock.elapsedRealtime()
+        logger("[LyricDiag] request trackId=${request.optString("trackId")}")
+        val requestedTrackId = request.optString("trackId")
+        val snapshot = playbackStateReader.lyricDiagnosticSnapshot()
+        val currentTrackId = snapshot.trackId
+        if (currentTrackId.isBlank()) {
+            sendShortJsonIfFits(
+                device = device,
+                type = "lyricDiagnosticUnavailable",
+                value = JSONObject()
+                    .put("type", "lyricDiagnosticUnavailable")
+                    .put("reason", "no active track")
+            )
+            logger("[LyricDiag] response unavailable reason=no active track")
+            return
+        }
+        if (requestedTrackId.isNotBlank() && requestedTrackId != currentTrackId) {
+            sendShortJsonIfFits(
+                device = device,
+                type = "lyricDiagnosticUnavailable",
+                value = JSONObject()
+                    .put("type", "lyricDiagnosticUnavailable")
+                    .put("trackId", requestedTrackId)
+                    .put("reason", "stale track")
+            )
+            logger("[LyricDiag] response unavailable reason=stale track")
+            return
+        }
+        sendShortJsonIfFits(
+            device = device,
+            type = "lyricDiagnostic",
+            value = JSONObject()
+                .put("type", "lyricDiagnostic")
+                .put("trackId", currentTrackId)
+                .put("songKey", snapshot.songKey)
+                .put("title", snapshot.title)
+                .put("artist", snapshot.artist)
+                .put("status", snapshot.status)
+                .put("source", snapshot.source)
+                .put("reason", snapshot.reason)
+                .put("lines", snapshot.lines)
+                .put("lastAttemptAt", snapshot.lastAttemptAt)
+                .put("nextRetryAt", snapshot.nextRetryAt)
+                .put("retryCount", snapshot.retryCount)
+                .put("cooldownUntil", snapshot.cooldownUntil)
+                .put("fuzzyIndexReady", snapshot.fuzzyIndexReady)
+                .put("qrcIndexLoaded", snapshot.qrcIndexLoaded)
+                .put("maintenanceBusy", snapshot.maintenanceBusy)
+                .put("waitingQqMusicCache", snapshot.waitingQqMusicCache)
+                .put("suggestion", snapshot.suggestion)
+        )
+        logger(
+            "[LyricDiag] response status=${snapshot.status} reason=${snapshot.reason} " +
+                "costMs=${SystemClock.elapsedRealtime() - startedAtMs}"
+        )
+    }
+
     fun handleIncrementalLyricsReady(ready: IncrementalLyricsReady) {
         if (!ready.matchedCurrentTrack) {
             return
@@ -657,6 +720,24 @@ class BleGattServerManager(
 
     fun manualRefreshCurrentLyric(): Boolean {
         return playbackStateReader.manualRefreshCurrentLyric()
+    }
+
+    private fun sendShortJsonIfFits(
+        device: BluetoothDevice,
+        type: String,
+        value: JSONObject
+    ) {
+        val bytes = value.toString().toByteArray(Charsets.UTF_8)
+        if (bytes.size > maximumPayloadFor(device)) {
+            logger("[BLE-A] short json skipped type=$type reason=payload too large bytes=${bytes.size}")
+            return
+        }
+        notifyQueue.enqueueShort(
+            device = device,
+            type = type,
+            value = bytes,
+            delayAfterMs = SHORT_MESSAGE_DELAY_MS
+        )
     }
 
     @SuppressLint("MissingPermission")
@@ -2475,10 +2556,13 @@ class BleGattServerManager(
 
         if (lines.isEmpty()) {
             val unavailableReason = playbackStateReader.lyricUnavailableReason()
+            val diagnostic = playbackStateReader.lyricDiagnosticSnapshot()
             val unavailable = JSONObject()
                 .put("type", "fullLyricsUnavailable")
                 .put("trackId", trackId)
                 .put("reason", unavailableReason)
+                .put("lyricStatus", diagnostic.status)
+                .put("lyricSuggestion", diagnostic.suggestion)
                 .toString()
                 .toByteArray(Charsets.UTF_8)
             if (unavailable.size <= maximumPayloadFor(device)) {

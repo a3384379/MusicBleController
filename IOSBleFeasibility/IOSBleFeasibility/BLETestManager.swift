@@ -123,6 +123,9 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var fullLyricsTrackId = ""
     @Published private(set) var isFullLyricsCurrent = false
     @Published private(set) var isFullLyricsReceiving = false
+    @Published private(set) var lyricDiagnostic: LyricDiagnostic?
+    @Published private(set) var lyricDiagnosticLoading = false
+    @Published private(set) var lyricDiagnosticLastUpdatedAt: Date?
     @Published private(set) var isPlaying = false
     @Published private(set) var positionMs: Int64 = 0
     @Published private(set) var displayPositionMs: Int64 = 0
@@ -240,6 +243,7 @@ final class BLETestManager: NSObject, ObservableObject {
     private var ignoredLyricSecondaryPlaceholderKeys: Set<String> = []
     private var pendingLyricSecondaryModes: [LyricSecondaryMode] = []
     private var lyricSecondaryTransfer: LyricSecondaryTransfer?
+    private var lastAutomaticLyricDiagnosticRequestAt: [String: Date] = [:]
     private var fullLyricsReceivingTrackID = ""
     private var fullLyricsExpectedCount = 0
     private var fullLyricsChunks: [Int: LyricLine] = [:]
@@ -488,6 +492,32 @@ final class BLETestManager: NSObject, ObservableObject {
 
     func sendGetFullLyrics(force: Bool = false) {
         requestFullLyricsIfNeeded(force: force)
+    }
+
+    func requestLyricDiagnostic(manual: Bool = false) {
+        let trackID = currentTrackID
+        guard !trackID.isEmpty else {
+            log("[LyricsDiag-iOS] request skipped reason=no track")
+            return
+        }
+        if !manual,
+           let last = lastAutomaticLyricDiagnosticRequestAt[trackID],
+           Date().timeIntervalSince(last) < 10 {
+            log("[LyricsDiag-iOS] request skipped reason=rate limited trackId=\(trackID)")
+            return
+        }
+        if !manual {
+            lastAutomaticLyricDiagnosticRequestAt[trackID] = Date()
+        }
+        lyricDiagnosticLoading = true
+        log("[LyricsDiag-iOS] request trackId=\(trackID) manual=\(manual)")
+        sendCommand(
+            cmd: "GET_LYRIC_DIAGNOSTIC",
+            extra: [
+                "trackId": trackID,
+                "time": Int64(Date().timeIntervalSince1970 * 1_000)
+            ]
+        )
     }
 
     func setKaraokeOffsetMs(_ value: Int64) {
@@ -2640,6 +2670,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 let oldPositionMs = self.positionMs
                 self.isPlaying = object["playing"] as? Bool ?? false
                 self.durationMs = Self.int64Value(object["duration"])
+                self.updateLightweightLyricDiagnostic(from: object)
                 if let lyric = object["lyric"] as? String {
                     self.lyric = lyric
                     let scheduledDelayedRetry = self.retryFullLyricsIfLyricsBecameAvailable(
@@ -2725,6 +2756,12 @@ extension BLETestManager: CBPeripheralDelegate {
 
             case "fullLyricsUnavailable":
                 self.handleFullLyricsUnavailable(object)
+
+            case "lyricDiagnostic":
+                self.handleLyricDiagnostic(object)
+
+            case "lyricDiagnosticUnavailable":
+                self.handleLyricDiagnosticUnavailable(object)
 
             case "lyricSecondaryStart":
                 self.handleLyricSecondaryStart(object)
@@ -3532,6 +3569,9 @@ extension BLETestManager: CBPeripheralDelegate {
             ignoredLyricSecondaryPlaceholderKeys.removeAll()
             pendingLyricSecondaryModes.removeAll()
             lyricSecondaryTransfer = nil
+            lyricDiagnostic = nil
+            lyricDiagnosticLoading = false
+            lyricDiagnosticLastUpdatedAt = nil
             log("[Lyrics-iOS] keep previous lyrics until new chunks")
         }
         title = newTitle
@@ -3832,6 +3872,94 @@ extension BLETestManager: CBPeripheralDelegate {
         resetFullLyricsTransfer()
     }
 
+    private func updateLightweightLyricDiagnostic(from object: [String: Any]) {
+        let status = object["lyricStatus"] as? String ?? ""
+        let reason = object["lyricReason"] as? String ?? ""
+        let suggestion = object["lyricSuggestion"] as? String ?? ""
+        guard !status.isEmpty || !reason.isEmpty else { return }
+        let trackID = currentTrackID
+        guard !trackID.isEmpty else { return }
+        let diagnostic = LyricDiagnostic.lightweight(
+            trackId: trackID,
+            title: title,
+            artist: artist,
+            status: normalizedLyricDiagnosticStatus(status),
+            reason: reason,
+            suggestion: suggestion
+        )
+        lyricDiagnostic = diagnostic
+        lyricDiagnosticLastUpdatedAt = Date()
+        if lyric.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           fullLyrics.isEmpty {
+            requestLyricDiagnosticIfNeeded()
+        }
+    }
+
+    private func requestLyricDiagnosticIfNeeded() {
+        requestLyricDiagnostic(manual: false)
+    }
+
+    private func handleLyricDiagnostic(_ object: [String: Any]) {
+        let trackID = object["trackId"] as? String ?? ""
+        guard trackID == currentTrackID else {
+            log("[LyricsDiag-iOS] discarded stale trackId=\(trackID)")
+            return
+        }
+        lyricDiagnostic = parseLyricDiagnostic(object)
+        lyricDiagnosticLoading = false
+        lyricDiagnosticLastUpdatedAt = Date()
+        log(
+            "[LyricsDiag-iOS] received status=\(lyricDiagnostic?.status ?? "") " +
+                "reason=\(lyricDiagnostic?.reason ?? "")"
+        )
+    }
+
+    private func handleLyricDiagnosticUnavailable(_ object: [String: Any]) {
+        lyricDiagnosticLoading = false
+        let reason = object["reason"] as? String ?? "unavailable"
+        log("[LyricsDiag-iOS] unavailable reason=\(reason)")
+    }
+
+    private func parseLyricDiagnostic(_ object: [String: Any]) -> LyricDiagnostic {
+        LyricDiagnostic(
+            trackId: object["trackId"] as? String ?? "",
+            songKey: object["songKey"] as? String ?? "",
+            title: object["title"] as? String ?? title,
+            artist: object["artist"] as? String ?? artist,
+            status: normalizedLyricDiagnosticStatus(object["status"] as? String ?? ""),
+            source: object["source"] as? String ?? "",
+            reason: object["reason"] as? String ?? "",
+            lines: Self.intValue(object["lines"]),
+            lastAttemptAt: Self.int64Value(object["lastAttemptAt"]),
+            nextRetryAt: Self.int64Value(object["nextRetryAt"]),
+            retryCount: Self.intValue(object["retryCount"]),
+            cooldownUntil: Self.int64Value(object["cooldownUntil"]),
+            fuzzyIndexReady: object["fuzzyIndexReady"] as? Bool ?? false,
+            qrcIndexLoaded: object["qrcIndexLoaded"] as? Bool ?? false,
+            maintenanceBusy: object["maintenanceBusy"] as? Bool ?? false,
+            waitingQqMusicCache: object["waitingQqMusicCache"] as? Bool ?? false,
+            suggestion: object["suggestion"] as? String ?? ""
+        )
+    }
+
+    private func normalizedLyricDiagnosticStatus(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch trimmed {
+        case "waiting qqmusic lyric cache":
+            return "waiting_qqmusic_cache"
+        case "maintenance busy":
+            return "maintenance_busy"
+        case "cooldown retry pending", "lyrics retry pending":
+            return "retry_pending"
+        case "no safe qrc candidate":
+            return "no_safe_candidate"
+        case "no parsed lyrics", "no lyrics final":
+            return "no_lyrics_final"
+        default:
+            return trimmed.replacingOccurrences(of: " ", with: "_")
+        }
+    }
+
     private func handleFullLyricsUnavailable(_ object: [String: Any]) {
         let trackID = object["trackId"] as? String ?? ""
         guard trackID == currentTrackID else { return }
@@ -3843,7 +3971,20 @@ extension BLETestManager: CBPeripheralDelegate {
             fullLyricsTrackId = ""
             isFullLyricsCurrent = false
         }
-        log("[FullLyrics] unavailable reason=\(object["reason"] as? String ?? "")")
+        let reason = object["reason"] as? String ?? ""
+        let status = normalizedLyricDiagnosticStatus(object["lyricStatus"] as? String ?? "")
+        let suggestion = object["lyricSuggestion"] as? String ?? ""
+        lyricDiagnostic = LyricDiagnostic.lightweight(
+            trackId: trackID,
+            title: title,
+            artist: artist,
+            status: status.isEmpty ? "no_lyrics_final" : status,
+            reason: reason,
+            suggestion: suggestion
+        )
+        lyricDiagnosticLastUpdatedAt = Date()
+        requestLyricDiagnosticIfNeeded()
+        log("[FullLyrics] unavailable reason=\(reason)")
     }
 
     private func handleLyricSecondaryStart(_ object: [String: Any]) {

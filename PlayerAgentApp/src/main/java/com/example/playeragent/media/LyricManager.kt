@@ -31,6 +31,8 @@ class LyricManager(
     private var retryableFailureAtMs: Long = 0L
     private var finalEmptySongKey: String? = null
     private var finalEmptyReason: String = ""
+    private var lastAttemptAtMs: Long = 0L
+    private var lastSource: LyricSource = LyricSource.NONE
     private var retryWindowSongKey: String? = null
     private var retryWindowStartedAtMs: Long = 0L
     private var retryCountInWindow: Int = 0
@@ -190,6 +192,7 @@ class LyricManager(
             artist = artist,
             album = album
         )
+        lastAttemptAtMs = System.currentTimeMillis()
         logger("[LyricAsync] scheduled songKey=$key reason=$reason force=$force")
         if (loadingSongKey != null && loadingSongKey != key) {
             logger("[LyricAsync] latest song promoted songKey=$key")
@@ -348,6 +351,67 @@ class LyricManager(
         }
     }
 
+    @Synchronized
+    fun diagnosticSnapshot(trackId: String): LyricDiagnosticSnapshot {
+        val key = activeSongKey.orEmpty()
+        val now = System.currentTimeMillis()
+        val lines = if (key.isNotBlank() && key == loadedSongKey) cachedLines.size else 0
+        val reason = currentUnavailableReason()
+        val status = when {
+            key.isBlank() -> "no_lyrics_final"
+            lines > 0 -> "loaded"
+            key == loadingSongKey -> "loading"
+            isWaitingForQqMusicCacheLocked(key) && !isLazyWaitExpiredLocked(key, now) ->
+                "waiting_qqmusic_cache"
+            retryableFailureSongKey == key -> {
+                if (retryableFailureReason == "maintenance busy") {
+                    "maintenance_busy"
+                } else {
+                    "retry_pending"
+                }
+            }
+            finalEmptySongKey == key -> {
+                if (finalEmptyReason.contains("safe", ignoreCase = true)) {
+                    "no_safe_candidate"
+                } else {
+                    "no_lyrics_final"
+                }
+            }
+            else -> "loading"
+        }
+        val nextRetryAt = when {
+            status == "waiting_qqmusic_cache" ->
+                (lastRetryAtMs + RETRYABLE_RECHECK_INTERVAL_MS).coerceAtLeast(now)
+            retryableFailureSongKey == key && retryableFailureAtMs > 0L ->
+                retryableFailureAtMs + RETRYABLE_RECHECK_INTERVAL_MS
+            else -> 0L
+        }
+        val cooldownUntil = if (retryableFailureSongKey == key && retryableFailureAtMs > 0L) {
+            retryableFailureAtMs + RETRYABLE_RECHECK_INTERVAL_MS
+        } else {
+            0L
+        }
+        return LyricDiagnosticSnapshot(
+            trackId = trackId,
+            songKey = key,
+            title = activeTitle,
+            artist = activeArtist,
+            status = status,
+            source = if (lines > 0) lastSource.name else LyricSource.NONE.name,
+            reason = reason,
+            lines = lines,
+            lastAttemptAt = lastAttemptAtMs,
+            nextRetryAt = nextRetryAt,
+            retryCount = retryCountInWindow,
+            cooldownUntil = cooldownUntil,
+            fuzzyIndexReady = QrcLyricCacheManager(appContext, logger).fuzzyIndexStatus().ready,
+            qrcIndexLoaded = true,
+            maintenanceBusy = QrcMaintenanceCoordinator.isRunning(),
+            waitingQqMusicCache = status == "waiting_qqmusic_cache",
+            suggestion = suggestionForStatus(status, reason)
+        )
+    }
+
     fun loadLyric(title: String, artist: String, album: String = "") {
         val request = LyricLoadRequest(
             key = lyricKey(title, artist, album),
@@ -414,6 +478,7 @@ class LyricManager(
         if (result.lines.isNotEmpty()) {
             cachedLines = result.lines
             loadedSongKey = request.key
+            lastSource = result.source
             retryableFailureSongKey = null
             retryableFailureReason = ""
             retryableFailureAtMs = 0L
@@ -436,6 +501,7 @@ class LyricManager(
             retryableFailureSongKey = request.key
             retryableFailureReason = result.failureReason.ifBlank { "lyrics retry pending" }
             retryableFailureAtMs = System.currentTimeMillis()
+            lastSource = result.source
             loadedSongKey = null
             if (retryableFailureReason == WAITING_QQMUSIC_LYRIC_CACHE_REASON) {
                 startLazyWaitIfNeededLocked(request.key)
@@ -451,6 +517,7 @@ class LyricManager(
             finalEmptySongKey = request.key
             finalEmptyReason = result.failureReason.ifBlank { "no lyrics final" }
             loadedSongKey = request.key
+            lastSource = result.source
             cachedLines = emptyList()
             if (lazyWaitSongKey == request.key) {
                 lazyWaitSongKey = null
@@ -660,6 +727,7 @@ class LyricManager(
         cachedKey = activeKey
         cachedLines = lines
         loadedSongKey = activeKey
+        lastSource = LyricSource.QRC
         lastLoggedLine = null
         qrcLyricManager.removeUncertainCooldown(
             currentTrack.songKey,
@@ -693,6 +761,23 @@ class LyricManager(
                 "no safe qrc candidate"
             }
             else -> "loading"
+        }
+    }
+
+    private fun suggestionForStatus(status: String, reason: String): String {
+        return when (status) {
+            "loaded" -> "loaded"
+            "waiting_qqmusic_cache" -> "open_qqmusic_lyrics"
+            "retry_pending" -> "retry_later"
+            "maintenance_busy" -> "maintenance_busy"
+            "no_safe_candidate" -> "no_safe_candidate"
+            "loading" -> "retry_later"
+            else -> when {
+                reason.contains("waiting qqmusic", ignoreCase = true) -> "open_qqmusic_lyrics"
+                reason.contains("maintenance", ignoreCase = true) -> "maintenance_busy"
+                reason.contains("safe", ignoreCase = true) -> "no_safe_candidate"
+                else -> "refresh_current_lyric"
+            }
         }
     }
 
@@ -1059,6 +1144,26 @@ class LyricManager(
         val words: List<QrcLyricWord> = emptyList(),
         val translation: String? = null,
         val romanization: String? = null
+    )
+
+    data class LyricDiagnosticSnapshot(
+        val trackId: String,
+        val songKey: String,
+        val title: String,
+        val artist: String,
+        val status: String,
+        val source: String,
+        val reason: String,
+        val lines: Int,
+        val lastAttemptAt: Long,
+        val nextRetryAt: Long,
+        val retryCount: Int,
+        val cooldownUntil: Long,
+        val fuzzyIndexReady: Boolean,
+        val qrcIndexLoaded: Boolean,
+        val maintenanceBusy: Boolean,
+        val waitingQqMusicCache: Boolean,
+        val suggestion: String
     )
 
     private data class LyricCandidate(

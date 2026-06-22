@@ -5,6 +5,7 @@ struct ContentView: View {
     @State private var showFullLyrics = false
     @State private var showDebugPage = false
     @State private var showPlaybackHistory = false
+    @State private var showLyricDiagnostic = false
     @AppStorage(LyricDisplayMode.userDefaultsKey)
     private var lyricDisplayModeRaw = LyricDisplayMode.originalTranslation.rawValue
 
@@ -37,6 +38,12 @@ struct ContentView: View {
             .sheet(isPresented: $showPlaybackHistory) {
                 PlaybackHistoryView(bleManager: bleManager)
             }
+            .sheet(isPresented: $showLyricDiagnostic) {
+                LyricDiagnosticView(
+                    bleManager: bleManager,
+                    onDismiss: { showLyricDiagnostic = false }
+                )
+            }
             .fullScreenCover(isPresented: $showFullLyrics) {
                 FullLyricsView(
                     title: nowPlayingInfo.title,
@@ -51,7 +58,11 @@ struct ContentView: View {
                     onPrevious: bleManager.sendPrevious,
                     onPlayPause: bleManager.sendPlayPause,
                     onNext: bleManager.sendNext,
-                    onSeekToLine: bleManager.seekToLyricLine
+                    onSeekToLine: bleManager.seekToLyricLine,
+                    onShowDiagnostic: {
+                        showFullLyrics = false
+                        showLyricDiagnostic = true
+                    }
                 )
             }
             .onChange(of: displayedPositionMs) { _, newValue in
@@ -211,20 +222,15 @@ struct ContentView: View {
     }
 
     private var lyricCard: some View {
-        Button {
-            if bleManager.fullLyrics.isEmpty {
-                bleManager.sendGetFullLyrics(force: true)
-            }
-            showFullLyrics = true
-        } label: {
-            VStack(spacing: 8) {
-                Text("当前歌词")
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.46))
-                    .textCase(.uppercase)
-                    .tracking(1.2)
+        VStack(spacing: 8) {
+            Text("当前歌词")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(.white.opacity(0.46))
+                .textCase(.uppercase)
+                .tracking(1.2)
 
-                if currentTrackFullLyrics.isEmpty {
+            if currentTrackFullLyrics.isEmpty {
+                VStack(spacing: 8) {
                     Text(currentLyricText)
                         .font(.system(size: 28, weight: .semibold, design: .rounded))
                         .foregroundStyle(
@@ -235,47 +241,74 @@ struct ContentView: View {
                         .multilineTextAlignment(.center)
                         .lineLimit(2)
                         .minimumScaleFactor(0.68)
-                        .frame(maxWidth: .infinity, minHeight: 62)
-                } else {
-                    VStack(spacing: 5) {
-                        Text(lyricPreviewLine(offset: -1))
-                            .font(.system(size: 17, weight: .medium, design: .rounded))
-                            .foregroundStyle(.white.opacity(0.44))
+                        .frame(maxWidth: .infinity, minHeight: 48)
+
+                    if currentLyricText == "暂无歌词" {
+                        Text("原因：\(bleManager.lyricDiagnostic?.statusTitle ?? "正在确认")")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.white.opacity(0.54))
                             .lineLimit(1)
-                        KaraokeLyricText(
-                            text: lyricPreviewLine(offset: 0),
-                            progress: currentLyricProgress,
-                            words: lyricPreviewLineModel(offset: 0)?.words ?? [],
-                            positionMs: karaokePositionMs,
-                            highlightColor: Color.green.opacity(0.98),
-                            normalColor: Color.white.opacity(0.48),
-                            font: .system(size: 24, weight: .bold, design: .rounded),
-                            lineLimit: 2,
-                            alignment: .center
-                        )
-                        .minimumScaleFactor(0.72)
-                        if let auxiliary = lyricPreviewAuxiliaryText(offset: 0) {
-                            Text(auxiliary)
-                                .font(.system(size: 14, weight: .medium, design: .rounded))
-                                .foregroundStyle(.white.opacity(0.52))
-                                .lineLimit(1)
-                                .minimumScaleFactor(0.72)
+
+                        Button {
+                            bleManager.requestLyricDiagnostic(manual: true)
+                            showLyricDiagnostic = true
+                        } label: {
+                            Text("查看原因")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 14)
+                                .frame(height: 30)
+                                .background(.white.opacity(0.10), in: Capsule())
                         }
-                        Text(lyricPreviewLine(offset: 1))
-                            .font(.system(size: 17, weight: .medium, design: .rounded))
-                            .foregroundStyle(.white.opacity(0.44))
-                            .lineLimit(1)
+                        .buttonStyle(.plain)
                     }
-                    .frame(maxWidth: .infinity, minHeight: 82)
                 }
+                .frame(maxWidth: .infinity, minHeight: 82)
+            } else {
+                VStack(spacing: 5) {
+                    Text(lyricPreviewLine(offset: -1))
+                        .font(.system(size: 17, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.44))
+                        .lineLimit(1)
+                    KaraokeLyricText(
+                        text: lyricPreviewLine(offset: 0),
+                        progress: currentLyricProgress,
+                        words: lyricPreviewLineModel(offset: 0)?.words ?? [],
+                        positionMs: karaokePositionMs,
+                        highlightColor: Color.green.opacity(0.98),
+                        normalColor: Color.white.opacity(0.48),
+                        font: .system(size: 24, weight: .bold, design: .rounded),
+                        lineLimit: 2,
+                        alignment: .center
+                    )
+                    .minimumScaleFactor(0.72)
+                    if let auxiliary = lyricPreviewAuxiliaryText(offset: 0) {
+                        Text(auxiliary)
+                            .font(.system(size: 14, weight: .medium, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.52))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.72)
+                    }
+                    Text(lyricPreviewLine(offset: 1))
+                        .font(.system(size: 17, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.44))
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, minHeight: 82)
             }
-            .padding(.horizontal, 4)
-            .padding(.vertical, 4)
-            .id(lyricPreviewIdentity)
-            .transition(.opacity)
-            .animation(.easeInOut(duration: 0.22), value: lyricPreviewIdentity)
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 4)
+        .id(lyricPreviewIdentity)
+        .transition(.opacity)
+        .animation(.easeInOut(duration: 0.22), value: lyricPreviewIdentity)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if bleManager.fullLyrics.isEmpty {
+                bleManager.sendGetFullLyrics(force: true)
+            }
+            showFullLyrics = true
+        }
         .accessibilityLabel("打开完整歌词")
     }
 
