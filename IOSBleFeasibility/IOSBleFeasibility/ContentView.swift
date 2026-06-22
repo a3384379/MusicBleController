@@ -137,7 +137,7 @@ struct ContentView: View {
             .accessibilityLabel("更多操作")
         }
         .foregroundStyle(.white)
-        .animation(.easeInOut(duration: 0.2), value: bleManager.connectionStatus)
+        .animation(.easeInOut(duration: 0.2), value: bleManager.connectionDisplayState)
     }
 
     private var nowPlayingSection: some View {
@@ -409,54 +409,33 @@ struct ContentView: View {
     }
 
     private var connectionColor: Color {
-        switch bleManager.connectionHealthState {
-        case "healthy":
+        switch bleManager.connectionDisplayState {
+        case "connected":
             return .green
-        case "suspect":
+        case "reconnecting":
             return .orange
-        case "stale":
-            return .orange
-        default:
-            break
-        }
-        switch bleManager.connectionStatus {
-        case "已连接":
-            return .green
-        case "扫描中", "连接中", "正在搜索 Sony", "正在连接 Sony", "正在恢复服务", "未找到，稍后重试":
-            return .orange
+        case "disconnected":
+            return .secondary
         default:
             return .secondary
         }
     }
 
     private var connectionStatusTitle: String {
-        switch bleManager.connectionHealthState {
-        case "healthy":
+        switch bleManager.connectionDisplayState {
+        case "connected":
             return "Sony 已连接"
-        case "suspect":
-            return "连接不稳定"
-        case "stale":
+        case "reconnecting":
             return "正在重连"
-        default:
-            break
-        }
-        switch bleManager.connectionStatus {
-        case "已连接":
-            return "Sony 已连接"
-        case "正在搜索 Sony", "扫描中":
-            return "正在搜索"
-        case "正在连接 Sony", "连接中", "正在恢复服务":
-            return "正在连接"
-        case "未找到，稍后重试":
-            return "继续重试"
+        case "disconnected":
+            return "未连接"
         default:
             return "未连接"
         }
     }
 
     private var isConnected: Bool {
-        bleManager.connectionStatus == "已连接" &&
-            bleManager.connectionHealthState == "healthy"
+        bleManager.connectionDisplayState == "connected"
     }
 
     private var displayedPositionMs: Int64 {

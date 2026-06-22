@@ -14,12 +14,14 @@ private let AUTO_RECONNECT_LAST_PERIPHERAL_KEY = "lastSonyPeripheralIdentifier"
 private let AUTO_RECONNECT_ENABLED_KEY = "autoReconnectEnabled"
 private let FAST_RETRIEVE_CONNECT_TIMEOUT_MS: Int64 = 1_800
 private let DEFAULT_CONNECT_TIMEOUT_MS: Int64 = 8_000
-private let CONNECTION_HEALTH_TICK_MS: Int64 = 2_000
-private let CONNECTION_HEALTH_SUSPECT_MS: Int64 = 3_500
-private let CONNECTION_HEALTH_STALE_MS: Int64 = 8_000
-private let CONNECTION_HEALTH_PROBE_TIMEOUT_MS: Int64 = 2_500
+private let CONNECTION_HEALTH_TICK_MS: Int64 = 3_000
+private let CONNECTION_HEALTH_SUSPECT_MS: Int64 = 6_000
+private let CONNECTION_HEALTH_STALE_MS: Int64 = 12_000
+private let CONNECTION_HEALTH_PROBE_TIMEOUT_MS: Int64 = 3_000
 private let CONNECTION_HEALTH_HARD_RECONNECT_MIN_INTERVAL_MS: Int64 = 5_000
 private let CONNECTION_SUBSCRIBE_NOTIFY_TIMEOUT_MS: Int64 = 5_000
+private let CONNECTION_DISPLAY_CONNECTED_MIN_HOLD_MS: Int64 = 5_000
+private let CONNECTION_DISPLAY_DISCONNECTED_CONFIRM_MS: Int64 = 1_000
 
 struct LyricWord: Identifiable, Equatable {
     let id: Int
@@ -68,6 +70,12 @@ private enum ConnectionHealthState: String {
     case healthy
     case suspect
     case stale
+    case disconnected
+}
+
+private enum ConnectionDisplayState: String {
+    case connected
+    case reconnecting
     case disconnected
 }
 
@@ -167,6 +175,11 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var connectionHealthAttemptId = "-"
     @Published private(set) var connectionHealthPeripheralState = "-"
     @Published private(set) var connectionHealthCharacteristicReady = false
+    @Published private(set) var connectionDisplayState = ConnectionDisplayState.disconnected.rawValue
+    @Published private(set) var connectionHealthSuspectCount = 0
+    @Published private(set) var connectionHealthStaleCount = 0
+    @Published private(set) var connectionHealthHardReconnectCount = 0
+    @Published private(set) var connectionHealthMaxNotifyGapMs: Int64 = 0
 
     private lazy var centralManager = CBCentralManager(delegate: self, queue: nil)
     private lazy var peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
@@ -281,6 +294,8 @@ final class BLETestManager: NSObject, ObservableObject {
     private var lastHealthProbeAt: Date?
     private var healthProbeStartedAt: Date?
     private var lastHardReconnectAt: Date?
+    private var connectionDisplayStateChangedAt = Date()
+    private var connectionDisplayWorkItem: DispatchWorkItem?
 
     private struct CommandWriteInfo {
         let seq: UInt64
@@ -343,7 +358,8 @@ final class BLETestManager: NSObject, ObservableObject {
     func scanSony() {
         log("[BLE-iOS] scanSony called")
         if sonyPeripheral?.state == .connected,
-           connectionHealthState != ConnectionHealthState.healthy.rawValue {
+           connectionHealthState == ConnectionHealthState.stale.rawValue ||
+            connectionHealthState == ConnectionHealthState.disconnected.rawValue {
             performHardReconnect(reason: "manual scan unhealthy state=\(connectionHealthState)", manual: true)
             return
         }
@@ -396,6 +412,7 @@ final class BLETestManager: NSObject, ObservableObject {
             return
         }
         lastHardReconnectAt = now
+        connectionHealthHardReconnectCount += 1
         log("[BLE-Health] hard reconnect reason=\(reason)")
         cancelPendingReconnect(reason: "force reconnect")
         if manual {
@@ -421,6 +438,7 @@ final class BLETestManager: NSObject, ObservableObject {
         sonyPeripheral = nil
         setConnectionHealth(.disconnected, reason: reason)
         setStatus("正在重新连接")
+        refreshConnectionDisplayState(reason: "hard reconnect \(reason)")
         if manual {
             beginSonyScan(reason: "force reconnect", isAutoReconnect: false, force: true)
         } else {
@@ -815,7 +833,7 @@ final class BLETestManager: NSObject, ObservableObject {
         )
 
         if isControlCommand(cmd),
-           connectionHealthState != ConnectionHealthState.healthy.rawValue {
+           !isConnectionHealthyOrSuspect {
             ctrlLog(
                 "[CTRL-iOS] write skipped seq=\(seq) cmd=\(cmd) " +
                     "reason=unhealthy health=\(connectionHealthState)"
@@ -1060,7 +1078,7 @@ final class BLETestManager: NSObject, ObservableObject {
             log("[VOL-iOS] dropped reason=encode failed value=\(value)")
             return
         }
-        guard connectionHealthState == ConnectionHealthState.healthy.rawValue else {
+        guard isConnectionHealthyOrSuspect else {
             log("[VOL-iOS] dropped reason=unhealthy health=\(connectionHealthState) value=\(value)")
             return
         }
@@ -1133,7 +1151,7 @@ final class BLETestManager: NSObject, ObservableObject {
             clearPendingVolume()
             return
         }
-        guard connectionHealthState == ConnectionHealthState.healthy.rawValue else {
+        guard isConnectionHealthyOrSuspect else {
             log("[VOL-iOS] dropped reason=unhealthy health=\(connectionHealthState) value=\(value)")
             clearPendingVolume()
             return
@@ -1199,8 +1217,8 @@ final class BLETestManager: NSObject, ObservableObject {
            sonyPeripheral.state == .connected,
            sonyCommandCharacteristic != nil,
            sonyStatusCharacteristic != nil,
-           connectionHealthState == ConnectionHealthState.healthy.rawValue {
-            log("[BLE-Reconnect] scan skipped reason=already healthy")
+           isConnectionHealthyOrSuspect {
+            log("[BLE-Reconnect] scan skipped reason=already usable health=\(connectionHealthState)")
             setAutoReconnectState(.connected)
             syncAfterReconnect(reason: "already connected")
             return
@@ -1366,7 +1384,12 @@ final class BLETestManager: NSObject, ObservableObject {
     private var isSonyHealthyForControls: Bool {
         sonyCharacteristicsReady &&
             connectionStatus == "已连接" &&
-            connectionHealthState == ConnectionHealthState.healthy.rawValue
+            isConnectionHealthyOrSuspect
+    }
+
+    private var isConnectionHealthyOrSuspect: Bool {
+        connectionHealthState == ConnectionHealthState.healthy.rawValue ||
+            connectionHealthState == ConnectionHealthState.suspect.rawValue
     }
 
     private func isControlCommand(_ cmd: String) -> Bool {
@@ -1414,10 +1437,84 @@ final class BLETestManager: NSObject, ObservableObject {
     private func setConnectionHealth(_ state: ConnectionHealthState, reason: String) {
         if connectionHealthState != state.rawValue {
             log("[BLE-Health] state=\(state.rawValue) reason=\(reason)")
+            if state == .suspect {
+                connectionHealthSuspectCount += 1
+            } else if state == .stale {
+                connectionHealthStaleCount += 1
+            }
         }
         connectionHealthState = state.rawValue
         updateConnectionHealthDebugFields()
         refreshLiveActivityControlStatus()
+        refreshConnectionDisplayState(reason: "health \(state.rawValue) \(reason)")
+    }
+
+    private func refreshConnectionDisplayState(reason: String, explicitDisconnect: Bool = false) {
+        let desired: ConnectionDisplayState
+        if connectionHealthState == ConnectionHealthState.stale.rawValue || isReconnectInProgress {
+            desired = .reconnecting
+        } else if connectionStatus == "已连接",
+                  connectionHealthState == ConnectionHealthState.healthy.rawValue ||
+                    connectionHealthState == ConnectionHealthState.suspect.rawValue {
+            desired = .connected
+        } else if connectionStatus == "正在重新连接" ||
+                    connectionStatus == "正在搜索 Sony" ||
+                    connectionStatus == "正在连接 Sony" ||
+                    connectionStatus == "正在恢复服务" ||
+                    connectionStatus == "连接中" ||
+                    connectionStatus == "扫描中" ||
+                    connectionStatus == "未找到，稍后重试" {
+            desired = .reconnecting
+        } else {
+            desired = .disconnected
+        }
+        setConnectionDisplayState(desired, reason: reason, explicitDisconnect: explicitDisconnect)
+    }
+
+    private func setConnectionDisplayState(
+        _ state: ConnectionDisplayState,
+        reason: String,
+        explicitDisconnect: Bool = false
+    ) {
+        connectionDisplayWorkItem?.cancel()
+        connectionDisplayWorkItem = nil
+        if connectionDisplayState == state.rawValue { return }
+
+        if state == .disconnected, !explicitDisconnect {
+            let delayMs: Int64
+            if connectionDisplayState == ConnectionDisplayState.connected.rawValue {
+                let heldMs = Int64(Date().timeIntervalSince(connectionDisplayStateChangedAt) * 1_000)
+                delayMs = max(
+                    CONNECTION_DISPLAY_DISCONNECTED_CONFIRM_MS,
+                    CONNECTION_DISPLAY_CONNECTED_MIN_HOLD_MS - heldMs
+                )
+            } else {
+                delayMs = CONNECTION_DISPLAY_DISCONNECTED_CONFIRM_MS
+            }
+            let item = DispatchWorkItem { [weak self] in
+                self?.applyConnectionDisplayState(.disconnected, reason: reason)
+            }
+            connectionDisplayWorkItem = item
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + Double(max(delayMs, 0)) / 1_000.0,
+                execute: item
+            )
+            return
+        }
+
+        applyConnectionDisplayState(state, reason: reason)
+    }
+
+    private func applyConnectionDisplayState(_ state: ConnectionDisplayState, reason: String) {
+        if connectionDisplayState != state.rawValue {
+            connectionDisplayState = state.rawValue
+            connectionDisplayStateChangedAt = Date()
+            if state == .connected, connectionHealthState == ConnectionHealthState.suspect.rawValue {
+                log("[BLE-UIState] display connected reason=health suspect hidden")
+            } else {
+                log("[BLE-UIState] display \(state.rawValue) reason=\(reason)")
+            }
+        }
     }
 
     private func stopHealthMonitoring(reason: String) {
@@ -1547,6 +1644,10 @@ final class BLETestManager: NSObject, ObservableObject {
 
     private func markStatusNotifyReceived(type: String) {
         let now = Date()
+        if let lastStatusNotifyAt {
+            let gapMs = Int64(now.timeIntervalSince(lastStatusNotifyAt) * 1_000)
+            connectionHealthMaxNotifyGapMs = max(connectionHealthMaxNotifyGapMs, gapMs)
+        }
         lastStatusNotifyAt = now
         if type == "playbackState" {
             lastPlaybackStateAt = now
@@ -1567,6 +1668,7 @@ final class BLETestManager: NSObject, ObservableObject {
 
     private func setAutoReconnectState(_ state: AutoReconnectState) {
         autoReconnectState = state.rawValue
+        refreshConnectionDisplayState(reason: "autoReconnectState \(state.rawValue)")
     }
 
     private func reconnectDelayMs(for attempt: Int) -> Int64 {
@@ -1603,7 +1705,7 @@ final class BLETestManager: NSObject, ObservableObject {
         }
         guard sonyPeripheral?.state != .connected ||
             sonyCommandCharacteristic == nil ||
-            connectionHealthState != ConnectionHealthState.healthy.rawValue else {
+            !isConnectionHealthyOrSuspect else {
             setAutoReconnectState(.connected)
             log("[BLE-Reconnect] schedule skipped reason=already connected trigger=\(reason)")
             return
@@ -1642,7 +1744,7 @@ final class BLETestManager: NSObject, ObservableObject {
         }
         guard sonyPeripheral?.state != .connected ||
             sonyCommandCharacteristic == nil ||
-            connectionHealthState != ConnectionHealthState.healthy.rawValue else {
+            !isConnectionHealthyOrSuspect else {
             setAutoReconnectState(.connected)
             syncAfterReconnect(reason: "auto already connected")
             return
@@ -1909,7 +2011,8 @@ final class BLETestManager: NSObject, ObservableObject {
             log("[BLE-Reconnect] foreground rediscover services reason=characteristic missing")
             setAutoReconnectState(.serviceDiscovering)
             sonyPeripheral.discoverServices([BLEUUIDs.service])
-        } else if connectionHealthState != ConnectionHealthState.healthy.rawValue {
+        } else if connectionHealthState == ConnectionHealthState.stale.rawValue ||
+                    connectionHealthState == ConnectionHealthState.disconnected.rawValue {
             performHardReconnect(
                 reason: "foreground unhealthy state=\(connectionHealthState)",
                 manual: false
@@ -1930,7 +2033,7 @@ final class BLETestManager: NSObject, ObservableObject {
             sonyPeripheral?.state == .connected &&
             sonyCommandCharacteristic != nil &&
             connectionStatus == "已连接" &&
-            connectionHealthState == ConnectionHealthState.healthy.rawValue
+            isConnectionHealthyOrSuspect
     }
 
     private var isReconnectInProgress: Bool {
@@ -1992,6 +2095,7 @@ final class BLETestManager: NSObject, ObservableObject {
         DispatchQueue.main.async {
             self.connectionStatus = value
             self.refreshLiveActivityControlStatus()
+            self.refreshConnectionDisplayState(reason: "status \(value)")
         }
     }
 }
@@ -2045,7 +2149,7 @@ extension BLETestManager: LiveActivityBLECommandSending {
                 startedAtMs: startedAtMs
             )
         }
-        guard connectionHealthState == ConnectionHealthState.healthy.rawValue else {
+        guard isConnectionHealthyOrSuspect else {
             ctrlLog(
                 "[LA-CTRL] command dropped seq=\(seq) " +
                     "reason=unhealthy health=\(connectionHealthState)"
