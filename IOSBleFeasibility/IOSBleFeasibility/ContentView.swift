@@ -6,6 +6,7 @@ struct ContentView: View {
     @State private var showDebugPage = false
     @State private var showPlaybackHistory = false
     @State private var showLyricDiagnostic = false
+    @State private var showNowPlayingDiagnostic = false
     @AppStorage(LyricDisplayMode.userDefaultsKey)
     private var lyricDisplayModeRaw = LyricDisplayMode.originalTranslation.rawValue
 
@@ -42,6 +43,12 @@ struct ContentView: View {
                 LyricDiagnosticView(
                     bleManager: bleManager,
                     onDismiss: { showLyricDiagnostic = false }
+                )
+            }
+            .sheet(isPresented: $showNowPlayingDiagnostic) {
+                NowPlayingDiagnosticView(
+                    bleManager: bleManager,
+                    onDismiss: { showNowPlayingDiagnostic = false }
                 )
             }
             .fullScreenCover(isPresented: $showFullLyrics) {
@@ -128,6 +135,12 @@ struct ContentView: View {
                     showPlaybackHistory = true
                 } label: {
                     Label("播放历史", systemImage: "clock.arrow.circlepath")
+                }
+
+                Button {
+                    showNowPlayingDiagnostic = true
+                } label: {
+                    Label("当前歌曲诊断", systemImage: "waveform.path.ecg.rectangle")
                 }
 
                 Picker("歌词显示", selection: lyricDisplayModeBinding) {

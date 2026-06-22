@@ -7,6 +7,7 @@ struct DebugToolsView: View {
     @State private var showSonyLogs = true
     @State private var showMediaFieldDump = true
     @State private var showLyricDiagnostic = false
+    @State private var showNowPlayingDiagnostic = false
 
     var body: some View {
         NavigationStack {
@@ -41,6 +42,12 @@ struct DebugToolsView: View {
             LyricDiagnosticView(
                 bleManager: bleManager,
                 onDismiss: { showLyricDiagnostic = false }
+            )
+        }
+        .sheet(isPresented: $showNowPlayingDiagnostic) {
+            NowPlayingDiagnosticView(
+                bleManager: bleManager,
+                onDismiss: { showNowPlayingDiagnostic = false }
             )
         }
     }
@@ -111,6 +118,14 @@ struct DebugToolsView: View {
                         action: {
                             bleManager.requestLyricDiagnostic(manual: true)
                             showLyricDiagnostic = true
+                        }
+                    )
+                    debugActionButton(
+                        title: "当前歌曲诊断",
+                        systemImage: "waveform.path.ecg.rectangle",
+                        disabled: false,
+                        action: {
+                            showNowPlayingDiagnostic = true
                         }
                     )
                 }

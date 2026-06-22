@@ -520,6 +520,72 @@ final class BLETestManager: NSObject, ObservableObject {
         )
     }
 
+    func refreshNowPlayingDiagnostics() {
+        log("[NowDiag] refresh all start trackId=\(currentTrackID)")
+        sendGetPlaybackState()
+        sendGetVolume()
+        requestLyricDiagnostic(manual: true)
+        _ = makeNowPlayingDiagnosticSnapshot()
+        log("[NowDiag] refresh all requested trackId=\(currentTrackID)")
+    }
+
+    func requestCurrentHqAlbumArt() {
+        let id = currentAlbumArtID
+        guard !id.isEmpty else {
+            log("[NowDiag] hq artwork request skipped reason=no artwork id")
+            return
+        }
+        requestedHqAlbumArtIDs.remove(id)
+        requestedAlbumArtKeys.remove("\(id)|hq")
+        log("[NowDiag] hq artwork request id=\(id)")
+        requestHqAlbumArt(id: id)
+    }
+
+    func noteNowPlayingDiagnosticsCopied(trackId: String) {
+        log("[NowDiag] copied diagnostics trackId=\(trackId)")
+    }
+
+    func makeNowPlayingDiagnosticSnapshot() -> NowPlayingDiagnosticSnapshot {
+        let hqWriteLength = sonyPeripheral?.maximumWriteValueLength(for: .withResponse) ?? 0
+        let connection = ConnectionDiagnosticSnapshot(
+            connectionStatus: connectionStatus,
+            displayState: connectionDisplayState,
+            healthState: connectionHealthState,
+            autoReconnectState: autoReconnectState,
+            autoReconnectAttempt: autoReconnectAttempt,
+            mtuBytes: hqWriteLength > 0 ? hqWriteLength + 3 : 0,
+            lastNotifyAgeMs: connectionHealthLastNotifyAgeMs,
+            peripheralState: connectionHealthPeripheralState,
+            characteristicReady: connectionHealthCharacteristicReady,
+            probeInFlight: connectionHealthProbeInFlight,
+            lastHardReconnectReason: connectionHealthLastHardReconnectReason
+        )
+        let displayWidth = albumArtImage?.pixelWidth ?? 0
+        let displayHeight = albumArtImage?.pixelHeight ?? 0
+        return NowPlayingDiagnosticSnapshot(
+            generatedAt: Date(),
+            title: title,
+            artist: artist,
+            album: album,
+            trackId: currentTrackID,
+            albumArtId: currentAlbumArtID,
+            albumArtDisplayQuality: artworkDisplayQuality.label,
+            displayArtworkPixelWidth: displayWidth,
+            displayArtworkPixelHeight: displayHeight,
+            artworkEnhancementStatus: artworkEnhancementStatus,
+            artworkCaches: makeArtworkCacheDiagnostics(id: currentAlbumArtID),
+            isPlaying: isPlaying,
+            positionMs: displayPositionMs,
+            durationMs: durationMs,
+            currentLyric: lyric,
+            lyricDiagnostic: lyricDiagnostic,
+            fullLyricsLineCount: fullLyrics.count,
+            isFullLyricsCurrent: isFullLyricsCurrent,
+            isFullLyricsReceiving: isFullLyricsReceiving,
+            connection: connection
+        )
+    }
+
     func setKaraokeOffsetMs(_ value: Int64) {
         karaokeOffsetMs = value
         log("[Lyrics-iOS] karaoke offsetMs=\(value)")
@@ -5016,6 +5082,73 @@ extension BLETestManager: CBPeripheralDelegate {
             pixelHeight: image.pixelHeight,
             bytes: data.count,
             createdAt: 0
+        )
+    }
+
+    private func makeArtworkCacheDiagnostics(id: String) -> [ArtworkCacheDiagnostic] {
+        guard !id.isEmpty else {
+            return [
+                ArtworkCacheDiagnostic.missing(quality: "preview"),
+                ArtworkCacheDiagnostic.missing(quality: "hq"),
+                ArtworkCacheDiagnostic.missing(quality: "enhanced")
+            ]
+        }
+        return [
+            makeAlbumArtCacheDiagnostic(id: id, quality: "preview"),
+            makeAlbumArtCacheDiagnostic(id: id, quality: "hq"),
+            makeEnhancedArtworkCacheDiagnostic(id: id)
+        ]
+    }
+
+    private func makeAlbumArtCacheDiagnostic(
+        id: String,
+        quality: String
+    ) -> ArtworkCacheDiagnostic {
+        let imageURL = albumArtCacheURL(id: id, quality: quality)
+        let metadata = cachedAlbumArtMetadata(id: id, quality: quality)
+        let attributes = try? FileManager.default.attributesOfItem(atPath: imageURL.path)
+        let bytes = attributes?[.size] as? Int ?? metadata?.bytes ?? 0
+        let modifiedAt = attributes?[.modificationDate] as? Date
+        guard FileManager.default.fileExists(atPath: imageURL.path) else {
+            return ArtworkCacheDiagnostic.missing(quality: quality, path: imageURL.path)
+        }
+        let data = try? Data(contentsOf: imageURL)
+        let image = data.flatMap(UIImage.init(data:))
+        let placeholder = image.map {
+            isLikelyPlaceholderAlbumArt($0, dataSize: data?.count ?? bytes)
+        } ?? false
+        return ArtworkCacheDiagnostic(
+            quality: quality,
+            exists: true,
+            bytes: bytes,
+            pixelWidth: metadata?.pixelWidth ?? image?.pixelWidth ?? 0,
+            pixelHeight: metadata?.pixelHeight ?? image?.pixelHeight ?? 0,
+            isPlaceholder: placeholder,
+            modifiedAt: modifiedAt,
+            path: imageURL.path
+        )
+    }
+
+    private func makeEnhancedArtworkCacheDiagnostic(id: String) -> ArtworkCacheDiagnostic {
+        guard let enhanced = ArtworkEnhancementManager.shared.cachedEnhancedArtwork(
+            artworkId: id,
+            targetPixelSize: artworkEnhancementTargetPixelSize,
+            sharpness: artworkEnhancementSharpness
+        ) else {
+            return ArtworkCacheDiagnostic.missing(quality: "enhanced")
+        }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: enhanced.fileURL.path)
+        let bytes = attributes?[.size] as? Int ?? 0
+        let modifiedAt = attributes?[.modificationDate] as? Date
+        return ArtworkCacheDiagnostic(
+            quality: "enhanced",
+            exists: true,
+            bytes: bytes,
+            pixelWidth: Int(enhanced.enhancedPixelSize.width),
+            pixelHeight: Int(enhanced.enhancedPixelSize.height),
+            isPlaceholder: false,
+            modifiedAt: modifiedAt,
+            path: enhanced.fileURL.path
         )
     }
 
