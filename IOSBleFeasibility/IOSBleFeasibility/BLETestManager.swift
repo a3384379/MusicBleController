@@ -22,6 +22,9 @@ private let CONNECTION_HEALTH_HARD_RECONNECT_MIN_INTERVAL_MS: Int64 = 5_000
 private let CONNECTION_SUBSCRIBE_NOTIFY_TIMEOUT_MS: Int64 = 5_000
 private let CONNECTION_DISPLAY_CONNECTED_MIN_HOLD_MS: Int64 = 5_000
 private let CONNECTION_DISPLAY_DISCONNECTED_CONFIRM_MS: Int64 = 1_000
+private let ALBUM_ART_FIRST_CHUNK_TIMEOUT_MS: Int64 = 3_000
+private let ALBUM_ART_IDLE_CHUNK_TIMEOUT_MS: Int64 = 4_000
+private let ALBUM_ART_TOTAL_TIMEOUT_MS: Int64 = 10_000
 
 struct LyricWord: Identifiable, Equatable {
     let id: Int
@@ -99,6 +102,18 @@ private struct AlbumArtCacheMetadata: Codable {
     let pixelHeight: Int
     let bytes: Int
     let createdAt: TimeInterval
+}
+
+private struct AlbumArtTransferSession {
+    let id: String
+    let quality: String
+    let totalChunks: Int
+    let startedAt: Date
+    var lastChunkAt: Date?
+    var receivedChunks: Set<Int>
+    var bytesReceived: Int
+
+    var receivedCount: Int { receivedChunks.count }
 }
 
 private extension UIImage {
@@ -227,6 +242,15 @@ final class BLETestManager: NSObject, ObservableObject {
     private var binaryAlbumArtExpectedSize = 0
     private var binaryAlbumArtExpectedChunks = 0
     private var binaryAlbumArtChunks: [Int: Data] = [:]
+    private var binaryAlbumArtSession: AlbumArtTransferSession?
+    private var albumArtFirstChunkTimeoutWorkItem: DispatchWorkItem?
+    private var albumArtIdleChunkTimeoutWorkItem: DispatchWorkItem?
+    private var albumArtTotalTimeoutWorkItem: DispatchWorkItem?
+    private var albumArtTransferState = "idle"
+    private var albumArtCurrentTransferQuality = "-"
+    private var albumArtLastFailureReason = "-"
+    private var albumArtPreviewRetryCounts: [String: Int] = [:]
+    private var albumArtHqRetryCounts: [String: Int] = [:]
     private var currentAlbumArtID = ""
     private var currentTrackID = ""
     private var currentCachedAlbumArtQuality = ""
@@ -601,6 +625,14 @@ final class BLETestManager: NSObject, ObservableObject {
             log("[NowDiag] request HQ skipped reason=unhealthy health=\(connectionHealthState)")
             return false
         }
+        cancelStaleBinaryAlbumArtTransferIfNeeded(reason: "request found stale transfer")
+        if let session = binaryAlbumArtSession,
+           session.id != id {
+            cancelBinaryAlbumArtTransfer(
+                reason: "transfer belongs to old id old=\(session.id) new=\(id)",
+                shouldRetryPreview: false
+            )
+        }
         guard albumArtExpectedChunks == 0,
               binaryAlbumArtExpectedChunks == 0 else {
             log("[NowDiag] request HQ skipped reason=album art transfer in progress")
@@ -650,6 +682,7 @@ final class BLETestManager: NSObject, ObservableObject {
             hqUnavailableBestBytes: hqAlbumArtUnavailableBestBytes,
             hqUnavailableBestChunks: hqAlbumArtUnavailableBestChunks,
             hqUnavailableMinCandidateScale: hqAlbumArtUnavailableMinCandidateScale,
+            albumArtTransfer: makeAlbumArtTransferDiagnosticSnapshot(),
             isPlaying: isPlaying,
             positionMs: displayPositionMs,
             durationMs: durationMs,
@@ -1416,7 +1449,7 @@ final class BLETestManager: NSObject, ObservableObject {
         sonyStatusCharacteristic = nil
         firstConnectionReadyAtMs = 0
         resetAlbumArtTransfer()
-        resetBinaryAlbumArtTransfer()
+        resetBinaryAlbumArtTransfer(reason: force ? "hard reconnect" : "reconnect")
         requestedAlbumArtKeys.removeAll()
         requestedHqAlbumArtIDs.removeAll()
         cancelHqAlbumArtRequest()
@@ -2079,7 +2112,7 @@ final class BLETestManager: NSObject, ObservableObject {
         liveActivityControlWriteStartedAtMs = 0
         clearPendingVolume()
         resetAlbumArtTransfer()
-        resetBinaryAlbumArtTransfer()
+        resetBinaryAlbumArtTransfer(reason: reason)
         cancelHqAlbumArtRequest()
         resetRemoteLogTransfer()
         resetMediaFieldDumpTransfer()
@@ -3147,7 +3180,7 @@ extension BLETestManager: CBPeripheralDelegate {
                       quality == "preview" || quality == "hq" || quality == "full",
                       size > 0,
                       chunks > 0 else {
-                    self.resetBinaryAlbumArtTransfer()
+                    self.resetBinaryAlbumArtTransfer(reason: "invalid binary start")
                     self.log("[AlbumArtBinary] invalid start")
                     return
                 }
@@ -3157,6 +3190,12 @@ extension BLETestManager: CBPeripheralDelegate {
                 self.binaryAlbumArtQuality = quality
                 self.binaryAlbumArtExpectedSize = size
                 self.binaryAlbumArtExpectedChunks = chunks
+                self.startBinaryAlbumArtTransferSession(
+                    id: id,
+                    quality: quality,
+                    size: size,
+                    chunks: chunks
+                )
                 let message = "[AlbumArtBinary] start chunks=\(chunks)"
                 self.log(message)
                 self.albumArtConsoleLog(message)
@@ -3212,14 +3251,21 @@ extension BLETestManager: CBPeripheralDelegate {
                     let failMessage = "[AlbumArtBinary] decode failed transfer mismatch"
                     self.log(failMessage)
                     self.albumArtConsoleLog(failMessage)
-                    self.resetBinaryAlbumArtTransfer()
+                    self.cancelBinaryAlbumArtTransfer(
+                        reason: "transfer mismatch",
+                        shouldRetryPreview: quality == "preview"
+                    )
                     return
                 }
                 self.finishBinaryAlbumArtTransfer(id: id, quality: quality)
 
             case "albumArtBinaryError":
                 let message = object["message"] as? String ?? "unknown"
-                self.resetBinaryAlbumArtTransfer()
+                let quality = self.binaryAlbumArtSession?.quality ?? self.binaryAlbumArtQuality
+                self.cancelBinaryAlbumArtTransfer(
+                    reason: "binary error \(message)",
+                    shouldRetryPreview: quality == "preview"
+                )
                 self.log("[AlbumArtBinary] error \(message)")
 
             case "albumArtUnavailable":
@@ -3230,7 +3276,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 let bestChunks = Self.intValue(object["bestChunks"])
                 let minCandidateScale = Self.intValue(object["minCandidateScale"])
                 self.resetAlbumArtTransfer()
-                self.resetBinaryAlbumArtTransfer()
+                self.resetBinaryAlbumArtTransfer(reason: "albumArtUnavailable")
                 self.requestedAlbumArtKeys.remove("\(id)|\(quality)")
                 if id == self.currentAlbumArtID,
                    quality == "hq" {
@@ -3679,7 +3725,19 @@ extension BLETestManager: CBPeripheralDelegate {
             albumArtConsoleLog(message)
             return
         }
-        binaryAlbumArtChunks[index] = data.subdata(in: 6..<data.count)
+        let payload = data.subdata(in: 6..<data.count)
+        binaryAlbumArtChunks[index] = payload
+        if var session = binaryAlbumArtSession,
+           session.quality == quality,
+           session.totalChunks == totalChunks {
+            session.lastChunkAt = Date()
+            session.receivedChunks.insert(index)
+            session.bytesReceived += payload.count
+            binaryAlbumArtSession = session
+            albumArtFirstChunkTimeoutWorkItem?.cancel()
+            albumArtFirstChunkTimeoutWorkItem = nil
+            scheduleAlbumArtIdleChunkTimeout(id: session.id, quality: quality)
+        }
         let message =
             "[AlbumArtBinary] chunk index=\(index) " +
             "received=\(binaryAlbumArtChunks.count)/\(binaryAlbumArtExpectedChunks)"
@@ -3699,7 +3757,10 @@ extension BLETestManager: CBPeripheralDelegate {
                 "expected=\(binaryAlbumArtExpectedChunks)"
             log(message)
             albumArtConsoleLog(message)
-            resetBinaryAlbumArtTransfer()
+            cancelBinaryAlbumArtTransfer(
+                reason: "end before all chunks",
+                shouldRetryPreview: quality == "preview"
+            )
             return
         }
 
@@ -3710,7 +3771,10 @@ extension BLETestManager: CBPeripheralDelegate {
                 let message = "[AlbumArtBinary] decode failed missing index=\(index)"
                 log(message)
                 albumArtConsoleLog(message)
-                resetBinaryAlbumArtTransfer()
+                cancelBinaryAlbumArtTransfer(
+                    reason: "missing chunk \(index)",
+                    shouldRetryPreview: quality == "preview"
+                )
                 return
             }
             jpegData.append(chunk)
@@ -3720,7 +3784,10 @@ extension BLETestManager: CBPeripheralDelegate {
             let message = "[AlbumArtBinary] decode failed"
             log(message)
             albumArtConsoleLog(message)
-            resetBinaryAlbumArtTransfer()
+            cancelBinaryAlbumArtTransfer(
+                reason: "decode failed",
+                shouldRetryPreview: quality == "preview"
+            )
             return
         }
         if isLikelyPlaceholderAlbumArt(image, dataSize: jpegData.count) {
@@ -3738,13 +3805,13 @@ extension BLETestManager: CBPeripheralDelegate {
                 updateLiveActivity(force: true, reason: "albumArt")
             }
             requestedAlbumArtKeys.remove("\(id)|\(quality)")
-            resetBinaryAlbumArtTransfer()
+            resetBinaryAlbumArtTransfer(reason: "complete placeholder")
             return
         }
         if quality == "hq",
            !shouldAcceptHqAlbumArt(image: image, data: jpegData, id: id) {
             requestedAlbumArtKeys.remove("\(id)|\(quality)")
-            resetBinaryAlbumArtTransfer()
+            resetBinaryAlbumArtTransfer(reason: "complete hq no visual upgrade")
             return
         }
 
@@ -3784,18 +3851,245 @@ extension BLETestManager: CBPeripheralDelegate {
         let message = "[AlbumArtBinary] decode success bytes=\(jpegData.count)"
         log(message)
         albumArtConsoleLog(message)
+        let completeMessage =
+            "[AlbumArt-iOS] transfer complete id=\(id) quality=\(quality) " +
+            "bytes=\(jpegData.count)"
+        log(completeMessage)
+        albumArtConsoleLog(completeMessage)
         if quality == "preview" {
             scheduleHqAlbumArtRequest(id: id)
         }
-        resetBinaryAlbumArtTransfer()
+        albumArtLastFailureReason = "-"
+        resetBinaryAlbumArtTransfer(reason: "complete")
     }
 
-    private func resetBinaryAlbumArtTransfer() {
+    private func resetBinaryAlbumArtTransfer(reason: String = "reset") {
+        cancelAlbumArtTransferTimeouts()
+        if binaryAlbumArtExpectedChunks > 0,
+           reason != "reset" {
+            let message = "[AlbumArt-iOS] cancel in-flight reason=\(reason)"
+            log(message)
+            albumArtConsoleLog(message)
+        }
         binaryAlbumArtID = ""
         binaryAlbumArtQuality = ""
         binaryAlbumArtExpectedSize = 0
         binaryAlbumArtExpectedChunks = 0
         binaryAlbumArtChunks.removeAll()
+        binaryAlbumArtSession = nil
+        albumArtTransferState = "idle"
+        albumArtCurrentTransferQuality = "-"
+    }
+
+    private func startBinaryAlbumArtTransferSession(
+        id: String,
+        quality: String,
+        size: Int,
+        chunks: Int
+    ) {
+        binaryAlbumArtSession = AlbumArtTransferSession(
+            id: id,
+            quality: quality,
+            totalChunks: chunks,
+            startedAt: Date(),
+            lastChunkAt: nil,
+            receivedChunks: [],
+            bytesReceived: 0
+        )
+        albumArtTransferState = "receiving"
+        albumArtCurrentTransferQuality = quality
+        albumArtLastFailureReason = "-"
+        scheduleAlbumArtFirstChunkTimeout(id: id, quality: quality)
+        scheduleAlbumArtTotalTimeout(id: id, quality: quality)
+        let message =
+            "[AlbumArt-iOS] transfer start id=\(id) quality=\(quality) " +
+            "chunks=\(chunks) bytes=\(size)"
+        log(message)
+        albumArtConsoleLog(message)
+    }
+
+    private func cancelAlbumArtTransferTimeouts() {
+        albumArtFirstChunkTimeoutWorkItem?.cancel()
+        albumArtFirstChunkTimeoutWorkItem = nil
+        albumArtIdleChunkTimeoutWorkItem?.cancel()
+        albumArtIdleChunkTimeoutWorkItem = nil
+        albumArtTotalTimeoutWorkItem?.cancel()
+        albumArtTotalTimeoutWorkItem = nil
+    }
+
+    private func scheduleAlbumArtFirstChunkTimeout(id: String, quality: String) {
+        albumArtFirstChunkTimeoutWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  let session = self.binaryAlbumArtSession,
+                  session.id == id,
+                  session.quality == quality,
+                  session.receivedCount == 0 else {
+                return
+            }
+            self.log("[AlbumArt-iOS] first chunk timeout id=\(id) quality=\(quality)")
+            self.cancelBinaryAlbumArtTransfer(
+                reason: "first chunk timeout",
+                shouldRetryPreview: quality == "preview"
+            )
+        }
+        albumArtFirstChunkTimeoutWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(Int(ALBUM_ART_FIRST_CHUNK_TIMEOUT_MS)),
+            execute: workItem
+        )
+    }
+
+    private func scheduleAlbumArtIdleChunkTimeout(id: String, quality: String) {
+        albumArtIdleChunkTimeoutWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  let session = self.binaryAlbumArtSession,
+                  session.id == id,
+                  session.quality == quality,
+                  session.receivedCount > 0 else {
+                return
+            }
+            self.log(
+                "[AlbumArt-iOS] idle chunk timeout id=\(id) " +
+                "received=\(session.receivedCount)/\(session.totalChunks)"
+            )
+            self.cancelBinaryAlbumArtTransfer(
+                reason: "idle chunk timeout",
+                shouldRetryPreview: quality == "preview"
+            )
+        }
+        albumArtIdleChunkTimeoutWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(Int(ALBUM_ART_IDLE_CHUNK_TIMEOUT_MS)),
+            execute: workItem
+        )
+    }
+
+    private func scheduleAlbumArtTotalTimeout(id: String, quality: String) {
+        albumArtTotalTimeoutWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  let session = self.binaryAlbumArtSession,
+                  session.id == id,
+                  session.quality == quality else {
+                return
+            }
+            self.log(
+                "[AlbumArt-iOS] total timeout id=\(id) " +
+                "received=\(session.receivedCount)/\(session.totalChunks)"
+            )
+            self.cancelBinaryAlbumArtTransfer(
+                reason: "total timeout",
+                shouldRetryPreview: quality == "preview"
+            )
+        }
+        albumArtTotalTimeoutWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(Int(ALBUM_ART_TOTAL_TIMEOUT_MS)),
+            execute: workItem
+        )
+    }
+
+    @discardableResult
+    private func cancelStaleBinaryAlbumArtTransferIfNeeded(reason: String) -> Bool {
+        guard let session = binaryAlbumArtSession else { return false }
+        let now = Date()
+        let elapsedMs = Int64(now.timeIntervalSince(session.startedAt) * 1_000)
+        if session.receivedCount == 0,
+           elapsedMs >= ALBUM_ART_FIRST_CHUNK_TIMEOUT_MS {
+            cancelBinaryAlbumArtTransfer(
+                reason: "\(reason): first chunk timeout",
+                shouldRetryPreview: false
+            )
+            return true
+        }
+        if let lastChunkAt = session.lastChunkAt {
+            let idleMs = Int64(now.timeIntervalSince(lastChunkAt) * 1_000)
+            if idleMs >= ALBUM_ART_IDLE_CHUNK_TIMEOUT_MS {
+                cancelBinaryAlbumArtTransfer(
+                    reason: "\(reason): idle chunk timeout",
+                    shouldRetryPreview: false
+                )
+                return true
+            }
+        }
+        if elapsedMs >= ALBUM_ART_TOTAL_TIMEOUT_MS {
+            cancelBinaryAlbumArtTransfer(
+                reason: "\(reason): total timeout",
+                shouldRetryPreview: false
+            )
+            return true
+        }
+        return false
+    }
+
+    private func cancelBinaryAlbumArtTransfer(
+        reason: String,
+        shouldRetryPreview: Bool
+    ) {
+        guard let session = binaryAlbumArtSession else {
+            resetBinaryAlbumArtTransfer(reason: reason)
+            return
+        }
+        let received = session.receivedCount
+        let total = session.totalChunks
+        let id = session.id
+        let quality = session.quality
+        requestedAlbumArtKeys.remove("\(id)|\(quality)")
+        cancelAlbumArtTransferTimeouts()
+        binaryAlbumArtID = ""
+        binaryAlbumArtQuality = ""
+        binaryAlbumArtExpectedSize = 0
+        binaryAlbumArtExpectedChunks = 0
+        binaryAlbumArtChunks.removeAll()
+        binaryAlbumArtSession = nil
+        albumArtCurrentTransferQuality = quality
+        albumArtLastFailureReason = reason
+        albumArtTransferState = reason.contains("timeout") ? "timeout" : "failed"
+        if quality == "hq" {
+            albumArtHqRetryCounts[id] = (albumArtHqRetryCounts[id] ?? 0) + 1
+        }
+        let message =
+            "[AlbumArt-iOS] transfer cancelled reason=\(reason) id=\(id) " +
+            "quality=\(quality) received=\(received)/\(total)"
+        log(message)
+        albumArtConsoleLog(message)
+        if shouldRetryPreview, quality == "preview" {
+            retryAlbumArtPreviewAfterTimeout(id: id, reason: reason)
+        }
+    }
+
+    private func retryAlbumArtPreviewAfterTimeout(id: String, reason: String) {
+        guard id == currentAlbumArtID else { return }
+        let count = albumArtPreviewRetryCounts[id] ?? 0
+        guard count < 1 else {
+            log("[AlbumArt-iOS] retry skipped reason=max retry reached id=\(id)")
+            return
+        }
+        albumArtPreviewRetryCounts[id] = count + 1
+        log("[AlbumArt-iOS] retry preview id=\(id) attempt=\(count + 1) reason=\(reason)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self,
+                  self.currentAlbumArtID == id,
+                  self.albumArtImage == nil else {
+                return
+            }
+            self.requestedAlbumArtKeys.remove("\(id)|preview")
+            self.requestAlbumArt(id: id, quality: "preview")
+        }
+    }
+
+    private func makeAlbumArtTransferDiagnosticSnapshot() -> AlbumArtTransferDiagnosticSnapshot {
+        AlbumArtTransferDiagnosticSnapshot(
+            state: albumArtTransferState,
+            quality: albumArtCurrentTransferQuality,
+            receivedChunks: binaryAlbumArtSession?.receivedCount ?? binaryAlbumArtChunks.count,
+            totalChunks: binaryAlbumArtSession?.totalChunks ?? binaryAlbumArtExpectedChunks,
+            lastFailureReason: albumArtLastFailureReason,
+            previewRetryCount: albumArtPreviewRetryCounts[currentAlbumArtID] ?? 0,
+            hqRetryCount: albumArtHqRetryCounts[currentAlbumArtID] ?? 0
+        )
     }
 
     private func applyTrackInfo(_ object: [String: Any]) {
@@ -4561,8 +4855,10 @@ extension BLETestManager: CBPeripheralDelegate {
         requestedAlbumArtKeys.removeAll()
         requestedHqAlbumArtIDs.removeAll()
         albumArtPreviewRetryCount = 0
+        albumArtPreviewRetryCounts.removeAll()
+        albumArtHqRetryCounts.removeAll()
         resetAlbumArtTransfer()
-        resetBinaryAlbumArtTransfer()
+        resetBinaryAlbumArtTransfer(reason: "track changed")
         cancelHqAlbumArtRequest()
 
         if let cached = loadCachedAlbumArt(id: id) {
@@ -4696,6 +4992,14 @@ extension BLETestManager: CBPeripheralDelegate {
             log("[AlbumArtHQ] request skipped not connected")
             return
         }
+        cancelStaleBinaryAlbumArtTransferIfNeeded(reason: "request found stale transfer")
+        if let session = binaryAlbumArtSession,
+           session.id != id {
+            cancelBinaryAlbumArtTransfer(
+                reason: "transfer belongs to old id old=\(session.id) new=\(id)",
+                shouldRetryPreview: false
+            )
+        }
         guard !isFullLyricsReceiving,
               lyricSecondaryTransfer == nil,
               !isRemoteLogTransferInProgress,
@@ -4712,6 +5016,18 @@ extension BLETestManager: CBPeripheralDelegate {
 
     private func requestAlbumArt(id: String, quality: String) {
         guard id == currentAlbumArtID else { return }
+        cancelStaleBinaryAlbumArtTransferIfNeeded(reason: "request found stale transfer")
+        if let session = binaryAlbumArtSession {
+            if session.id != id {
+                cancelBinaryAlbumArtTransfer(
+                    reason: "transfer belongs to old id old=\(session.id) new=\(id)",
+                    shouldRetryPreview: false
+                )
+            } else {
+                log("[AlbumArt] request \(quality) skipped reason=transfer in progress")
+                return
+            }
+        }
         let key = "\(id)|\(quality)"
         guard requestedAlbumArtKeys.insert(key).inserted else { return }
         log("[AlbumArt] request \(quality)")

@@ -366,6 +366,9 @@ class BleNotifyQueue(
 
         notificationInFlight = true
         val requested = notify(server, characteristic, job.device, packet.value)
+        if (job.type == "albumArt") {
+            logAlbumArtPacketProgress(job, packet)
+        }
         val sendLog = "[BleNotifyQueue] send type=${packet.type} bytes=${packet.value.size}"
         when {
             packet.type == "mediaFieldDumpChunk" -> {
@@ -423,8 +426,14 @@ class BleNotifyQueue(
         }
         job.failureLogged = true
         when (job.type) {
-            "albumArt" ->
+            "albumArt" -> {
                 logger("[AlbumArt][BLE] failed reason=$reason")
+                logger(
+                    "[AlbumArt-Sony] send cancelled reason=$reason " +
+                        "id=${job.albumArtId} quality=${job.albumArtQuality}"
+                )
+                logger("[AlbumArt-Sony] queue snapshot=${snapshot()}")
+            }
             "remoteLog" ->
                 logger("[RemoteLog] send failed reason=$reason")
             "mediaFieldDump" ->
@@ -435,6 +444,40 @@ class BleNotifyQueue(
                 logger("[TrackInfo] send failed reason=$reason")
             "playHistory", "playStats" ->
                 logger("[HistoryBLE] cancelled reason=$reason")
+        }
+    }
+
+    private fun logAlbumArtPacketProgress(job: SendJob, packet: Packet) {
+        when (packet.type) {
+            "albumArtBinaryStart", "albumArtStart" -> {
+                logger(
+                    "[AlbumArt-Sony] binary start id=${job.albumArtId} " +
+                        "quality=${job.albumArtQuality} chunks=${job.chunkCount}"
+                )
+                logger("[AlbumArt-Sony] queue snapshot=${snapshot()}")
+            }
+            "albumArtBinaryChunk", "albumArtChunk" -> {
+                val sent = job.packets
+                    .take(activePacketIndex + 1)
+                    .count { it.type == "albumArtBinaryChunk" || it.type == "albumArtChunk" }
+                if (sent == 1 || sent % 20 == 0 || sent == job.chunkCount) {
+                    logger(
+                        "[AlbumArt-Sony] chunk progress id=${job.albumArtId} " +
+                            "sent=$sent/${job.chunkCount}"
+                    )
+                }
+            }
+            "albumArtBinaryEnd", "albumArtEnd" -> {
+                val costMs = if (activeJobStartedAtMs > 0L) {
+                    SystemClock.elapsedRealtime() - activeJobStartedAtMs
+                } else {
+                    0L
+                }
+                logger(
+                    "[AlbumArt-Sony] binary end id=${job.albumArtId} " +
+                        "quality=${job.albumArtQuality} costMs=$costMs"
+                )
+            }
         }
     }
 

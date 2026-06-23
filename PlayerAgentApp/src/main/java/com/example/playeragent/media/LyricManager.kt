@@ -47,9 +47,16 @@ class LyricManager(
         context = appContext,
         logger = logger
     )
+    private val recoveryEngine = LyricRecoveryEngine(
+        logger = logger,
+        retryCallback = { reason, bypassRetryableCooldown ->
+            retryActiveSongFromRecovery(reason, bypassRetryableCooldown)
+        }
+    )
 
     init {
         QrcLyricCacheManager.addFuzzyIndexReadyListener {
+            recoveryEngine.onFuzzyIndexReady()
             retryActiveSong("fuzzy index ready")
         }
     }
@@ -164,6 +171,7 @@ class LyricManager(
             if (lazyWaitSongKey != null) {
                 logger("[LyricLazyLoad] cancelled reason=song changed")
             }
+            recoveryEngine.onSongChanged()
             lazyWaitSongKey = null
             lazyWaitStartedAtMs = 0L
             lastLoggedLine = null
@@ -268,6 +276,10 @@ class LyricManager(
             return false
         }
         lastWatcherRetryAtMs = now
+        recoveryEngine.onQrcGenerationChanged(
+            oldGeneration = recoveryEngine.snapshot().lastQrcGeneration,
+            newGeneration = QrcDirectoryGeneration.current()
+        )
         logger("[QrcCooldown] cleared active song reason=qrc generation changed")
         qrcLyricManager.removeUncertainCooldown(key, "qrc generation changed")
         logger("[LyricLazyLoad] retry reason=qrc watcher generation changed")
@@ -296,6 +308,7 @@ class LyricManager(
         }
         logger("[LyricRetry] manual refresh current songKey=$key")
         logger("[LyricRetry] manual refresh bypass retryable cooldown songKey=$key")
+        recoveryEngine.onManualRefresh()
         qrcLyricManager.removeUncertainCooldown(key, "manual refresh current lyric")
         retryableFailureSongKey = null
         retryableFailureReason = ""
@@ -312,6 +325,16 @@ class LyricManager(
             reason = "manual refresh current lyric"
         )
         return true
+    }
+
+    @Synchronized
+    fun notifyIncrementalBatchDone(groupIds: Collection<String>) {
+        recoveryEngine.onIncrementalBatchDone(groupIds)
+    }
+
+    @Synchronized
+    fun recoverySnapshot(): LyricRecoverySnapshot {
+        return recoveryEngine.snapshot()
     }
 
     private fun consumeRetrySlotLocked(key: String, now: Long): Boolean {
@@ -340,6 +363,14 @@ class LyricManager(
                     "waiting qqmusic lyric cache"
                 }
             }
+            key != null && recoveryEngine.isActiveFor(key) -> {
+                val recovery = recoveryEngine.snapshot()
+                if (recovery.lastReason == WAITING_QQMUSIC_LYRIC_CACHE_REASON) {
+                    WAITING_QQMUSIC_LYRIC_CACHE_REASON
+                } else {
+                    "lyric recovery active"
+                }
+            }
             key != null && retryableFailureSongKey == key -> retryableFailureReason.ifBlank {
                 "lyrics retry pending"
             }
@@ -363,6 +394,7 @@ class LyricManager(
             key == loadingSongKey -> "loading"
             isWaitingForQqMusicCacheLocked(key) && !isLazyWaitExpiredLocked(key, now) ->
                 "waiting_qqmusic_cache"
+            recoveryEngine.isActiveFor(key) -> "lyric_recovery_active"
             retryableFailureSongKey == key -> {
                 if (retryableFailureReason == "maintenance busy") {
                     "maintenance_busy"
@@ -382,6 +414,10 @@ class LyricManager(
         val nextRetryAt = when {
             status == "waiting_qqmusic_cache" ->
                 (lastRetryAtMs + RETRYABLE_RECHECK_INTERVAL_MS).coerceAtLeast(now)
+            status == "lyric_recovery_active" -> {
+                val recovery = recoveryEngine.snapshot()
+                (recovery.lastRetryAt + RETRYABLE_RECHECK_INTERVAL_MS).coerceAtLeast(now)
+            }
             retryableFailureSongKey == key && retryableFailureAtMs > 0L ->
                 retryableFailureAtMs + RETRYABLE_RECHECK_INTERVAL_MS
             else -> 0L
@@ -391,6 +427,7 @@ class LyricManager(
         } else {
             0L
         }
+        val recovery = recoveryEngine.snapshot()
         return LyricDiagnosticSnapshot(
             trackId = trackId,
             songKey = key,
@@ -408,7 +445,12 @@ class LyricManager(
             qrcIndexLoaded = true,
             maintenanceBusy = QrcMaintenanceCoordinator.isRunning(),
             waitingQqMusicCache = status == "waiting_qqmusic_cache",
-            suggestion = suggestionForStatus(status, reason)
+            suggestion = suggestionForStatus(status, reason),
+            recoveryState = recovery.state.name,
+            recoveryRetryCount = recovery.retryCount,
+            recoveryExpiresAt = recovery.expiresAt,
+            lastRecoveryReason = recovery.lastReason,
+            recentQrcCandidateCount = recovery.recentCandidateCount
         )
     }
 
@@ -479,6 +521,7 @@ class LyricManager(
             cachedLines = result.lines
             loadedSongKey = request.key
             lastSource = result.source
+            recoveryEngine.onLyricLoaded(request.key, result.lineCount)
             retryableFailureSongKey = null
             retryableFailureReason = ""
             retryableFailureAtMs = 0L
@@ -506,6 +549,15 @@ class LyricManager(
             if (retryableFailureReason == WAITING_QQMUSIC_LYRIC_CACHE_REASON) {
                 startLazyWaitIfNeededLocked(request.key)
             }
+            recoveryEngine.onActiveSongNoLyrics(
+                songKey = request.key,
+                trackId = "",
+                title = request.title,
+                artist = request.artist,
+                album = request.album,
+                reason = retryableFailureReason,
+                qrcGeneration = QrcDirectoryGeneration.current()
+            )
             if (result.source != LyricSource.QRC) {
                 cachedLines = emptyList()
             }
@@ -523,6 +575,7 @@ class LyricManager(
                 lazyWaitSongKey = null
                 lazyWaitStartedAtMs = 0L
             }
+            recoveryEngine.onFinalFailure(request.key, finalEmptyReason)
             logger(
                 "[LyricAsync] final empty, marked loaded " +
                     "songKey=${request.key} reason=$finalEmptyReason"
@@ -733,6 +786,7 @@ class LyricManager(
             currentTrack.songKey,
             "incremental lyrics ready"
         )
+        recoveryEngine.onLyricLoaded(activeKey, lines.size)
         retryableFailureSongKey = null
         retryableFailureReason = ""
         retryableFailureAtMs = 0L
@@ -751,6 +805,10 @@ class LyricManager(
         return when {
             key == loadedSongKey && cachedLines.isNotEmpty() -> "loaded"
             key == loadingSongKey -> "loading"
+            recoveryEngine.isActiveFor(key) -> {
+                val recovery = recoveryEngine.snapshot()
+                "lyric recovery: ${recovery.state.name} retry=${recovery.retryCount}"
+            }
             isWaitingForQqMusicCacheLocked(key) &&
                 !isLazyWaitExpiredLocked(key, System.currentTimeMillis()) ->
                 "waiting QQMusic lyric cache"
@@ -768,6 +826,7 @@ class LyricManager(
         return when (status) {
             "loaded" -> "loaded"
             "waiting_qqmusic_cache" -> "open_qqmusic_lyrics"
+            "lyric_recovery_active" -> "open_qqmusic_lyrics"
             "retry_pending" -> "retry_later"
             "maintenance_busy" -> "maintenance_busy"
             "no_safe_candidate" -> "no_safe_candidate"
@@ -819,6 +878,44 @@ class LyricManager(
         finalEmptyReason = "no safe qrc candidate"
         loadedSongKey = key
         cachedLines = emptyList()
+        recoveryEngine.onFinalFailure(key, finalEmptyReason)
+    }
+
+    @Synchronized
+    private fun retryActiveSongFromRecovery(
+        reason: String,
+        bypassRetryableCooldown: Boolean
+    ): Boolean {
+        val key = activeSongKey ?: return false
+        if (cachedLines.isNotEmpty() && loadedSongKey == key) {
+            logger("[LyricRecovery] retry skipped reason=has lyrics songKey=$key")
+            return false
+        }
+        if (loadingSongKey == key || pendingRequest?.key == key) {
+            logger("[LyricRecovery] retry skipped reason=in flight songKey=$key")
+            return false
+        }
+        if (QrcMaintenanceCoordinator.isRunning()) {
+            logger("[LyricRecovery] retry skipped reason=maintenance busy songKey=$key")
+            return false
+        }
+        if (bypassRetryableCooldown) {
+            qrcLyricManager.removeUncertainCooldown(key, "lyric recovery $reason")
+        } else if (retryableFailureSongKey == key && retryableFailureAtMs > 0L) {
+            val retryAfter = retryableFailureAtMs + RETRYABLE_RECHECK_INTERVAL_MS
+            if (System.currentTimeMillis() < retryAfter) {
+                logger("[LyricRecovery] respect cooldown retryAfter=$retryAfter")
+                return false
+            }
+        }
+        requestLyricLoadAsync(
+            title = activeTitle,
+            artist = activeArtist,
+            album = activeAlbum,
+            force = true,
+            reason = "lyric recovery $reason"
+        )
+        return true
     }
 
     private fun resolveLyricDirectory(): File {
@@ -1163,7 +1260,12 @@ class LyricManager(
         val qrcIndexLoaded: Boolean,
         val maintenanceBusy: Boolean,
         val waitingQqMusicCache: Boolean,
-        val suggestion: String
+        val suggestion: String,
+        val recoveryState: String = LyricRecoveryState.IDLE.name,
+        val recoveryRetryCount: Int = 0,
+        val recoveryExpiresAt: Long = 0L,
+        val lastRecoveryReason: String = "",
+        val recentQrcCandidateCount: Int = 0
     )
 
     private data class LyricCandidate(

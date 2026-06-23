@@ -221,6 +221,14 @@ class PlaybackStateReader(
         return lyricManager.retryActiveSongFromWatcher(reason)
     }
 
+    fun notifyLyricIncrementalBatchDone(groupIds: Collection<String>) {
+        lyricManager.notifyIncrementalBatchDone(groupIds)
+    }
+
+    fun lyricRecoverySnapshot(): LyricRecoverySnapshot {
+        return lyricManager.recoverySnapshot()
+    }
+
     fun manualRefreshCurrentLyric(): Boolean {
         return lyricManager.manualRefreshCurrentLyric()
     }

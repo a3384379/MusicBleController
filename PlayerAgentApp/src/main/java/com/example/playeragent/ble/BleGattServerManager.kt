@@ -693,9 +693,15 @@ class BleGattServerManager(
                 .put("maintenanceBusy", snapshot.maintenanceBusy)
                 .put("waitingQqMusicCache", snapshot.waitingQqMusicCache)
                 .put("suggestion", snapshot.suggestion)
+                .put("recoveryState", snapshot.recoveryState)
+                .put("recoveryRetryCount", snapshot.recoveryRetryCount)
+                .put("recoveryExpiresAt", snapshot.recoveryExpiresAt)
+                .put("lastRecoveryReason", snapshot.lastRecoveryReason)
+                .put("recentQrcCandidateCount", snapshot.recentQrcCandidateCount)
         )
         logger(
             "[LyricDiag] response status=${snapshot.status} reason=${snapshot.reason} " +
+                "recoveryState=${snapshot.recoveryState} " +
                 "costMs=${SystemClock.elapsedRealtime() - startedAtMs}"
         )
     }
@@ -716,6 +722,10 @@ class BleGattServerManager(
 
     fun retryCurrentLyricsFromWatcher(reason: String): Boolean {
         return playbackStateReader.retryActiveLyricsFromWatcher(reason)
+    }
+
+    fun notifyLyricIncrementalBatchDone(groupIds: Collection<String>) {
+        playbackStateReader.notifyLyricIncrementalBatchDone(groupIds)
     }
 
     fun manualRefreshCurrentLyric(): Boolean {

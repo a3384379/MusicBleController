@@ -360,6 +360,7 @@ class PlayerAgentForegroundService : Service() {
             },
             onBatchProcessed = { groups ->
                 if (groups.isNotEmpty()) {
+                    gattServerManager?.notifyLyricIncrementalBatchDone(groups)
                     val handled = gattServerManager?.retryCurrentLyricsFromWatcher(
                         "qrc watcher generation changed"
                     ) == true

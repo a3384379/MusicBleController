@@ -174,6 +174,19 @@ struct NowPlayingDiagnosticView: View {
                     String(format: "%.2f%%", snapshot.artworkEnhancementStatus.lastEdgeGainPercent)
                 )
                 diagnosticRow("增强状态", snapshot.artworkEnhancementStatus.lastMessage)
+                diagnosticRow("传输状态", snapshot.albumArtTransfer.state)
+                diagnosticRow("传输质量", snapshot.albumArtTransfer.quality)
+                diagnosticRow(
+                    "传输进度",
+                    "\(snapshot.albumArtTransfer.receivedChunks)/" +
+                        "\(snapshot.albumArtTransfer.totalChunks)"
+                )
+                if snapshot.albumArtTransfer.lastFailureReason != "-" &&
+                    !snapshot.albumArtTransfer.lastFailureReason.isEmpty {
+                    diagnosticRow("传输异常", snapshot.albumArtTransfer.lastFailureReason)
+                }
+                diagnosticRow("Preview 重试", "\(snapshot.albumArtTransfer.previewRetryCount)")
+                diagnosticRow("HQ 重试", "\(snapshot.albumArtTransfer.hqRetryCount)")
                 if snapshot.hqUnavailableReason != "-" &&
                     !snapshot.hqUnavailableReason.isEmpty {
                     diagnosticRow("HQ 未生成", snapshot.hqUnavailableReason)

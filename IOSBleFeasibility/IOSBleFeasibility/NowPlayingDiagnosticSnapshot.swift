@@ -39,6 +39,16 @@ struct ConnectionDiagnosticSnapshot: Equatable {
     let lastHardReconnectReason: String
 }
 
+struct AlbumArtTransferDiagnosticSnapshot: Equatable {
+    let state: String
+    let quality: String
+    let receivedChunks: Int
+    let totalChunks: Int
+    let lastFailureReason: String
+    let previewRetryCount: Int
+    let hqRetryCount: Int
+}
+
 struct NowPlayingDiagnosticSnapshot {
     let generatedAt: Date
     let title: String
@@ -55,6 +65,7 @@ struct NowPlayingDiagnosticSnapshot {
     let hqUnavailableBestBytes: Int
     let hqUnavailableBestChunks: Int
     let hqUnavailableMinCandidateScale: Int
+    let albumArtTransfer: AlbumArtTransferDiagnosticSnapshot
     let isPlaying: Bool
     let positionMs: Int64
     let durationMs: Int64
@@ -74,6 +85,8 @@ struct NowPlayingDiagnosticSnapshot {
         lyricStatus=\(lyricDiagnostic?.status ?? "-")
         lyricReason=\(lyricDiagnostic?.reason ?? "-")
         artworkQuality=\(albumArtDisplayQuality)
+        artworkTransferState=\(albumArtTransfer.state)
+        artworkTransferReason=\(albumArtTransfer.lastFailureReason)
         trackId=\(trackId)
         """
     }
@@ -95,7 +108,11 @@ struct NowPlayingDiagnosticSnapshot {
 
         let hqCache = artworkCaches.first { $0.quality == "hq" }
         if albumArtDisplayQuality == "placeholder" {
-            issues.append("封面：当前没有可显示封面")
+            if albumArtTransfer.state == "timeout" || albumArtTransfer.state == "failed" {
+                issues.append("封面：传输中断，\(albumArtTransfer.lastFailureReason)")
+            } else {
+                issues.append("封面：当前没有可显示封面")
+            }
         } else if !hqUnavailableReason.isEmpty,
                   hqUnavailableReason != "-" {
             issues.append("封面：HQ 未生成，\(hqUnavailableReason)")
@@ -183,6 +200,14 @@ struct NowPlayingDiagnosticSnapshot {
         lines.append("hqUnavailableBestBytes: \(hqUnavailableBestBytes)")
         lines.append("hqUnavailableBestChunks: \(hqUnavailableBestChunks)")
         lines.append("hqUnavailableMinCandidateScale: \(hqUnavailableMinCandidateScale)")
+        lines.append("transferState: \(albumArtTransfer.state)")
+        lines.append("transferQuality: \(albumArtTransfer.quality)")
+        lines.append(
+            "transferChunks: \(albumArtTransfer.receivedChunks)/\(albumArtTransfer.totalChunks)"
+        )
+        lines.append("transferLastFailure: \(albumArtTransfer.lastFailureReason)")
+        lines.append("previewRetryCount: \(albumArtTransfer.previewRetryCount)")
+        lines.append("hqRetryCount: \(albumArtTransfer.hqRetryCount)")
         for cache in artworkCaches {
             lines.append(
                 "\(cache.quality): exists=\(cache.exists) bytes=\(cache.bytes) " +
