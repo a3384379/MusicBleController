@@ -8,8 +8,11 @@ struct ContentView: View {
     @State private var showLyricDiagnostic = false
     @State private var showNowPlayingDiagnostic = false
     @State private var showSystemHealthOverview = false
+    @State private var showPreferences = false
     @AppStorage(LyricDisplayMode.userDefaultsKey)
     private var lyricDisplayModeRaw = LyricDisplayMode.originalTranslation.rawValue
+    @AppStorage(ArtworkDisplaySizeOption.userDefaultsKey)
+    private var artworkDisplaySizeRaw = ArtworkDisplaySizeOption.defaultOption.rawValue
 
     var body: some View {
         NavigationStack {
@@ -39,6 +42,12 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showPlaybackHistory) {
                 PlaybackHistoryView(bleManager: bleManager)
+            }
+            .sheet(isPresented: $showPreferences) {
+                PreferencesView(
+                    bleManager: bleManager,
+                    onDismiss: { showPreferences = false }
+                )
             }
             .sheet(isPresented: $showLyricDiagnostic) {
                 LyricDiagnosticView(
@@ -145,6 +154,12 @@ struct ContentView: View {
                     showPlaybackHistory = true
                 } label: {
                     Label("播放历史", systemImage: "clock.arrow.circlepath")
+                }
+
+                Button {
+                    showPreferences = true
+                } label: {
+                    Label("设置", systemImage: "gearshape")
                 }
 
                 Button {
@@ -659,7 +674,8 @@ struct ContentView: View {
     }
 
     private var albumArtSize: CGFloat {
-        260
+        let option = ArtworkDisplaySizeOption(rawValue: artworkDisplaySizeRaw) ?? .defaultOption
+        return option.pointSize
     }
 
     private var volumeIcon: String {

@@ -12,6 +12,7 @@ private let VOLUME_SEND_THROTTLE_MS: Int64 = 120
 private let VOLUME_PENDING_TTL_MS: Int64 = 1_000
 private let AUTO_RECONNECT_LAST_PERIPHERAL_KEY = "lastSonyPeripheralIdentifier"
 private let AUTO_RECONNECT_ENABLED_KEY = "autoReconnectEnabled"
+private let KARAOKE_OFFSET_MS_KEY = "lyricOffsetMs"
 private let FAST_RETRIEVE_CONNECT_TIMEOUT_MS: Int64 = 1_800
 private let DEFAULT_CONNECT_TIMEOUT_MS: Int64 = 8_000
 private let CONNECTION_HEALTH_TICK_MS: Int64 = 3_000
@@ -153,6 +154,7 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var volumeSeekValue = 0
     @Published private(set) var isVolumeSeeking = false
     @Published private(set) var albumArtImage: UIImage?
+    @Published private(set) var connectedDeviceName = "-"
     @Published private(set) var artworkDisplayQuality: ArtworkDisplayQuality = .placeholder
     @Published private(set) var artworkEnhancementStatus = ArtworkEnhancementDebugStatus()
     @Published private(set) var artworkEnhancementTargetPixelSize = 780
@@ -164,7 +166,8 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var mediaFieldDumpCopyStatus = ""
     @Published private(set) var isMediaFieldDumpReceiving = false
     @Published private(set) var mediaFieldDumpProgressText = ""
-    @Published private(set) var karaokeOffsetMs: Int64 = 600
+    @Published private(set) var karaokeOffsetMs: Int64 =
+        Int64(UserDefaults.standard.object(forKey: KARAOKE_OFFSET_MS_KEY) as? Int ?? 600)
     @Published private(set) var localLogActionStatus = ""
     @Published private(set) var liveActivityControlStatus = LiveActivityControlStatus()
     @Published private(set) var playbackHistorySessions: [PlaybackHistorySession] = []
@@ -506,6 +509,7 @@ final class BLETestManager: NSObject, ObservableObject {
         }
         clearConnectionTransports(reason: "force reconnect")
         sonyPeripheral = nil
+        connectedDeviceName = "-"
         setConnectionHealth(.disconnected, reason: reason)
         setStatus("正在重新连接")
         refreshConnectionDisplayState(reason: "hard reconnect \(reason)")
@@ -703,7 +707,9 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     func setKaraokeOffsetMs(_ value: Int64) {
-        karaokeOffsetMs = value
+        let normalized = min(max(value, -2_000), 2_000)
+        karaokeOffsetMs = normalized
+        UserDefaults.standard.set(normalized, forKey: KARAOKE_OFFSET_MS_KEY)
         log("[Lyrics-iOS] karaoke offsetMs=\(value)")
     }
 
@@ -781,6 +787,15 @@ final class BLETestManager: NSObject, ObservableObject {
                 self.log("[ArtworkEnhance] cache cleared")
             }
         }
+    }
+
+    var artworkEnhancementEnabledForPreferences: Bool {
+        artworkEnhancementStatus.enabled
+    }
+
+    var currentMtuBytesForPreferences: Int {
+        let writeLength = sonyPeripheral?.maximumWriteValueLength(for: .withResponse) ?? 0
+        return writeLength > 0 ? writeLength + 3 : 0
     }
 
     func rebuildCurrentEnhancedArtwork() {
@@ -2065,6 +2080,7 @@ final class BLETestManager: NSObject, ObservableObject {
         connectStartedAtMs = currentTimeMs()
         currentConnectIsRetrievedPeripheral = isRetrieved
         sonyPeripheral = peripheral
+        connectedDeviceName = peripheral.name ?? connectedDeviceName
         peripheral.delegate = self
         setAutoReconnectState(.connecting)
         setStatus("正在连接 Sony")
@@ -2576,6 +2592,7 @@ extension BLETestManager: CBCentralManagerDelegate {
         autoReconnectLastScanCostMs = currentTimeMs() - scanStartedAtMs
         log("[BLE] connecting \(name) id=\(peripheral.identifier)")
         log("[BLE-iOS] connect peripheral=\(peripheral.identifier)")
+        connectedDeviceName = name
         currentConnectIsAutoReconnect = currentScanIsAutoReconnect
         connectSonyPeripheral(
             peripheral,
@@ -2604,6 +2621,7 @@ extension BLETestManager: CBCentralManagerDelegate {
         healthProbeStartedAt = nil
         log("[BLE] connected")
         log("[BLE-iOS] didConnect")
+        connectedDeviceName = peripheral.name ?? connectedDeviceName
         log("[BLE-Reconnect] restore services")
         let subscribeTimeout = DispatchWorkItem { [weak self, weak peripheral] in
             guard let self,
@@ -2640,6 +2658,7 @@ extension BLETestManager: CBCentralManagerDelegate {
         log("[BLE-iOS] didFailToConnect error=\(error?.localizedDescription ?? "unknown")")
         log("[BLE-Reconnect] failed reason=connect error=\(error?.localizedDescription ?? "unknown")")
         sonyPeripheral = nil
+        connectedDeviceName = "-"
         if currentConnectIsAutoReconnect || autoReconnectEnabled {
             scheduleReconnect(reason: "connect failed", immediate: false)
         }
@@ -2669,6 +2688,7 @@ extension BLETestManager: CBCentralManagerDelegate {
         stopHealthMonitoring(reason: "didDisconnect")
         setConnectionHealth(.disconnected, reason: "didDisconnect")
         sonyPeripheral = nil
+        connectedDeviceName = "-"
         clearConnectionTransports(reason: "disconnect")
         requestedAlbumArtKeys.removeAll()
         requestedHqAlbumArtIDs.removeAll()
