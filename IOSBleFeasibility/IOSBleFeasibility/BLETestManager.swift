@@ -112,6 +112,7 @@ private extension UIImage {
 }
 
 final class BLETestManager: NSObject, ObservableObject {
+    @Published private(set) var appExperienceMode: AppExperienceMode = .defaultMode
     @Published private(set) var mode = "BLE Central / GATT Client"
     @Published private(set) var connectionStatus = "未连接"
     @Published private(set) var logs: [String] = []
@@ -334,6 +335,7 @@ final class BLETestManager: NSObject, ObservableObject {
 
     override init() {
         super.init()
+        loadAppExperienceMode()
         log("[BLE-iOS] app log store ready")
         LiveActivityCommandBridge.shared.register(self, logger: { [weak self] message in
             self?.log(message)
@@ -346,6 +348,34 @@ final class BLETestManager: NSObject, ObservableObject {
         loadCachedPlaybackHistory()
         loadArtworkEnhancementSettings()
         updateArtworkEnhancementStatus(message: "ready")
+    }
+
+    func toggleAppExperienceMode() {
+        setAppExperienceMode(appExperienceMode.toggled)
+    }
+
+    func setAppExperienceMode(_ mode: AppExperienceMode) {
+        guard appExperienceMode != mode else { return }
+        appExperienceMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: AppExperienceMode.userDefaultsKey)
+        log("[AppMode] changed mode=\(mode.rawValue)")
+        if mode == .daily {
+            log("[AppMode] daily mode skip debug stats")
+        } else {
+            log("[AppMode] debug mode debug tools available")
+        }
+    }
+
+    private func loadAppExperienceMode() {
+        let raw = UserDefaults.standard.string(forKey: AppExperienceMode.userDefaultsKey)
+        let mode = raw.flatMap(AppExperienceMode.init(rawValue:)) ?? .defaultMode
+        appExperienceMode = mode
+        log("[AppMode] loaded mode=\(mode.rawValue)")
+        if mode == .daily {
+            log("[AppMode] daily mode skip debug stats")
+        } else {
+            log("[AppMode] debug mode debug tools available")
+        }
     }
 
     deinit {

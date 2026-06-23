@@ -15,6 +15,7 @@ struct FullLyricsView: View {
     let onPlayPause: () -> Void
     let onNext: () -> Void
     let onSeekToLine: (Int64) -> Void
+    var showDiagnosticButton = true
     let onShowDiagnostic: () -> Void
 
     @State private var isBrowsingLyrics = false
@@ -210,15 +211,22 @@ struct FullLyricsView: View {
             Text("暂无歌词")
                 .font(.system(size: 30, weight: .bold, design: .rounded))
                 .foregroundStyle(.white.opacity(0.62))
-            Button(action: onShowDiagnostic) {
-                Text("查看原因")
-                    .font(.callout.weight(.bold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 16)
-                    .frame(height: 36)
-                    .background(.white.opacity(0.12), in: Capsule())
+            if showDiagnosticButton {
+                Button(action: onShowDiagnostic) {
+                    Text("查看原因")
+                        .font(.callout.weight(.bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 16)
+                        .frame(height: 36)
+                        .background(.white.opacity(0.12), in: Capsule())
+                }
+                .buttonStyle(.plain)
+            } else {
+                Text("可在 Sony QQ音乐打开歌词/桌面歌词后稍等")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.58))
+                    .multilineTextAlignment(.center)
             }
-            .buttonStyle(.plain)
         }
             .frame(maxWidth: .infinity, alignment: .center)
     }

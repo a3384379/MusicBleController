@@ -31,6 +31,7 @@
 		A10000000000000000000022 /* LyricDiagnosticView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000025 /* LyricDiagnosticView.swift */; };
 		A10000000000000000000023 /* NowPlayingDiagnosticSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000026 /* NowPlayingDiagnosticSnapshot.swift */; };
 		A10000000000000000000024 /* NowPlayingDiagnosticView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000027 /* NowPlayingDiagnosticView.swift */; };
+		A10000000000000000000025 /* AppExperienceMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000028 /* AppExperienceMode.swift */; };
 		B10000000000000000000001 /* SonyMusicActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* SonyMusicActivityAttributes.swift */; };
 		B10000000000000000000002 /* LiveActivityManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000002 /* LiveActivityManager.swift */; };
 		B10000000000000000000003 /* SonyMusicLiveActivityExtensionBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000004 /* SonyMusicLiveActivityExtensionBundle.swift */; };
@@ -98,6 +99,7 @@
 		A20000000000000000000025 /* LyricDiagnosticView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LyricDiagnosticView.swift; sourceTree = "<group>"; };
 		A20000000000000000000026 /* NowPlayingDiagnosticSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NowPlayingDiagnosticSnapshot.swift; sourceTree = "<group>"; };
 		A20000000000000000000027 /* NowPlayingDiagnosticView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NowPlayingDiagnosticView.swift; sourceTree = "<group>"; };
+		A20000000000000000000028 /* AppExperienceMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppExperienceMode.swift; sourceTree = "<group>"; };
 		B20000000000000000000001 /* SonyMusicActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SonyMusicActivityAttributes.swift; sourceTree = "<group>"; };
 		B20000000000000000000002 /* LiveActivityManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityManager.swift; sourceTree = "<group>"; };
 		B20000000000000000000004 /* SonyMusicLiveActivityExtensionBundle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SonyMusicLiveActivityExtensionBundle.swift; sourceTree = "<group>"; };
@@ -154,6 +156,7 @@
 				A20000000000000000000019 /* PlaybackHistoryModels.swift */,
 				A20000000000000000000020 /* PlaybackHistoryStore.swift */,
 				A20000000000000000000021 /* PlaybackHistoryView.swift */,
+				A20000000000000000000028 /* AppExperienceMode.swift */,
 				A20000000000000000000022 /* LyricDisplayMode.swift */,
 				A20000000000000000000024 /* LyricDiagnostic.swift */,
 				A20000000000000000000025 /* LyricDiagnosticView.swift */,
@@ -321,6 +324,7 @@
 				A10000000000000000000022 /* LyricDiagnosticView.swift in Sources */,
 				A10000000000000000000023 /* NowPlayingDiagnosticSnapshot.swift in Sources */,
 				A10000000000000000000024 /* NowPlayingDiagnosticView.swift in Sources */,
+				A10000000000000000000025 /* AppExperienceMode.swift in Sources */,
 				A10000000000000000000020 /* ArtworkEnhancementManager.swift in Sources */,
 				A10000000000000000000008 /* AppLogStore.swift in Sources */,
 				A10000000000000000000003 /* BLEUUIDs.swift in Sources */,

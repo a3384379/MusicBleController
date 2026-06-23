@@ -66,6 +66,7 @@ struct ContentView: View {
                     onPlayPause: bleManager.sendPlayPause,
                     onNext: bleManager.sendNext,
                     onSeekToLine: bleManager.seekToLyricLine,
+                    showDiagnosticButton: isDebugMode,
                     onShowDiagnostic: {
                         showFullLyrics = false
                         showLyricDiagnostic = true
@@ -85,6 +86,13 @@ struct ContentView: View {
             }
             .onChange(of: bleManager.fullLyrics) { _, _ in
                 requestOptionalLyricsIfNeeded()
+            }
+            .onChange(of: bleManager.appExperienceMode) { _, mode in
+                if mode == .daily {
+                    showDebugPage = false
+                    showLyricDiagnostic = false
+                    showNowPlayingDiagnostic = false
+                }
             }
         }
     }
@@ -126,22 +134,44 @@ struct ContentView: View {
                 }
 
                 Button {
-                    showDebugPage = true
-                } label: {
-                    Label("调试工具", systemImage: "slider.horizontal.3")
-                }
-
-                Button {
                     showPlaybackHistory = true
                 } label: {
                     Label("播放历史", systemImage: "clock.arrow.circlepath")
                 }
 
                 Button {
-                    showNowPlayingDiagnostic = true
+                    bleManager.toggleAppExperienceMode()
                 } label: {
-                    Label("当前歌曲诊断", systemImage: "waveform.path.ecg.rectangle")
+                    Label(
+                        bleManager.appExperienceMode.toggleTitle,
+                        systemImage: isDebugMode ? "person.fill" : "ladybug.fill"
+                    )
                 }
+
+                if isDebugMode {
+                    Divider()
+
+                    Button {
+                        showNowPlayingDiagnostic = true
+                    } label: {
+                        Label("当前歌曲诊断", systemImage: "waveform.path.ecg.rectangle")
+                    }
+
+                    Button {
+                        bleManager.requestLyricDiagnostic(manual: true)
+                        showLyricDiagnostic = true
+                    } label: {
+                        Label("歌词诊断中心", systemImage: "text.magnifyingglass")
+                    }
+
+                    Button {
+                        showDebugPage = true
+                    } label: {
+                        Label("调试工具", systemImage: "slider.horizontal.3")
+                    }
+                }
+
+                Divider()
 
                 Picker("歌词显示", selection: lyricDisplayModeBinding) {
                     ForEach(LyricDisplayMode.allCases) { mode in
@@ -257,23 +287,43 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, minHeight: 48)
 
                     if currentLyricText == "暂无歌词" {
-                        Text("原因：\(bleManager.lyricDiagnostic?.statusTitle ?? "正在确认")")
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.white.opacity(0.54))
-                            .lineLimit(1)
+                        if isDebugMode {
+                            Text("原因：\(bleManager.lyricDiagnostic?.statusTitle ?? "正在确认")")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.white.opacity(0.54))
+                                .lineLimit(1)
 
-                        Button {
-                            bleManager.requestLyricDiagnostic(manual: true)
-                            showLyricDiagnostic = true
-                        } label: {
-                            Text("查看原因")
-                                .font(.caption.weight(.bold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 14)
-                                .frame(height: 30)
-                                .background(.white.opacity(0.10), in: Capsule())
+                            Button {
+                                bleManager.requestLyricDiagnostic(manual: true)
+                                showLyricDiagnostic = true
+                            } label: {
+                                Text("查看原因")
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 14)
+                                    .frame(height: 30)
+                                    .background(.white.opacity(0.10), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            Text("提示：可在 Sony QQ音乐打开歌词/桌面歌词后稍等")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.white.opacity(0.54))
+                                .multilineTextAlignment(.center)
+                                .lineLimit(2)
+
+                            Button {
+                                bleManager.refreshCurrentLyricFromNowPlayingDiagnostics()
+                            } label: {
+                                Text("刷新歌词")
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 14)
+                                    .frame(height: 30)
+                                    .background(.white.opacity(0.10), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
                     }
                 }
                 .frame(maxWidth: .infinity, minHeight: 82)
@@ -482,6 +532,10 @@ struct ContentView: View {
 
     private var isConnected: Bool {
         bleManager.connectionDisplayState == "connected"
+    }
+
+    private var isDebugMode: Bool {
+        bleManager.appExperienceMode == .debug
     }
 
     private var displayedPositionMs: Int64 {
