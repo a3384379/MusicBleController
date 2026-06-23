@@ -1246,6 +1246,15 @@ class BleGattServerManager(
                 )
             } else {
                 logger("[AlbumArtDebug] unavailable reason=too large")
+                sendAlbumArtUnavailable(
+                    device = device,
+                    protocolId = protocolId,
+                    quality = quality,
+                    reason = "too large",
+                    bestBytes = preparation.bestBytes,
+                    bestChunks = preparation.bestChunks,
+                    minCandidateScale = preparation.minCandidateScale
+                )
             }
             return
         }
@@ -1266,7 +1275,8 @@ class BleGattServerManager(
             logger(
                 "[AlbumArtHQ] selected scale=${compressedAlbumArt.width} " +
                     "quality=${compressedAlbumArt.quality} " +
-                    "bytes=${compressedAlbumArt.bytes.size} chunks=$totalChunks"
+                    "bytes=${compressedAlbumArt.bytes.size} chunks=$totalChunks " +
+                    "fallback=${preparedAlbumArt.fallback}"
             )
         } else if (useBinaryAlbumArt) {
             logger(
@@ -1373,6 +1383,24 @@ class BleGattServerManager(
                     minOf(bitmap.height, 240),
                     85,
                     HQ_MAX_JPEG_BYTES
+                ),
+                CompressionAttempt(
+                    minOf(bitmap.width, 224),
+                    minOf(bitmap.height, 224),
+                    82,
+                    HQ_MAX_JPEG_BYTES
+                ),
+                CompressionAttempt(
+                    minOf(bitmap.width, 208),
+                    minOf(bitmap.height, 208),
+                    80,
+                    HQ_MAX_JPEG_BYTES
+                ),
+                CompressionAttempt(
+                    minOf(bitmap.width, 192),
+                    minOf(bitmap.height, 192),
+                    78,
+                    HQ_MAX_JPEG_BYTES
                 )
             ).distinctBy {
                 "${it.width}x${it.height}@${it.quality}"
@@ -1396,6 +1424,9 @@ class BleGattServerManager(
             AlbumArtQuality.HQ -> ALBUM_ART_HQ_MAX_CHUNKS
             AlbumArtQuality.FULL -> ALBUM_ART_FULL_MAX_CHUNKS
         }
+        var bestBytes = Int.MAX_VALUE
+        var bestChunks = 0
+        var minCandidateScale = Int.MAX_VALUE
 
         attempts.forEachIndexed { index, attempt ->
             if (index > 0) {
@@ -1431,6 +1462,7 @@ class BleGattServerManager(
                 }
                 return AlbumArtPreparation(compressionFailed = true)
             }
+            minCandidateScale = minOf(minCandidateScale, minOf(compressed.width, compressed.height))
             val packets = if (binaryTransport) {
                 buildBinaryAlbumArtPackets(
                     deviceMaximumPayload = deviceMaximumPayload,
@@ -1449,6 +1481,14 @@ class BleGattServerManager(
                 )
             }
             if (packets == null) {
+                if (compressed.bytes.size < bestBytes) {
+                    bestBytes = compressed.bytes.size
+                    bestChunks = estimateAlbumArtChunks(
+                        binaryTransport = binaryTransport,
+                        deviceMaximumPayload = deviceMaximumPayload,
+                        bytes = compressed.bytes.size
+                    )
+                }
                 val prefix = if (binaryTransport && quality == AlbumArtQuality.HQ) {
                     "[AlbumArtHQ]"
                 } else if (quality == AlbumArtQuality.PREVIEW && binaryTransport) {
@@ -1471,6 +1511,10 @@ class BleGattServerManager(
                 }
                 val accepted = compressed.bytes.size <= attempt.maximumBytes &&
                     packets.totalChunks <= maximumChunks
+                if (!accepted && compressed.bytes.size < bestBytes) {
+                    bestBytes = compressed.bytes.size
+                    bestChunks = packets.totalChunks
+                }
                 val rejectReason = when {
                     compressed.bytes.size > attempt.maximumBytes -> "bytes_exceed"
                     packets.totalChunks > maximumChunks -> "chunks_exceed"
@@ -1507,7 +1551,11 @@ class BleGattServerManager(
                 return AlbumArtPreparation(
                     prepared = PreparedAlbumArt(
                         compressed = compressed,
-                        packets = packets
+                        packets = packets,
+                        fallback = quality == AlbumArtQuality.HQ &&
+                            (attempt.width < bitmap.width ||
+                                attempt.height < bitmap.height ||
+                                attempt.quality < 88)
                     )
                 )
             }
@@ -1526,7 +1574,27 @@ class BleGattServerManager(
         } else {
             logger("[AlbumArt] skip because too large chunks")
         }
-        return AlbumArtPreparation()
+        return AlbumArtPreparation(
+            bestBytes = if (bestBytes == Int.MAX_VALUE) 0 else bestBytes,
+            bestChunks = bestChunks,
+            minCandidateScale = if (minCandidateScale == Int.MAX_VALUE) 0 else minCandidateScale
+        )
+    }
+
+    private fun estimateAlbumArtChunks(
+        binaryTransport: Boolean,
+        deviceMaximumPayload: Int,
+        bytes: Int
+    ): Int {
+        val chunkSize = if (binaryTransport) {
+            deviceMaximumPayload - ALBUM_ART_BINARY_HEADER_BYTES
+        } else {
+            MAX_ALBUM_CHUNK_RAW_BYTES
+        }
+        if (chunkSize <= 0) {
+            return 0
+        }
+        return (bytes + chunkSize - 1) / chunkSize
     }
 
     private fun compressAlbumArt(
@@ -1812,13 +1880,26 @@ class BleGattServerManager(
         device: BluetoothDevice,
         protocolId: String,
         quality: AlbumArtQuality,
-        reason: String
+        reason: String,
+        bestBytes: Int = 0,
+        bestChunks: Int = 0,
+        minCandidateScale: Int = 0
     ) {
-        val value = JSONObject()
+        val objectValue = JSONObject()
             .put("type", "albumArtUnavailable")
             .put("id", protocolId)
             .put("quality", quality.wireValue)
-            .toString()
+            .put("reason", reason)
+        if (bestBytes > 0) {
+            objectValue.put("bestBytes", bestBytes)
+        }
+        if (bestChunks > 0) {
+            objectValue.put("bestChunks", bestChunks)
+        }
+        if (minCandidateScale > 0) {
+            objectValue.put("minCandidateScale", minCandidateScale)
+        }
+        val value = objectValue.toString()
             .toByteArray(Charsets.UTF_8)
         if (value.size > maximumPayloadFor(device)) {
             logger("[AlbumArt][BLE] unavailable message exceeds MTU")
@@ -1827,6 +1908,13 @@ class BleGattServerManager(
         }
         logger("[AlbumArt][BLE] unavailable")
         logger("[AlbumArtDebug] unavailable reason=$reason")
+        if (quality == AlbumArtQuality.HQ) {
+            logger(
+                "[AlbumArtHQ] unavailable sent reason=$reason " +
+                    "bestBytes=$bestBytes bestChunks=$bestChunks " +
+                    "minCandidateScale=$minCandidateScale"
+            )
+        }
         notifyQueue.enqueueShort(
             device = device,
             type = "albumArtUnavailable",
@@ -3325,11 +3413,15 @@ class BleGattServerManager(
 
     private data class PreparedAlbumArt(
         val compressed: CompressedAlbumArt,
-        val packets: AlbumArtPackets
+        val packets: AlbumArtPackets,
+        val fallback: Boolean = false
     )
 
     private data class AlbumArtPreparation(
         val prepared: PreparedAlbumArt? = null,
-        val compressionFailed: Boolean = false
+        val compressionFailed: Boolean = false,
+        val bestBytes: Int = 0,
+        val bestChunks: Int = 0,
+        val minCandidateScale: Int = 0
     )
 }

@@ -160,6 +160,11 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var autoReconnectState = AutoReconnectState.idle.rawValue
     @Published private(set) var autoReconnectAttempt = 0
     @Published private(set) var autoReconnectNextRetryAt: Date?
+    @Published private(set) var autoReconnectWorkItemExists = false
+    @Published private(set) var autoReconnectScheduledAgeMs: Int64 = -1
+    @Published private(set) var autoReconnectScheduledDelayMs: Int64 = 0
+    @Published private(set) var autoReconnectIsConnecting = false
+    @Published private(set) var autoReconnectIsScanning = false
     @Published private(set) var autoReconnectLastPeripheralId =
         UserDefaults.standard.string(forKey: AUTO_RECONNECT_LAST_PERIPHERAL_KEY) ?? "-"
     @Published private(set) var autoReconnectLastDisconnectError = "-"
@@ -234,6 +239,10 @@ final class BLETestManager: NSObject, ObservableObject {
     private var requestedAlbumArtKeys: Set<String> = []
     private var requestedHqAlbumArtIDs: Set<String> = []
     private var hqAlbumArtWorkItem: DispatchWorkItem?
+    private var hqAlbumArtUnavailableReason = "-"
+    private var hqAlbumArtUnavailableBestBytes = 0
+    private var hqAlbumArtUnavailableBestChunks = 0
+    private var hqAlbumArtUnavailableMinCandidateScale = 0
     private var requestedFullLyricsTrackIDs: Set<String> = []
     private var fullLyricsUnavailableTrackIDs: Set<String> = []
     private var fullLyricsDelayedRetryTrackIDs: Set<String> = []
@@ -277,6 +286,9 @@ final class BLETestManager: NSObject, ObservableObject {
     private var shouldScanWhenPoweredOn = false
     private var scanTimeoutWorkItem: DispatchWorkItem?
     private var reconnectWorkItem: DispatchWorkItem?
+    private var reconnectStuckCheckWorkItem: DispatchWorkItem?
+    private var reconnectScheduledAt: Date?
+    private var reconnectScheduledDelayMs: Int64 = 0
     private var connectTimeoutWorkItem: DispatchWorkItem?
     private var healthCheckWorkItem: DispatchWorkItem?
     private var healthProbeTimeoutWorkItem: DispatchWorkItem?
@@ -402,7 +414,7 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     func forceReconnect() {
-        log("[BLE-Reconnect] force reconnect requested")
+        log("[BLE-Reconnect] hard reconnect requested reason=manual")
         performHardReconnect(reason: "manual force reconnect", manual: true)
     }
 
@@ -418,7 +430,7 @@ final class BLETestManager: NSObject, ObservableObject {
         lastHardReconnectAt = now
         connectionHealthHardReconnectCount += 1
         log("[BLE-Health] hard reconnect reason=\(reason)")
-        cancelPendingReconnect(reason: "force reconnect")
+        cancelPendingReconnect(reason: manual ? "manual hard reconnect" : "force reconnect")
         if manual {
             manualReconnectCount += 1
             autoReconnectAttempt = 0
@@ -444,6 +456,7 @@ final class BLETestManager: NSObject, ObservableObject {
         setStatus("正在重新连接")
         refreshConnectionDisplayState(reason: "hard reconnect \(reason)")
         if manual {
+            log("[BLE-Reconnect] start fresh scan")
             beginSonyScan(reason: "force reconnect", isAutoReconnect: false, force: true)
         } else {
             setAutoReconnectState(.failed)
@@ -529,16 +542,45 @@ final class BLETestManager: NSObject, ObservableObject {
         log("[NowDiag] refresh all requested trackId=\(currentTrackID)")
     }
 
-    func requestCurrentHqAlbumArt() {
+    func refreshCurrentLyricFromNowPlayingDiagnostics() {
+        log("[NowDiag] refresh lyric requested trackId=\(currentTrackID)")
+        requestLyricDiagnostic(manual: true)
+        sendGetFullLyrics(force: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.log("[NowDiag] lyric refresh completed trackId=\(self?.currentTrackID ?? "-")")
+        }
+    }
+
+    @discardableResult
+    func requestCurrentHqAlbumArt() -> Bool {
         let id = currentAlbumArtID
         guard !id.isEmpty else {
             log("[NowDiag] hq artwork request skipped reason=no artwork id")
-            return
+            return false
+        }
+        guard connectionDisplayState == ConnectionDisplayState.connected.rawValue,
+              connectionHealthCharacteristicReady else {
+            log(
+                "[NowDiag] request HQ skipped reason=not ready " +
+                    "display=\(connectionDisplayState) ready=\(connectionHealthCharacteristicReady)"
+            )
+            return false
+        }
+        guard connectionHealthState != ConnectionHealthState.stale.rawValue,
+              connectionHealthState != ConnectionHealthState.disconnected.rawValue else {
+            log("[NowDiag] request HQ skipped reason=unhealthy health=\(connectionHealthState)")
+            return false
+        }
+        guard albumArtExpectedChunks == 0,
+              binaryAlbumArtExpectedChunks == 0 else {
+            log("[NowDiag] request HQ skipped reason=album art transfer in progress")
+            return false
         }
         requestedHqAlbumArtIDs.remove(id)
         requestedAlbumArtKeys.remove("\(id)|hq")
-        log("[NowDiag] hq artwork request id=\(id)")
+        log("[NowDiag] request HQ artwork id=\(id)")
         requestHqAlbumArt(id: id)
+        return true
     }
 
     func noteNowPlayingDiagnosticsCopied(trackId: String) {
@@ -574,6 +616,10 @@ final class BLETestManager: NSObject, ObservableObject {
             displayArtworkPixelHeight: displayHeight,
             artworkEnhancementStatus: artworkEnhancementStatus,
             artworkCaches: makeArtworkCacheDiagnostics(id: currentAlbumArtID),
+            hqUnavailableReason: hqAlbumArtUnavailableReason,
+            hqUnavailableBestBytes: hqAlbumArtUnavailableBestBytes,
+            hqUnavailableBestChunks: hqAlbumArtUnavailableBestChunks,
+            hqUnavailableMinCandidateScale: hqAlbumArtUnavailableMinCandidateScale,
             isPlaying: isPlaying,
             positionMs: displayPositionMs,
             durationMs: durationMs,
@@ -1300,6 +1346,7 @@ final class BLETestManager: NSObject, ObservableObject {
             connectTimeoutWorkItem?.cancel()
             connectTimeoutWorkItem = nil
             isConnectingToSony = false
+            updateAutoReconnectDebugFields()
         }
         if reason.hasPrefix("foreground") {
             reconnectStartedAtMs = currentTimeMs()
@@ -1355,6 +1402,7 @@ final class BLETestManager: NSObject, ObservableObject {
         currentScanIsAutoReconnect = isAutoReconnect
         scanStartedAtMs = currentTimeMs()
         setAutoReconnectState(.scanning)
+        updateAutoReconnectDebugFields()
         centralManager.scanForPeripherals(
             withServices: [BLEUUIDs.service],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
@@ -1374,6 +1422,7 @@ final class BLETestManager: NSObject, ObservableObject {
             self.autoReconnectLastScanCostMs = self.currentTimeMs() - self.scanStartedAtMs
             self.setStatus(self.autoReconnectEnabled ? "未找到，稍后重试" : "未连接")
             self.setAutoReconnectState(.failed)
+            self.updateAutoReconnectDebugFields()
             self.log("[BLE] scan timeout: SonyPlayerAgent not found")
             self.log("[BLE-Reconnect] scan timeout attempt=\(self.autoReconnectAttempt)")
             self.log("[BLE-iOS] scan timeout status reset")
@@ -1764,6 +1813,20 @@ final class BLETestManager: NSObject, ObservableObject {
 
     private func setAutoReconnectState(_ state: AutoReconnectState) {
         autoReconnectState = state.rawValue
+        if state == .reconnectScheduled {
+            if reconnectScheduledAt == nil {
+                reconnectScheduledAt = Date()
+            }
+            scheduleReconnectStuckCheck()
+        } else {
+            reconnectStuckCheckWorkItem?.cancel()
+            reconnectStuckCheckWorkItem = nil
+            if state != .failed {
+                reconnectScheduledAt = nil
+                reconnectScheduledDelayMs = 0
+            }
+        }
+        updateAutoReconnectDebugFields()
         refreshConnectionDisplayState(reason: "autoReconnectState \(state.rawValue)")
     }
 
@@ -1783,13 +1846,22 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     private func cancelPendingReconnect(reason: String) {
+        if reconnectWorkItem != nil {
+            log("[BLE-Reconnect] work item cancelled reason=\(reason)")
+        }
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
+        reconnectStuckCheckWorkItem?.cancel()
+        reconnectStuckCheckWorkItem = nil
         autoReconnectNextRetryAt = nil
-        log("[BLE-Reconnect] cancelled reason=\(reason)")
+        reconnectScheduledAt = nil
+        reconnectScheduledDelayMs = 0
+        updateAutoReconnectDebugFields()
+        log("[BLE-Reconnect] pending schedule cleared reason=\(reason)")
     }
 
     private func scheduleReconnect(reason: String, immediate: Bool) {
+        log("[BLE-Reconnect] schedule requested reason=\(reason) immediate=\(immediate)")
         guard autoReconnectEnabled else {
             log("[BLE-Reconnect] schedule skipped reason=disabled trigger=\(reason)")
             return
@@ -1806,22 +1878,41 @@ final class BLETestManager: NSObject, ObservableObject {
             log("[BLE-Reconnect] schedule skipped reason=already connected trigger=\(reason)")
             return
         }
-        if isReconnectInProgress {
-            log("[BLE-Reconnect] schedule skipped reason=in progress state=\(autoReconnectState) trigger=\(reason)")
+        if reconnectWorkItem != nil {
+            log("[BLE-Reconnect] schedule skipped reason=existing work item trigger=\(reason)")
+            updateAutoReconnectDebugFields()
             return
+        }
+        if isActiveReconnectState {
+            log("[BLE-Reconnect] schedule skipped reason=active reconnect state=\(autoReconnectState) trigger=\(reason)")
+            return
+        }
+        if AutoReconnectState(rawValue: autoReconnectState) == .reconnectScheduled {
+            log("[BLE-Reconnect] recover missing work item state=reconnectScheduled")
         }
 
         reconnectWorkItem?.cancel()
         autoReconnectAttempt += 1
         let delayMs = immediate ? 0 : reconnectDelayMs(for: autoReconnectAttempt)
         autoReconnectNextRetryAt = Date().addingTimeInterval(TimeInterval(delayMs) / 1_000)
+        reconnectScheduledAt = Date()
+        reconnectScheduledDelayMs = delayMs
         setAutoReconnectState(.reconnectScheduled)
         log("[BLE-Reconnect] scheduled attempt=\(autoReconnectAttempt) delayMs=\(delayMs) reason=\(reason)")
 
-        let item = DispatchWorkItem { [weak self] in
-            self?.startAutoReconnect(reason: reason)
+        let scheduledAttempt = autoReconnectAttempt
+        var item: DispatchWorkItem!
+        item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard !item.isCancelled else {
+                self.log("[BLE-Reconnect] work item cancelled attempt=\(scheduledAttempt)")
+                return
+            }
+            self.log("[BLE-Reconnect] work item fired attempt=\(scheduledAttempt)")
+            self.startAutoReconnect(reason: reason)
         }
         reconnectWorkItem = item
+        updateAutoReconnectDebugFields()
         DispatchQueue.main.asyncAfter(deadline: .now() + TimeInterval(delayMs) / 1_000, execute: item)
     }
 
@@ -1829,6 +1920,9 @@ final class BLETestManager: NSObject, ObservableObject {
         guard autoReconnectEnabled else { return }
         reconnectWorkItem = nil
         autoReconnectNextRetryAt = nil
+        reconnectScheduledAt = nil
+        reconnectScheduledDelayMs = 0
+        updateAutoReconnectDebugFields()
         reconnectStartedAtMs = currentTimeMs()
         autoReconnectCount += 1
         log("[BLE-Reconnect] start attempt=\(autoReconnectAttempt) reason=\(reason)")
@@ -1896,6 +1990,7 @@ final class BLETestManager: NSObject, ObservableObject {
             return
         }
         isConnectingToSony = true
+        updateAutoReconnectDebugFields()
         connectTimeoutWorkItem?.cancel()
         connectStartedAtMs = currentTimeMs()
         currentConnectIsRetrievedPeripheral = isRetrieved
@@ -1923,6 +2018,7 @@ final class BLETestManager: NSObject, ObservableObject {
                 self.log("[BLE-Reconnect] connect timeout id=\(peripheral.identifier.uuidString) costMs=\(costMs)")
             }
             self.isConnectingToSony = false
+            self.updateAutoReconnectDebugFields()
             self.centralManager.cancelPeripheralConnection(peripheral)
             self.sonyPeripheral = nil
             self.setAutoReconnectState(.failed)
@@ -2133,12 +2229,49 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     private var isReconnectInProgress: Bool {
+        reconnectWorkItem != nil || isActiveReconnectState
+    }
+
+    private var isActiveReconnectState: Bool {
         switch AutoReconnectState(rawValue: autoReconnectState) {
-        case .reconnectScheduled, .scanning, .connecting, .serviceDiscovering, .subscribing, .syncing:
+        case .scanning, .connecting, .serviceDiscovering, .subscribing, .syncing:
             return true
         default:
             return false
         }
+    }
+
+    private func updateAutoReconnectDebugFields() {
+        autoReconnectWorkItemExists = reconnectWorkItem != nil
+        if let reconnectScheduledAt {
+            autoReconnectScheduledAgeMs = Int64(Date().timeIntervalSince(reconnectScheduledAt) * 1_000)
+        } else {
+            autoReconnectScheduledAgeMs = -1
+        }
+        autoReconnectScheduledDelayMs = reconnectScheduledDelayMs
+        autoReconnectIsConnecting = isConnectingToSony
+        autoReconnectIsScanning = AutoReconnectState(rawValue: autoReconnectState) == .scanning
+    }
+
+    private func scheduleReconnectStuckCheck() {
+        reconnectStuckCheckWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.updateAutoReconnectDebugFields()
+            guard AutoReconnectState(rawValue: self.autoReconnectState) == .reconnectScheduled,
+                  self.reconnectWorkItem == nil else {
+                return
+            }
+            let ageMs = self.reconnectScheduledAt.map {
+                Int64(Date().timeIntervalSince($0) * 1_000)
+            } ?? -1
+            guard ageMs < 0 || ageMs > 2_000 else { return }
+            self.log("[BLE-Reconnect] stuck scheduled detected no workItem ageMs=\(ageMs)")
+            self.log("[BLE-Reconnect] recover stuck scheduled now")
+            self.scheduleReconnect(reason: "recover stuck scheduled", immediate: true)
+        }
+        reconnectStuckCheckWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: item)
     }
 
     private func recordLiveActivityControlResult(
@@ -2388,6 +2521,7 @@ extension BLETestManager: CBCentralManagerDelegate {
             return
         }
         isConnectingToSony = false
+        updateAutoReconnectDebugFields()
         connectTimeoutWorkItem?.cancel()
         connectTimeoutWorkItem = nil
         autoReconnectLastConnectCostMs = currentTimeMs() - connectStartedAtMs
@@ -2456,7 +2590,9 @@ extension BLETestManager: CBCentralManagerDelegate {
         let errorText = error?.localizedDescription ?? "none"
         autoReconnectLastDisconnectError = errorText
         setStatus(autoReconnectEnabled ? "正在连接" : "未连接")
-        setAutoReconnectState(autoReconnectEnabled ? .reconnectScheduled : .idle)
+        if !autoReconnectEnabled {
+            setAutoReconnectState(.idle)
+        }
         log("[BLE] disconnected error=\(errorText)")
         log("[BLE-iOS] didDisconnect error=\(errorText)")
         log("[BLE-Reconnect] disconnected error=\(errorText)")
@@ -2469,7 +2605,9 @@ extension BLETestManager: CBCentralManagerDelegate {
         clearPendingVolume()
         log("[BLE-Reconnect] update LiveActivity disconnected")
         updateLiveActivityDisconnected()
-        scheduleReconnect(reason: "disconnect", immediate: false)
+        if autoReconnectEnabled {
+            scheduleReconnect(reason: "disconnect", immediate: false)
+        }
     }
 }
 
@@ -3057,9 +3195,26 @@ extension BLETestManager: CBPeripheralDelegate {
             case "albumArtUnavailable":
                 let id = object["id"] as? String ?? ""
                 let quality = object["quality"] as? String ?? "preview"
+                let reason = object["reason"] as? String ?? "unknown"
+                let bestBytes = Self.intValue(object["bestBytes"])
+                let bestChunks = Self.intValue(object["bestChunks"])
+                let minCandidateScale = Self.intValue(object["minCandidateScale"])
                 self.resetAlbumArtTransfer()
                 self.resetBinaryAlbumArtTransfer()
                 self.requestedAlbumArtKeys.remove("\(id)|\(quality)")
+                if id == self.currentAlbumArtID,
+                   quality == "hq" {
+                    self.hqAlbumArtUnavailableReason = reason
+                    self.hqAlbumArtUnavailableBestBytes = bestBytes
+                    self.hqAlbumArtUnavailableBestChunks = bestChunks
+                    self.hqAlbumArtUnavailableMinCandidateScale = minCandidateScale
+                    self.log(
+                        "[AlbumArt-iOS] unavailable id=\(id) quality=hq " +
+                            "reason=\(reason) bestBytes=\(bestBytes) " +
+                            "bestChunks=\(bestChunks) minCandidateScale=\(minCandidateScale)"
+                    )
+                    self.log("[NowDiag] artwork hq unavailable reason=\(reason)")
+                }
                 if id == self.currentAlbumArtID,
                    quality == "preview" {
                     self.cancelAlbumArtFallback()
@@ -3071,7 +3226,7 @@ extension BLETestManager: CBPeripheralDelegate {
                     self.updateLiveActivity(force: true, reason: "albumArt")
                 }
                 self.log(
-                    "[AlbumArt] unavailable id=\(id) quality=\(quality)"
+                    "[AlbumArt] unavailable id=\(id) quality=\(quality) reason=\(reason)"
                 )
 
             case "logStart":
@@ -4366,6 +4521,10 @@ extension BLETestManager: CBPeripheralDelegate {
         currentAlbumArtID = id
         currentCachedAlbumArtQuality = ""
         artworkDisplayQuality = .placeholder
+        hqAlbumArtUnavailableReason = "-"
+        hqAlbumArtUnavailableBestBytes = 0
+        hqAlbumArtUnavailableBestChunks = 0
+        hqAlbumArtUnavailableMinCandidateScale = 0
         artworkEnhancementABOriginalMode = false
         updateArtworkEnhancementStatus(message: "track changed")
         clearLiveArtwork(reason: "track changed", shouldUpdate: false)

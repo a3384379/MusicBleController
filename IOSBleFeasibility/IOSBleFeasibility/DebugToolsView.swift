@@ -143,6 +143,11 @@ struct DebugToolsView: View {
                     debugRow("Enabled", bleManager.autoReconnectEnabled ? "true" : "false")
                     debugRow("State", bleManager.autoReconnectState)
                     debugRow("Attempt", "\(bleManager.autoReconnectAttempt)")
+                    debugRow("Work item", bleManager.autoReconnectWorkItemExists ? "true" : "false")
+                    debugRow("Scheduled age", reconnectScheduledAgeText)
+                    debugRow("Scheduled delay", "\(bleManager.autoReconnectScheduledDelayMs)ms")
+                    debugRow("Is scanning", bleManager.autoReconnectIsScanning ? "true" : "false")
+                    debugRow("Is connecting", bleManager.autoReconnectIsConnecting ? "true" : "false")
                     debugRow("Next retry", reconnectRetryText)
                     debugRow("Last peripheral", bleManager.autoReconnectLastPeripheralId)
                     debugRow("Last error", bleManager.autoReconnectLastDisconnectError)
@@ -557,6 +562,15 @@ struct DebugToolsView: View {
         guard let retryAt = bleManager.autoReconnectNextRetryAt else { return "-" }
         let remaining = max(0, retryAt.timeIntervalSinceNow)
         return String(format: "%.1fs", remaining)
+    }
+
+    private var reconnectScheduledAgeText: String {
+        let ageMs = bleManager.autoReconnectScheduledAgeMs
+        guard ageMs >= 0 else { return "-" }
+        if ageMs < 1_000 {
+            return "\(ageMs)ms"
+        }
+        return String(format: "%.1fs", Double(ageMs) / 1_000.0)
     }
 
     private var healthNotifyAgeText: String {

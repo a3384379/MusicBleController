@@ -51,6 +51,10 @@ struct NowPlayingDiagnosticSnapshot {
     let displayArtworkPixelHeight: Int
     let artworkEnhancementStatus: ArtworkEnhancementDebugStatus
     let artworkCaches: [ArtworkCacheDiagnostic]
+    let hqUnavailableReason: String
+    let hqUnavailableBestBytes: Int
+    let hqUnavailableBestChunks: Int
+    let hqUnavailableMinCandidateScale: Int
     let isPlaying: Bool
     let positionMs: Int64
     let durationMs: Int64
@@ -61,8 +65,79 @@ struct NowPlayingDiagnosticSnapshot {
     let isFullLyricsReceiving: Bool
     let connection: ConnectionDiagnosticSnapshot
 
+    var quickSnapshotText: String {
+        """
+        [Quick Snapshot]
+        time=\(Self.dateTimeFormatter.string(from: generatedAt))
+        displayState=\(connection.displayState)
+        health=\(connection.healthState)
+        lyricStatus=\(lyricDiagnostic?.status ?? "-")
+        lyricReason=\(lyricDiagnostic?.reason ?? "-")
+        artworkQuality=\(albumArtDisplayQuality)
+        trackId=\(trackId)
+        """
+    }
+
+    var recentIssues: [String] {
+        var issues: [String] = []
+        if let lyricDiagnostic {
+            let status = lyricDiagnostic.status
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            if status != "loaded", status != "loading" {
+                issues.append("歌词：\(lyricDiagnostic.statusTitle)")
+            } else if status == "loading" {
+                issues.append("歌词：正在加载")
+            }
+        } else if currentLyric.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            issues.append("歌词：暂无诊断数据")
+        }
+
+        let hqCache = artworkCaches.first { $0.quality == "hq" }
+        if albumArtDisplayQuality == "placeholder" {
+            issues.append("封面：当前没有可显示封面")
+        } else if !hqUnavailableReason.isEmpty,
+                  hqUnavailableReason != "-" {
+            issues.append("封面：HQ 未生成，\(hqUnavailableReason)")
+        } else if albumArtDisplayQuality == "preview", hqCache?.exists != true {
+            issues.append("封面：仅 Preview，HQ 不存在")
+        } else if albumArtDisplayQuality == "hq",
+                  artworkEnhancementStatus.enabled,
+                  artworkEnhancementStatus.displayQuality != .enhanced {
+            issues.append("封面：HQ 可用，增强图未显示")
+        }
+
+        if connection.displayState != "connected" {
+            issues.append("连接：\(connection.displayState)")
+        } else if connection.healthState != "healthy" {
+            issues.append("连接：\(connection.healthState)")
+        } else if connection.lastNotifyAgeMs > 5_000 {
+            issues.append("连接：\(connection.lastNotifyAgeMs)ms 未收到通知")
+        }
+
+        return issues.isEmpty ? ["状态正常"] : issues
+    }
+
+    var canRequestHqArtwork: Bool {
+        !albumArtId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            connection.displayState == "connected" &&
+            connection.characteristicReady &&
+            connection.healthState != "stale" &&
+            connection.healthState != "disconnected"
+    }
+
+    var canForceReconnect: Bool {
+        connection.displayState == "connected" ||
+            connection.displayState == "reconnecting" ||
+            connection.displayState == "connecting" ||
+            connection.healthState == "suspect" ||
+            connection.healthState == "stale"
+    }
+
     var diagnosticText: String {
         var lines: [String] = []
+        lines.append(quickSnapshotText)
+        lines.append("")
         lines.append("Now Playing Diagnostics")
         lines.append("generatedAt: \(Self.dateTimeFormatter.string(from: generatedAt))")
         lines.append("")
@@ -104,6 +179,10 @@ struct NowPlayingDiagnosticSnapshot {
         lines.append("enhancementLastCostMs: \(artworkEnhancementStatus.lastProcessingCostMs)")
         lines.append("enhancementEdgeGain: \(String(format: "%.2f", artworkEnhancementStatus.lastEdgeGainPercent))")
         lines.append("enhancementMessage: \(artworkEnhancementStatus.lastMessage)")
+        lines.append("hqUnavailableReason: \(hqUnavailableReason)")
+        lines.append("hqUnavailableBestBytes: \(hqUnavailableBestBytes)")
+        lines.append("hqUnavailableBestChunks: \(hqUnavailableBestChunks)")
+        lines.append("hqUnavailableMinCandidateScale: \(hqUnavailableMinCandidateScale)")
         for cache in artworkCaches {
             lines.append(
                 "\(cache.quality): exists=\(cache.exists) bytes=\(cache.bytes) " +

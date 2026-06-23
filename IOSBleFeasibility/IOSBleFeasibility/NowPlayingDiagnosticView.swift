@@ -6,6 +6,9 @@ struct NowPlayingDiagnosticView: View {
     let onDismiss: () -> Void
     @State private var snapshot: NowPlayingDiagnosticSnapshot?
     @State private var copyStatus = ""
+    @State private var actionStatus = ""
+    @State private var showReconnectConfirmation = false
+    @State private var showDebugTools = false
 
     var body: some View {
         NavigationStack {
@@ -28,7 +31,8 @@ struct NowPlayingDiagnosticView: View {
                             lyricCard(snapshot)
                             artworkCard(snapshot)
                             connectionCard(snapshot)
-                            actionCard(snapshot)
+                            recentIssuesCard(snapshot)
+                            quickActionsCard(snapshot)
                         } else {
                             ProgressView("正在生成诊断")
                                 .tint(.white)
@@ -66,6 +70,19 @@ struct NowPlayingDiagnosticView: View {
         }
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
+        .sheet(isPresented: $showDebugTools) {
+            DebugToolsView(bleManager: bleManager)
+        }
+        .alert("重新连接 Sony？", isPresented: $showReconnectConfirmation) {
+            Button("取消", role: .cancel) {}
+            Button("重新连接", role: .destructive) {
+                actionStatus = "正在重连..."
+                bleManager.forceReconnect()
+                refreshSnapshot(after: 0.35)
+            }
+        } message: {
+            Text("会断开当前 BLE 连接并立即重新扫描连接。")
+        }
     }
 
     private func trackCard(_ snapshot: NowPlayingDiagnosticSnapshot) -> some View {
@@ -157,6 +174,21 @@ struct NowPlayingDiagnosticView: View {
                     String(format: "%.2f%%", snapshot.artworkEnhancementStatus.lastEdgeGainPercent)
                 )
                 diagnosticRow("增强状态", snapshot.artworkEnhancementStatus.lastMessage)
+                if snapshot.hqUnavailableReason != "-" &&
+                    !snapshot.hqUnavailableReason.isEmpty {
+                    diagnosticRow("HQ 未生成", snapshot.hqUnavailableReason)
+                    diagnosticRow(
+                        "最佳候选",
+                        "\(snapshot.hqUnavailableBestBytes) bytes / " +
+                            "\(snapshot.hqUnavailableBestChunks) chunks"
+                    )
+                    diagnosticRow(
+                        "最低候选尺寸",
+                        snapshot.hqUnavailableMinCandidateScale > 0
+                            ? "\(snapshot.hqUnavailableMinCandidateScale)"
+                            : "-"
+                    )
+                }
 
                 VStack(spacing: 8) {
                     ForEach(snapshot.artworkCaches) { cache in
@@ -193,10 +225,34 @@ struct NowPlayingDiagnosticView: View {
         }
     }
 
-    private func actionCard(_ snapshot: NowPlayingDiagnosticSnapshot) -> some View {
+    private func recentIssuesCard(_ snapshot: NowPlayingDiagnosticSnapshot) -> some View {
         DiagnosticCard {
             VStack(alignment: .leading, spacing: 12) {
-                Label("操作", systemImage: "wrench.and.screwdriver")
+                Label("Recent Issues", systemImage: "exclamationmark.triangle")
+                    .font(.headline.weight(.bold))
+
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(snapshot.recentIssues, id: \.self) { issue in
+                        HStack(alignment: .top, spacing: 8) {
+                            Circle()
+                                .fill(issue == "状态正常" ? Color.green : Color.orange)
+                                .frame(width: 7, height: 7)
+                                .padding(.top, 5)
+                            Text(issue)
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(.white.opacity(0.82))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func quickActionsCard(_ snapshot: NowPlayingDiagnosticSnapshot) -> some View {
+        DiagnosticCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Quick Actions", systemImage: "bolt.fill")
                     .font(.headline.weight(.bold))
 
                 LazyVGrid(
@@ -206,35 +262,45 @@ struct NowPlayingDiagnosticView: View {
                     ],
                     spacing: 10
                 ) {
-                    actionButton("刷新全部", "arrow.clockwise") {
+                    actionButton("刷新诊断", "arrow.clockwise") {
+                        actionStatus = "正在刷新诊断..."
                         bleManager.refreshNowPlayingDiagnostics()
                         refreshSnapshot(after: 0.35)
                     }
-                    actionButton("刷新歌词诊断", "text.magnifyingglass") {
-                        bleManager.requestLyricDiagnostic(manual: true)
+                    actionButton("刷新歌词", "text.magnifyingglass") {
+                        actionStatus = "正在重新检查歌词状态"
+                        bleManager.refreshCurrentLyricFromNowPlayingDiagnostics()
                         refreshSnapshot(after: 0.35)
                     }
-                    actionButton("请求完整歌词", "text.quote") {
-                        bleManager.sendGetFullLyrics(force: true)
+                    actionButton(
+                        "请求 HQ 封面",
+                        "photo.badge.arrow.down",
+                        disabled: !snapshot.canRequestHqArtwork
+                    ) {
+                        let accepted = bleManager.requestCurrentHqAlbumArt()
+                        actionStatus = accepted ? "已请求 HQ 封面" : "当前无法请求 HQ"
                         refreshSnapshot(after: 0.35)
                     }
-                    actionButton("重新请求 HQ", "photo.badge.arrow.down") {
-                        bleManager.requestCurrentHqAlbumArt()
-                        refreshSnapshot(after: 0.35)
-                    }
-                    actionButton("强制重连", "arrow.triangle.2.circlepath") {
-                        bleManager.forceReconnect()
-                        refreshSnapshot(after: 0.35)
+                    actionButton(
+                        "强制重连",
+                        "arrow.triangle.2.circlepath",
+                        disabled: !snapshot.canForceReconnect
+                    ) {
+                        showReconnectConfirmation = true
                     }
                     actionButton("复制诊断", "doc.on.doc") {
                         UIPasteboard.general.string = snapshot.diagnosticText
                         copyStatus = "已复制诊断信息"
+                        actionStatus = "已复制诊断信息"
                         bleManager.noteNowPlayingDiagnosticsCopied(trackId: snapshot.trackId)
+                    }
+                    actionButton("打开 Debug Tools", "slider.horizontal.3") {
+                        showDebugTools = true
                     }
                 }
 
-                if !copyStatus.isEmpty {
-                    Text(copyStatus)
+                if !actionStatus.isEmpty || !copyStatus.isEmpty {
+                    Text(actionStatus.nonEmpty ?? copyStatus)
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.green.opacity(0.9))
                 }
@@ -288,11 +354,13 @@ struct NowPlayingDiagnosticView: View {
     private func actionButton(
         _ title: String,
         _ systemImage: String,
+        disabled: Bool = false,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
-            HStack(spacing: 7) {
+            VStack(spacing: 6) {
                 Image(systemName: systemImage)
+                    .font(.system(size: 20, weight: .semibold))
                 Text(title)
                     .lineLimit(1)
                     .minimumScaleFactor(0.78)
@@ -300,9 +368,11 @@ struct NowPlayingDiagnosticView: View {
             .font(.caption.weight(.semibold))
             .foregroundStyle(.white)
             .frame(maxWidth: .infinity)
-            .frame(height: 42)
-            .background(.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .frame(height: 56)
+            .background(.white.opacity(disabled ? 0.045 : 0.10), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .opacity(disabled ? 0.42 : 1)
         }
+        .disabled(disabled)
         .buttonStyle(.plain)
     }
 
