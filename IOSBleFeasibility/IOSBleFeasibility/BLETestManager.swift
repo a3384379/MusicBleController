@@ -11,8 +11,6 @@ private let DEBUG_ART_DIAGNOSTICS = true
 private let VOLUME_SEND_THROTTLE_MS: Int64 = 120
 private let VOLUME_PENDING_TTL_MS: Int64 = 1_000
 private let AUTO_RECONNECT_LAST_PERIPHERAL_KEY = "lastSonyPeripheralIdentifier"
-private let AUTO_RECONNECT_ENABLED_KEY = "autoReconnectEnabled"
-private let KARAOKE_OFFSET_MS_KEY = "lyricOffsetMs"
 private let FAST_RETRIEVE_CONNECT_TIMEOUT_MS: Int64 = 1_800
 private let DEFAULT_CONNECT_TIMEOUT_MS: Int64 = 8_000
 private let CONNECTION_HEALTH_TICK_MS: Int64 = 3_000
@@ -128,7 +126,7 @@ private extension UIImage {
 }
 
 final class BLETestManager: NSObject, ObservableObject {
-    @Published private(set) var appExperienceMode: AppExperienceMode = .defaultMode
+    @Published private(set) var appExperienceMode: AppExperienceMode = PreferencesStore.shared.appExperienceMode
     @Published private(set) var mode = "BLE Central / GATT Client"
     @Published private(set) var connectionStatus = "未连接"
     @Published private(set) var logs: [String] = []
@@ -166,16 +164,14 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var mediaFieldDumpCopyStatus = ""
     @Published private(set) var isMediaFieldDumpReceiving = false
     @Published private(set) var mediaFieldDumpProgressText = ""
-    @Published private(set) var karaokeOffsetMs: Int64 =
-        Int64(UserDefaults.standard.object(forKey: KARAOKE_OFFSET_MS_KEY) as? Int ?? 600)
+    @Published private(set) var karaokeOffsetMs: Int64 = Int64(PreferencesStore.shared.lyricOffsetMs)
     @Published private(set) var localLogActionStatus = ""
     @Published private(set) var liveActivityControlStatus = LiveActivityControlStatus()
     @Published private(set) var playbackHistorySessions: [PlaybackHistorySession] = []
     @Published private(set) var playbackStats: [String: PlaybackStatsSnapshot] = [:]
     @Published private(set) var isPlaybackHistorySyncing = false
     @Published private(set) var playbackHistoryStatus = ""
-    @Published private(set) var autoReconnectEnabled =
-        UserDefaults.standard.object(forKey: AUTO_RECONNECT_ENABLED_KEY) as? Bool ?? true
+    @Published private(set) var autoReconnectEnabled = PreferencesStore.shared.autoReconnectEnabled
     @Published private(set) var autoReconnectState = AutoReconnectState.idle.rawValue
     @Published private(set) var autoReconnectAttempt = 0
     @Published private(set) var autoReconnectNextRetryAt: Date?
@@ -208,6 +204,7 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var connectionHealthHardReconnectCount = 0
     @Published private(set) var connectionHealthMaxNotifyGapMs: Int64 = 0
 
+    private let preferences = PreferencesStore.shared
     private lazy var centralManager = CBCentralManager(delegate: self, queue: nil)
     private lazy var peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
 
@@ -288,7 +285,7 @@ final class BLETestManager: NSObject, ObservableObject {
     private var lastFullLyricsPartialPublishAtMs: Int64 = 0
     private var albumArtPreviewRetryCount = 0
     private var albumArtFallbackWorkItem: DispatchWorkItem?
-    private var artworkEnhancementEnabled = UserDefaults.standard.object(forKey: "artworkEnhancementEnabled") as? Bool ?? true
+    private var artworkEnhancementEnabled = PreferencesStore.shared.artworkEnhancementEnabled
     private var artworkEnhancementABOriginalMode = false
     private var remoteLogExpectedChunks = 0
     private var remoteLogExpectedLines = 0
@@ -362,7 +359,9 @@ final class BLETestManager: NSObject, ObservableObject {
 
     override init() {
         super.init()
-        loadAppExperienceMode()
+        preferences.load()
+        syncPreferencesStateFromStore()
+        logAppExperienceModeLoaded()
         log("[BLE-iOS] app log store ready")
         LiveActivityCommandBridge.shared.register(self, logger: { [weak self] message in
             self?.log(message)
@@ -383,9 +382,9 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     func setAppExperienceMode(_ mode: AppExperienceMode) {
-        guard appExperienceMode != mode else { return }
+        guard preferences.appExperienceMode != mode else { return }
+        preferences.appExperienceMode = mode
         appExperienceMode = mode
-        UserDefaults.standard.set(mode.rawValue, forKey: AppExperienceMode.userDefaultsKey)
         log("[AppMode] changed mode=\(mode.rawValue)")
         if mode == .daily {
             log("[AppMode] daily mode skip debug stats")
@@ -394,10 +393,15 @@ final class BLETestManager: NSObject, ObservableObject {
         }
     }
 
-    private func loadAppExperienceMode() {
-        let raw = UserDefaults.standard.string(forKey: AppExperienceMode.userDefaultsKey)
-        let mode = raw.flatMap(AppExperienceMode.init(rawValue:)) ?? .defaultMode
-        appExperienceMode = mode
+    private func syncPreferencesStateFromStore() {
+        appExperienceMode = preferences.appExperienceMode
+        autoReconnectEnabled = preferences.autoReconnectEnabled
+        karaokeOffsetMs = Int64(preferences.lyricOffsetMs)
+        artworkEnhancementEnabled = preferences.artworkEnhancementEnabled
+    }
+
+    private func logAppExperienceModeLoaded() {
+        let mode = preferences.appExperienceMode
         log("[AppMode] loaded mode=\(mode.rawValue)")
         if mode == .daily {
             log("[AppMode] daily mode skip debug stats")
@@ -413,30 +417,33 @@ final class BLETestManager: NSObject, ObservableObject {
         let markerKey = "smokeTestPreferencesWritten"
         if arguments.contains("--smoke-test-preferences") {
             setAppExperienceMode(.debug)
-            UserDefaults.standard.set(200, forKey: "artworkDisplaySize")
+            preferences.artworkDisplaySize = .small
             setKaraokeOffsetMs(300)
             setAutoReconnectEnabled(true)
             defaults.set(true, forKey: markerKey)
-            log("[SmokeTest] preferences written")
-            let verified = appExperienceMode == .debug &&
-                defaults.integer(forKey: "artworkDisplaySize") == 200 &&
-                karaokeOffsetMs == 300 &&
-                autoReconnectEnabled
-            if verified {
-                log("[SmokeTest] preferences verified mode=debug artworkDisplaySize=200 lyricOffsetMs=300 autoReconnect=true")
-            } else {
-                log(
-                    "[SmokeTest] preferences verification failed " +
-                        "mode=\(appExperienceMode.rawValue) " +
-                        "artworkDisplaySize=\(defaults.integer(forKey: "artworkDisplaySize")) " +
-                        "lyricOffsetMs=\(karaokeOffsetMs) autoReconnect=\(autoReconnectEnabled)"
-                )
+            AppLogStore.shared.clear { [weak self] in
+                guard let self else { return }
+                self.log("[SmokeTest] preferences written")
+                let verified = self.preferences.appExperienceMode == .debug &&
+                    self.preferences.artworkDisplaySize.rawValue == 200 &&
+                    self.karaokeOffsetMs == 300 &&
+                    self.preferences.autoReconnectEnabled
+                if verified {
+                    self.log("[SmokeTest] preferences verified mode=debug artworkDisplaySize=200 lyricOffsetMs=300 autoReconnect=true")
+                } else {
+                    self.log(
+                        "[SmokeTest] preferences verification failed " +
+                            "mode=\(self.preferences.appExperienceMode.rawValue) " +
+                            "artworkDisplaySize=\(self.preferences.artworkDisplaySize.rawValue) " +
+                            "lyricOffsetMs=\(self.karaokeOffsetMs) autoReconnect=\(self.preferences.autoReconnectEnabled)"
+                    )
+                }
             }
         } else if defaults.bool(forKey: markerKey),
-                  appExperienceMode == .debug,
-                  defaults.integer(forKey: "artworkDisplaySize") == 200,
+                  preferences.appExperienceMode == .debug,
+                  preferences.artworkDisplaySize.rawValue == 200,
                   karaokeOffsetMs == 300,
-                  autoReconnectEnabled {
+                  preferences.autoReconnectEnabled {
             log("[SmokeTest] preferences persisted")
         }
         #endif
@@ -496,8 +503,8 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     func setAutoReconnectEnabled(_ enabled: Bool) {
+        preferences.autoReconnectEnabled = enabled
         autoReconnectEnabled = enabled
-        UserDefaults.standard.set(enabled, forKey: AUTO_RECONNECT_ENABLED_KEY)
         log("[BLE-Reconnect] enabled=\(enabled)")
         if enabled {
             scheduleReconnect(reason: "enabled", immediate: true)
@@ -745,8 +752,8 @@ final class BLETestManager: NSObject, ObservableObject {
 
     func setKaraokeOffsetMs(_ value: Int64) {
         let normalized = min(max(value, -2_000), 2_000)
+        preferences.lyricOffsetMs = Int(normalized)
         karaokeOffsetMs = normalized
-        UserDefaults.standard.set(normalized, forKey: KARAOKE_OFFSET_MS_KEY)
         log("[Lyrics-iOS] karaoke offsetMs=\(value)")
     }
 
@@ -771,8 +778,8 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     func setArtworkEnhancementEnabled(_ enabled: Bool) {
+        preferences.artworkEnhancementEnabled = enabled
         artworkEnhancementEnabled = enabled
-        UserDefaults.standard.set(enabled, forKey: "artworkEnhancementEnabled")
         artworkEnhancementABOriginalMode = false
         updateArtworkEnhancementStatus(message: enabled ? "enabled" : "disabled")
         log("[ArtworkEnhance] enabled=\(enabled)")

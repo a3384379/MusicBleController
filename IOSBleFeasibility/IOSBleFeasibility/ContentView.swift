@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var bleManager = BLETestManager()
+    @ObservedObject private var preferences = PreferencesStore.shared
     @State private var showFullLyrics = false
     @State private var showDebugPage = false
     @State private var showPlaybackHistory = false
@@ -9,10 +10,6 @@ struct ContentView: View {
     @State private var showNowPlayingDiagnostic = false
     @State private var showSystemHealthOverview = false
     @State private var showPreferences = false
-    @AppStorage(LyricDisplayMode.userDefaultsKey)
-    private var lyricDisplayModeRaw = LyricDisplayMode.originalTranslation.rawValue
-    @AppStorage(ArtworkDisplaySizeOption.userDefaultsKey)
-    private var artworkDisplaySizeRaw = ArtworkDisplaySizeOption.defaultOption.rawValue
 
     var body: some View {
         NavigationStack {
@@ -92,7 +89,7 @@ struct ContentView: View {
             .onChange(of: displayedPositionMs) { _, newValue in
                 bleManager.logKaraokeOffset(rawPositionMs: newValue)
             }
-            .onChange(of: lyricDisplayModeRaw) { _, _ in
+            .onChange(of: preferences.lyricDisplayMode) { _, _ in
                 requestOptionalLyricsIfNeeded()
             }
             .onChange(of: showFullLyrics) { _, isPresented in
@@ -103,7 +100,7 @@ struct ContentView: View {
             .onChange(of: bleManager.fullLyrics) { _, _ in
                 requestOptionalLyricsIfNeeded()
             }
-            .onChange(of: bleManager.appExperienceMode) { _, mode in
+            .onChange(of: preferences.appExperienceMode) { _, mode in
                 if mode == .daily {
                     showDebugPage = false
                     showLyricDiagnostic = false
@@ -166,7 +163,7 @@ struct ContentView: View {
                     bleManager.toggleAppExperienceMode()
                 } label: {
                     Label(
-                        bleManager.appExperienceMode.toggleTitle,
+                        preferences.appExperienceMode.toggleTitle,
                         systemImage: isDebugMode ? "person.fill" : "ladybug.fill"
                     )
                 }
@@ -564,7 +561,7 @@ struct ContentView: View {
     }
 
     private var isDebugMode: Bool {
-        bleManager.appExperienceMode == .debug
+        preferences.appExperienceMode == .debug
     }
 
     private var displayedPositionMs: Int64 {
@@ -592,7 +589,7 @@ struct ContentView: View {
     }
 
     private var lyricDisplayMode: LyricDisplayMode {
-        LyricDisplayMode(rawValue: lyricDisplayModeRaw) ?? .originalTranslation
+        preferences.lyricDisplayMode
     }
 
     private func requestOptionalLyricsIfNeeded() {
@@ -602,7 +599,7 @@ struct ContentView: View {
     private var lyricDisplayModeBinding: Binding<LyricDisplayMode> {
         Binding(
             get: { lyricDisplayMode },
-            set: { lyricDisplayModeRaw = $0.rawValue }
+            set: { preferences.lyricDisplayMode = $0 }
         )
     }
 
@@ -674,8 +671,7 @@ struct ContentView: View {
     }
 
     private var albumArtSize: CGFloat {
-        let option = ArtworkDisplaySizeOption(rawValue: artworkDisplaySizeRaw) ?? .defaultOption
-        return option.pointSize
+        preferences.artworkDisplaySize.pointSize
     }
 
     private var volumeIcon: String {

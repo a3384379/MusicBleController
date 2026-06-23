@@ -23,8 +23,7 @@ struct FullLyricsView: View {
     @State private var lastAutoScrolledIndex: Int?
     @State private var isProgrammaticScroll = false
     @State private var browseResetWorkItem: DispatchWorkItem?
-    @AppStorage(LyricDisplayMode.userDefaultsKey)
-    private var displayModeRaw = LyricDisplayMode.originalTranslation.rawValue
+    @ObservedObject private var preferences = PreferencesStore.shared
 
     var body: some View {
         ZStack {
@@ -47,12 +46,12 @@ struct FullLyricsView: View {
     private var displayModeBinding: Binding<LyricDisplayMode> {
         Binding(
             get: { displayMode },
-            set: { displayModeRaw = $0.rawValue }
+            set: { preferences.lyricDisplayMode = $0 }
         )
     }
 
     private var displayMode: LyricDisplayMode {
-        LyricDisplayMode(rawValue: displayModeRaw) ?? .originalTranslation
+        preferences.lyricDisplayMode
     }
 
     @ViewBuilder

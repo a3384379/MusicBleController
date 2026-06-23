@@ -1,37 +1,11 @@
 import SwiftUI
 import UIKit
 
-enum ArtworkDisplaySizeOption: Int, CaseIterable, Identifiable {
-    case small = 200
-    case medium = 220
-    case large = 260
-
-    var id: Int { rawValue }
-
-    var title: String {
-        switch self {
-        case .small: return "小"
-        case .medium: return "中"
-        case .large: return "大"
-        }
-    }
-
-    var pointSize: CGFloat {
-        CGFloat(rawValue)
-    }
-
-    static let userDefaultsKey = "artworkDisplaySize"
-    static let defaultOption: ArtworkDisplaySizeOption = .large
-}
-
 struct PreferencesView: View {
     @ObservedObject var bleManager: BLETestManager
+    @ObservedObject private var preferences = PreferencesStore.shared
     let onDismiss: () -> Void
 
-    @AppStorage(LyricDisplayMode.userDefaultsKey)
-    private var lyricDisplayModeRaw = LyricDisplayMode.originalTranslation.rawValue
-    @AppStorage(ArtworkDisplaySizeOption.userDefaultsKey)
-    private var artworkDisplaySizeRaw = ArtworkDisplaySizeOption.defaultOption.rawValue
     @State private var actionStatus = ""
 
     var body: some View {
@@ -122,7 +96,7 @@ struct PreferencesView: View {
                     Text("歌词偏移校准")
                         .font(.subheadline.weight(.semibold))
                     Spacer()
-                    Text(offsetLabel(bleManager.karaokeOffsetMs))
+                    Text(offsetLabel(Int64(preferences.lyricOffsetMs)))
                         .font(.caption.monospacedDigit().weight(.bold))
                         .foregroundStyle(.green)
                 }
@@ -214,47 +188,43 @@ struct PreferencesView: View {
             preferencesRow("App", "Sony Music BLE Controller")
             preferencesRow("版本", appVersion)
             preferencesRow("Build", buildVersion)
-            preferencesRow("当前模式", bleManager.appExperienceMode.title)
+            preferencesRow("当前模式", preferences.appExperienceMode.title)
             preferencesRow("连接设备", bleManager.connectedDeviceName == "-" ? "Sony" : bleManager.connectedDeviceName)
         }
     }
 
     private var appModeBinding: Binding<AppExperienceMode> {
         Binding(
-            get: { bleManager.appExperienceMode },
+            get: { preferences.appExperienceMode },
             set: { bleManager.setAppExperienceMode($0) }
         )
     }
 
     private var autoReconnectBinding: Binding<Bool> {
         Binding(
-            get: { bleManager.autoReconnectEnabled },
+            get: { preferences.autoReconnectEnabled },
             set: { bleManager.setAutoReconnectEnabled($0) }
         )
     }
 
     private var karaokeOffsetBinding: Binding<Double> {
         Binding(
-            get: { Double(bleManager.karaokeOffsetMs) },
+            get: { Double(preferences.lyricOffsetMs) },
             set: { bleManager.setKaraokeOffsetMs(Int64($0)) }
         )
     }
 
     private var lyricDisplayModeBinding: Binding<LyricDisplayMode> {
         Binding(
-            get: {
-                LyricDisplayMode(rawValue: lyricDisplayModeRaw) ?? .originalTranslation
-            },
-            set: { lyricDisplayModeRaw = $0.rawValue }
+            get: { preferences.lyricDisplayMode },
+            set: { preferences.lyricDisplayMode = $0 }
         )
     }
 
     private var artworkDisplaySizeBinding: Binding<ArtworkDisplaySizeOption> {
         Binding(
-            get: {
-                ArtworkDisplaySizeOption(rawValue: artworkDisplaySizeRaw) ?? .defaultOption
-            },
-            set: { artworkDisplaySizeRaw = $0.rawValue }
+            get: { preferences.artworkDisplaySize },
+            set: { preferences.artworkDisplaySize = $0 }
         )
     }
 
