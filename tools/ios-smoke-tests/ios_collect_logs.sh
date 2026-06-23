@@ -8,7 +8,8 @@ DEST_NAME="${1:-ios_ble.log}"
 
 mkdir -p "$OUT_DIR"
 
-copy_log() {
+copy_log_once() {
+  rm -f "$OUT_DIR/$DEST_NAME"
   xcrun devicectl device copy from \
     --device "$IOS_DEVICE_ID" \
     --domain-type appDataContainer \
@@ -18,9 +19,21 @@ copy_log() {
     >/tmp/ios_smoke_copy_log.out 2>/tmp/ios_smoke_copy_log.err
 }
 
+copy_log() {
+  local attempt
+  for attempt in 1 2 3; do
+    if copy_log_once && [[ -s "$OUT_DIR/$DEST_NAME" ]] &&
+      grep -Eq 'BLE-iOS|BLE-Reconnect|AppMode|Preferences|App launch|SmokeTest' "$OUT_DIR/$DEST_NAME"; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
 if ! copy_log; then
-  sleep 3
-  copy_log
+  echo "Unable to copy a non-empty iOS log with expected smoke keywords: $OUT_DIR/$DEST_NAME" >&2
+  exit 1
 fi
 
 xcrun devicectl device copy from \

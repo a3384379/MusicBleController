@@ -20,7 +20,7 @@ if [[ ! -s "$LOG_FILE" ]]; then
   exit 0
 fi
 
-if grep -Eq 'scanSony called|start scan|scan start|\\[BLE-Reconnect\\] start scan|\\[BLE-iOS\\] start scan' "$LOG_FILE"; then
+if grep -Eq 'scanSony called|start scan|scan start|\[BLE-Reconnect\] start scan|\[BLE-iOS\] start scan' "$LOG_FILE"; then
   record "BLE Scan" "PASS" "scan activity found"
 else
   record "BLE Scan" "WARN" "iOS did not start scan"

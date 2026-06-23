@@ -11,16 +11,28 @@ SKIP_BUILD="${SKIP_BUILD:-false}"
 SKIP_INSTALL="${SKIP_INSTALL:-false}"
 
 mkdir -p "$OUT_DIR"
+COST_FILE="$OUT_DIR/costs.env"
+: > "$COST_FILE"
+
+now_ms() {
+  python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+}
 
 if [[ "$SKIP_BUILD" != true ]]; then
+  build_start="$(now_ms)"
   xcodebuild \
     -project "$PROJECT_PATH" \
     -scheme "$SCHEME" \
     -configuration "$CONFIGURATION" \
     -destination 'generic/platform=iOS' \
     build | tee "$OUT_DIR/ios_build.log"
+  echo "buildCostMs=$(( $(now_ms) - build_start ))" >> "$COST_FILE"
 else
   echo "Build skipped" | tee "$OUT_DIR/ios_build.log"
+  echo "buildCostMs=0" >> "$COST_FILE"
 fi
 
 BUILD_SETTINGS="$OUT_DIR/xcode_build_settings.txt"
@@ -43,9 +55,12 @@ fi
 echo "$APP_PATH" > "$OUT_DIR/app_path.txt"
 
 if [[ "$SKIP_INSTALL" != true ]]; then
+  install_start="$(now_ms)"
   xcrun devicectl device install app \
     --device "$IOS_DEVICE_ID" \
     "$APP_PATH" | tee "$OUT_DIR/ios_install.log"
+  echo "installCostMs=$(( $(now_ms) - install_start ))" >> "$COST_FILE"
 else
   echo "Install skipped" | tee "$OUT_DIR/ios_install.log"
+  echo "installCostMs=0" >> "$COST_FILE"
 fi
