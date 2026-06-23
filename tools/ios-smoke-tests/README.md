@@ -23,6 +23,12 @@ These tests are iOS-only. They do not use Android Debug Bridge, Android device l
 
 ## Commands
 
+Codex workflow shortcut:
+
+```bash
+./tools/ios-smoke-tests/codex_check.sh
+```
+
 Full test:
 
 ```bash
@@ -97,6 +103,26 @@ Important files:
 - `required_results.tsv`: required test rows
 - `optional_results.tsv`: optional test rows
 - `file_checks.tsv`: app container file access summary
+
+## Codex Workflow
+
+Quick:
+
+```bash
+./tools/ios-smoke-tests/run_ios_smoke_tests.sh --quick --json
+```
+
+Full:
+
+```bash
+./tools/ios-smoke-tests/run_ios_smoke_tests.sh --json
+```
+
+Use quick after normal iOS UI, BLE manager, lyric, album art, diagnostics, reconnect, health, settings, or Live Activity changes.
+
+Use full after changes to app launch, install behavior, UserDefaults, Preferences persistence, app container files, logging, build settings, or `project.pbxproj`.
+
+Codex should read `report.json`. Required tests must pass. Optional BLE warnings do not fail the workflow.
 
 ## Common Failures
 
