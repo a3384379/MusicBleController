@@ -7,6 +7,7 @@ struct ContentView: View {
     @State private var showPlaybackHistory = false
     @State private var showLyricDiagnostic = false
     @State private var showNowPlayingDiagnostic = false
+    @State private var showSystemHealthOverview = false
     @AppStorage(LyricDisplayMode.userDefaultsKey)
     private var lyricDisplayModeRaw = LyricDisplayMode.originalTranslation.rawValue
 
@@ -51,6 +52,12 @@ struct ContentView: View {
                     onDismiss: { showNowPlayingDiagnostic = false }
                 )
             }
+            .sheet(isPresented: $showSystemHealthOverview) {
+                SystemHealthOverviewView(
+                    bleManager: bleManager,
+                    onDismiss: { showSystemHealthOverview = false }
+                )
+            }
             .fullScreenCover(isPresented: $showFullLyrics) {
                 FullLyricsView(
                     title: nowPlayingInfo.title,
@@ -92,6 +99,7 @@ struct ContentView: View {
                     showDebugPage = false
                     showLyricDiagnostic = false
                     showNowPlayingDiagnostic = false
+                    showSystemHealthOverview = false
                 }
             }
         }
@@ -150,6 +158,12 @@ struct ContentView: View {
 
                 if isDebugMode {
                     Divider()
+
+                    Button {
+                        showSystemHealthOverview = true
+                    } label: {
+                        Label("系统健康总览", systemImage: "heart.text.square")
+                    }
 
                     Button {
                         showNowPlayingDiagnostic = true

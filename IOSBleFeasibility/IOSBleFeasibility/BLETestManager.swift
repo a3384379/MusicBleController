@@ -596,6 +596,12 @@ final class BLETestManager: NSObject, ObservableObject {
         log("[NowDiag] refresh all requested trackId=\(currentTrackID)")
     }
 
+    func refreshSystemHealthOverview() {
+        log("[SystemHealth] refresh requested trackId=\(currentTrackID)")
+        sendGetPlaybackState()
+        requestLyricDiagnostic(manual: true)
+    }
+
     func refreshCurrentLyricFromNowPlayingDiagnostics() {
         log("[NowDiag] refresh lyric requested trackId=\(currentTrackID)")
         requestLyricDiagnostic(manual: true)
@@ -662,7 +668,8 @@ final class BLETestManager: NSObject, ObservableObject {
             peripheralState: connectionHealthPeripheralState,
             characteristicReady: connectionHealthCharacteristicReady,
             probeInFlight: connectionHealthProbeInFlight,
-            lastHardReconnectReason: connectionHealthLastHardReconnectReason
+            lastHardReconnectReason: connectionHealthLastHardReconnectReason,
+            reconnectWorkItemExists: autoReconnectWorkItemExists
         )
         let displayWidth = albumArtImage?.pixelWidth ?? 0
         let displayHeight = albumArtImage?.pixelHeight ?? 0
@@ -4483,7 +4490,12 @@ extension BLETestManager: CBPeripheralDelegate {
             qrcIndexLoaded: object["qrcIndexLoaded"] as? Bool ?? false,
             maintenanceBusy: object["maintenanceBusy"] as? Bool ?? false,
             waitingQqMusicCache: object["waitingQqMusicCache"] as? Bool ?? false,
-            suggestion: object["suggestion"] as? String ?? ""
+            suggestion: object["suggestion"] as? String ?? "",
+            recoveryState: object["recoveryState"] as? String ?? "unknown",
+            recoveryRetryCount: Self.intValue(object["recoveryRetryCount"]),
+            recoveryExpiresAt: Self.int64Value(object["recoveryExpiresAt"]),
+            lastRecoveryReason: object["lastRecoveryReason"] as? String ?? "",
+            recentQrcCandidateCount: Self.intValue(object["recentQrcCandidateCount"])
         )
     }
 

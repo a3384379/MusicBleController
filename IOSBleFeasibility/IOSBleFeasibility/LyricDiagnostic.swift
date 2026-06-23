@@ -18,6 +18,11 @@ struct LyricDiagnostic: Equatable {
     var maintenanceBusy: Bool
     var waitingQqMusicCache: Bool
     var suggestion: String
+    var recoveryState: String
+    var recoveryRetryCount: Int
+    var recoveryExpiresAt: Int64
+    var lastRecoveryReason: String
+    var recentQrcCandidateCount: Int
 
     static func lightweight(
         trackId: String,
@@ -44,7 +49,12 @@ struct LyricDiagnostic: Equatable {
             qrcIndexLoaded: false,
             maintenanceBusy: false,
             waitingQqMusicCache: status == "waiting_qqmusic_cache",
-            suggestion: suggestion
+            suggestion: suggestion,
+            recoveryState: "unknown",
+            recoveryRetryCount: 0,
+            recoveryExpiresAt: 0,
+            lastRecoveryReason: "",
+            recentQrcCandidateCount: 0
         )
     }
 

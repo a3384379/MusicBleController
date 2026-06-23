@@ -8,6 +8,7 @@ struct DebugToolsView: View {
     @State private var showMediaFieldDump = true
     @State private var showLyricDiagnostic = false
     @State private var showNowPlayingDiagnostic = false
+    @State private var showSystemHealthOverview = false
 
     var body: some View {
         NavigationStack {
@@ -48,6 +49,12 @@ struct DebugToolsView: View {
             NowPlayingDiagnosticView(
                 bleManager: bleManager,
                 onDismiss: { showNowPlayingDiagnostic = false }
+            )
+        }
+        .sheet(isPresented: $showSystemHealthOverview) {
+            SystemHealthOverviewView(
+                bleManager: bleManager,
+                onDismiss: { showSystemHealthOverview = false }
             )
         }
     }
@@ -110,6 +117,14 @@ struct DebugToolsView: View {
                         systemImage: "list.bullet.clipboard",
                         disabled: !isConnected || bleManager.isMediaFieldDumpReceiving,
                         action: bleManager.sendDumpMediaFields
+                    )
+                    debugActionButton(
+                        title: "系统健康总览",
+                        systemImage: "heart.text.square",
+                        disabled: false,
+                        action: {
+                            showSystemHealthOverview = true
+                        }
                     )
                     debugActionButton(
                         title: "歌词诊断中心",

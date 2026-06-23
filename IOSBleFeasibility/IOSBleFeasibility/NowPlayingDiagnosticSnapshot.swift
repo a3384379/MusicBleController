@@ -37,6 +37,7 @@ struct ConnectionDiagnosticSnapshot: Equatable {
     let characteristicReady: Bool
     let probeInFlight: Bool
     let lastHardReconnectReason: String
+    let reconnectWorkItemExists: Bool
 }
 
 struct AlbumArtTransferDiagnosticSnapshot: Equatable {
@@ -229,6 +230,7 @@ struct NowPlayingDiagnosticSnapshot {
         lines.append("characteristicReady: \(connection.characteristicReady)")
         lines.append("probeInFlight: \(connection.probeInFlight)")
         lines.append("lastHardReconnectReason: \(connection.lastHardReconnectReason)")
+        lines.append("reconnectWorkItemExists: \(connection.reconnectWorkItemExists)")
         return lines.joined(separator: "\n")
     }
 
@@ -250,4 +252,350 @@ struct NowPlayingDiagnosticSnapshot {
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         return formatter
     }()
+}
+
+enum SystemHealthLevel: String {
+    case ok
+    case working
+    case warning
+    case critical
+    case unknown
+
+    var badgeTitle: String {
+        switch self {
+        case .ok: return "正常"
+        case .working: return "处理中"
+        case .warning: return "注意"
+        case .critical: return "异常"
+        case .unknown: return "未知"
+        }
+    }
+
+    var rank: Int {
+        switch self {
+        case .critical: return 4
+        case .warning: return 3
+        case .working: return 2
+        case .unknown: return 1
+        case .ok: return 0
+        }
+    }
+}
+
+struct SystemHealthField: Identifiable {
+    let id = UUID()
+    let title: String
+    let value: String
+}
+
+struct SystemHealthCardSnapshot: Identifiable {
+    let id: String
+    let title: String
+    let systemImage: String
+    let status: String
+    let level: SystemHealthLevel
+    let summary: String
+    let fields: [SystemHealthField]
+}
+
+struct SystemHealthSnapshot {
+    let generatedAt: Date
+    let overallStatus: String
+    let overallLevel: SystemHealthLevel
+    let connection: SystemHealthCardSnapshot
+    let lyric: SystemHealthCardSnapshot
+    let artwork: SystemHealthCardSnapshot
+    let sony: SystemHealthCardSnapshot
+    let recommendation: String
+    let source: NowPlayingDiagnosticSnapshot
+
+    init(nowPlaying source: NowPlayingDiagnosticSnapshot) {
+        self.generatedAt = Date()
+        self.source = source
+        self.connection = Self.makeConnectionCard(source)
+        self.lyric = Self.makeLyricCard(source)
+        self.artwork = Self.makeArtworkCard(source)
+        self.sony = Self.makeSonyCard(source)
+        self.recommendation = Self.makeRecommendation(
+            connection: connection,
+            lyric: lyric,
+            artwork: artwork,
+            sony: sony,
+            source: source
+        )
+        let worst = [connection.level, lyric.level, artwork.level, sony.level].max {
+            $0.rank < $1.rank
+        } ?? .unknown
+        self.overallLevel = worst
+        self.overallStatus = worst == .ok ? "系统正常" : worst.badgeTitle
+    }
+
+    var copyText: String {
+        var lines: [String] = []
+        lines.append("系统健康总览")
+        lines.append("时间：\(NowPlayingDiagnosticSnapshot.optionalDate(generatedAt))")
+        lines.append("")
+        appendCard(connection, to: &lines)
+        appendCard(lyric, to: &lines)
+        appendCard(artwork, to: &lines)
+        appendCard(sony, to: &lines)
+        lines.append("")
+        lines.append("[建议]")
+        lines.append(recommendation)
+        return lines.joined(separator: "\n")
+    }
+
+    private func appendCard(_ card: SystemHealthCardSnapshot, to lines: inout [String]) {
+        lines.append("[\(card.title)]")
+        lines.append("状态=\(card.status)")
+        lines.append("说明=\(card.summary)")
+        for field in card.fields {
+            lines.append("\(field.title)=\(field.value)")
+        }
+        lines.append("")
+    }
+
+    private static func makeConnectionCard(_ source: NowPlayingDiagnosticSnapshot) -> SystemHealthCardSnapshot {
+        let connection = source.connection
+        let display = connection.displayState
+        let health = connection.healthState
+        let status: String
+        let level: SystemHealthLevel
+        let summary: String
+        if display == "connected", health == "healthy" {
+            status = "正常"
+            level = .ok
+            summary = "连接正常。"
+        } else if display == "reconnecting" || connection.autoReconnectState == "scanning" ||
+                    connection.autoReconnectState == "connecting" {
+            status = "正在重连"
+            level = .working
+            summary = "正在重新连接 Sony。"
+        } else if display == "connected", health == "suspect" {
+            status = "连接异常"
+            level = .warning
+            summary = "长时间未收到 Sony 状态，正在确认连接是否可用。"
+        } else if display == "connected", health == "stale" {
+            status = "连接异常"
+            level = .critical
+            summary = "长时间未收到 Sony 状态，正在恢复连接。"
+        } else {
+            status = display == "disconnected" ? "未连接" : "连接异常"
+            level = .critical
+            summary = "当前未建立可用的 Sony 连接。"
+        }
+        return SystemHealthCardSnapshot(
+            id: "connection",
+            title: "连接",
+            systemImage: "antenna.radiowaves.left.and.right",
+            status: status,
+            level: level,
+            summary: summary,
+            fields: [
+                .init(title: "displayState", value: connection.displayState),
+                .init(title: "healthState", value: connection.healthState),
+                .init(title: "autoReconnectState", value: connection.autoReconnectState),
+                .init(title: "MTU", value: connection.mtuBytes > 0 ? "\(connection.mtuBytes)" : "unknown"),
+                .init(
+                    title: "lastNotifyAge",
+                    value: connection.lastNotifyAgeMs >= 0 ? "\(connection.lastNotifyAgeMs)ms" : "unknown"
+                ),
+                .init(title: "lastReconnectReason", value: connection.lastHardReconnectReason),
+                .init(title: "reconnectWorkItemExists", value: connection.reconnectWorkItemExists ? "true" : "false")
+            ]
+        )
+    }
+
+    private static func makeLyricCard(_ source: NowPlayingDiagnosticSnapshot) -> SystemHealthCardSnapshot {
+        guard let diagnostic = source.lyricDiagnostic else {
+            return SystemHealthCardSnapshot(
+                id: "lyric",
+                title: "歌词",
+                systemImage: "text.magnifyingglass",
+                status: "未知",
+                level: .unknown,
+                summary: "尚未获取 Sony 歌词诊断。",
+                fields: [.init(title: "lyricStatus", value: "unknown")]
+            )
+        }
+        let normalized = diagnostic.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let status: String
+        let level: SystemHealthLevel
+        switch normalized {
+        case "loaded":
+            status = "正常"
+            level = .ok
+        case "loading", "retry_pending":
+            status = "加载中"
+            level = .working
+        case "waiting_qqmusic_cache":
+            status = "等待 QQ音乐生成歌词缓存"
+            level = .working
+        case "no_safe_candidate":
+            status = "无安全歌词候选"
+            level = .warning
+        case "maintenance_busy":
+            status = "维护任务中"
+            level = .working
+        default:
+            status = diagnostic.statusTitle
+            level = diagnostic.lines > 0 ? .ok : .warning
+        }
+        return SystemHealthCardSnapshot(
+            id: "lyric",
+            title: "歌词",
+            systemImage: "quote.bubble",
+            status: status,
+            level: level,
+            summary: diagnostic.suggestionText,
+            fields: [
+                .init(title: "lyricStatus", value: diagnostic.status),
+                .init(title: "lyricReason", value: diagnostic.reason.isEmpty ? "unknown" : diagnostic.reason),
+                .init(title: "lyricSuggestion", value: diagnostic.suggestion.isEmpty ? "unknown" : diagnostic.suggestion),
+                .init(title: "recoveryState", value: diagnostic.recoveryState),
+                .init(title: "retryCount", value: "\(diagnostic.retryCount)"),
+                .init(
+                    title: "nextRetryAt",
+                    value: diagnostic.nextRetryAt > 0 ? Self.formatTimestamp(diagnostic.nextRetryAt) : "unknown"
+                ),
+                .init(title: "lines", value: "\(diagnostic.lines)")
+            ]
+        )
+    }
+
+    private static func makeArtworkCard(_ source: NowPlayingDiagnosticSnapshot) -> SystemHealthCardSnapshot {
+        let quality = source.albumArtDisplayQuality
+        let transfer = source.albumArtTransfer
+        let preview = source.artworkCaches.first { $0.quality == "preview" }
+        let hq = source.artworkCaches.first { $0.quality == "hq" }
+        let enhanced = source.artworkCaches.first { $0.quality == "enhanced" }
+        let status: String
+        let level: SystemHealthLevel
+        let summary: String
+        if transfer.state == "timeout" || transfer.state == "failed" {
+            status = "传输中断"
+            level = .warning
+            summary = "封面传输中断，可重新请求。"
+        } else if source.hqUnavailableReason.lowercased().contains("too large") ||
+                    source.hqUnavailableReason.contains("过大") {
+            status = "图片过大"
+            level = .warning
+            summary = "HQ 图片过大，已使用 fallback 或 preview。"
+        } else if quality == "enhanced" || quality == "hq" {
+            status = "HQ 正常"
+            level = .ok
+            summary = "当前显示高清封面。"
+        } else if quality == "preview" {
+            status = "Preview"
+            level = .warning
+            summary = "当前只有预览封面。"
+        } else {
+            status = "默认图"
+            level = .warning
+            summary = "当前没有可显示封面。"
+        }
+        return SystemHealthCardSnapshot(
+            id: "artwork",
+            title: "封面",
+            systemImage: "photo",
+            status: status,
+            level: level,
+            summary: summary,
+            fields: [
+                .init(title: "displayQuality", value: quality),
+                .init(title: "preview", value: Self.cacheSummary(preview)),
+                .init(title: "hq", value: Self.cacheSummary(hq)),
+                .init(title: "enhanced", value: Self.cacheSummary(enhanced)),
+                .init(title: "transferState", value: transfer.state),
+                .init(title: "lastFailureReason", value: transfer.lastFailureReason),
+                .init(title: "hqUnavailableReason", value: source.hqUnavailableReason.isEmpty ? "-" : source.hqUnavailableReason),
+                .init(
+                    title: "fallbackScale",
+                    value: source.hqUnavailableMinCandidateScale > 0 ? "\(source.hqUnavailableMinCandidateScale)" : "unknown"
+                )
+            ]
+        )
+    }
+
+    private static func makeSonyCard(_ source: NowPlayingDiagnosticSnapshot) -> SystemHealthCardSnapshot {
+        let diagnostic = source.lyricDiagnostic
+        let maintenance = diagnostic?.maintenanceBusy == true
+        let waiting = diagnostic?.waitingQqMusicCache == true
+        let recovery = diagnostic?.recoveryState ?? "unknown"
+        let status: String
+        let level: SystemHealthLevel
+        let summary: String
+        if maintenance {
+            status = "缓存维护中"
+            level = .working
+            summary = "Sony 正在处理歌词缓存维护任务。"
+        } else if waiting {
+            status = "等待 QQ音乐缓存"
+            level = .working
+            summary = "QQ音乐可能还没生成当前歌曲歌词缓存。"
+        } else if recovery != "unknown", recovery.lowercased() != "idle" {
+            status = "歌词恢复中"
+            level = .working
+            summary = "Sony 正在尝试恢复当前歌曲歌词。"
+        } else {
+            status = "正常"
+            level = .ok
+            summary = "Sony 服务和缓存状态正常。"
+        }
+        return SystemHealthCardSnapshot(
+            id: "sony",
+            title: "Sony / 缓存",
+            systemImage: "externaldrive.connected.to.line.below",
+            status: status,
+            level: level,
+            summary: summary,
+            fields: [
+                .init(title: "maintenanceBusy", value: diagnostic.map { $0.maintenanceBusy ? "true" : "false" } ?? "unknown"),
+                .init(title: "recoveryState", value: recovery),
+                .init(title: "fuzzyIndexReady", value: diagnostic.map { $0.fuzzyIndexReady ? "true" : "false" } ?? "unknown"),
+                .init(title: "qrcIndexLoaded", value: diagnostic.map { $0.qrcIndexLoaded ? "true" : "false" } ?? "unknown"),
+                .init(title: "waitingQqMusicCache", value: diagnostic.map { $0.waitingQqMusicCache ? "true" : "false" } ?? "unknown"),
+                .init(title: "recentQrcCandidateCount", value: diagnostic.map { "\($0.recentQrcCandidateCount)" } ?? "unknown")
+            ]
+        )
+    }
+
+    private static func makeRecommendation(
+        connection: SystemHealthCardSnapshot,
+        lyric: SystemHealthCardSnapshot,
+        artwork: SystemHealthCardSnapshot,
+        sony: SystemHealthCardSnapshot,
+        source: NowPlayingDiagnosticSnapshot
+    ) -> String {
+        if connection.level == .critical || connection.status == "正在重连" {
+            return "先恢复 Sony 连接。"
+        }
+        if source.lyricDiagnostic?.waitingQqMusicCache == true ||
+            lyric.status == "等待 QQ音乐生成歌词缓存" {
+            return "在 Sony QQ音乐打开歌词或桌面歌词后稍等。"
+        }
+        if artwork.status == "传输中断" {
+            return "封面传输中断，可点击重试封面。"
+        }
+        if artwork.status == "图片过大" {
+            return "HQ 图片过大，已使用 fallback 或 preview。"
+        }
+        if [connection, lyric, artwork, sony].allSatisfy({ $0.level == .ok }) {
+            return "当前状态正常。"
+        }
+        return "优先查看标记为注意或异常的项目。"
+    }
+
+    private static func cacheSummary(_ cache: ArtworkCacheDiagnostic?) -> String {
+        guard let cache else { return "unknown" }
+        guard cache.exists else { return "missing" }
+        return "\(cache.pixelWidth)x\(cache.pixelHeight), \(cache.bytes) bytes"
+    }
+
+    private static func formatTimestamp(_ value: Int64) -> String {
+        guard value > 0 else { return "unknown" }
+        return NowPlayingDiagnosticSnapshot.optionalDate(
+            Date(timeIntervalSince1970: TimeInterval(value) / 1_000)
+        )
+    }
 }

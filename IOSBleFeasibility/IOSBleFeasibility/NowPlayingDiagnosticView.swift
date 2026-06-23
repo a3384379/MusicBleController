@@ -401,6 +401,294 @@ struct NowPlayingDiagnosticView: View {
     }
 }
 
+struct SystemHealthOverviewView: View {
+    @ObservedObject var bleManager: BLETestManager
+    let onDismiss: () -> Void
+    @State private var snapshot: SystemHealthSnapshot?
+    @State private var actionStatus = ""
+    @State private var showNowPlayingDiagnostic = false
+    @State private var showLyricDiagnostic = false
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                LinearGradient(
+                    colors: [
+                        Color.black,
+                        Color(red: 0.06, green: 0.09, blue: 0.11),
+                        Color.black.opacity(0.96)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .ignoresSafeArea()
+
+                ScrollView(showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        if let snapshot {
+                            recommendationCard(snapshot)
+                            healthCard(snapshot.connection) {
+                                actionButton("强制重连", "arrow.triangle.2.circlepath") {
+                                    actionStatus = "正在重连..."
+                                    bleManager.forceReconnect()
+                                    refreshSnapshot(after: 0.35)
+                                }
+                                actionButton("当前歌曲诊断", "waveform.path.ecg.rectangle") {
+                                    showNowPlayingDiagnostic = true
+                                }
+                            }
+                            healthCard(snapshot.lyric) {
+                                actionButton("刷新歌词诊断", "arrow.clockwise") {
+                                    actionStatus = "正在刷新歌词诊断..."
+                                    bleManager.requestLyricDiagnostic(manual: true)
+                                    refreshSnapshot(after: 0.35)
+                                }
+                                actionButton("请求完整歌词", "text.badge.plus") {
+                                    actionStatus = "已请求完整歌词"
+                                    bleManager.sendGetFullLyrics(force: true)
+                                    refreshSnapshot(after: 0.35)
+                                }
+                                actionButton("歌词诊断中心", "text.magnifyingglass") {
+                                    bleManager.requestLyricDiagnostic(manual: true)
+                                    showLyricDiagnostic = true
+                                }
+                            }
+                            healthCard(snapshot.artwork) {
+                                actionButton("请求 HQ 封面", "photo.badge.arrow.down") {
+                                    let accepted = bleManager.requestCurrentHqAlbumArt()
+                                    actionStatus = accepted ? "已请求 HQ 封面" : "当前无法请求 HQ"
+                                    refreshSnapshot(after: 0.35)
+                                }
+                                actionButton("重试封面", "arrow.clockwise.circle") {
+                                    let accepted = bleManager.requestCurrentHqAlbumArt()
+                                    actionStatus = accepted ? "已重试封面" : "当前无法重试封面"
+                                    refreshSnapshot(after: 0.35)
+                                }
+                                actionButton("当前歌曲诊断", "waveform.path.ecg.rectangle") {
+                                    showNowPlayingDiagnostic = true
+                                }
+                            }
+                            healthCard(snapshot.sony) {
+                                actionButton("刷新诊断", "arrow.clockwise") {
+                                    actionStatus = "正在刷新诊断..."
+                                    bleManager.refreshSystemHealthOverview()
+                                    refreshSnapshot(after: 0.35)
+                                }
+                                actionButton("复制诊断信息", "doc.on.doc") {
+                                    UIPasteboard.general.string = snapshot.copyText
+                                    actionStatus = "已复制健康摘要"
+                                }
+                            }
+                            copyCard(snapshot)
+                        } else {
+                            ProgressView("正在生成健康总览")
+                                .tint(.white)
+                                .foregroundStyle(.white)
+                                .frame(maxWidth: .infinity, minHeight: 220)
+                        }
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.top, 18)
+                    .padding(.bottom, 32)
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Text("系统健康总览")
+                        .font(.headline.weight(.bold))
+                        .foregroundStyle(.white)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成", action: onDismiss)
+                        .foregroundStyle(.white)
+                }
+            }
+            .toolbarBackground(.hidden, for: .navigationBar)
+            .onAppear {
+                refreshSnapshot()
+                bleManager.sendGetPlaybackState()
+                bleManager.requestLyricDiagnostic(manual: false)
+            }
+            .onChange(of: bleManager.lyricDiagnostic) { _, _ in
+                refreshSnapshot()
+            }
+            .onChange(of: bleManager.connectionHealthLastNotifyAgeMs) { _, _ in
+                refreshSnapshot()
+            }
+        }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+        .sheet(isPresented: $showNowPlayingDiagnostic) {
+            NowPlayingDiagnosticView(
+                bleManager: bleManager,
+                onDismiss: { showNowPlayingDiagnostic = false }
+            )
+        }
+        .sheet(isPresented: $showLyricDiagnostic) {
+            LyricDiagnosticView(
+                bleManager: bleManager,
+                onDismiss: { showLyricDiagnostic = false }
+            )
+        }
+    }
+
+    private func recommendationCard(_ snapshot: SystemHealthSnapshot) -> some View {
+        DiagnosticCard {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Image(systemName: "heart.text.square")
+                        .font(.title3.weight(.semibold))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(snapshot.overallStatus)
+                            .font(.title3.weight(.bold))
+                        Text("生成于 \(NowPlayingDiagnosticSnapshot.optionalDate(snapshot.generatedAt))")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.55))
+                    }
+                    Spacer()
+                    statusBadge(snapshot.overallStatus, level: snapshot.overallLevel)
+                }
+
+                Text(snapshot.recommendation)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.86))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func healthCard<Actions: View>(
+        _ card: SystemHealthCardSnapshot,
+        @ViewBuilder actions: () -> Actions
+    ) -> some View {
+        DiagnosticCard {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .center, spacing: 10) {
+                    Image(systemName: card.systemImage)
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(levelColor(card.level))
+                        .frame(width: 24)
+                    Text(card.title)
+                        .font(.headline.weight(.bold))
+                    Spacer()
+                    statusBadge(card.status, level: card.level)
+                }
+
+                Text(card.summary)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.76))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                VStack(spacing: 7) {
+                    ForEach(card.fields) { field in
+                        diagnosticRow(field.title, field.value)
+                    }
+                }
+
+                LazyVGrid(
+                    columns: [
+                        GridItem(.flexible(), spacing: 10),
+                        GridItem(.flexible(), spacing: 10)
+                    ],
+                    spacing: 10
+                ) {
+                    actions()
+                }
+                .padding(.top, 2)
+            }
+        }
+    }
+
+    private func copyCard(_ snapshot: SystemHealthSnapshot) -> some View {
+        DiagnosticCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("健康摘要", systemImage: "doc.on.doc")
+                    .font(.headline.weight(.bold))
+
+                Text("复制后可直接发给 Codex 分析，不包含完整歌词或图片。")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.68))
+
+                actionButton("复制健康摘要", "doc.on.doc") {
+                    UIPasteboard.general.string = snapshot.copyText
+                    actionStatus = "已复制健康摘要"
+                }
+
+                if !actionStatus.isEmpty {
+                    Text(actionStatus)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.green.opacity(0.9))
+                }
+            }
+        }
+    }
+
+    private func statusBadge(_ title: String, level: SystemHealthLevel) -> some View {
+        Text(title)
+            .font(.caption.weight(.bold))
+            .foregroundStyle(levelColor(level))
+            .padding(.horizontal, 10)
+            .frame(height: 26)
+            .background(levelColor(level).opacity(0.14), in: Capsule())
+            .overlay {
+                Capsule().stroke(levelColor(level).opacity(0.24), lineWidth: 1)
+            }
+    }
+
+    private func diagnosticRow(_ title: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(title)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.white.opacity(0.50))
+                .frame(width: 126, alignment: .leading)
+            Text(value.isEmpty ? "-" : value)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.white.opacity(0.80))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .lineLimit(3)
+        }
+    }
+
+    private func actionButton(
+        _ title: String,
+        _ systemImage: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.78)
+                .frame(maxWidth: .infinity)
+                .frame(height: 46)
+                .background(.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func levelColor(_ level: SystemHealthLevel) -> Color {
+        switch level {
+        case .ok: return .green
+        case .working: return .yellow
+        case .warning: return .orange
+        case .critical: return .red
+        case .unknown: return .gray
+        }
+    }
+
+    private func refreshSnapshot(after delay: TimeInterval = 0) {
+        let update = {
+            snapshot = SystemHealthSnapshot(nowPlaying: bleManager.makeNowPlayingDiagnosticSnapshot())
+        }
+        if delay > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: update)
+        } else {
+            update()
+        }
+    }
+}
+
 private struct DiagnosticCard<Content: View>: View {
     @ViewBuilder var content: Content
 
