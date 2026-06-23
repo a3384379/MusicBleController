@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OUT_DIR="${OUT_DIR:-/tmp/music_ble_ios_smoke/manual}"
+IOS_DEVICE_ID="${IOS_DEVICE_ID:?IOS_DEVICE_ID is required}"
+BUNDLE_ID="${BUNDLE_ID:-com.sqz.IOSBleFeasibility}"
+DEST_NAME="${1:-ios_ble.log}"
+
+mkdir -p "$OUT_DIR"
+
+copy_log() {
+  xcrun devicectl device copy from \
+    --device "$IOS_DEVICE_ID" \
+    --domain-type appDataContainer \
+    --domain-identifier "$BUNDLE_ID" \
+    --source Documents/Logs/ios_ble.log \
+    --destination "$OUT_DIR/$DEST_NAME" \
+    >/tmp/ios_smoke_copy_log.out 2>/tmp/ios_smoke_copy_log.err
+}
+
+if ! copy_log; then
+  sleep 3
+  copy_log
+fi
+
+xcrun devicectl device copy from \
+  --device "$IOS_DEVICE_ID" \
+  --domain-type appDataContainer \
+  --domain-identifier "$BUNDLE_ID" \
+  --source Documents/Logs/ios_ble.old.log \
+  --destination "$OUT_DIR/ios_ble.old.log" \
+  >/tmp/ios_smoke_copy_old_log.out 2>/tmp/ios_smoke_copy_old_log.err || true
+
+if [[ ! -s "$OUT_DIR/$DEST_NAME" ]]; then
+  echo "iOS log is missing or empty: $OUT_DIR/$DEST_NAME" >&2
+  exit 1
+fi
+
+if ! grep -Eq 'BLE-iOS|BLE-Reconnect|AppMode|Preferences|App launch|SmokeTest' "$OUT_DIR/$DEST_NAME"; then
+  echo "iOS log does not contain expected smoke keywords" >&2
+  exit 1
+fi
+
+echo "$OUT_DIR/$DEST_NAME"

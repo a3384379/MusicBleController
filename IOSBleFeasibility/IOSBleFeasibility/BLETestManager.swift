@@ -375,6 +375,7 @@ final class BLETestManager: NSObject, ObservableObject {
         loadCachedPlaybackHistory()
         loadArtworkEnhancementSettings()
         updateArtworkEnhancementStatus(message: "ready")
+        runDebugSmokeTestIfNeeded()
     }
 
     func toggleAppExperienceMode() {
@@ -403,6 +404,42 @@ final class BLETestManager: NSObject, ObservableObject {
         } else {
             log("[AppMode] debug mode debug tools available")
         }
+    }
+
+    private func runDebugSmokeTestIfNeeded() {
+        #if DEBUG
+        let defaults = UserDefaults.standard
+        let arguments = ProcessInfo.processInfo.arguments
+        let markerKey = "smokeTestPreferencesWritten"
+        if arguments.contains("--smoke-test-preferences") {
+            setAppExperienceMode(.debug)
+            UserDefaults.standard.set(200, forKey: "artworkDisplaySize")
+            setKaraokeOffsetMs(300)
+            setAutoReconnectEnabled(true)
+            defaults.set(true, forKey: markerKey)
+            log("[SmokeTest] preferences written")
+            let verified = appExperienceMode == .debug &&
+                defaults.integer(forKey: "artworkDisplaySize") == 200 &&
+                karaokeOffsetMs == 300 &&
+                autoReconnectEnabled
+            if verified {
+                log("[SmokeTest] preferences verified mode=debug artworkDisplaySize=200 lyricOffsetMs=300 autoReconnect=true")
+            } else {
+                log(
+                    "[SmokeTest] preferences verification failed " +
+                        "mode=\(appExperienceMode.rawValue) " +
+                        "artworkDisplaySize=\(defaults.integer(forKey: "artworkDisplaySize")) " +
+                        "lyricOffsetMs=\(karaokeOffsetMs) autoReconnect=\(autoReconnectEnabled)"
+                )
+            }
+        } else if defaults.bool(forKey: markerKey),
+                  appExperienceMode == .debug,
+                  defaults.integer(forKey: "artworkDisplaySize") == 200,
+                  karaokeOffsetMs == 300,
+                  autoReconnectEnabled {
+            log("[SmokeTest] preferences persisted")
+        }
+        #endif
     }
 
     deinit {
