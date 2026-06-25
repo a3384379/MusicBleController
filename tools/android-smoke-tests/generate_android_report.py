@@ -83,6 +83,15 @@ def read_debug_control(out_dir: Path) -> dict:
         }
 
 
+def read_json_file(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def table(rows: list[dict]) -> str:
     lines = ["| Test | Result | Cost | Detail |", "|---|---|---:|---|"]
     for row in rows:
@@ -116,7 +125,7 @@ def build_failure_excerpt(out_dir: Path, should_extract: bool) -> str:
         return ""
     keywords = [
         "PlayerAgent", "BLE-A", "BLE-ADV", "BLE-GATT", "BLE-RECOVERY",
-        "Qrc", "Lyric", "AlbumArt", "FullLyrics", "FATAL EXCEPTION",
+        "Qrc", "Lyric", "AlbumArt", "FullLyrics", "PlaybackDiff", "FATAL EXCEPTION",
         "ANR", "AndroidRuntime", "failed", "error",
     ]
     selected = []
@@ -150,11 +159,13 @@ def main():
     git = git_info(root)
     device = read_device(out_dir)
     debug_control = read_debug_control(out_dir)
+    playback_diff_flow = read_json_file(out_dir / "playback_diff_flow.json")
 
     report_path = out_dir / "report.md"
     report_json_path = out_dir / "report.json"
     logcat = out_dir / "sony_logcat.log"
     filtered = out_dir / "sony_filtered.log"
+    playback_diff_flow_path = out_dir / "playback_diff_flow.json"
 
     report = [
         "# Android Smoke Test Report",
@@ -192,6 +203,19 @@ def main():
         f"- available: `{str(debug_control.get('debugControlAvailable', False)).lower()}`",
         f"- startAttempted: `{str(debug_control.get('debugControlStartAttempted', False)).lower()}`",
         f"- startResult: `{debug_control.get('debugControlStartResult', 'unknown')}`",
+        "",
+        "## PlaybackDiff Flow",
+        "",
+        f"- result: `{playback_diff_flow.get('result', 'not recorded')}`",
+        f"- snapshots: `{playback_diff_flow.get('snapshotBuildCount', 0)}`",
+        f"- diffs: `{playback_diff_flow.get('diffCount', 0)}`",
+        f"- push: `{playback_diff_flow.get('pushCount', 0)}`",
+        f"- skip: `{playback_diff_flow.get('skipCount', 0)}`",
+        f"- skipRatio: `{playback_diff_flow.get('skipRatio', 0)}`",
+        f"- trackChanged: `{playback_diff_flow.get('trackChangedCount', 0)}`",
+        f"- wordChanged: `{playback_diff_flow.get('wordChangedCount', 0)}`",
+        f"- positionJump: `{playback_diff_flow.get('positionJumpCount', 0)}`",
+        f"- reason: {playback_diff_flow.get('reason', 'not recorded')}",
         "",
         "## File Checks",
         "",
@@ -233,9 +257,11 @@ def main():
             "report_json": str(report_json_path),
             "logcat": str(logcat) if logcat.exists() else "",
             "filtered_logcat": str(filtered) if filtered.exists() else "",
+            "playback_diff_flow": str(playback_diff_flow_path) if playback_diff_flow_path.exists() else "",
             "failure_excerpt": failure_excerpt,
         },
         "debugControl": debug_control,
+        "playbackDiffFlow": playback_diff_flow,
     }
     report_json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(report_path)

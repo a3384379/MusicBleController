@@ -72,12 +72,24 @@ In quick mode, build/install are marked PASS as skipped by request.
 ## Optional Tests
 
 - BLE Service
+- PlaybackDiff Flow
 - QRC Cache
 - QQMusic Dir
 
 Optional WARN means the device may not have started the foreground service or may not have QQMusic/QRC cache ready. This does not necessarily mean PlayerAgent is broken.
 
 Optional FAIL is reserved for severe evidence such as FATAL/ANR or GATT/advertising failure without recovery success.
+
+`PlaybackDiff Flow` reads Sony logcat only. It reports:
+
+- snapshotBuildCount
+- diffCount
+- pushCount
+- skipCount
+- skipRatio
+- trackChangedCount / wordChangedCount / positionJumpCount
+
+If no iPhone subscriber is visible in logcat, it returns SKIPPED. If a subscriber is visible but there are no PlaybackDiff decisions yet, it returns WARN. During a real 2-3 minute playback session with an iPhone subscriber, `skipCount` should be greater than `pushCount`.
 
 ## Debug-only Service Control
 
@@ -119,6 +131,7 @@ Important files:
 - `failure_excerpt.log`: key excerpt when failures or warnings exist
 - `file_checks.tsv`: app/cache/QQMusic path checks
 - `debug_control.json`: whether debug control receiver was available and whether START was attempted
+- `playback_diff_flow.json`: parsed PlaybackDiff metrics from Sony logcat
 
 ## Why It Does Not Start The Service Directly
 

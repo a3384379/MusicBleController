@@ -274,6 +274,17 @@ else
   record_optional "BLE Service" "WARN" "$ble_cost" "optional analyzer produced no result"
 fi
 
+start="$(now_ms)"
+"$SCRIPT_DIR/android_playback_diff_flow_test.sh" "$OUT_DIR/sony_logcat.log" \
+  >"$OUT_DIR/android_playback_diff_flow_stdout.log" \
+  2>"$OUT_DIR/android_playback_diff_flow_stderr.log" || true
+playback_diff_cost="$(elapsed_ms "$start")"
+if [[ -s "$OUT_DIR/android_playback_diff_flow_stdout.log" ]]; then
+  awk -F'\t' -v cost="$playback_diff_cost" 'BEGIN {OFS="\t"} {$4=cost; print $0}' "$OUT_DIR/android_playback_diff_flow_stdout.log" >> "$OPTIONAL_RESULTS"
+else
+  record_optional "PlaybackDiff Flow" "WARN" "$playback_diff_cost" "optional analyzer produced no result"
+fi
+
 python3 "$SCRIPT_DIR/generate_android_report.py" "$OUT_DIR" > "$OUT_DIR/report_path.txt"
 REPORT_PATH="$(sed -n '1p' "$OUT_DIR/report_path.txt")"
 REPORT_JSON="$(sed -n '2p' "$OUT_DIR/report_path.txt")"

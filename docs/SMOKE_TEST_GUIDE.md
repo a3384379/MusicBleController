@@ -15,12 +15,13 @@
 
 ## Android/Sony-only 模块职责
 
-- `tools/android-smoke-tests/run_android_smoke_tests.sh`：总入口，设备发现、build/install/launch/log/file checks、optional BLE、生成报告。
+- `tools/android-smoke-tests/run_android_smoke_tests.sh`：总入口，设备发现、build/install/launch/log/file checks、optional BLE、optional PlaybackDiff Flow、生成报告。
 - `android_device_check.sh`：选择 adb device，处理多设备和 unauthorized。
 - `android_build_install.sh`：构建 `:PlayerAgentApp:assembleDebug` 并安装 APK。
 - `android_collect_logs.sh`：采集 Sony logcat 和过滤日志。
 - `android_file_checks.sh`：检查 app external files、QRC cache、QQMusic public 目录。
 - `android_ble_optional_test.sh`：只基于 Sony logcat 判断 GATT/advertising 健康。
+- `android_playback_diff_flow_test.sh`：只基于 Sony logcat 统计 PlaybackDiff snapshot/diff/push/skip 指标。
 - `generate_android_report.py`：生成 Android `report.md` 和 `report.json`。
 - Debug build 会通过 `PlayerAgentDebugControlReceiver` 尝试启动 BLE foreground service，减少人工点击 Sony UI。
 
@@ -48,6 +49,7 @@
 - [android_collect_logs.sh](/Volumes/雷电/project/MusicBleController/tools/android-smoke-tests/android_collect_logs.sh)
 - [android_file_checks.sh](/Volumes/雷电/project/MusicBleController/tools/android-smoke-tests/android_file_checks.sh)
 - [android_ble_optional_test.sh](/Volumes/雷电/project/MusicBleController/tools/android-smoke-tests/android_ble_optional_test.sh)
+- [android_playback_diff_flow_test.sh](/Volumes/雷电/project/MusicBleController/tools/android-smoke-tests/android_playback_diff_flow_test.sh)
 - [generate_android_report.py](/Volumes/雷电/project/MusicBleController/tools/android-smoke-tests/generate_android_report.py)
 
 ## Cross-device 核心文件
@@ -77,7 +79,8 @@
 5. 采集 `logcat -d`，生成 `sony_logcat.log` 和 `sony_filtered.log`。
 6. 检查 `/sdcard/Android/data/com.example.playeragent/files`、QRC cache、ArtworkDiscovery、Logs、QQMusic public 目录。
 7. Optional BLE 只从 logcat 判断 GATT server / service add / advertising。
-8. 输出 `/tmp/music_ble_android_smoke/<timestamp>/report.md` 和 `report.json`。
+8. Optional PlaybackDiff Flow 只从 logcat 统计 snapshotBuildCount、diffCount、pushCount、skipCount、skipRatio、trackChanged、wordChanged、positionJump。
+9. 输出 `/tmp/music_ble_android_smoke/<timestamp>/report.md` 和 `report.json`。
 
 ## Cross-device 数据流
 
@@ -114,9 +117,11 @@
   - Cache Dirs
 - Optional tests：
   - BLE Service
+  - PlaybackDiff Flow
   - QRC Cache
   - QQMusic Dir
 - Optional WARN 常见于用户没有启动 PlayerAgent BLE service，不代表 Required 失败。
+- PlaybackDiff Flow 在没有 iPhone subscriber 时返回 SKIPPED；有 subscriber 但样本不足时返回 WARN。真实连接并播放 2-3 分钟后，期望 `skipCount > pushCount`。
 - Optional FAIL 用于 FATAL/ANR 或 GATT/advertising 失败且没有 recovery success。
 - `--no-debug-control` 可关闭 Debug-only service control，回到只读 logcat 的旧行为。
 - release build 不包含 debug control receiver，`PlayerAgentForegroundService` 仍保持 `exported=false`。
