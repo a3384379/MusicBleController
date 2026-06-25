@@ -35,6 +35,12 @@ Android only:
 ./tools/smoke/run_all_smoke_tests.sh --android-only --quick --json
 ```
 
+Android without debug service control:
+
+```bash
+./tools/android-smoke-tests/run_android_smoke_tests.sh --quick --json --no-debug-control
+```
+
 Specified devices:
 
 ```bash
@@ -121,3 +127,10 @@ Use platform-specific suites when only one side changed:
 - It does not operate QQMusic.
 - It does not force-stop user apps.
 - It does not prove Live Activity visual layout, BLE subjective latency, or lyrics/artwork UX correctness.
+
+## Debug-only Sony Service Control
+
+Android/Sony smoke uses the debug-only receiver in debug builds to start the
+PlayerAgent BLE foreground service before checking GATT/advertising logs.
+
+This is not a BLE protocol feature and is not present in release builds.

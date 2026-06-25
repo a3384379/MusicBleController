@@ -103,13 +103,22 @@ docs-only 改动：
 - BLE recovery / advertising / GATT 逻辑。
 - QRC / Lyrics / AlbumArt / PlaybackHistory 的 Sony 端逻辑。
 - Sony Debug Tools UI。
+- Debug-only service control receiver 或 Android smoke optional BLE 检查。
 
 需要 Android full 的改动：
 - `PlayerAgentApp/build.gradle`
 - `AndroidManifest.xml`
+- `PlayerAgentApp/src/debug/AndroidManifest.xml`
 - App 启动流程。
 - foreground service 启动/权限。
 - APK install 相关配置。
+
+Debug-only receiver 安全要求：
+
+- receiver 必须位于 `PlayerAgentApp/src/debug`。
+- release manifest 不得注册 receiver。
+- `PlayerAgentForegroundService` 必须继续 `exported=false`。
+- 该入口只服务 smoke/adb 测试，不属于 BLE 协议。
 
 iOS 和 Sony 都改动时，两个 smoke 都要跑。跨端 BLE 协议改动时，smoke 只能覆盖基础健康检查，仍必须安排 iPhone + Sony 真机链路验证。
 

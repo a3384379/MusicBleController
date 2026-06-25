@@ -22,6 +22,7 @@
 - `android_file_checks.sh`：检查 app external files、QRC cache、QQMusic public 目录。
 - `android_ble_optional_test.sh`：只基于 Sony logcat 判断 GATT/advertising 健康。
 - `generate_android_report.py`：生成 Android `report.md` 和 `report.json`。
+- Debug build 会通过 `PlayerAgentDebugControlReceiver` 尝试启动 BLE foreground service，减少人工点击 Sony UI。
 
 ## Cross-device 模块职责
 
@@ -117,6 +118,8 @@
   - QQMusic Dir
 - Optional WARN 常见于用户没有启动 PlayerAgent BLE service，不代表 Required 失败。
 - Optional FAIL 用于 FATAL/ANR 或 GATT/advertising 失败且没有 recovery success。
+- `--no-debug-control` 可关闭 Debug-only service control，回到只读 logcat 的旧行为。
+- release build 不包含 debug control receiver，`PlayerAgentForegroundService` 仍保持 `exported=false`。
 
 ## Cross-device 关键状态
 
@@ -144,6 +147,7 @@
 - Android Build FAIL：看 `android_build_stderr.log`。
 - Android Launch FAIL：看 `launch_logcat.log`。
 - Android BLE Service WARN：可能只是未手动启动 PlayerAgent 前台服务。
+- Debug control unavailable：确认安装的是 debug build；release 不包含该测试 receiver。
 - Cross-device WARN：通常是只连接了一台设备或某个 Optional 检查 WARN。
 - Cross-device FAIL：先看总 `report.json` 的 `ios.report_json` / `android.report_json` 指向的子报告。
 
@@ -155,5 +159,6 @@
 - 改 Android smoke 脚本：至少跑 `./tools/android-smoke-tests/run_android_smoke_tests.sh --quick --json`。
 - 改 Sony Android 普通逻辑：跑 Android quick。
 - 改 Android build/manifest/service/permission/install：跑 Android full。
+- 改 Debug-only service control receiver：跑 Android full，并验证 release manifest 不包含 receiver。
 - 改 cross-device 总入口：跑 `./tools/smoke/run_all_smoke_tests.sh --quick --json`。
 - 跨端相关改动且两台设备都连接：优先跑 `./tools/smoke/run_all_smoke_tests.sh --quick --json`。

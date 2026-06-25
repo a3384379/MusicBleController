@@ -134,6 +134,10 @@ If both iOS and Sony are changed, run both iOS smoke and Android smoke. If a
 cross-device BLE protocol changed, smoke tests are only basic validation; real
 iPhone + Sony manual validation is still required.
 
+Android smoke may use Debug-only Sony service control from `PlayerAgentApp/src/debug`
+to start the BLE foreground service. This receiver must never move into
+`src/main`, and `PlayerAgentForegroundService` must remain `exported=false`.
+
 ## Cross-device Smoke Entry
 
 When a change spans iOS and Sony, or when both devices are connected and a broad

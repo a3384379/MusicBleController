@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <receiver
+            android:name=".debug.PlayerAgentDebugControlReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.example.playeragent.debug.START_BLE_SERVICE" />
+                <action android:name="com.example.playeragent.debug.STOP_BLE_SERVICE" />
+                <action android:name="com.example.playeragent.debug.RECOVER_BLE_STACK" />
+                <action android:name="com.example.playeragent.debug.DUMP_BLE_DIAGNOSTICS" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>

@@ -38,6 +38,12 @@ Quick test:
 ./tools/android-smoke-tests/run_android_smoke_tests.sh --quick --json
 ```
 
+Disable debug service control:
+
+```bash
+./tools/android-smoke-tests/run_android_smoke_tests.sh --quick --json --no-debug-control
+```
+
 Specified device:
 
 ```bash
@@ -73,6 +79,29 @@ Optional WARN means the device may not have started the foreground service or ma
 
 Optional FAIL is reserved for severe evidence such as FATAL/ANR or GATT/advertising failure without recovery success.
 
+## Debug-only Service Control
+
+Debug builds include `PlayerAgentDebugControlReceiver` from `PlayerAgentApp/src/debug`.
+
+The smoke suite attempts:
+
+```bash
+adb shell am broadcast \
+  -a com.example.playeragent.debug.START_BLE_SERVICE \
+  -p com.example.playeragent
+```
+
+Then it waits briefly and checks logcat for:
+
+- `[DebugControl] received action=...`
+- `[BLE-A] GATT server started`
+- `[BLE-A] service added success`
+- `BLE advertising started`
+
+Release builds do not include this receiver. The formal `PlayerAgentForegroundService` remains `exported=false`.
+
+Use `--no-debug-control` to keep the previous passive behavior.
+
 ## Reports
 
 Each run creates:
@@ -89,6 +118,7 @@ Important files:
 - `sony_filtered.log`: filtered PlayerAgent/BLE/QRC/lyrics/artwork logs
 - `failure_excerpt.log`: key excerpt when failures or warnings exist
 - `file_checks.tsv`: app/cache/QQMusic path checks
+- `debug_control.json`: whether debug control receiver was available and whether START was attempted
 
 ## Why It Does Not Start The Service Directly
 
@@ -107,3 +137,4 @@ This suite is for Sony-only regression. Cross-device BLE behavior still requires
 - install failed: inspect `android_install_stderr.log`.
 - launch failed: inspect `launch_logcat.log`.
 - BLE Service WARN: PlayerAgent BLE foreground service may not be started.
+- Debug control unavailable: installed app may not be a debug build, or the receiver is not present.

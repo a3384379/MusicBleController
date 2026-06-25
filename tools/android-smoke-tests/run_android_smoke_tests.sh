@@ -7,6 +7,7 @@ PACKAGE_NAME="${PACKAGE_NAME:-com.example.playeragent}"
 SKIP_BUILD=false
 SKIP_INSTALL=false
 JSON_OUTPUT=false
+DEBUG_CONTROL=true
 OUTPUT_DIR_ARG=""
 
 usage() {
@@ -17,6 +18,8 @@ Options:
   --quick          Skip build/install and run fast installed-app checks.
   --skip-build     Skip Gradle build.
   --skip-install   Skip APK install.
+  --no-debug-control
+                   Do not send debug-only service control broadcasts.
   --device <id>    Use a specific adb device id.
   --output <dir>   Write artifacts to a specific output directory.
   --json           Keep stdout machine-readable; write report.json path and summary.
@@ -39,6 +42,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-install)
       SKIP_INSTALL=true
+      shift
+      ;;
+    --no-debug-control)
+      DEBUG_CONTROL=false
       shift
       ;;
     --device)
@@ -256,7 +263,10 @@ if [[ -f "$OUT_DIR/file_checks.tsv" ]]; then
 fi
 
 start="$(now_ms)"
-"$SCRIPT_DIR/android_ble_optional_test.sh" "$OUT_DIR/sony_logcat.log" >"$OUT_DIR/android_ble_optional_stdout.log" 2>"$OUT_DIR/android_ble_optional_stderr.log" || true
+DEBUG_CONTROL_ENABLED="$DEBUG_CONTROL" \
+  "$SCRIPT_DIR/android_ble_optional_test.sh" "$OUT_DIR/sony_logcat.log" \
+  >"$OUT_DIR/android_ble_optional_stdout.log" \
+  2>"$OUT_DIR/android_ble_optional_stderr.log" || true
 ble_cost="$(elapsed_ms "$start")"
 if [[ -s "$OUT_DIR/android_ble_optional_stdout.log" ]]; then
   awk -F'\t' -v cost="$ble_cost" 'BEGIN {OFS="\t"} {$4=cost; print $0}' "$OUT_DIR/android_ble_optional_stdout.log" >> "$OPTIONAL_RESULTS"

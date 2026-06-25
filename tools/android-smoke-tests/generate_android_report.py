@@ -65,6 +65,24 @@ def read_device(out_dir: Path) -> dict:
     }
 
 
+def read_debug_control(out_dir: Path) -> dict:
+    path = out_dir / "debug_control.json"
+    if not path.exists():
+        return {
+            "debugControlAvailable": False,
+            "debugControlStartAttempted": False,
+            "debugControlStartResult": "not recorded",
+        }
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {
+            "debugControlAvailable": False,
+            "debugControlStartAttempted": False,
+            "debugControlStartResult": "invalid debug_control.json",
+        }
+
+
 def table(rows: list[dict]) -> str:
     lines = ["| Test | Result | Cost | Detail |", "|---|---|---:|---|"]
     for row in rows:
@@ -131,6 +149,7 @@ def main():
     failure_excerpt = build_failure_excerpt(out_dir, overall_result != "PASS" or optional_warn > 0)
     git = git_info(root)
     device = read_device(out_dir)
+    debug_control = read_debug_control(out_dir)
 
     report_path = out_dir / "report.md"
     report_json_path = out_dir / "report.json"
@@ -167,6 +186,12 @@ def main():
         "## Optional Tests",
         "",
         table(optional) if optional else "| Test | Result | Cost | Detail |\n|---|---|---:|---|\n| Optional | SKIPPED | 0 ms | no optional tests |",
+        "",
+        "## Debug Control",
+        "",
+        f"- available: `{str(debug_control.get('debugControlAvailable', False)).lower()}`",
+        f"- startAttempted: `{str(debug_control.get('debugControlStartAttempted', False)).lower()}`",
+        f"- startResult: `{debug_control.get('debugControlStartResult', 'unknown')}`",
         "",
         "## File Checks",
         "",
@@ -210,6 +235,7 @@ def main():
             "filtered_logcat": str(filtered) if filtered.exists() else "",
             "failure_excerpt": failure_excerpt,
         },
+        "debugControl": debug_control,
     }
     report_json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(report_path)

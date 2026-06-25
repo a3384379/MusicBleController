@@ -72,9 +72,11 @@ class PlayerAgentForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+            ACTION_STOP_SERVICE -> stopSelf()
             ACTION_STOP_QRC_WATCHER -> stopQrcWatcher()
             ACTION_START_QRC_WATCHER -> startQrcWatcher()
             ACTION_RECOVER_BLE_STACK -> recoverBleStack("manual debug")
+            ACTION_DUMP_BLE_DIAGNOSTICS -> logBleDiagnostics("debug dump")
             ACTION_REFRESH_CURRENT_LYRIC -> refreshCurrentLyric()
             else -> {
                 startPlaybackHistoryMonitor()
@@ -520,12 +522,16 @@ class PlayerAgentForegroundService : Service() {
             "com.example.playeragent.ACTION_PLAYER_UI_STATE"
         const val ACTION_QRC_WATCHER_STATUS =
             "com.example.playeragent.ACTION_QRC_WATCHER_STATUS"
+        const val ACTION_STOP_SERVICE =
+            "com.example.playeragent.ACTION_STOP_SERVICE"
         const val ACTION_START_QRC_WATCHER =
             "com.example.playeragent.ACTION_START_QRC_WATCHER"
         const val ACTION_STOP_QRC_WATCHER =
             "com.example.playeragent.ACTION_STOP_QRC_WATCHER"
         const val ACTION_RECOVER_BLE_STACK =
             "com.example.playeragent.ACTION_RECOVER_BLE_STACK"
+        const val ACTION_DUMP_BLE_DIAGNOSTICS =
+            "com.example.playeragent.ACTION_DUMP_BLE_DIAGNOSTICS"
         const val ACTION_REFRESH_CURRENT_LYRIC =
             "com.example.playeragent.ACTION_REFRESH_CURRENT_LYRIC"
         const val EXTRA_LOG_MESSAGE = "extra_log_message"
