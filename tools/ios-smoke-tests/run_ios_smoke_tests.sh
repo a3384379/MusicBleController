@@ -285,6 +285,27 @@ if [[ -s "$OPTIONAL_RESULTS" ]]; then
   mv "$OPTIONAL_RESULTS.tmp" "$OPTIONAL_RESULTS"
 fi
 
+start="$(now_ms)"
+if [[ "$BLE_OPTIONAL" == true ]]; then
+  album_art_cost=0
+  set +e
+  ALBUM_ART_FLOW_COST_MS=0 "$SCRIPT_DIR/ios_album_art_flow_test.sh" \
+    "$OUT_DIR/ios_ble_after_preferences_restart.log" \
+    >"$OUT_DIR/ios_album_art_flow_stdout.log" \
+    2>"$OUT_DIR/ios_album_art_flow_stderr.log"
+  album_art_rc="$?"
+  set -e
+  album_art_cost="$(elapsed_ms "$start")"
+  if [[ "$album_art_rc" -eq 0 && -s "$OUT_DIR/ios_album_art_flow_stdout.log" ]]; then
+    awk -F'\t' -v cost="$album_art_cost" 'BEGIN {OFS="\t"} {$4=cost; print $0}' \
+      "$OUT_DIR/ios_album_art_flow_stdout.log" >> "$OPTIONAL_RESULTS"
+  else
+    printf 'optional\tAlbumArt Flow\tWARN\t%s\talbum art flow analyzer failed\n' "$album_art_cost" >> "$OPTIONAL_RESULTS"
+  fi
+else
+  printf 'optional\tAlbumArt Flow\tSKIPPED\t0\tdisabled by --no-ble-optional\n' >> "$OPTIONAL_RESULTS"
+fi
+
 python3 "$SCRIPT_DIR/generate_ios_report.py" "$OUT_DIR" > "$OUT_DIR/report_path.txt"
 REPORT_PATH="$(sed -n '1p' "$OUT_DIR/report_path.txt")"
 REPORT_JSON="$(sed -n '2p' "$OUT_DIR/report_path.txt")"

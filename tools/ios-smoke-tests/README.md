@@ -10,6 +10,7 @@ This suite verifies the iPhone app side of MusicBleController without controllin
 - smoke-test preferences persistence
 - app container file access
 - optional BLE activity based only on iOS logs
+- optional AlbumArt flow validation based only on iOS logs
 - Markdown and JSON reports for Codex-friendly parsing
 
 ## Requirements
@@ -67,6 +68,13 @@ Disable optional BLE checks:
 ./tools/ios-smoke-tests/run_ios_smoke_tests.sh --no-ble-optional
 ```
 
+Analyze AlbumArt flow from an existing iOS log:
+
+```bash
+./tools/ios-smoke-tests/ios_album_art_flow_test.sh /tmp/ios_ble.log
+./tools/ios-smoke-tests/ios_album_art_flow_test.sh /tmp/ios_ble.log --album-art-id <id>
+```
+
 Write artifacts to a known directory:
 
 ```bash
@@ -86,6 +94,8 @@ Required tests decide the process exit code:
 
 Optional BLE tests inspect existing iOS logs for scan, discover, connect, notify subscription, playbackState, and health signals. Optional `WARN` or `SKIPPED` results do not fail the suite because Sony may be offline or not advertising during an iOS-only run.
 
+AlbumArt Flow is also optional. It inspects only iOS logs for `albumArtOffer`, preview/HQ requests, binary start/chunk/end, cache saves, enhancement, fallback, timeout cleanup, and final display quality. Sony offline or missing album art logs produce `WARN`/`SKIPPED`, not a required failure. A stuck binary transfer is reported as optional `FAIL` in the report for diagnosis.
+
 ## Reports
 
 Each run creates a timestamped directory under:
@@ -100,6 +110,7 @@ Important files:
 - `report.json`: machine-readable summary for Codex
 - `ios_ble.log`: copied iOS app log
 - `failure_excerpt.log`: key log excerpt when a required test fails or an optional test warns
+- `album_art_flow.json`: AlbumArt flow summary, if collected
 - `required_results.tsv`: required test rows
 - `optional_results.tsv`: optional test rows
 - `file_checks.tsv`: app container file access summary
@@ -133,3 +144,4 @@ Codex should read `report.json`. Required tests must pass. Optional BLE warnings
 - Log file missing: launch the app once, then rerun.
 - Preferences failed: the installed app may not include the DEBUG smoke-test launch hook.
 - Optional BLE warnings: Sony may be offline, not advertising, or not connected.
+- AlbumArt Flow skipped/warned: Sony may be offline, no recent `albumArtOffer` was logged, or the current song has no artwork.

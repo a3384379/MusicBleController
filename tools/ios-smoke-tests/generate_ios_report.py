@@ -60,13 +60,26 @@ def read_tsv(path: Path) -> list[dict]:
             cost = int(cost_ms)
         except ValueError:
             cost = 0
-        rows.append({
+        row = {
             "category": category,
             "name": name,
             "result": result,
             "detail": detail,
             "costMs": cost,
-        })
+        }
+        for extra in parts[5:]:
+            if "=" not in extra:
+                continue
+            key, value = extra.split("=", 1)
+            if not key:
+                continue
+            if value.lower() == "true":
+                row[key] = True
+            elif value.lower() == "false":
+                row[key] = False
+            else:
+                row[key] = value
+        rows.append(row)
     return rows
 
 
@@ -133,12 +146,20 @@ def main():
     required_total = len(required)
     optional_pass = sum(1 for row in optional if row["result"] == "PASS")
     optional_warn = sum(1 for row in optional if row["result"] == "WARN")
+    optional_fail = sum(1 for row in optional if row["result"] == "FAIL")
     optional_skipped = sum(1 for row in optional if row["result"] == "SKIPPED")
     required_fail = sum(1 for row in required if row["result"] == "FAIL")
     overall_result = "PASS" if required_fail == 0 else "FAIL"
     has_warn_or_fail = any(row["result"] in {"WARN", "FAIL"} for row in tests)
     failure_excerpt = build_failure_excerpt(out_dir, has_warn_or_fail)
     git = git_info(root)
+    album_art_flow_path = out_dir / "album_art_flow.json"
+    album_art_flow = None
+    if album_art_flow_path.exists():
+        try:
+            album_art_flow = json.loads(album_art_flow_path.read_text(encoding="utf-8"))
+        except Exception:
+            album_art_flow = None
 
     report_path = out_dir / "report.md"
     report_json_path = out_dir / "report.json"
@@ -174,11 +195,29 @@ def main():
         "",
         table(optional) if optional else "| Test | Result | Cost | Detail |\n|---|---|---:|---|\n| Optional BLE | SKIPPED | 0 ms | disabled |",
         "",
+        "## AlbumArt Flow",
+        "",
+    ]
+    if album_art_flow:
+        report.extend([
+            f"- result: `{album_art_flow.get('result', 'unknown')}`",
+            f"- albumArtId: `{album_art_flow.get('albumArtId') or '-'}`",
+            f"- finalQuality: `{album_art_flow.get('finalQuality') or '-'}`",
+            f"- preview: `{str(album_art_flow.get('preview', False)).lower()}`",
+            f"- hq: `{str(album_art_flow.get('hq', False)).lower()}`",
+            f"- enhanced: `{str(album_art_flow.get('enhanced', False)).lower()}`",
+            f"- timeout: `{str(album_art_flow.get('timeout', False)).lower()}`",
+            f"- reason: {album_art_flow.get('reason') or '-'}",
+            "",
+        ])
+    else:
+        report.extend(["AlbumArt Flow was not collected.", ""])
+    report.extend([
         "## File Checks",
         "",
         file_table(out_dir / "file_checks.tsv"),
         "",
-    ]
+    ])
     if failure_excerpt:
         report.extend([
             "## Failure/WARN Excerpt",
@@ -191,7 +230,7 @@ def main():
         "",
         f"Overall: {overall_result}",
         f"Required PASS {required_pass}/{required_total}",
-        f"Optional PASS {optional_pass}, WARN {optional_warn}, SKIPPED {optional_skipped}",
+        f"Optional PASS {optional_pass}, WARN {optional_warn}, FAIL {optional_fail}, SKIPPED {optional_skipped}",
         "",
     ])
     report_path.write_text("\n".join(report), encoding="utf-8")
@@ -202,6 +241,7 @@ def main():
             "required_total": required_total,
             "optional_pass": optional_pass,
             "optional_warn": optional_warn,
+            "optional_fail": optional_fail,
             "optional_skipped": optional_skipped,
             "overall_result": overall_result,
         },
@@ -213,8 +253,11 @@ def main():
             "report_json": str(report_json_path),
             "ios_log": str(ios_log) if ios_log.exists() else "",
             "failure_excerpt": failure_excerpt,
+            "album_art_flow": str(album_art_flow_path) if album_art_flow_path.exists() else "",
         },
     }
+    if album_art_flow:
+        payload["albumArtFlow"] = album_art_flow
     report_json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(report_path)
     print(report_json_path)
