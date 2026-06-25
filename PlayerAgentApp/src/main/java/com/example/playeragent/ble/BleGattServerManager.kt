@@ -25,6 +25,7 @@ import com.example.playeragent.logging.LogConfig
 import com.example.playeragent.logging.LogBuffer
 import com.example.playeragent.media.MediaCommandExecutor
 import com.example.playeragent.media.MediaFieldDumpManager
+import com.example.playeragent.media.CurrentTrackRuntimeCache
 import com.example.playeragent.media.CurrentTrackSnapshot
 import com.example.playeragent.media.IncrementalLyricsReady
 import com.example.playeragent.media.PlaybackStateReader
@@ -635,7 +636,8 @@ class BleGattServerManager(
     }
 
     fun currentTrackSnapshot(): CurrentTrackSnapshot? {
-        return playbackStateReader.currentTrackSnapshot()
+        return playbackStateReader.runtimeCacheSnapshot().track
+            ?: playbackStateReader.currentTrackSnapshot()
     }
 
     private fun sendLyricDiagnostic(request: JSONObject) {
@@ -703,6 +705,13 @@ class BleGattServerManager(
             "[LyricDiag] response status=${snapshot.status} reason=${snapshot.reason} " +
                 "recoveryState=${snapshot.recoveryState} " +
                 "costMs=${SystemClock.elapsedRealtime() - startedAtMs}"
+        )
+        val runtimeMetrics = playbackStateReader.runtimeCacheSnapshot().metrics
+        logger(
+            "[RuntimeCache] metrics hit=${runtimeMetrics.cacheHit} " +
+                "miss=${runtimeMetrics.cacheMiss} refresh=${runtimeMetrics.refreshCount} " +
+                "lastRefreshCostMs=${runtimeMetrics.lastRefreshCostMs} " +
+                "lastTrackSwitchCostMs=${runtimeMetrics.lastTrackSwitchCostMs}"
         )
     }
 
@@ -1051,6 +1060,12 @@ class BleGattServerManager(
         }
         lastAlbumArtKey = cacheKey
         currentAlbumArtId = protocolId
+        CurrentTrackRuntimeCache.updateAlbumArt(
+            trackId = protocolId,
+            albumArtId = protocolId,
+            albumArtState = "scheduled",
+            logger = logger
+        )
 
         val pending = PendingAlbumArt(
             cacheKey = cacheKey,
@@ -1091,6 +1106,12 @@ class BleGattServerManager(
             return
         }
         currentAlbumArtId = protocolId
+        CurrentTrackRuntimeCache.updateAlbumArt(
+            trackId = protocolId,
+            albumArtId = protocolId,
+            albumArtState = "offer",
+            logger = logger
+        )
         albumArtRequestsInFlight.removeIf {
             !it.startsWith("$protocolId|")
         }
@@ -1188,6 +1209,12 @@ class BleGattServerManager(
         if (quality == AlbumArtQuality.HQ) {
             logger("[AlbumArtHQ] request accepted id=$protocolId")
         }
+        CurrentTrackRuntimeCache.updateAlbumArt(
+            trackId = protocolId,
+            albumArtId = protocolId,
+            albumArtState = "request:${quality.wireValue}",
+            logger = logger
+        )
         logger("[AlbumArtDebug] id=$protocolId")
 
         val device = subscribedDevices.values.firstOrNull()
@@ -1348,12 +1375,24 @@ class BleGattServerManager(
                         "costMs=$costMs"
                 )
                 sendPendingAlbumArtIfAny()
+                CurrentTrackRuntimeCache.updateAlbumArt(
+                    trackId = protocolId,
+                    albumArtId = protocolId,
+                    albumArtState = "sent:${quality.wireValue}",
+                    logger = logger
+                )
             },
             onFailure = {
                 albumArtRequestsInFlight.remove(requestKey)
                 if (quality == AlbumArtQuality.HQ && currentAlbumArtId != protocolId) {
                     logger("[AlbumArtHQ] cancelled reason=track changed")
                 }
+                CurrentTrackRuntimeCache.updateAlbumArt(
+                    trackId = protocolId,
+                    albumArtId = protocolId,
+                    albumArtState = "failed:${quality.wireValue}",
+                    logger = logger
+                )
                 sendPendingAlbumArtIfAny()
             }
         )
@@ -2627,7 +2666,8 @@ class BleGattServerManager(
         val trackId = buildAlbumArtProtocolId(source)
         val title = source.optString("title")
         val artist = source.optString("artist")
-        val lines = playbackStateReader.lyricLinesSnapshot()
+        val allLines = playbackStateReader.runtimeLyricLinesSnapshot()
+        val lines = allLines
             .filter { it.text.isNotBlank() }
             .take(MAX_FULL_LYRICS_LINES)
         val includeWordsAroundCurrent =
@@ -2743,8 +2783,8 @@ class BleGattServerManager(
             value = end,
             delayAfterMs = FULL_LYRICS_NOTIFICATION_DELAY_MS
         )
-        if (playbackStateReader.lyricLinesSnapshot().size > MAX_FULL_LYRICS_LINES) {
-            logger("[FullLyrics] truncated count=${playbackStateReader.lyricLinesSnapshot().size}")
+        if (allLines.size > MAX_FULL_LYRICS_LINES) {
+            logger("[FullLyrics] truncated count=${allLines.size}")
         }
         val wordsLines = wordLineIndexes.count { lines[it].words.isNotEmpty() }
         logger(
@@ -2804,7 +2844,7 @@ class BleGattServerManager(
             )
             return
         }
-        val lines = playbackStateReader.lyricLinesSnapshot()
+        val lines = playbackStateReader.runtimeLyricLinesSnapshot()
             .filter { it.text.isNotBlank() }
             .take(MAX_FULL_LYRICS_LINES)
         if (lines.isEmpty()) {

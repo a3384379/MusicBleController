@@ -540,6 +540,12 @@ class LyricManager(
                 "[LyricAsync] success marked loaded songKey=${request.key} " +
                     "lines=${result.lineCount}"
             )
+            CurrentTrackRuntimeCache.updateLyrics(
+                songKey = request.key,
+                lines = cachedLines,
+                lyricSource = result.source.name,
+                logger = logger
+            )
         } else if (result.retryable) {
             retryableFailureSongKey = request.key
             retryableFailureReason = result.failureReason.ifBlank { "lyrics retry pending" }
@@ -557,6 +563,11 @@ class LyricManager(
                 album = request.album,
                 reason = retryableFailureReason,
                 qrcGeneration = QrcDirectoryGeneration.current()
+            )
+            CurrentTrackRuntimeCache.updateRecovery(
+                songKey = request.key,
+                recoveryState = recoveryEngine.snapshot().state.name,
+                logger = logger
             )
             if (result.source != LyricSource.QRC) {
                 cachedLines = emptyList()
@@ -576,6 +587,11 @@ class LyricManager(
                 lazyWaitStartedAtMs = 0L
             }
             recoveryEngine.onFinalFailure(request.key, finalEmptyReason)
+            CurrentTrackRuntimeCache.updateRecovery(
+                songKey = request.key,
+                recoveryState = recoveryEngine.snapshot().state.name,
+                logger = logger
+            )
             logger(
                 "[LyricAsync] final empty, marked loaded " +
                     "songKey=${request.key} reason=$finalEmptyReason"
@@ -714,6 +730,13 @@ class LyricManager(
             }
             lastLoggedLine = currentLine
         }
+        activeSongKey?.let { key ->
+            CurrentTrackRuntimeCache.updateCurrentLine(
+                songKey = key,
+                positionMs = safePosition,
+                currentLine = currentLine
+            )
+        }
 
         return currentLine
     }
@@ -795,6 +818,12 @@ class LyricManager(
         logger(
             "[Lyric] incremental lyrics applied " +
                 "songKey=${currentTrack.songKey} lines=${lines.size}"
+        )
+        CurrentTrackRuntimeCache.updateLyrics(
+            songKey = activeKey,
+            lines = lines,
+            lyricSource = LyricSource.QRC.name,
+            logger = logger
         )
         return true
     }

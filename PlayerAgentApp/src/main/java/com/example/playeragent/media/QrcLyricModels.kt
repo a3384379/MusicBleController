@@ -185,7 +185,22 @@ data class CurrentTrackSnapshot(
     val artist: String,
     val album: String,
     val trackChangedAtMs: Long,
-    val hasLyrics: Boolean
+    val hasLyrics: Boolean,
+    val positionMs: Long = 0L,
+    val durationMs: Long = 0L,
+    val isPlaying: Boolean = false,
+    val albumArtId: String? = null,
+    val lyricSource: String = "NONE",
+    val lyricLines: List<RuntimeLyricLine> = emptyList(),
+    val translationLines: List<String?> = emptyList(),
+    val romanizationLines: List<String?> = emptyList(),
+    val currentLine: String = "",
+    val currentWord: RuntimeLyricWord? = null,
+    val lastPlaybackState: String = "",
+    val lastUpdatedAtMs: Long = 0L,
+    val recoveryState: String = "",
+    val albumArtState: String = "",
+    val diagnosticSnapshot: String = ""
 )
 
 data class IncrementalLyricsReady(

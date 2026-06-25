@@ -111,6 +111,9 @@ class PlaybackStateReader(
             lastLoggedLyric = lyric
             logger("[PlaybackState] lyric=$lyric")
         }
+        val lyricStatus = lyricManager.currentStatusText()
+        val lyricReason = lyricManager.currentUnavailableReason()
+        val diagnostic = lyricManager.diagnosticSnapshot(lastTrackId)
         val totalCostMs = SystemClock.elapsedRealtime() - startedAtMs
         if (LogConfig.DEBUG_VERBOSE_LOG || totalCostMs > SLOW_PLAYBACK_READ_MS) {
             logger(
@@ -131,7 +134,7 @@ class PlaybackStateReader(
                 "lyric=$lyric"
         )
 
-        return JSONObject()
+        val response = JSONObject()
             .put("type", "playbackState")
             .put("playing", playing)
             .put("title", title)
@@ -140,12 +143,47 @@ class PlaybackStateReader(
             .put("position", position)
             .put("duration", duration)
             .put("lyric", lyric)
-            .put("lyricStatus", lyricManager.currentStatusText())
-            .put("lyricReason", lyricManager.currentUnavailableReason())
-            .put("lyricSuggestion", lyricManager.diagnosticSnapshot(lastTrackId).suggestion)
+            .put("lyricStatus", lyricStatus)
+            .put("lyricReason", lyricReason)
+            .put("lyricSuggestion", diagnostic.suggestion)
+        val songKey = buildLyricSongKey(title, artist, album)
+        CurrentTrackRuntimeCache.updatePlaybackState(
+            trackId = lastTrackId,
+            songKey = songKey,
+            title = title,
+            artist = artist,
+            album = album,
+            positionMs = position,
+            durationMs = duration,
+            isPlaying = playing,
+            currentLine = lyric,
+            lyricSource = diagnostic.source,
+            lastPlaybackState = response,
+            diagnosticSnapshot = diagnostic.status,
+            logger = logger
+        )
+        if (includeLyric) {
+            val loadedLines = lyricManager.lyricLinesSnapshot()
+            if (loadedLines.isNotEmpty()) {
+                CurrentTrackRuntimeCache.updateLyrics(
+                    songKey = songKey,
+                    lines = loadedLines,
+                    lyricSource = diagnostic.source
+                )
+            }
+        }
+        return response
     }
 
     fun lyricLinesSnapshot(): List<LyricManager.LyricLine> {
+        return lyricManager.lyricLinesSnapshot()
+    }
+
+    fun runtimeLyricLinesSnapshot(): List<LyricManager.LyricLine> {
+        val runtimeLines = CurrentTrackRuntimeCache.lyricLinesSnapshot()
+        if (runtimeLines.isNotEmpty()) {
+            return runtimeLines
+        }
         return lyricManager.lyricLinesSnapshot()
     }
 
@@ -210,7 +248,12 @@ class PlaybackStateReader(
     }
 
     fun currentTrackSnapshot(): CurrentTrackSnapshot? {
-        return lyricManager.currentTrackSnapshot(lastTrackId)
+        return CurrentTrackRuntimeCache.trackSnapshot()
+            ?: lyricManager.currentTrackSnapshot(lastTrackId)
+    }
+
+    fun runtimeCacheSnapshot(): CurrentTrackRuntimeCacheSnapshot {
+        return CurrentTrackRuntimeCache.snapshot()
     }
 
     fun applyIncrementalLyrics(ready: IncrementalLyricsReady): Boolean {
@@ -279,6 +322,14 @@ class PlaybackStateReader(
             .digest(source.toByteArray(Charsets.UTF_8))
             .take(TRACK_ID_HASH_BYTES)
             .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    }
+
+    private fun buildLyricSongKey(
+        title: String,
+        artist: String,
+        album: String
+    ): String {
+        return "${title.trim()}|${artist.trim()}|${album.trim()}"
     }
 
     private fun calculatePosition(playbackState: PlaybackState?): Long {
