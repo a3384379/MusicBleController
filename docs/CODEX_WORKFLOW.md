@@ -113,6 +113,30 @@ docs-only 改动：
 
 iOS 和 Sony 都改动时，两个 smoke 都要跑。跨端 BLE 协议改动时，smoke 只能覆盖基础健康检查，仍必须安排 iPhone + Sony 真机链路验证。
 
+## 跨设备 smoke 总入口
+
+如果改动同时涉及 iOS 和 Sony，或两台设备都 USB 连接且需要一次完整回归，优先使用：
+
+```bash
+./tools/smoke/run_all_smoke_tests.sh --quick --json
+```
+
+耗时可接受时跑完整：
+
+```bash
+./tools/smoke/run_all_smoke_tests.sh --json
+```
+
+总入口规则：
+
+- iPhone + Sony 都存在：跑 iOS smoke 和 Android smoke。
+- 只有 iPhone：跑 iOS，Android 标记 `SKIPPED`，overall 可为 `WARN`。
+- 只有 Sony：跑 Android，iOS 标记 `SKIPPED`，overall 可为 `WARN`。
+- 两台都没有：`FAIL`。
+- 显式 `--ios-only` 或 `--android-only` 时，缺指定设备为 `FAIL`。
+
+跨端 BLE 协议改动时，总入口只能证明两端基础构建/安装/启动健康；协议兼容、控制、歌词、封面等真实链路仍需要人工真机验证。
+
 ## 协议兼容性规则
 
 默认禁止改协议，除非用户明确要求。

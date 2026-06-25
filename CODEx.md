@@ -134,6 +134,25 @@ If both iOS and Sony are changed, run both iOS smoke and Android smoke. If a
 cross-device BLE protocol changed, smoke tests are only basic validation; real
 iPhone + Sony manual validation is still required.
 
+## Cross-device Smoke Entry
+
+When a change spans iOS and Sony, or when both devices are connected and a broad
+regression pass is useful, prefer the unified entry:
+
+```bash
+./tools/smoke/run_all_smoke_tests.sh --quick --json
+```
+
+For full cross-device smoke orchestration:
+
+```bash
+./tools/smoke/run_all_smoke_tests.sh --json
+```
+
+The unified entry automatically degrades when only iPhone or only Sony is
+connected. A missing device is WARN/SKIPPED unless the suite was explicitly
+requested with `--ios-only` or `--android-only`.
+
 ## Codex Result Analysis
 
 Read `report.json`.

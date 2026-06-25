@@ -4,6 +4,7 @@
 
 - iOS-only：只验证 iPhone 端，不控制 Sony，也不使用 adb。
 - Android/Sony-only：只验证 Sony `PlayerAgentApp`，使用 adb，不操作 iPhone。
+- Cross-device entry：编排 iOS-only 和 Android/Sony-only，并生成总报告。
 
 ## iOS-only 模块职责
 
@@ -21,6 +22,11 @@
 - `android_file_checks.sh`：检查 app external files、QRC cache、QQMusic public 目录。
 - `android_ble_optional_test.sh`：只基于 Sony logcat 判断 GATT/advertising 健康。
 - `generate_android_report.py`：生成 Android `report.md` 和 `report.json`。
+
+## Cross-device 模块职责
+
+- `tools/smoke/run_all_smoke_tests.sh`：检测 iPhone/Sony，调用 iOS 和 Android 子 suite，支持自动降级。
+- `tools/smoke/generate_all_report.py`：读取子报告并生成总 `report.md` / `report.json`。
 
 ## iOS-only 核心文件
 
@@ -42,6 +48,12 @@
 - [android_file_checks.sh](/Volumes/雷电/project/MusicBleController/tools/android-smoke-tests/android_file_checks.sh)
 - [android_ble_optional_test.sh](/Volumes/雷电/project/MusicBleController/tools/android-smoke-tests/android_ble_optional_test.sh)
 - [generate_android_report.py](/Volumes/雷电/project/MusicBleController/tools/android-smoke-tests/generate_android_report.py)
+
+## Cross-device 核心文件
+
+- [run_all_smoke_tests.sh](/Volumes/雷电/project/MusicBleController/tools/smoke/run_all_smoke_tests.sh)
+- [generate_all_report.py](/Volumes/雷电/project/MusicBleController/tools/smoke/generate_all_report.py)
+- [README.md](/Volumes/雷电/project/MusicBleController/tools/smoke/README.md)
 
 ## iOS-only 数据流
 
@@ -65,6 +77,15 @@
 6. 检查 `/sdcard/Android/data/com.example.playeragent/files`、QRC cache、ArtworkDiscovery、Logs、QQMusic public 目录。
 7. Optional BLE 只从 logcat 判断 GATT server / service add / advertising。
 8. 输出 `/tmp/music_ble_android_smoke/<timestamp>/report.md` 和 `report.json`。
+
+## Cross-device 数据流
+
+1. 检测 iPhone：`devicectl list devices`。
+2. 检测 Sony：`adb devices`。
+3. 两台都存在时分别运行 iOS 和 Android smoke。
+4. 只存在一台时自动只跑对应 suite，另一个 suite 标记 `SKIPPED`。
+5. 子报告输出到 `<output>/ios/` 和 `<output>/android/`。
+6. 总报告输出到 `/tmp/music_ble_smoke/<timestamp>/report.md` 和 `report.json`。
 
 ## iOS-only 关键状态
 
@@ -97,13 +118,21 @@
 - Optional WARN 常见于用户没有启动 PlayerAgent BLE service，不代表 Required 失败。
 - Optional FAIL 用于 FATAL/ANR 或 GATT/advertising 失败且没有 recovery success。
 
+## Cross-device 关键状态
+
+- `PASS`：所有已运行 suite Required 通过，且没有 Optional 严重 FAIL。
+- `WARN`：Required 通过，但缺一台设备导致 suite `SKIPPED`，或 Optional 有 WARN。
+- `FAIL`：任一已运行 suite Required FAIL，显式指定的 suite 缺设备，或子脚本异常无报告。
+- 退出码：`0` 表示 PASS/WARN，`1` 表示 FAIL。
+
 ## 不允许随便修改的点
 
-- smoke 工具不得调用 `adb`、`logcat` 或 Android Gradle 构建。
+- iOS smoke 工具不得调用 `adb`、`logcat` 或 Android Gradle 构建。
 - Optional WARN/SKIPPED 不得让 suite 失败。
 - `--quick` 必须跳过 build/install。
 - `--json` stdout 应保持机器可读。
 - Android smoke 工具不得调用 `devicectl`，不得操作 iPhone，不能删除 QRC/QQMusic/用户数据。
+- Cross-device 总入口不得直接操作业务数据，只能编排子 smoke。
 
 ## 常见问题排查入口
 
@@ -115,6 +144,8 @@
 - Android Build FAIL：看 `android_build_stderr.log`。
 - Android Launch FAIL：看 `launch_logcat.log`。
 - Android BLE Service WARN：可能只是未手动启动 PlayerAgent 前台服务。
+- Cross-device WARN：通常是只连接了一台设备或某个 Optional 检查 WARN。
+- Cross-device FAIL：先看总 `report.json` 的 `ios.report_json` / `android.report_json` 指向的子报告。
 
 ## 修改后必须跑哪些 smoke test
 
@@ -124,3 +155,5 @@
 - 改 Android smoke 脚本：至少跑 `./tools/android-smoke-tests/run_android_smoke_tests.sh --quick --json`。
 - 改 Sony Android 普通逻辑：跑 Android quick。
 - 改 Android build/manifest/service/permission/install：跑 Android full。
+- 改 cross-device 总入口：跑 `./tools/smoke/run_all_smoke_tests.sh --quick --json`。
+- 跨端相关改动且两台设备都连接：优先跑 `./tools/smoke/run_all_smoke_tests.sh --quick --json`。
