@@ -91,6 +91,28 @@ docs-only 改动：
 - 不需要 build。
 - 需要 `git diff --check`。
 
+## Android/Sony smoke 决策
+
+- Quick：
+  `./tools/android-smoke-tests/run_android_smoke_tests.sh --quick --json`
+- Full：
+  `./tools/android-smoke-tests/run_android_smoke_tests.sh --json`
+
+需要 Android quick 的改动：
+- Sony Kotlin/Java 普通逻辑。
+- BLE recovery / advertising / GATT 逻辑。
+- QRC / Lyrics / AlbumArt / PlaybackHistory 的 Sony 端逻辑。
+- Sony Debug Tools UI。
+
+需要 Android full 的改动：
+- `PlayerAgentApp/build.gradle`
+- `AndroidManifest.xml`
+- App 启动流程。
+- foreground service 启动/权限。
+- APK install 相关配置。
+
+iOS 和 Sony 都改动时，两个 smoke 都要跑。跨端 BLE 协议改动时，smoke 只能覆盖基础健康检查，仍必须安排 iPhone + Sony 真机链路验证。
+
 ## 协议兼容性规则
 
 默认禁止改协议，除非用户明确要求。

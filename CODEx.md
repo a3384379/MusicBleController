@@ -113,6 +113,27 @@ Command:
 ./tools/ios-smoke-tests/run_ios_smoke_tests.sh --json
 ```
 
+## Android/Sony Changes
+
+After Sony Android changes, run the Android-only smoke suite.
+
+For normal Sony app changes:
+
+```bash
+./tools/android-smoke-tests/run_android_smoke_tests.sh --quick --json
+```
+
+For changes touching `build.gradle`, `AndroidManifest.xml`, app launch,
+foreground service startup, permissions, or install behavior:
+
+```bash
+./tools/android-smoke-tests/run_android_smoke_tests.sh --json
+```
+
+If both iOS and Sony are changed, run both iOS smoke and Android smoke. If a
+cross-device BLE protocol changed, smoke tests are only basic validation; real
+iPhone + Sony manual validation is still required.
+
 ## Codex Result Analysis
 
 Read `report.json`.
