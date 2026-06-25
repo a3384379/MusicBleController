@@ -7,13 +7,21 @@ BUNDLE_ID="${BUNDLE_ID:-com.sqz.IOSBleFeasibility}"
 
 mkdir -p "$OUT_DIR/file_checks"
 TABLE="$OUT_DIR/file_checks.tsv"
+DETAILS="$OUT_DIR/file_checks_details.env"
 : > "$TABLE"
+: > "$DETAILS"
 
 record() {
   local path="$1"
   local exists="$2"
   local bytes="$3"
   printf '%s\t%s\t%s\n' "$path" "$exists" "$bytes" >> "$TABLE"
+}
+
+detail() {
+  local key="$1"
+  local value="$2"
+  printf '%s=%s\n' "$key" "$value" >> "$DETAILS"
 }
 
 copy_path() {
@@ -28,6 +36,15 @@ copy_path() {
     >/tmp/ios_smoke_copy_path.out 2>/tmp/ios_smoke_copy_path.err
 }
 
+file_bytes() {
+  local path="$1"
+  if [[ -s "$path" ]]; then
+    wc -c < "$path" | tr -d ' '
+  else
+    echo "0"
+  fi
+}
+
 list_path() {
   local source="$1"
   local dest="$2"
@@ -39,14 +56,56 @@ list_path() {
     >"$dest" 2>"$dest.err"
 }
 
-if copy_path "Documents/Logs/ios_ble.log" "$OUT_DIR/file_checks/ios_ble.log"; then
-  bytes="$(wc -c < "$OUT_DIR/file_checks/ios_ble.log" | tr -d ' ')"
-  record "Documents/Logs/ios_ble.log" "true" "$bytes"
+logs_dir_exists="false"
+if list_path "Documents/Logs" "$OUT_DIR/file_checks/Logs.list"; then
+  logs_dir_exists="true"
+fi
+detail "logsDirExists" "$logs_dir_exists"
+
+ios_log_copied="false"
+ios_log_local_path="$OUT_DIR/ios_ble.log"
+ios_log_local_bytes="$(file_bytes "$ios_log_local_path")"
+ios_log_device_copy_attempted="false"
+ios_log_device_copy_result="not_attempted"
+
+for attempt in 1 2 3; do
+  ios_log_local_bytes="$(file_bytes "$ios_log_local_path")"
+  if [[ "$ios_log_local_bytes" -gt 0 ]]; then
+    ios_log_copied="true"
+    ios_log_device_copy_result="local_artifact"
+    break
+  fi
+
+  ios_log_device_copy_attempted="true"
+  if copy_path "Documents/Logs/ios_ble.log" "$OUT_DIR/file_checks/ios_ble.log"; then
+    copied_bytes="$(file_bytes "$OUT_DIR/file_checks/ios_ble.log")"
+    if [[ "$copied_bytes" -gt 0 ]]; then
+      cp "$OUT_DIR/file_checks/ios_ble.log" "$ios_log_local_path"
+      ios_log_local_bytes="$copied_bytes"
+      ios_log_copied="true"
+      ios_log_device_copy_result="copy_success_attempt_$attempt"
+      break
+    fi
+    ios_log_device_copy_result="copy_empty_attempt_$attempt"
+  else
+    ios_log_device_copy_result="copy_failed_attempt_$attempt"
+  fi
+  sleep 1
+done
+
+detail "iosLogCopied" "$ios_log_copied"
+detail "iosLogLocalPath" "$ios_log_local_path"
+detail "iosLogLocalBytes" "$ios_log_local_bytes"
+detail "iosLogDeviceCopyAttempted" "$ios_log_device_copy_attempted"
+detail "iosLogDeviceCopyResult" "$ios_log_device_copy_result"
+
+if [[ "$ios_log_copied" == "true" ]]; then
+  record "Documents/Logs/ios_ble.log" "true" "$ios_log_local_bytes"
 else
   record "Documents/Logs/ios_ble.log" "false" "0"
 fi
 
-if list_path "Documents/Logs" "$OUT_DIR/file_checks/Logs.list"; then
+if [[ "$logs_dir_exists" == "true" ]]; then
   bytes="$(wc -c < "$OUT_DIR/file_checks/Logs.list" | tr -d ' ')"
   record "Documents/Logs/" "true" "$bytes"
 else

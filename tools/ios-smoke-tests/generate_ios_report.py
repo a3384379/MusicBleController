@@ -112,6 +112,28 @@ def file_table(path: Path) -> str:
     return "\n".join(lines)
 
 
+def read_env_details(path: Path) -> dict:
+    details = {}
+    if not path.exists():
+        return details
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key:
+            details[key] = value
+    return details
+
+
+def details_table(details: dict) -> str:
+    if not details:
+        return ""
+    lines = ["| key | value |", "|---|---|"]
+    for key in sorted(details):
+        lines.append(f"| {key} | {details[key]} |")
+    return "\n".join(lines)
+
+
 def build_failure_excerpt(out_dir: Path, should_extract: bool) -> str:
     if not should_extract:
         return ""
@@ -154,6 +176,7 @@ def main():
     failure_excerpt = build_failure_excerpt(out_dir, has_warn_or_fail)
     git = git_info(root)
     album_art_flow_path = out_dir / "album_art_flow.json"
+    file_check_details = read_env_details(out_dir / "file_checks_details.env")
     album_art_flow = None
     if album_art_flow_path.exists():
         try:
@@ -218,6 +241,13 @@ def main():
         file_table(out_dir / "file_checks.tsv"),
         "",
     ])
+    if file_check_details:
+        report.extend([
+            "### File Check Details",
+            "",
+            details_table(file_check_details),
+            "",
+        ])
     if failure_excerpt:
         report.extend([
             "## Failure/WARN Excerpt",
@@ -258,6 +288,8 @@ def main():
     }
     if album_art_flow:
         payload["albumArtFlow"] = album_art_flow
+    if file_check_details:
+        payload["fileChecks"] = file_check_details
     report_json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(report_path)
     print(report_json_path)

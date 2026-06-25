@@ -114,6 +114,7 @@ Important files:
 - `required_results.tsv`: required test rows
 - `optional_results.tsv`: optional test rows
 - `file_checks.tsv`: app container file access summary
+- `file_checks_details.env`: File Checks diagnostics. `ios_ble.log` first reuses the already collected local artifact, then retries app-container copy before failing.
 
 ## Codex Workflow
 

@@ -31,6 +31,7 @@ struct NowPlayingDiagnosticView: View {
                             lyricCard(snapshot)
                             artworkCard(snapshot)
                             connectionCard(snapshot)
+                            selfHealingCard(snapshot)
                             recentIssuesCard(snapshot)
                             quickActionsCard(snapshot)
                         } else {
@@ -238,6 +239,37 @@ struct NowPlayingDiagnosticView: View {
         }
     }
 
+    private func selfHealingCard(_ snapshot: NowPlayingDiagnosticSnapshot) -> some View {
+        DiagnosticCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Self-Healing", systemImage: "cross.case")
+                    .font(.headline.weight(.bold))
+
+                Text(snapshot.selfHealing.overallStatus)
+                    .font(.headline.weight(.semibold))
+                Text(snapshot.selfHealing.summaryText)
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.74))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Divider().overlay(.white.opacity(0.12))
+
+                diagnosticRow("Active", "\(snapshot.selfHealing.metrics.activeCount)")
+                diagnosticRow("Detect", "\(snapshot.selfHealing.metrics.detectCount)")
+                diagnosticRow("Recover", "\(snapshot.selfHealing.metrics.recoverCount)")
+                diagnosticRow("Verify", "\(snapshot.selfHealing.metrics.verifyCount)")
+                diagnosticRow("Success", "\(snapshot.selfHealing.metrics.successCount)")
+                diagnosticRow("Fail", "\(snapshot.selfHealing.metrics.failCount)")
+
+                VStack(spacing: 8) {
+                    ForEach(snapshot.selfHealing.reports) { report in
+                        recoveryReportRow(report)
+                    }
+                }
+            }
+        }
+    }
+
     private func recentIssuesCard(_ snapshot: NowPlayingDiagnosticSnapshot) -> some View {
         DiagnosticCard {
             VStack(alignment: .leading, spacing: 12) {
@@ -345,6 +377,33 @@ struct NowPlayingDiagnosticView: View {
                 .font(.caption2.monospaced())
                 .foregroundStyle(.white.opacity(0.42))
                 .lineLimit(2)
+        }
+        .padding(10)
+        .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func recoveryReportRow(_ report: RecoveryReport) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(report.domain.title)
+                    .font(.caption.weight(.bold))
+                Spacer()
+                Text(report.state.stage.title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(report.state.isActive ? .yellow : .green)
+            }
+            Text(report.detectedIssue)
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.78))
+                .lineLimit(2)
+            Text("Recover: \(report.recoveryAction)")
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.54))
+                .lineLimit(3)
+            Text("Verify: \(report.verifySignal)")
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.54))
+                .lineLimit(3)
         }
         .padding(10)
         .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -477,6 +536,16 @@ struct SystemHealthOverviewView: View {
                                 actionButton("复制诊断信息", "doc.on.doc") {
                                     UIPasteboard.general.string = snapshot.copyText
                                     actionStatus = "已复制健康摘要"
+                                }
+                            }
+                            healthCard(snapshot.selfHealing) {
+                                actionButton("刷新诊断", "arrow.clockwise") {
+                                    actionStatus = "正在刷新恢复状态..."
+                                    bleManager.refreshSystemHealthOverview()
+                                    refreshSnapshot(after: 0.35)
+                                }
+                                actionButton("当前歌曲诊断", "waveform.path.ecg.rectangle") {
+                                    showNowPlayingDiagnostic = true
                                 }
                             }
                             copyCard(snapshot)

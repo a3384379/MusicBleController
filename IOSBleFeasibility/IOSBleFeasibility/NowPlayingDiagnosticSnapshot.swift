@@ -76,6 +76,7 @@ struct NowPlayingDiagnosticSnapshot {
     let isFullLyricsCurrent: Bool
     let isFullLyricsReceiving: Bool
     let connection: ConnectionDiagnosticSnapshot
+    let selfHealing: SelfHealingSnapshot
 
     var quickSnapshotText: String {
         """
@@ -88,6 +89,7 @@ struct NowPlayingDiagnosticSnapshot {
         artworkQuality=\(albumArtDisplayQuality)
         artworkTransferState=\(albumArtTransfer.state)
         artworkTransferReason=\(albumArtTransfer.lastFailureReason)
+        selfHealing=\(selfHealing.overallStatus)
         trackId=\(trackId)
         """
     }
@@ -231,6 +233,26 @@ struct NowPlayingDiagnosticSnapshot {
         lines.append("probeInFlight: \(connection.probeInFlight)")
         lines.append("lastHardReconnectReason: \(connection.lastHardReconnectReason)")
         lines.append("reconnectWorkItemExists: \(connection.reconnectWorkItemExists)")
+        lines.append("")
+        lines.append("[SelfHealing]")
+        lines.append("overallStatus: \(selfHealing.overallStatus)")
+        lines.append("activeCount: \(selfHealing.metrics.activeCount)")
+        lines.append("detectCount: \(selfHealing.metrics.detectCount)")
+        lines.append("recoverCount: \(selfHealing.metrics.recoverCount)")
+        lines.append("verifyCount: \(selfHealing.metrics.verifyCount)")
+        lines.append("successCount: \(selfHealing.metrics.successCount)")
+        lines.append("failCount: \(selfHealing.metrics.failCount)")
+        lines.append("diagnosticsCount: \(selfHealing.metrics.diagnosticsCount)")
+        for report in selfHealing.reports {
+            lines.append(
+                "\(report.domain.title): stage=\(report.state.stage.rawValue) " +
+                    "active=\(report.state.isActive) result=\(report.result.status) " +
+                    "reason=\(report.state.reason)"
+            )
+            lines.append("  detect: \(report.detectedIssue)")
+            lines.append("  recover: \(report.recoveryAction)")
+            lines.append("  verify: \(report.verifySignal)")
+        }
         return lines.joined(separator: "\n")
     }
 
@@ -306,6 +328,7 @@ struct SystemHealthSnapshot {
     let lyric: SystemHealthCardSnapshot
     let artwork: SystemHealthCardSnapshot
     let sony: SystemHealthCardSnapshot
+    let selfHealing: SystemHealthCardSnapshot
     let recommendation: String
     let source: NowPlayingDiagnosticSnapshot
 
@@ -316,14 +339,16 @@ struct SystemHealthSnapshot {
         self.lyric = Self.makeLyricCard(source)
         self.artwork = Self.makeArtworkCard(source)
         self.sony = Self.makeSonyCard(source)
+        self.selfHealing = Self.makeSelfHealingCard(source)
         self.recommendation = Self.makeRecommendation(
             connection: connection,
             lyric: lyric,
             artwork: artwork,
             sony: sony,
+            selfHealing: selfHealing,
             source: source
         )
-        let worst = [connection.level, lyric.level, artwork.level, sony.level].max {
+        let worst = [connection.level, lyric.level, artwork.level, sony.level, selfHealing.level].max {
             $0.rank < $1.rank
         } ?? .unknown
         self.overallLevel = worst
@@ -339,6 +364,7 @@ struct SystemHealthSnapshot {
         appendCard(lyric, to: &lines)
         appendCard(artwork, to: &lines)
         appendCard(sony, to: &lines)
+        appendCard(selfHealing, to: &lines)
         lines.append("")
         lines.append("[建议]")
         lines.append(recommendation)
@@ -560,11 +586,50 @@ struct SystemHealthSnapshot {
         )
     }
 
+    private static func makeSelfHealingCard(_ source: NowPlayingDiagnosticSnapshot) -> SystemHealthCardSnapshot {
+        let snapshot = source.selfHealing
+        let level: SystemHealthLevel
+        switch snapshot.overallSeverity {
+        case .normal:
+            level = .ok
+        case .working:
+            level = .working
+        case .warning:
+            level = .warning
+        case .critical:
+            level = .critical
+        }
+        var fields: [SystemHealthField] = [
+            .init(title: "active", value: "\(snapshot.metrics.activeCount)"),
+            .init(title: "detect", value: "\(snapshot.metrics.detectCount)"),
+            .init(title: "recover", value: "\(snapshot.metrics.recoverCount)"),
+            .init(title: "verify", value: "\(snapshot.metrics.verifyCount)"),
+            .init(title: "success", value: "\(snapshot.metrics.successCount)"),
+            .init(title: "fail", value: "\(snapshot.metrics.failCount)")
+        ]
+        fields.append(contentsOf: snapshot.reports.map {
+            .init(
+                title: $0.domain.title,
+                value: "\($0.state.stage.title) / \($0.result.status)"
+            )
+        })
+        return SystemHealthCardSnapshot(
+            id: "selfHealing",
+            title: "Self-Healing",
+            systemImage: "cross.case",
+            status: snapshot.overallStatus,
+            level: level,
+            summary: snapshot.summaryText,
+            fields: fields
+        )
+    }
+
     private static func makeRecommendation(
         connection: SystemHealthCardSnapshot,
         lyric: SystemHealthCardSnapshot,
         artwork: SystemHealthCardSnapshot,
         sony: SystemHealthCardSnapshot,
+        selfHealing: SystemHealthCardSnapshot,
         source: NowPlayingDiagnosticSnapshot
     ) -> String {
         if connection.level == .critical || connection.status == "正在重连" {
@@ -580,7 +645,10 @@ struct SystemHealthSnapshot {
         if artwork.status == "图片过大" {
             return "HQ 图片过大，已使用 fallback 或 preview。"
         }
-        if [connection, lyric, artwork, sony].allSatisfy({ $0.level == .ok }) {
+        if selfHealing.level == .warning || selfHealing.level == .critical {
+            return "查看 Self-Healing 报告中的失败或诊断项。"
+        }
+        if [connection, lyric, artwork, sony, selfHealing].allSatisfy({ $0.level == .ok }) {
             return "当前状态正常。"
         }
         return "优先查看标记为注意或异常的项目。"

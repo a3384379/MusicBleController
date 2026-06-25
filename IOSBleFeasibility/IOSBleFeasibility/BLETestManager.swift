@@ -235,6 +235,7 @@ final class BLETestManager: NSObject, ObservableObject {
     private var basePlaybackPositionMs: Int64 = 0
     private var playbackStateReceivedAt = Date()
     private var progressTimer: Timer?
+    private let selfHealingEngine = SelfHealingEngine.shared
     private lazy var albumArtReceiver: AlbumArtReceiver = {
         let receiver = AlbumArtReceiver(delegate: self)
         receiver.onStateChanged = { [weak self] receiver in
@@ -630,6 +631,16 @@ final class BLETestManager: NSObject, ObservableObject {
             reconnectWorkItemExists: autoReconnectWorkItemExists
         )
         let artwork = albumArtReceiver.snapshot()
+        let selfHealing = selfHealingEngine.evaluate(
+            trackId: currentTrackID,
+            title: title,
+            connection: connection,
+            artwork: artwork,
+            lyric: lyricDiagnostic,
+            currentLyric: lyric,
+            fullLyricsLineCount: fullLyrics.count,
+            isFullLyricsCurrent: isFullLyricsCurrent
+        )
         return NowPlayingDiagnosticSnapshot(
             generatedAt: Date(),
             title: title,
@@ -655,7 +666,8 @@ final class BLETestManager: NSObject, ObservableObject {
             fullLyricsLineCount: fullLyrics.count,
             isFullLyricsCurrent: isFullLyricsCurrent,
             isFullLyricsReceiving: isFullLyricsReceiving,
-            connection: connection
+            connection: connection,
+            selfHealing: selfHealing
         )
     }
 

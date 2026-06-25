@@ -265,7 +265,17 @@ fi
 start="$(now_ms)"
 if "$SCRIPT_DIR/ios_file_checks.sh" > "$OUT_DIR/file_checks_stdout.txt" 2>"$OUT_DIR/file_checks_stderr.txt"; then
   if grep -q $'Documents/Logs/ios_ble.log\ttrue' "$OUT_DIR/file_checks.tsv"; then
-    record_required "File Checks" "PASS" "$(elapsed_ms "$start")" "app container files accessible"
+    ios_log_bytes="$(awk -F'\t' '$1 == "Documents/Logs/ios_ble.log" {print $3}' "$OUT_DIR/file_checks.tsv")"
+    ios_log_source="app container"
+    if [[ -f "$OUT_DIR/file_checks_details.env" ]]; then
+      copy_result="$(awk -F= '$1 == "iosLogDeviceCopyResult" {print $2}' "$OUT_DIR/file_checks_details.env")"
+      if [[ "$copy_result" == "local_artifact" ]]; then
+        ios_log_source="collected artifact"
+      elif [[ -n "$copy_result" ]]; then
+        ios_log_source="$copy_result"
+      fi
+    fi
+    record_required "File Checks" "PASS" "$(elapsed_ms "$start")" "ios_ble.log copied bytes=${ios_log_bytes:-0} source=$ios_log_source"
   else
     record_required "File Checks" "FAIL" "$(elapsed_ms "$start")" "ios_ble.log not accessible in app container"
   fi
