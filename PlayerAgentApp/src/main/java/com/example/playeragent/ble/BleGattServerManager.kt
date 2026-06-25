@@ -29,6 +29,7 @@ import com.example.playeragent.media.CurrentTrackRuntimeCache
 import com.example.playeragent.media.CurrentTrackSnapshot
 import com.example.playeragent.media.IncrementalLyricsReady
 import com.example.playeragent.media.PlaybackStateReader
+import com.example.playeragent.media.PlaybackStateDiffType
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -108,6 +109,7 @@ class BleGattServerManager(
     private var currentAlbumArtPlaybackState: JSONObject? = null
     private var lastAutoPushSongKey: String? = null
     private var lastAutoPushPlaying: Boolean? = null
+    private var lastPlaybackDiffSkipLogAtMs: Long = 0L
     @Volatile
     private var clientSupportsBinaryAlbumArt = false
     @Volatile
@@ -706,12 +708,23 @@ class BleGattServerManager(
                 "recoveryState=${snapshot.recoveryState} " +
                 "costMs=${SystemClock.elapsedRealtime() - startedAtMs}"
         )
-        val runtimeMetrics = playbackStateReader.runtimeCacheSnapshot().metrics
+        val runtimeSnapshot = playbackStateReader.runtimeCacheSnapshot()
+        val runtimeMetrics = runtimeSnapshot.metrics
         logger(
             "[RuntimeCache] metrics hit=${runtimeMetrics.cacheHit} " +
                 "miss=${runtimeMetrics.cacheMiss} refresh=${runtimeMetrics.refreshCount} " +
                 "lastRefreshCostMs=${runtimeMetrics.lastRefreshCostMs} " +
                 "lastTrackSwitchCostMs=${runtimeMetrics.lastTrackSwitchCostMs}"
+        )
+        val playbackDiffMetrics = runtimeSnapshot.playbackDiffMetrics
+        logger(
+            "[PlaybackDiff] metrics snapshots=${playbackDiffMetrics.snapshotBuildCount} " +
+                "diffs=${playbackDiffMetrics.diffCount} " +
+                "push=${playbackDiffMetrics.pushCount} " +
+                "skip=${playbackDiffMetrics.skipCount} " +
+                "trackChanged=${playbackDiffMetrics.trackChangedCount} " +
+                "wordChanged=${playbackDiffMetrics.wordChangedCount} " +
+                "positionJump=${playbackDiffMetrics.positionJumpCount}"
         )
     }
 
@@ -813,6 +826,7 @@ class BleGattServerManager(
         }
 
         logger("[BLE-A][AutoPush] started")
+        CurrentTrackRuntimeCache.resetPlaybackDiffState()
         autoPushExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
             Thread(runnable, "BlePlaybackStateAutoPushThread")
         }.also { executor ->
@@ -839,6 +853,7 @@ class BleGattServerManager(
         val executor = autoPushExecutor ?: return
         executor.shutdownNow()
         autoPushExecutor = null
+        CurrentTrackRuntimeCache.resetPlaybackDiffState()
         logger("[BLE-A][AutoPush] stopped")
     }
 
@@ -851,10 +866,15 @@ class BleGattServerManager(
         try {
             val source = playbackStateReader.readPlaybackState()
             onPlaybackUiState(source)
-            val wasPlaying = lastAutoPushPlaying
-            val playing = source.optBoolean("playing")
             val songChanged = logAutoPushStateChanges(source)
-            if (songChanged) {
+            val snapshot = CurrentTrackRuntimeCache.buildPlaybackStateSnapshot(
+                connectionState = "subscribed"
+            )
+            val diff = snapshot?.let {
+                CurrentTrackRuntimeCache.diffFromLastSent(it)
+            }
+            val diffTrackChanged = diff?.type == PlaybackStateDiffType.TrackChanged
+            if (songChanged || diffTrackChanged) {
                 sendTrackInfo(source)
             }
             if (LogConfig.DEBUG_VERBOSE_LOG) {
@@ -864,14 +884,36 @@ class BleGattServerManager(
                         "duration=${source.optLong("duration")}"
                 )
             }
-            val shouldSendPlaybackState =
-                playing || songChanged || wasPlaying != false
-            val result = if (shouldSendPlaybackState) {
-                sendCompactPlaybackState(source)
+            val result = if (diff == null || diff.shouldPush) {
+                logger(
+                    "[PlaybackDiff] push playback type=${diff?.type ?: "unknown"} " +
+                        "fields=${diff?.changedFields.orEmpty()} " +
+                        "deltaMs=${diff?.positionDeltaMs ?: 0L}"
+                )
+                val sent = sendCompactPlaybackState(source)
+                if (sent && snapshot != null && diff != null) {
+                    CurrentTrackRuntimeCache.markPlaybackSnapshotSent(snapshot)
+                }
+                sent
             } else {
+                CurrentTrackRuntimeCache.markPlaybackSnapshotSkipped(diff)
+                if (LogConfig.DEBUG_VERBOSE_LOG) {
+                    verboseLogger(
+                        "[PlaybackDiff] skip identical " +
+                            "deltaMs=${diff.positionDeltaMs}"
+                    )
+                } else {
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - lastPlaybackDiffSkipLogAtMs >=
+                        PLAYBACK_DIFF_SKIP_LOG_INTERVAL_MS
+                    ) {
+                        lastPlaybackDiffSkipLogAtMs = now
+                        logger("[PlaybackDiff] skip identical")
+                    }
+                }
                 true
             }
-            if (songChanged) {
+            if (songChanged || diffTrackChanged) {
                 sendAlbumArtIfSongChanged(source)
             }
             if (LogConfig.DEBUG_VERBOSE_LOG) {
@@ -3333,6 +3375,7 @@ class BleGattServerManager(
         private const val MIN_ALBUM_ART_PAYLOAD_BYTES = 100
         private const val ASSUMED_IOS_ALBUM_ART_PAYLOAD_BYTES = 182
         private const val AUTO_PUSH_INTERVAL_MS = 1000L
+        private const val PLAYBACK_DIFF_SKIP_LOG_INTERVAL_MS = 10_000L
         private const val ALBUM_ART_ENABLED = true
         private const val DEBUG_ART_DIAGNOSTICS = true
         private const val ALBUM_ART_PREVIEW_MAX_CHUNKS = 32

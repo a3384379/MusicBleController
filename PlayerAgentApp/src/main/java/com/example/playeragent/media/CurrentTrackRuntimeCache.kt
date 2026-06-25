@@ -29,7 +29,10 @@ data class RuntimeCacheMetrics(
 
 data class CurrentTrackRuntimeCacheSnapshot(
     val track: CurrentTrackSnapshot?,
-    val metrics: RuntimeCacheMetrics
+    val metrics: RuntimeCacheMetrics,
+    val lastSnapshot: PlaybackStateSnapshot? = null,
+    val lastSentSnapshot: PlaybackStateSnapshot? = null,
+    val playbackDiffMetrics: PlaybackDiffMetrics = PlaybackDiffMetrics()
 )
 
 object CurrentTrackRuntimeCache {
@@ -41,6 +44,8 @@ object CurrentTrackRuntimeCache {
     private var refreshCount = 0L
     private var lastRefreshCostMs = 0L
     private var lastTrackSwitchCostMs = 0L
+    private var lastSnapshot: PlaybackStateSnapshot? = null
+    private var lastSentSnapshot: PlaybackStateSnapshot? = null
 
     fun updatePlaybackState(
         trackId: String,
@@ -195,7 +200,10 @@ object CurrentTrackRuntimeCache {
             }
             return CurrentTrackRuntimeCacheSnapshot(
                 track = current,
-                metrics = metricsLocked()
+                metrics = metricsLocked(),
+                lastSnapshot = lastSnapshot,
+                lastSentSnapshot = lastSentSnapshot,
+                playbackDiffMetrics = PlaybackStateDiffEngine.metricsSnapshot()
             )
         }
     }
@@ -215,6 +223,62 @@ object CurrentTrackRuntimeCache {
     fun metricsSnapshot(): RuntimeCacheMetrics {
         synchronized(lock) {
             return metricsLocked()
+        }
+    }
+
+    fun buildPlaybackStateSnapshot(
+        volume: Int? = null,
+        connectionState: String = ""
+    ): PlaybackStateSnapshot? {
+        synchronized(lock) {
+            val track = current ?: return null
+            val snapshot = PlaybackStateSnapshot(
+                trackId = track.trackId,
+                title = track.title,
+                artist = track.artist,
+                album = track.album,
+                positionMs = track.positionMs,
+                durationMs = track.durationMs,
+                playing = track.isPlaying,
+                albumArtId = track.albumArtId,
+                currentLine = track.currentLine,
+                currentWord = track.currentWord,
+                lyricStatus = track.lyricSource,
+                recoveryState = track.recoveryState,
+                albumArtState = track.albumArtState,
+                volume = volume,
+                connectionState = connectionState,
+                lastUpdatedAtMs = track.lastUpdatedAtMs
+            )
+            lastSnapshot = snapshot
+            PlaybackStateDiffEngine.recordSnapshotBuilt()
+            return snapshot
+        }
+    }
+
+    fun diffFromLastSent(snapshot: PlaybackStateSnapshot): PlaybackStateDiff {
+        synchronized(lock) {
+            return PlaybackStateDiffEngine.diff(lastSentSnapshot, snapshot)
+        }
+    }
+
+    fun markPlaybackSnapshotSent(
+        snapshot: PlaybackStateSnapshot
+    ) {
+        synchronized(lock) {
+            lastSentSnapshot = snapshot
+            PlaybackStateDiffEngine.recordPush()
+        }
+    }
+
+    fun markPlaybackSnapshotSkipped(diff: PlaybackStateDiff) {
+        PlaybackStateDiffEngine.recordSkip(diff)
+    }
+
+    fun resetPlaybackDiffState() {
+        synchronized(lock) {
+            lastSnapshot = null
+            lastSentSnapshot = null
         }
     }
 
