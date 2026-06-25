@@ -96,6 +96,8 @@ Optional BLE tests inspect existing iOS logs for scan, discover, connect, notify
 
 AlbumArt Flow is also optional. It inspects only iOS logs for `albumArtOffer`, preview/HQ requests, binary start/chunk/end, cache saves, enhancement, fallback, timeout cleanup, and final display quality. Sony offline or missing album art logs produce `WARN`/`SKIPPED`, not a required failure. A stuck binary transfer is reported as optional `FAIL` in the report for diagnosis.
 
+CurrentWord Flow is optional too. It inspects only iOS logs for lightweight `currentWord` notifications and reports received count, drop count, latest line/word, and latency. Sony offline or old Sony builds without `currentWord` support produce `WARN`/`SKIPPED`, not a required failure.
+
 ## Reports
 
 Each run creates a timestamped directory under:
@@ -150,3 +152,4 @@ Codex should read `report.json`. Required tests must pass. Optional BLE warnings
 - Preferences failed: the installed app may not include the DEBUG smoke-test launch hook.
 - Optional BLE warnings: Sony may be offline, not advertising, or not connected.
 - AlbumArt Flow skipped/warned: Sony may be offline, no recent `albumArtOffer` was logged, or the current song has no artwork.
+- CurrentWord Flow skipped/warned: Sony may be offline, not subscribed, using an older build, or the current song may not have word timing.

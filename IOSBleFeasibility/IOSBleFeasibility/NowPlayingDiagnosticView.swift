@@ -148,6 +148,14 @@ struct NowPlayingDiagnosticView: View {
                 diagnosticRow("完整歌词", "\(snapshot.fullLyricsLineCount) 行")
                 diagnosticRow("接收中", snapshot.isFullLyricsReceiving ? "是" : "否")
                 diagnosticRow("当前曲目", snapshot.isFullLyricsCurrent ? "是" : "否")
+                diagnosticRow(
+                    "当前词",
+                    "line \(snapshot.currentWord.lineIndex), word \(snapshot.currentWord.wordIndex)"
+                )
+                diagnosticRow("轻量词推送", "\(snapshot.currentWord.pushCount) 次")
+                diagnosticRow("轻量词丢弃", "\(snapshot.currentWord.dropCount) 次")
+                diagnosticRow("平均间隔", "\(snapshot.currentWord.averageUpdateIntervalMs)ms")
+                diagnosticRow("最近延迟", "\(snapshot.currentWord.lastLatencyMs)ms")
             }
         }
     }

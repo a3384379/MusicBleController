@@ -167,6 +167,12 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var connectionHealthStaleCount = 0
     @Published private(set) var connectionHealthHardReconnectCount = 0
     @Published private(set) var connectionHealthMaxNotifyGapMs: Int64 = 0
+    @Published private(set) var currentWordLineIndex = -1
+    @Published private(set) var currentWordIndex = -1
+    @Published private(set) var currentWordPushCount: Int64 = 0
+    @Published private(set) var currentWordDropCount: Int64 = 0
+    @Published private(set) var currentWordAverageUpdateIntervalMs: Int64 = 0
+    @Published private(set) var currentWordLastLatencyMs: Int64 = 0
 
     private let preferences = PreferencesStore.shared
     private lazy var centralManager = CBCentralManager(delegate: self, queue: nil)
@@ -235,6 +241,9 @@ final class BLETestManager: NSObject, ObservableObject {
     private var basePlaybackPositionMs: Int64 = 0
     private var playbackStateReceivedAt = Date()
     private var progressTimer: Timer?
+    private var lastCurrentWordReceivedAtMs: Int64 = 0
+    private var currentWordIntervalTotalMs: Int64 = 0
+    private var currentWordIntervalCount: Int64 = 0
     private let selfHealingEngine = SelfHealingEngine.shared
     private lazy var albumArtReceiver: AlbumArtReceiver = {
         let receiver = AlbumArtReceiver(delegate: self)
@@ -666,6 +675,14 @@ final class BLETestManager: NSObject, ObservableObject {
             fullLyricsLineCount: fullLyrics.count,
             isFullLyricsCurrent: isFullLyricsCurrent,
             isFullLyricsReceiving: isFullLyricsReceiving,
+            currentWord: CurrentWordDiagnosticSnapshot(
+                lineIndex: currentWordLineIndex,
+                wordIndex: currentWordIndex,
+                pushCount: currentWordPushCount,
+                dropCount: currentWordDropCount,
+                averageUpdateIntervalMs: currentWordAverageUpdateIntervalMs,
+                lastLatencyMs: currentWordLastLatencyMs
+            ),
             connection: connection,
             selfHealing: selfHealing
         )
@@ -2893,6 +2910,9 @@ extension BLETestManager: CBPeripheralDelegate {
                     self.updateLiveActivity(force: false, reason: "playbackState")
                 }
 
+            case "currentWord":
+                self.handleCurrentWord(object)
+
             case "trackInfo":
                 self.applyTrackInfo(object)
 
@@ -3981,6 +4001,82 @@ extension BLETestManager: CBPeripheralDelegate {
                     "transCount=\(transCount) romaCount=\(romaCount)"
             )
         }
+    }
+
+    private func handleCurrentWord(_ object: [String: Any]) {
+        let trackID = object["trackId"] as? String ?? ""
+        let sameTrack = isSameTrackId(incoming: trackID, current: currentTrackID)
+        guard !trackID.isEmpty, sameTrack else {
+            currentWordDropCount += 1
+            log(
+                "[Lyrics-iOS] currentWord discarded stale trackId=\(trackID) " +
+                    "current=\(currentTrackID)"
+            )
+            return
+        }
+        if trackID != currentTrackID {
+            log(
+                "[Lyrics-iOS] currentWord accepted by normalized trackId " +
+                    "incoming=\(trackID) current=\(currentTrackID)"
+            )
+        }
+
+        let lineIndex = Self.intValue(object["line"])
+        let wordIndex = Self.intValue(object["word"])
+        let remotePositionMs = Self.int64Value(object["position"])
+        let timestampMs = Self.int64Value(object["timestamp"])
+        let nowMs = currentTimeMs()
+
+        currentWordLineIndex = lineIndex
+        currentWordIndex = wordIndex
+        currentWordPushCount += 1
+        if lastCurrentWordReceivedAtMs > 0 {
+            currentWordIntervalTotalMs += max(nowMs - lastCurrentWordReceivedAtMs, 0)
+            currentWordIntervalCount += 1
+            if currentWordIntervalCount > 0 {
+                currentWordAverageUpdateIntervalMs =
+                    currentWordIntervalTotalMs / currentWordIntervalCount
+            } else {
+                currentWordAverageUpdateIntervalMs = 0
+            }
+        }
+        lastCurrentWordReceivedAtMs = nowMs
+        currentWordLastLatencyMs = timestampMs > 0 ? max(nowMs - timestampMs, 0) : 0
+
+        let oldLyric = lyric
+        let lineByOffset = fullLyrics.indices.contains(lineIndex) ? fullLyrics[lineIndex] : nil
+        if isSameTrackId(incoming: trackID, current: fullLyricsTrackId),
+           let line = fullLyrics.first(where: { $0.index == lineIndex }) ?? lineByOffset {
+            lyric = line.text
+        }
+
+        if !isSeeking {
+            positionMs = remotePositionMs
+            displayPositionMs = remotePositionMs
+            seekPositionMs = remotePositionMs
+            basePlaybackPositionMs = remotePositionMs
+            playbackStateReceivedAt = Date()
+        }
+
+        log(
+            "[Lyrics-iOS] currentWord line=\(lineIndex) word=\(wordIndex) " +
+                "position=\(remotePositionMs) latencyMs=\(currentWordLastLatencyMs) " +
+                "count=\(currentWordPushCount) avgIntervalMs=\(currentWordAverageUpdateIntervalMs)"
+        )
+
+        if oldLyric != lyric {
+            _ = updateLiveActivityForCurrentLyricIfNeeded(reason: "currentWord")
+        }
+    }
+
+    private func isSameTrackId(incoming: String, current: String) -> Bool {
+        let incoming = incoming.trimmingCharacters(in: .whitespacesAndNewlines)
+        let current = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !incoming.isEmpty, !current.isEmpty else { return false }
+        if incoming == current { return true }
+        if current.count >= 10, incoming.hasPrefix(current) { return true }
+        if incoming.count >= 10, current.hasPrefix(incoming) { return true }
+        return false
     }
 
     private func startProgressTimer() {

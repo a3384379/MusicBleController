@@ -50,6 +50,15 @@ struct AlbumArtTransferDiagnosticSnapshot: Equatable {
     let hqRetryCount: Int
 }
 
+struct CurrentWordDiagnosticSnapshot: Equatable {
+    let lineIndex: Int
+    let wordIndex: Int
+    let pushCount: Int64
+    let dropCount: Int64
+    let averageUpdateIntervalMs: Int64
+    let lastLatencyMs: Int64
+}
+
 struct NowPlayingDiagnosticSnapshot {
     let generatedAt: Date
     let title: String
@@ -75,6 +84,7 @@ struct NowPlayingDiagnosticSnapshot {
     let fullLyricsLineCount: Int
     let isFullLyricsCurrent: Bool
     let isFullLyricsReceiving: Bool
+    let currentWord: CurrentWordDiagnosticSnapshot
     let connection: ConnectionDiagnosticSnapshot
     let selfHealing: SelfHealingSnapshot
 
@@ -89,6 +99,10 @@ struct NowPlayingDiagnosticSnapshot {
         artworkQuality=\(albumArtDisplayQuality)
         artworkTransferState=\(albumArtTransfer.state)
         artworkTransferReason=\(albumArtTransfer.lastFailureReason)
+        currentWordLine=\(currentWord.lineIndex)
+        currentWordIndex=\(currentWord.wordIndex)
+        currentWordPushCount=\(currentWord.pushCount)
+        currentWordDropCount=\(currentWord.dropCount)
         selfHealing=\(selfHealing.overallStatus)
         trackId=\(trackId)
         """
@@ -189,6 +203,12 @@ struct NowPlayingDiagnosticSnapshot {
         lines.append("fullLyricsLineCount: \(fullLyricsLineCount)")
         lines.append("isFullLyricsCurrent: \(isFullLyricsCurrent)")
         lines.append("isFullLyricsReceiving: \(isFullLyricsReceiving)")
+        lines.append("currentWordLine: \(currentWord.lineIndex)")
+        lines.append("currentWordIndex: \(currentWord.wordIndex)")
+        lines.append("currentWordPushCount: \(currentWord.pushCount)")
+        lines.append("currentWordDropCount: \(currentWord.dropCount)")
+        lines.append("currentWordAverageIntervalMs: \(currentWord.averageUpdateIntervalMs)")
+        lines.append("currentWordLastLatencyMs: \(currentWord.lastLatencyMs)")
         lines.append("")
         lines.append("[Artwork]")
         lines.append("displayQuality: \(albumArtDisplayQuality)")

@@ -160,12 +160,14 @@ def main():
     device = read_device(out_dir)
     debug_control = read_debug_control(out_dir)
     playback_diff_flow = read_json_file(out_dir / "playback_diff_flow.json")
+    current_word_flow = read_json_file(out_dir / "current_word_flow.json")
 
     report_path = out_dir / "report.md"
     report_json_path = out_dir / "report.json"
     logcat = out_dir / "sony_logcat.log"
     filtered = out_dir / "sony_filtered.log"
     playback_diff_flow_path = out_dir / "playback_diff_flow.json"
+    current_word_flow_path = out_dir / "current_word_flow.json"
 
     report = [
         "# Android Smoke Test Report",
@@ -217,6 +219,17 @@ def main():
         f"- positionJump: `{playback_diff_flow.get('positionJumpCount', 0)}`",
         f"- reason: {playback_diff_flow.get('reason', 'not recorded')}",
         "",
+        "## CurrentWord Flow",
+        "",
+        f"- result: `{current_word_flow.get('result', 'not recorded')}`",
+        f"- push: `{current_word_flow.get('pushCount', 0)}`",
+        f"- skip: `{current_word_flow.get('skipCount', 0)}`",
+        f"- averageIntervalMs: `{current_word_flow.get('averageIntervalMs', 0)}`",
+        f"- lastPushCostMs: `{current_word_flow.get('lastPushCostMs', 0)}`",
+        f"- lastLine: `{current_word_flow.get('lastLine', -1)}`",
+        f"- lastWord: `{current_word_flow.get('lastWord', -1)}`",
+        f"- reason: {current_word_flow.get('reason', 'not recorded')}",
+        "",
         "## File Checks",
         "",
         file_table(out_dir / "file_checks.tsv"),
@@ -258,10 +271,12 @@ def main():
             "logcat": str(logcat) if logcat.exists() else "",
             "filtered_logcat": str(filtered) if filtered.exists() else "",
             "playback_diff_flow": str(playback_diff_flow_path) if playback_diff_flow_path.exists() else "",
+            "current_word_flow": str(current_word_flow_path) if current_word_flow_path.exists() else "",
             "failure_excerpt": failure_excerpt,
         },
         "debugControl": debug_control,
         "playbackDiffFlow": playback_diff_flow,
+        "currentWordFlow": current_word_flow,
     }
     report_json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(report_path)

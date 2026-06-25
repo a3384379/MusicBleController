@@ -35,6 +35,15 @@ data class CurrentTrackRuntimeCacheSnapshot(
     val playbackDiffMetrics: PlaybackDiffMetrics = PlaybackDiffMetrics()
 )
 
+data class CurrentWordState(
+    val trackId: String,
+    val lineIndex: Int,
+    val wordIndex: Int,
+    val positionMs: Long,
+    val timestampMs: Long,
+    val version: Int = 1
+)
+
 object CurrentTrackRuntimeCache {
     private val lock = Any()
 
@@ -232,6 +241,7 @@ object CurrentTrackRuntimeCache {
     ): PlaybackStateSnapshot? {
         synchronized(lock) {
             val track = current ?: return null
+            val wordState = findCurrentWordStateLocked(track, System.currentTimeMillis())
             val snapshot = PlaybackStateSnapshot(
                 trackId = track.trackId,
                 title = track.title,
@@ -242,7 +252,12 @@ object CurrentTrackRuntimeCache {
                 playing = track.isPlaying,
                 albumArtId = track.albumArtId,
                 currentLine = track.currentLine,
-                currentWord = track.currentWord,
+                currentWord = wordState?.let {
+                    track.lyricLines
+                        .getOrNull(it.lineIndex)
+                        ?.words
+                        ?.getOrNull(it.wordIndex)
+                } ?: track.currentWord,
                 lyricStatus = track.lyricSource,
                 recoveryState = track.recoveryState,
                 albumArtState = track.albumArtState,
@@ -253,6 +268,13 @@ object CurrentTrackRuntimeCache {
             lastSnapshot = snapshot
             PlaybackStateDiffEngine.recordSnapshotBuilt()
             return snapshot
+        }
+    }
+
+    fun currentWordState(timestampMs: Long = System.currentTimeMillis()): CurrentWordState? {
+        synchronized(lock) {
+            val track = current ?: return null
+            return findCurrentWordStateLocked(track, timestampMs)
         }
     }
 
@@ -327,13 +349,61 @@ object CurrentTrackRuntimeCache {
         lines: List<RuntimeLyricLine>,
         positionMs: Long
     ): RuntimeLyricWord? {
-        return lines.asSequence()
-            .flatMap { it.words.asSequence() }
-            .lastOrNull { word ->
-                positionMs >= word.startMs &&
-                    (word.durationMs <= 0L || positionMs < word.startMs + word.durationMs)
-            }
+        return findCurrentWordIndexed(lines, positionMs)?.word
     }
+
+    private fun findCurrentWordStateLocked(
+        track: CurrentTrackSnapshot,
+        timestampMs: Long
+    ): CurrentWordState? {
+        if (track.trackId.isBlank() || track.lyricLines.isEmpty()) {
+            return null
+        }
+        val elapsedMs = if (track.isPlaying && track.lastUpdatedAtMs > 0L) {
+            (timestampMs - track.lastUpdatedAtMs).coerceAtLeast(0L)
+        } else {
+            0L
+        }
+        val rawPosition = track.positionMs + elapsedMs
+        val position = if (track.durationMs > 0L) {
+            rawPosition.coerceIn(0L, track.durationMs)
+        } else {
+            rawPosition.coerceAtLeast(0L)
+        }
+        val indexed = findCurrentWordIndexed(track.lyricLines, position) ?: return null
+        return CurrentWordState(
+            trackId = track.trackId,
+            lineIndex = indexed.lineIndex,
+            wordIndex = indexed.wordIndex,
+            positionMs = position,
+            timestampMs = timestampMs
+        )
+    }
+
+    private fun findCurrentWordIndexed(
+        lines: List<RuntimeLyricLine>,
+        positionMs: Long
+    ): IndexedRuntimeWord? {
+        var fallback: IndexedRuntimeWord? = null
+        lines.forEachIndexed { lineIndex, line ->
+            line.words.forEachIndexed { wordIndex, word ->
+                if (positionMs >= word.startMs) {
+                    val indexed = IndexedRuntimeWord(lineIndex, wordIndex, word)
+                    fallback = indexed
+                    if (word.durationMs <= 0L || positionMs < word.startMs + word.durationMs) {
+                        return indexed
+                    }
+                }
+            }
+        }
+        return fallback
+    }
+
+    private data class IndexedRuntimeWord(
+        val lineIndex: Int,
+        val wordIndex: Int,
+        val word: RuntimeLyricWord
+    )
 
     private fun LyricManager.LyricLine.toRuntimeLine(): RuntimeLyricLine {
         return RuntimeLyricLine(

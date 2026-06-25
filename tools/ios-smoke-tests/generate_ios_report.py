@@ -176,6 +176,7 @@ def main():
     failure_excerpt = build_failure_excerpt(out_dir, has_warn_or_fail)
     git = git_info(root)
     album_art_flow_path = out_dir / "album_art_flow.json"
+    current_word_flow_path = out_dir / "current_word_flow.json"
     file_check_details = read_env_details(out_dir / "file_checks_details.env")
     album_art_flow = None
     if album_art_flow_path.exists():
@@ -183,6 +184,12 @@ def main():
             album_art_flow = json.loads(album_art_flow_path.read_text(encoding="utf-8"))
         except Exception:
             album_art_flow = None
+    current_word_flow = None
+    if current_word_flow_path.exists():
+        try:
+            current_word_flow = json.loads(current_word_flow_path.read_text(encoding="utf-8"))
+        except Exception:
+            current_word_flow = None
 
     report_path = out_dir / "report.md"
     report_json_path = out_dir / "report.json"
@@ -236,6 +243,28 @@ def main():
     else:
         report.extend(["AlbumArt Flow was not collected.", ""])
     report.extend([
+        "## CurrentWord Flow",
+        "",
+    ])
+    if current_word_flow:
+        report.extend([
+            f"- result: `{current_word_flow.get('result', 'unknown')}`",
+            f"- raw: `{current_word_flow.get('receivedRawCount', current_word_flow.get('receivedCount', 0))}`",
+            f"- accepted: `{current_word_flow.get('acceptedCount', current_word_flow.get('receivedCount', 0))}`",
+            f"- stale: `{current_word_flow.get('discardedStaleCount', current_word_flow.get('dropCount', 0))}`",
+            f"- normalizedAccepted: `{current_word_flow.get('normalizedAcceptedCount', 0)}`",
+            f"- sonyTrackIdSample: `{current_word_flow.get('sonyTrackIdSample') or '-'}`",
+            f"- iosCurrentTrackIdSample: `{current_word_flow.get('iosCurrentTrackIdSample') or '-'}`",
+            f"- averageIntervalMs: `{current_word_flow.get('averageIntervalMs', 0)}`",
+            f"- lastLatencyMs: `{current_word_flow.get('lastLatencyMs', 0)}`",
+            f"- lastLine: `{current_word_flow.get('lastLine', -1)}`",
+            f"- lastWord: `{current_word_flow.get('lastWord', -1)}`",
+            f"- reason: {current_word_flow.get('reason') or '-'}",
+            "",
+        ])
+    else:
+        report.extend(["CurrentWord Flow was not collected.", ""])
+    report.extend([
         "## File Checks",
         "",
         file_table(out_dir / "file_checks.tsv"),
@@ -284,10 +313,13 @@ def main():
             "ios_log": str(ios_log) if ios_log.exists() else "",
             "failure_excerpt": failure_excerpt,
             "album_art_flow": str(album_art_flow_path) if album_art_flow_path.exists() else "",
+            "current_word_flow": str(current_word_flow_path) if current_word_flow_path.exists() else "",
         },
     }
     if album_art_flow:
         payload["albumArtFlow"] = album_art_flow
+    if current_word_flow:
+        payload["currentWordFlow"] = current_word_flow
     if file_check_details:
         payload["fileChecks"] = file_check_details
     report_json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -73,6 +73,7 @@ In quick mode, build/install are marked PASS as skipped by request.
 
 - BLE Service
 - PlaybackDiff Flow
+- CurrentWord Flow
 - QRC Cache
 - QQMusic Dir
 
@@ -90,6 +91,8 @@ Optional FAIL is reserved for severe evidence such as FATAL/ANR or GATT/advertis
 - trackChangedCount / wordChangedCount / positionJumpCount
 
 If no iPhone subscriber is visible in logcat, it returns SKIPPED. If a subscriber is visible but there are no PlaybackDiff decisions yet, it returns WARN. During a real 2-3 minute playback session with an iPhone subscriber, `skipCount` should be greater than `pushCount`.
+
+`CurrentWord Flow` reads Sony logcat only. It reports lightweight current-word push count, skip count, average interval, and last push cost. If no iPhone subscriber is visible it returns SKIPPED; with a subscriber and a fast lyric song it should show `pushCount > 0`.
 
 ## Debug-only Service Control
 

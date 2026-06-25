@@ -88,6 +88,12 @@ class BleGattServerManager(
     private var gattServer: BluetoothGattServer? = null
     private var statusCharacteristic: BluetoothGattCharacteristic? = null
     private var autoPushExecutor: ScheduledExecutorService? = null
+    private var currentWordExecutor: ScheduledExecutorService? = null
+    private val currentWordPushEngine = CurrentWordPushEngine(
+        logger = logger,
+        sendStatusMessage = { message -> sendStatusMessage(message) },
+        normalizeTrackId = { trackId -> normalizeCurrentWordTrackId(trackId) }
+    )
     private val notifyQueue = BleNotifyQueue(
         serverProvider = { gattServer },
         characteristicProvider = { statusCharacteristic },
@@ -726,6 +732,7 @@ class BleGattServerManager(
                 "wordChanged=${playbackDiffMetrics.wordChangedCount} " +
                 "positionJump=${playbackDiffMetrics.positionJumpCount}"
         )
+        currentWordPushEngine.logMetrics()
     }
 
     fun handleIncrementalLyricsReady(ready: IncrementalLyricsReady) {
@@ -798,7 +805,8 @@ class BleGattServerManager(
         val messageType = readMessageType(message)
         if ((messageType == "playbackState" ||
                 messageType == "trackInfo" ||
-                messageType == "volumeState") &&
+                messageType == "volumeState" ||
+                messageType == "currentWord") &&
             notifyQueue.hasLongJobActiveOrQueued()
         ) {
             notifyQueue.setLatestInterleavedShort(
@@ -827,6 +835,8 @@ class BleGattServerManager(
 
         logger("[BLE-A][AutoPush] started")
         CurrentTrackRuntimeCache.resetPlaybackDiffState()
+        currentWordPushEngine.reset()
+        startCurrentWordPush()
         autoPushExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
             Thread(runnable, "BlePlaybackStateAutoPushThread")
         }.also { executor ->
@@ -853,7 +863,9 @@ class BleGattServerManager(
         val executor = autoPushExecutor ?: return
         executor.shutdownNow()
         autoPushExecutor = null
+        stopCurrentWordPush()
         CurrentTrackRuntimeCache.resetPlaybackDiffState()
+        currentWordPushEngine.logMetrics()
         logger("[BLE-A][AutoPush] stopped")
     }
 
@@ -884,7 +896,20 @@ class BleGattServerManager(
                         "duration=${source.optLong("duration")}"
                 )
             }
-            val result = if (diff == null || diff.shouldPush) {
+            val result = if (diff?.type == PlaybackStateDiffType.CurrentWordChanged) {
+                logger(
+                    "[PlaybackDiff] word changed -> currentWord " +
+                        "fields=${diff.changedFields} deltaMs=${diff.positionDeltaMs}"
+                )
+                val sentState = currentWordPushEngine.pushCurrentWord()
+                if (sentState != null) {
+                    CurrentTrackRuntimeCache.markPlaybackSnapshotSent(snapshot)
+                    true
+                } else {
+                    CurrentTrackRuntimeCache.markPlaybackSnapshotSkipped(diff)
+                    true
+                }
+            } else if (diff == null || diff.shouldPush) {
                 logger(
                     "[PlaybackDiff] push playback type=${diff?.type ?: "unknown"} " +
                         "fields=${diff?.changedFields.orEmpty()} " +
@@ -922,6 +947,46 @@ class BleGattServerManager(
         } catch (exception: Exception) {
             logger("[BLE-A][AutoPush] error=${exception.message}")
         }
+    }
+
+    @Synchronized
+    private fun startCurrentWordPush() {
+        if (currentWordExecutor != null) {
+            return
+        }
+        logger("[CurrentWordPush] started")
+        currentWordExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "BleCurrentWordPushThread")
+        }.also { executor ->
+            executor.scheduleAtFixedRate(
+                {
+                    if (subscribedDevices.isEmpty()) {
+                        stopCurrentWordPush()
+                    } else {
+                        val sentState = currentWordPushEngine.pushCurrentWord()
+                        if (sentState != null) {
+                            CurrentTrackRuntimeCache.buildPlaybackStateSnapshot(
+                                connectionState = "subscribed"
+                            )?.let { snapshot ->
+                                CurrentTrackRuntimeCache.markPlaybackSnapshotSent(snapshot)
+                            }
+                        }
+                    }
+                },
+                CURRENT_WORD_PUSH_INTERVAL_MS,
+                CURRENT_WORD_PUSH_INTERVAL_MS,
+                TimeUnit.MILLISECONDS
+            )
+        }
+    }
+
+    @Synchronized
+    private fun stopCurrentWordPush() {
+        val executor = currentWordExecutor ?: return
+        executor.shutdownNow()
+        currentWordExecutor = null
+        currentWordPushEngine.reset()
+        logger("[CurrentWordPush] stopped")
     }
 
     private fun logAutoPushStateChanges(state: JSONObject): Boolean {
@@ -2038,6 +2103,14 @@ class BleGattServerManager(
         val source = listOf(title, artist, album).joinToString("|").ifBlank { "unknown" }
         return sha256(source.toByteArray(Charsets.UTF_8))
             .take(ALBUM_ART_ID_HASH_BYTES)
+    }
+
+    private fun normalizeCurrentWordTrackId(trackId: String): String {
+        val trimmed = trackId.trim()
+        if (trimmed.length <= ALBUM_ART_ID_HASH_BYTES) {
+            return trimmed
+        }
+        return trimmed.take(ALBUM_ART_ID_HASH_BYTES)
     }
 
     private fun sha256(bytes: ByteArray): String {
@@ -3375,6 +3448,7 @@ class BleGattServerManager(
         private const val MIN_ALBUM_ART_PAYLOAD_BYTES = 100
         private const val ASSUMED_IOS_ALBUM_ART_PAYLOAD_BYTES = 182
         private const val AUTO_PUSH_INTERVAL_MS = 1000L
+        private const val CURRENT_WORD_PUSH_INTERVAL_MS = 60L
         private const val PLAYBACK_DIFF_SKIP_LOG_INTERVAL_MS = 10_000L
         private const val ALBUM_ART_ENABLED = true
         private const val DEBUG_ART_DIAGNOSTICS = true
