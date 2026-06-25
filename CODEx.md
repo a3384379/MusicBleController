@@ -2,6 +2,55 @@
 
 This file defines the local Codex workflow for MusicBleController changes.
 
+## Before Any Code Change
+
+Before editing business code, Codex must identify the task type and read the
+matching architecture documents. This is mandatory because this repository has
+cross-device state machines and BLE payload formats that are easy to break by
+local-only changes.
+
+Codex must state, before modifying code:
+
+1. task type
+2. documents read
+3. boundaries that must not be changed
+4. smoke tests or builds required after the change
+
+Docs-only changes do not require build or smoke tests. They still require:
+
+```bash
+git diff --check
+```
+
+## Required Architecture Reading
+
+| Task type | Required docs |
+|---|---|
+| iOS BLE connection / auto reconnect / Health Check | `docs/IOS_ARCHITECTURE.md`, `docs/RECONNECT_HEALTH_ARCHITECTURE.md`, `docs/BLE_PROTOCOL.md`, `docs/SMOKE_TEST_GUIDE.md` |
+| AlbumArt / artwork / HQ / enhanced / cache / transfer timeout | `docs/ALBUM_ART_ARCHITECTURE.md`, `docs/BLE_PROTOCOL.md`, `docs/IOS_ARCHITECTURE.md`, `docs/SMOKE_TEST_GUIDE.md` |
+| Lyrics / FullLyrics / LyricSecondary / translation / romanization / QRC / Recovery | `docs/LYRICS_ARCHITECTURE.md`, `docs/BLE_PROTOCOL.md`, `docs/PROJECT_OVERVIEW.md` |
+| Settings / Preferences / UserDefaults | `docs/IOS_ARCHITECTURE.md`, `docs/SMOKE_TEST_GUIDE.md` |
+| Smoke Test / automated test tooling | `docs/SMOKE_TEST_GUIDE.md`, `docs/CODEX_WORKFLOW.md` |
+| Sony Android / GATT / advertising / BLE recovery | `docs/PROJECT_OVERVIEW.md`, `docs/BLE_PROTOCOL.md`, `docs/RECONNECT_HEALTH_ARCHITECTURE.md` |
+| Cross-device protocol changes | `docs/BLE_PROTOCOL.md`, `docs/PROJECT_OVERVIEW.md` |
+
+If a task spans multiple rows, read the union of all required docs.
+
+## Protocol Change Policy
+
+Protocol changes are forbidden by default unless the user explicitly asks for
+them. This includes:
+
+1. BLE UUIDs
+2. command/status characteristic behavior
+3. AlbumArt binary protocol
+4. FullLyrics and LyricSecondary payload formats
+5. playback, volume, and Live Activity control command names
+
+If a task explicitly changes BLE protocol, FullLyrics, or AlbumArt binary
+payloads, Codex must state whether the change is backward compatible with older
+iOS/Sony builds.
+
 ## iOS Changes
 
 After any iOS change that touches one of these areas, run the quick smoke test:
@@ -110,6 +159,15 @@ git diff --check
 4. Generate a concise commit message.
 5. Commit.
 6. Push only after the required checks pass.
+
+Before the final response after code changes, Codex must report:
+
+1. modified files
+2. whether any protocol changed
+3. whether iOS quick smoke was required and run
+4. whether iOS full smoke was required and run
+5. whether Android build was required and run
+6. whether real-device manual validation is still needed
 
 ## Shortcut
 

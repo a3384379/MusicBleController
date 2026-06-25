@@ -117,6 +117,10 @@ Important files:
 
 ## Codex Workflow
 
+Before changing code, Codex should read the required architecture docs listed in
+`CODEx.md` and `docs/CODEX_WORKFLOW.md` for the task type. The smoke scripts
+validate behavior after the change; they do not replace that architecture review.
+
 Quick:
 
 ```bash

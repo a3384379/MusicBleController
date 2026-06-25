@@ -10,13 +10,54 @@
 
 ## 标准流程
 
-1. 先读相关架构文档。
+1. 先判定任务类型，并阅读对应架构文档。
 2. 用 `rg` 查调用链和日志关键词。
 3. 只修改任务要求范围内的文件。
 4. 改业务代码前后注意工作区是否有用户未提交改动。
 5. iOS 改动按 `CODEx.md` 跑 quick 或 full smoke。
 6. Android/Sony 改动至少跑对应 Gradle build；涉及真机链路时输出未验证项。
 7. 提交前跑 `git diff --check`。
+
+## 任务类型到必读文档
+
+Codex 修改代码前必须先声明：
+
+- 本次任务类型。
+- 已阅读的文档。
+- 不允许修改的边界。
+- 修改后需要跑的 smoke test / build / 真机验证。
+
+| 任务类型 | 必读文档 |
+|---|---|
+| iOS BLE 连接 / 自动重连 / Health Check | [IOS_ARCHITECTURE.md](/Volumes/雷电/project/MusicBleController/docs/IOS_ARCHITECTURE.md), [RECONNECT_HEALTH_ARCHITECTURE.md](/Volumes/雷电/project/MusicBleController/docs/RECONNECT_HEALTH_ARCHITECTURE.md), [BLE_PROTOCOL.md](/Volumes/雷电/project/MusicBleController/docs/BLE_PROTOCOL.md), [SMOKE_TEST_GUIDE.md](/Volumes/雷电/project/MusicBleController/docs/SMOKE_TEST_GUIDE.md) |
+| AlbumArt / 封面 / HQ / enhanced / cache / transfer timeout | [ALBUM_ART_ARCHITECTURE.md](/Volumes/雷电/project/MusicBleController/docs/ALBUM_ART_ARCHITECTURE.md), [BLE_PROTOCOL.md](/Volumes/雷电/project/MusicBleController/docs/BLE_PROTOCOL.md), [IOS_ARCHITECTURE.md](/Volumes/雷电/project/MusicBleController/docs/IOS_ARCHITECTURE.md), [SMOKE_TEST_GUIDE.md](/Volumes/雷电/project/MusicBleController/docs/SMOKE_TEST_GUIDE.md) |
+| 歌词 / FullLyrics / LyricSecondary / 翻译 / 罗马音 / QRC / Recovery | [LYRICS_ARCHITECTURE.md](/Volumes/雷电/project/MusicBleController/docs/LYRICS_ARCHITECTURE.md), [BLE_PROTOCOL.md](/Volumes/雷电/project/MusicBleController/docs/BLE_PROTOCOL.md), [PROJECT_OVERVIEW.md](/Volumes/雷电/project/MusicBleController/docs/PROJECT_OVERVIEW.md) |
+| 设置页 / Preferences / UserDefaults | [IOS_ARCHITECTURE.md](/Volumes/雷电/project/MusicBleController/docs/IOS_ARCHITECTURE.md), [SMOKE_TEST_GUIDE.md](/Volumes/雷电/project/MusicBleController/docs/SMOKE_TEST_GUIDE.md) |
+| Smoke Test / 自动测试 | [SMOKE_TEST_GUIDE.md](/Volumes/雷电/project/MusicBleController/docs/SMOKE_TEST_GUIDE.md), [CODEX_WORKFLOW.md](/Volumes/雷电/project/MusicBleController/docs/CODEX_WORKFLOW.md) |
+| Sony Android / GATT / advertising / BLE recovery | [PROJECT_OVERVIEW.md](/Volumes/雷电/project/MusicBleController/docs/PROJECT_OVERVIEW.md), [BLE_PROTOCOL.md](/Volumes/雷电/project/MusicBleController/docs/BLE_PROTOCOL.md), [RECONNECT_HEALTH_ARCHITECTURE.md](/Volumes/雷电/project/MusicBleController/docs/RECONNECT_HEALTH_ARCHITECTURE.md) |
+| 跨端协议 | [BLE_PROTOCOL.md](/Volumes/雷电/project/MusicBleController/docs/BLE_PROTOCOL.md), [PROJECT_OVERVIEW.md](/Volumes/雷电/project/MusicBleController/docs/PROJECT_OVERVIEW.md) |
+
+如果任务横跨多类，读取所有相关文档的并集。不要只读其中一个局部文档。
+
+## 修改边界声明
+
+修改代码前，Codex 应输出类似：
+
+```text
+任务类型：AlbumArt / HQ transfer timeout
+已阅读：ALBUM_ART_ARCHITECTURE.md, BLE_PROTOCOL.md, IOS_ARCHITECTURE.md, SMOKE_TEST_GUIDE.md
+不修改：BLE UUID、AlbumArt binary 协议字段、Sony Android
+验证：codex_check.sh；如触及 project.pbxproj 再跑 full smoke
+```
+
+修改完成后，Codex 必须输出：
+
+- 修改文件。
+- 是否涉及协议。
+- 是否需要 iOS quick smoke，以及是否已运行。
+- 是否需要 iOS full smoke，以及是否已运行。
+- 是否需要 Android build，以及是否已运行。
+- 是否需要真机手测，以及未测原因。
 
 ## iOS smoke 决策
 
@@ -49,6 +90,20 @@
 docs-only 改动：
 - 不需要 build。
 - 需要 `git diff --check`。
+
+## 协议兼容性规则
+
+默认禁止改协议，除非用户明确要求。
+
+如果涉及以下任一项，必须明确说明是否兼容旧版本：
+
+- BLE UUID。
+- command/status characteristic JSON 字段。
+- FullLyrics / LyricSecondary payload。
+- AlbumArt binary start/chunk/end payload。
+- 播放、音量、Live Activity 控制命令名称。
+
+协议改动必须优先保持向后兼容。不能仅修改 iOS 或仅修改 Sony 后假设另一端会同步更新。
 
 ## Git 工作流
 
