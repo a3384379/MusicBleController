@@ -92,6 +92,14 @@ def write_result(payload):
         f"enhanced={str(payload.get('enhanced', False)).lower()}",
         f"timeout={str(payload.get('timeout', False)).lower()}",
         f"reason={payload.get('reason') or '-'}",
+        f"hqPrefetchScheduled={payload.get('hqPrefetchScheduled', 0)}",
+        f"hqPrefetchSent={payload.get('hqPrefetchSent', 0)}",
+        f"hqPrefetchSkippedCacheHit={payload.get('hqPrefetchSkippedCacheHit', 0)}",
+        f"hqPrefetchSkippedInFlight={payload.get('hqPrefetchSkippedInFlight', 0)}",
+        f"hqPrefetchSkippedNotConnected={payload.get('hqPrefetchSkippedNotConnected', 0)}",
+        f"hqPrefetchCancelledTrackChanged={payload.get('hqPrefetchCancelledTrackChanged', 0)}",
+        f"offerToHqRequestMs={payload.get('offerToHqRequestMs', 0)}",
+        f"offerToHqReadyMs={payload.get('offerToHqReadyMs', 0)}",
     ]
     print("\t".join(fields))
 
@@ -187,10 +195,19 @@ state = {
     "inProgressBlocked": False,
     "cacheSaveFailed": False,
     "hqUnavailable": False,
+    "predictiveOffer": False,
+    "hqPrefetchScheduled": 0,
+    "hqPrefetchSent": 0,
+    "hqPrefetchSkippedCacheHit": 0,
+    "hqPrefetchSkippedInFlight": 0,
+    "hqPrefetchSkippedNotConnected": 0,
+    "hqPrefetchCancelledTrackChanged": 0,
 }
 final_quality = "placeholder"
 last_start_index = None
 last_cleanup_index = None
+offer_to_hq_request_ms = 0
+offer_to_hq_ready_ms = 0
 
 quality_rank = {
     "placeholder": 0,
@@ -217,6 +234,35 @@ for idx, line in enumerate(lines):
     if "albumartoffer" in lower or "[albumart] offer" in lower:
         state["offer"] = True
         event = "offer"
+    if "[predictivealbumart]" in lower:
+        if " offer " in lower or lower.endswith(" offer"):
+            state["predictiveOffer"] = True
+            event = "predictive offer"
+        if "schedule hq" in lower:
+            state["hqPrefetchScheduled"] += 1
+            event = "predictive schedule hq"
+        if "request hq" in lower:
+            state["hqPrefetchSent"] += 1
+            event = "predictive request hq"
+        if "skip hq" in lower:
+            event = "predictive skip hq"
+            if "cache hit" in lower:
+                state["hqPrefetchSkippedCacheHit"] += 1
+            elif "in flight" in lower:
+                state["hqPrefetchSkippedInFlight"] += 1
+            elif "not connected" in lower:
+                state["hqPrefetchSkippedNotConnected"] += 1
+        if "cancel pending" in lower and "track changed" in lower:
+            state["hqPrefetchCancelledTrackChanged"] += 1
+            event = "predictive cancel"
+        request_match = re.search(r"offerToHqRequestMs=(\d+)", line)
+        if request_match:
+            offer_to_hq_request_ms = int(request_match.group(1))
+            event = event or "predictive request latency"
+        ready_match = re.search(r"offerToHqReadyMs=(\d+)", line)
+        if ready_match:
+            offer_to_hq_ready_ms = int(ready_match.group(1))
+            event = event or "predictive ready latency"
     if "album_art_request" in lower or "[albumart] request " in lower:
         if "quality=preview" in lower or "request preview" in lower or '"quality":"preview"' in lower:
             state["previewRequest"] = True
@@ -329,6 +375,9 @@ elif state["hqUnavailable"] and state["inProgressBlocked"]:
 elif final_quality in {"preview", "hq", "enhanced", "hqFallback"}:
     result = "PASS"
     reason = "non-placeholder artwork displayed"
+elif state["offer"] and not state["hqRequest"] and state["hqPrefetchScheduled"] == 0 and state["hqPrefetchSkippedCacheHit"] == 0:
+    result = "WARN"
+    reason = "albumArt offer without hq request or predictive reason"
 elif state["timeout"] and state["transferCancelled"]:
     result = "WARN"
     reason = "timeout recovered without final artwork"
@@ -343,7 +392,11 @@ detail = (
     f"albumArtId={target_id} finalQuality={final_quality} "
     f"offer={state['offer']} preview={state['previewReceived']} "
     f"hq={state['hqReceived']} enhanced={state['enhancedCompleted']} "
-    f"timeout={state['timeout']} reason={reason}"
+    f"timeout={state['timeout']} "
+    f"hqPrefetchScheduled={state['hqPrefetchScheduled']} "
+    f"hqPrefetchSent={state['hqPrefetchSent']} "
+    f"offerToHqRequestMs={offer_to_hq_request_ms} "
+    f"offerToHqReadyMs={offer_to_hq_ready_ms} reason={reason}"
 )
 
 write_result({
@@ -366,6 +419,15 @@ write_result({
     "transferCancelled": state["transferCancelled"],
     "inProgressBlocked": state["inProgressBlocked"],
     "hqUnavailable": state["hqUnavailable"],
+    "predictiveOffer": state["predictiveOffer"],
+    "hqPrefetchScheduled": state["hqPrefetchScheduled"],
+    "hqPrefetchSent": state["hqPrefetchSent"],
+    "hqPrefetchSkippedCacheHit": state["hqPrefetchSkippedCacheHit"],
+    "hqPrefetchSkippedInFlight": state["hqPrefetchSkippedInFlight"],
+    "hqPrefetchSkippedNotConnected": state["hqPrefetchSkippedNotConnected"],
+    "hqPrefetchCancelledTrackChanged": state["hqPrefetchCancelledTrackChanged"],
+    "offerToHqRequestMs": offer_to_hq_request_ms,
+    "offerToHqReadyMs": offer_to_hq_ready_ms,
     "reason": reason,
     "detail": detail,
     "events": events[-80:],

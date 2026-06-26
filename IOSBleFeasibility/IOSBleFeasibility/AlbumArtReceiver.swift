@@ -20,6 +20,26 @@ struct AlbumArtSnapshot {
     let hqUnavailableBestChunks: Int
     let hqUnavailableMinCandidateScale: Int
     let transfer: AlbumArtTransferDiagnosticSnapshot
+    let predictive: PredictiveAlbumArtSnapshot
+}
+
+struct PredictiveAlbumArtSnapshot: Equatable {
+    let lastAlbumArtId: String
+    let pendingHq: Bool
+    let pendingHqId: String
+    let lastSkipReason: String
+    let offerCount: Int
+    let hqPrefetchScheduled: Int
+    let hqPrefetchSent: Int
+    let hqPrefetchSkippedCacheHit: Int
+    let hqPrefetchSkippedInFlight: Int
+    let hqPrefetchSkippedNotConnected: Int
+    let hqPrefetchCancelledTrackChanged: Int
+    let hqArrivedBeforeDisplayCount: Int
+    let avgOfferToHqRequestMs: Int
+    let avgOfferToHqReadyMs: Int
+    let lastOfferToHqRequestMs: Int
+    let lastOfferToHqReadyMs: Int
 }
 
 private struct AlbumArtCacheMetadata: Codable {
@@ -113,6 +133,25 @@ final class AlbumArtReceiver {
     private var hqAlbumArtUnavailableMinCandidateScale = 0
     private var albumArtPreviewRetryCount = 0
     private var albumArtFallbackWorkItem: DispatchWorkItem?
+    private var predictiveLastAlbumArtId = ""
+    private var predictivePendingHqId = ""
+    private var predictiveLastSkipReason = "-"
+    private var predictiveOfferCount = 0
+    private var predictiveHqPrefetchScheduled = 0
+    private var predictiveHqPrefetchSent = 0
+    private var predictiveHqPrefetchSkippedCacheHit = 0
+    private var predictiveHqPrefetchSkippedInFlight = 0
+    private var predictiveHqPrefetchSkippedNotConnected = 0
+    private var predictiveHqPrefetchCancelledTrackChanged = 0
+    private var predictiveHqArrivedBeforeDisplayCount = 0
+    private var predictiveOfferToHqRequestTotalMs = 0
+    private var predictiveOfferToHqRequestCount = 0
+    private var predictiveOfferToHqReadyTotalMs = 0
+    private var predictiveOfferToHqReadyCount = 0
+    private var predictiveLastOfferToHqRequestMs = 0
+    private var predictiveLastOfferToHqReadyMs = 0
+    private var predictiveOfferTimes: [String: Date] = [:]
+    private var predictiveHqRequestTimes: [String: Date] = [:]
     private var artworkEnhancementEnabled = PreferencesStore.shared.artworkEnhancementEnabled
     private var artworkEnhancementABOriginalMode = false
 
@@ -129,10 +168,12 @@ final class AlbumArtReceiver {
         }
         log("[AlbumArt] offer id=\(id)")
         log("[AlbumArtOffer] id=\(id) currentTitle=\(delegate?.albumArtCurrentTitle ?? "-")")
+        recordPredictiveOffer(id: id)
         handleAlbumArtIdentity(id)
         if let cached = cachedEnhancedAlbumArt(id: id) {
             cancelAlbumArtFallback()
             cancelHqAlbumArtRequest()
+            recordPredictiveHqSkip(id: id, reason: "cache hit", category: .cacheHit)
             setAlbumArtDisplay(image: cached.image, id: id, quality: .enhanced, reason: "offer cacheHit")
             delegate?.albumArtPublishLiveArtwork(image: cached.image, key: id, reason: "enhancedCacheHit")
             let message = "[AlbumArtCache] display quality=enhanced id=\(id), skip hq request"
@@ -142,6 +183,7 @@ final class AlbumArtReceiver {
         } else if let cached = validateCachedAlbumArt(id: id, preferredQuality: "hq") {
             cancelAlbumArtFallback()
             cancelHqAlbumArtRequest()
+            recordPredictiveHqSkip(id: id, reason: "cache hit", category: .cacheHit)
             setAlbumArtDisplay(image: cached.image, id: id, quality: .hq, reason: "offer cacheHit")
             delegate?.albumArtPublishLiveArtwork(image: cached.image, key: id, reason: "cacheHit")
             startArtworkEnhancementFromCachedHq(id: id, reason: "hq cacheHit")
@@ -156,7 +198,7 @@ final class AlbumArtReceiver {
             let message = "[AlbumArtCache] display quality=preview id=\(id), schedule hq"
             log(message)
             consoleLog(message)
-            scheduleHqAlbumArtRequest(id: id)
+            schedulePredictiveHqPrefetch(id: id, delay: 0.35, reason: "preview cache")
         } else {
             let message = "[AlbumArtCache] invalid id=\(id), request preview"
             log(message)
@@ -166,6 +208,7 @@ final class AlbumArtReceiver {
             updateArtworkEnhancementStatus(message: "cache miss")
             delegate?.albumArtClearLiveArtwork(reason: "cacheMiss", shouldUpdate: false)
             requestAlbumArt(id: id, quality: "preview")
+            schedulePredictiveHqPrefetch(id: id, delay: 0.65, reason: "offer cache miss")
             notifyStateChanged()
         }
     }
@@ -487,6 +530,7 @@ final class AlbumArtReceiver {
         requestedAlbumArtKeys.removeAll()
         requestedHqAlbumArtIDs.removeAll()
         cancelHqAlbumArtRequest()
+        predictivePendingHqId = ""
         notifyStateChanged()
     }
 
@@ -507,7 +551,8 @@ final class AlbumArtReceiver {
             hqUnavailableBestBytes: hqAlbumArtUnavailableBestBytes,
             hqUnavailableBestChunks: hqAlbumArtUnavailableBestChunks,
             hqUnavailableMinCandidateScale: hqAlbumArtUnavailableMinCandidateScale,
-            transfer: makeAlbumArtTransferDiagnosticSnapshot()
+            transfer: makeAlbumArtTransferDiagnosticSnapshot(),
+            predictive: makePredictiveAlbumArtSnapshot()
         )
     }
 
@@ -649,7 +694,9 @@ final class AlbumArtReceiver {
         log("[AlbumArt] decode success imageSize=\(image.pixelWidth)x\(image.pixelHeight)")
         albumArtPreviewRetryCount = 0
         if quality == "preview" {
-            scheduleHqAlbumArtRequest(id: id)
+            schedulePredictiveHqPrefetch(id: id, delay: 0.05, reason: "preview complete")
+        } else if quality == "hq" || quality == "full" {
+            recordPredictiveHqReady(id: id)
         }
         notifyStateChanged()
     }
@@ -659,6 +706,7 @@ final class AlbumArtReceiver {
 
         if !currentAlbumArtID.isEmpty {
             ArtworkEnhancementManager.shared.cancel(artworkId: currentAlbumArtID)
+            cancelPredictiveHqPrefetch(reason: "track changed", oldId: currentAlbumArtID)
         }
         currentAlbumArtID = id
         currentCachedAlbumArtQuality = ""
@@ -901,6 +949,120 @@ final class AlbumArtReceiver {
         )
     }
 
+    private func makePredictiveAlbumArtSnapshot() -> PredictiveAlbumArtSnapshot {
+        PredictiveAlbumArtSnapshot(
+            lastAlbumArtId: predictiveLastAlbumArtId,
+            pendingHq: !predictivePendingHqId.isEmpty,
+            pendingHqId: predictivePendingHqId,
+            lastSkipReason: predictiveLastSkipReason,
+            offerCount: predictiveOfferCount,
+            hqPrefetchScheduled: predictiveHqPrefetchScheduled,
+            hqPrefetchSent: predictiveHqPrefetchSent,
+            hqPrefetchSkippedCacheHit: predictiveHqPrefetchSkippedCacheHit,
+            hqPrefetchSkippedInFlight: predictiveHqPrefetchSkippedInFlight,
+            hqPrefetchSkippedNotConnected: predictiveHqPrefetchSkippedNotConnected,
+            hqPrefetchCancelledTrackChanged: predictiveHqPrefetchCancelledTrackChanged,
+            hqArrivedBeforeDisplayCount: predictiveHqArrivedBeforeDisplayCount,
+            avgOfferToHqRequestMs: averageMs(
+                total: predictiveOfferToHqRequestTotalMs,
+                count: predictiveOfferToHqRequestCount
+            ),
+            avgOfferToHqReadyMs: averageMs(
+                total: predictiveOfferToHqReadyTotalMs,
+                count: predictiveOfferToHqReadyCount
+            ),
+            lastOfferToHqRequestMs: predictiveLastOfferToHqRequestMs,
+            lastOfferToHqReadyMs: predictiveLastOfferToHqReadyMs
+        )
+    }
+
+    private func averageMs(total: Int, count: Int) -> Int {
+        count > 0 ? total / count : 0
+    }
+
+    private func schedulePredictiveHqPrefetch(id: String, delay: TimeInterval, reason: String) {
+        scheduleHqAlbumArtRequest(id: id, delay: delay, reason: reason, predictive: true)
+    }
+
+    private enum PredictiveHqSkipCategory {
+        case cacheHit
+        case inFlight
+        case notConnected
+    }
+
+    private func recordPredictiveOffer(id: String) {
+        predictiveLastAlbumArtId = id
+        predictiveOfferCount += 1
+        predictiveOfferTimes[id] = Date()
+        log("[PredictiveAlbumArt] offer id=\(id)")
+    }
+
+    private func recordPredictiveHqRequest(id: String) {
+        let now = Date()
+        predictiveHqRequestTimes[id] = now
+        if let offeredAt = predictiveOfferTimes[id] {
+            let elapsedMs = max(0, Int(now.timeIntervalSince(offeredAt) * 1_000))
+            predictiveLastOfferToHqRequestMs = elapsedMs
+            predictiveOfferToHqRequestTotalMs += elapsedMs
+            predictiveOfferToHqRequestCount += 1
+            log("[PredictiveAlbumArt] offerToHqRequestMs=\(elapsedMs) id=\(id)")
+        }
+    }
+
+    private func recordPredictiveHqReady(id: String) {
+        let now = Date()
+        if let offeredAt = predictiveOfferTimes[id] {
+            let elapsedMs = max(0, Int(now.timeIntervalSince(offeredAt) * 1_000))
+            predictiveLastOfferToHqReadyMs = elapsedMs
+            predictiveOfferToHqReadyTotalMs += elapsedMs
+            predictiveOfferToHqReadyCount += 1
+            log("[PredictiveAlbumArt] hq ready id=\(id) offerToHqReadyMs=\(elapsedMs)")
+        }
+        if let requestedAt = predictiveHqRequestTimes[id] {
+            let elapsedMs = max(0, Int(now.timeIntervalSince(requestedAt) * 1_000))
+            log("[PredictiveAlbumArt] hq ready id=\(id) requestToHqReadyMs=\(elapsedMs)")
+        }
+        if artworkDisplayQuality == .placeholder {
+            predictiveHqArrivedBeforeDisplayCount += 1
+        }
+        predictiveHqRequestTimes[id] = nil
+    }
+
+    private func recordPredictiveHqSkip(id: String, reason: String, category: PredictiveHqSkipCategory) {
+        predictiveLastSkipReason = reason
+        switch category {
+        case .cacheHit:
+            predictiveHqPrefetchSkippedCacheHit += 1
+        case .inFlight:
+            predictiveHqPrefetchSkippedInFlight += 1
+        case .notConnected:
+            predictiveHqPrefetchSkippedNotConnected += 1
+        }
+        log("[PredictiveAlbumArt] skip hq id=\(id) reason=\(reason)")
+    }
+
+    private func cancelPredictiveHqPrefetch(reason: String, oldId: String) {
+        guard !oldId.isEmpty else { return }
+        if hqAlbumArtWorkItem != nil || predictivePendingHqId == oldId {
+            predictiveHqPrefetchCancelledTrackChanged += 1
+            log("[PredictiveAlbumArt] cancel pending reason=\(reason) id=\(oldId)")
+        }
+        predictivePendingHqId = ""
+        predictiveOfferTimes[oldId] = nil
+        predictiveHqRequestTimes[oldId] = nil
+    }
+
+    private func isPredictiveHqConnectionReady() -> Bool {
+        let statusReady = delegate?.albumArtConnectionStatus == "已连接" ||
+            delegate?.albumArtConnectionDisplayState == "connected"
+        guard statusReady,
+              delegate?.albumArtCharacteristicReady == true else {
+            return false
+        }
+        let health = delegate?.albumArtConnectionHealthState ?? "disconnected"
+        return health != "stale" && health != "disconnected" && health != "reconnecting"
+    }
+
     private func scheduleAlbumArtFallback(id: String) {
         cancelAlbumArtFallback()
         let workItem = DispatchWorkItem { [weak self] in
@@ -926,19 +1088,49 @@ final class AlbumArtReceiver {
         albumArtFallbackWorkItem = nil
     }
 
-    private func scheduleHqAlbumArtRequest(id: String, delay: TimeInterval = 1.8) {
+    private func scheduleHqAlbumArtRequest(
+        id: String,
+        delay: TimeInterval = 1.8,
+        reason: String = "standard",
+        predictive: Bool = false
+    ) {
         guard id == currentAlbumArtID else { return }
-        guard artworkDisplayQuality < .hq else { return }
-        guard !requestedHqAlbumArtIDs.contains(id) else { return }
+        guard artworkDisplayQuality < .hq else {
+            if predictive {
+                recordPredictiveHqSkip(id: id, reason: "cache hit", category: .cacheHit)
+            }
+            return
+        }
+        guard !requestedHqAlbumArtIDs.contains(id),
+              !requestedAlbumArtKeys.contains("\(id)|hq") else {
+            if predictive {
+                recordPredictiveHqSkip(id: id, reason: "in flight", category: .inFlight)
+            }
+            return
+        }
+        if predictive, !isPredictiveHqConnectionReady() {
+            predictivePendingHqId = id
+            recordPredictiveHqSkip(id: id, reason: "not connected", category: .notConnected)
+            return
+        }
         cancelHqAlbumArtRequest()
-        let timing = delegate?.albumArtEffectiveHqDelay(delay)
+        let timing = predictive ? nil : delegate?.albumArtEffectiveHqDelay(delay)
         let effectiveDelay = timing?.delay ?? delay
         let deferred = timing?.deferred ?? false
         let workItem = DispatchWorkItem { [weak self] in
-            self?.requestHqAlbumArt(id: id)
+            self?.requestHqAlbumArt(id: id, reason: reason, predictive: predictive)
         }
         hqAlbumArtWorkItem = workItem
         log("[AlbumArtHQ] scheduled id=\(id) delayMs=\(Int(effectiveDelay * 1_000))")
+        if predictive {
+            predictivePendingHqId = id
+            predictiveHqPrefetchScheduled += 1
+            predictiveLastSkipReason = "-"
+            log(
+                "[PredictiveAlbumArt] schedule hq id=\(id) " +
+                    "delayMs=\(Int(effectiveDelay * 1_000)) reason=\(reason)"
+            )
+        }
         if deferred {
             log("[StartupLoad] defer request=AlbumArtHQ delayMs=\(Int(effectiveDelay * 1_000))")
         }
@@ -950,11 +1142,20 @@ final class AlbumArtReceiver {
         hqAlbumArtWorkItem = nil
     }
 
-    private func requestHqAlbumArt(id: String) {
+    private func requestHqAlbumArt(id: String, reason: String = "standard", predictive: Bool = false) {
         guard id == currentAlbumArtID else { return }
-        guard artworkDisplayQuality < .hq else { return }
+        guard artworkDisplayQuality < .hq else {
+            if predictive {
+                recordPredictiveHqSkip(id: id, reason: "cache hit", category: .cacheHit)
+            }
+            return
+        }
         guard delegate?.albumArtConnectionStatus == "已连接" else {
             log("[AlbumArtHQ] request skipped not connected")
+            if predictive {
+                predictivePendingHqId = id
+                recordPredictiveHqSkip(id: id, reason: "not connected", category: .notConnected)
+            }
             return
         }
         cancelStaleBinaryAlbumArtTransferIfNeeded(reason: "request found stale transfer")
@@ -968,10 +1169,24 @@ final class AlbumArtReceiver {
               albumArtExpectedChunks == 0,
               binaryAlbumArtExpectedChunks == 0 else {
             log("[AlbumArtHQ] request skipped busy")
-            scheduleHqAlbumArtRequest(id: id, delay: 2.0)
+            if predictive {
+                recordPredictiveHqSkip(id: id, reason: "in flight", category: .inFlight)
+            }
+            scheduleHqAlbumArtRequest(id: id, delay: 1.0, reason: "busy retry", predictive: predictive)
             return
         }
-        guard requestedHqAlbumArtIDs.insert(id).inserted else { return }
+        guard requestedHqAlbumArtIDs.insert(id).inserted else {
+            if predictive {
+                recordPredictiveHqSkip(id: id, reason: "in flight", category: .inFlight)
+            }
+            return
+        }
+        if predictive {
+            predictivePendingHqId = ""
+            predictiveHqPrefetchSent += 1
+            recordPredictiveHqRequest(id: id)
+            log("[PredictiveAlbumArt] request hq id=\(id) reason=\(reason)")
+        }
         requestAlbumArt(id: id, quality: "hq")
     }
 

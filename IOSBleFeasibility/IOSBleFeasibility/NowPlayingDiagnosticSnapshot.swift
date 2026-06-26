@@ -50,6 +50,25 @@ struct AlbumArtTransferDiagnosticSnapshot: Equatable {
     let hqRetryCount: Int
 }
 
+struct PredictiveAlbumArtDiagnosticSnapshot: Equatable {
+    let lastAlbumArtId: String
+    let pendingHq: Bool
+    let pendingHqId: String
+    let lastSkipReason: String
+    let offerCount: Int
+    let hqPrefetchScheduled: Int
+    let hqPrefetchSent: Int
+    let hqPrefetchSkippedCacheHit: Int
+    let hqPrefetchSkippedInFlight: Int
+    let hqPrefetchSkippedNotConnected: Int
+    let hqPrefetchCancelledTrackChanged: Int
+    let hqArrivedBeforeDisplayCount: Int
+    let avgOfferToHqRequestMs: Int
+    let avgOfferToHqReadyMs: Int
+    let lastOfferToHqRequestMs: Int
+    let lastOfferToHqReadyMs: Int
+}
+
 struct CurrentWordDiagnosticSnapshot: Equatable {
     let lineIndex: Int
     let wordIndex: Int
@@ -76,6 +95,7 @@ struct NowPlayingDiagnosticSnapshot {
     let hqUnavailableBestChunks: Int
     let hqUnavailableMinCandidateScale: Int
     let albumArtTransfer: AlbumArtTransferDiagnosticSnapshot
+    let predictiveAlbumArt: PredictiveAlbumArtDiagnosticSnapshot
     let isPlaying: Bool
     let positionMs: Int64
     let durationMs: Int64
@@ -99,6 +119,8 @@ struct NowPlayingDiagnosticSnapshot {
         artworkQuality=\(albumArtDisplayQuality)
         artworkTransferState=\(albumArtTransfer.state)
         artworkTransferReason=\(albumArtTransfer.lastFailureReason)
+        predictiveAlbumArtPendingHq=\(predictiveAlbumArt.pendingHq)
+        predictiveAlbumArtLastSkip=\(predictiveAlbumArt.lastSkipReason)
         currentWordLine=\(currentWord.lineIndex)
         currentWordIndex=\(currentWord.wordIndex)
         currentWordPushCount=\(currentWord.pushCount)
@@ -231,6 +253,22 @@ struct NowPlayingDiagnosticSnapshot {
         lines.append("transferLastFailure: \(albumArtTransfer.lastFailureReason)")
         lines.append("previewRetryCount: \(albumArtTransfer.previewRetryCount)")
         lines.append("hqRetryCount: \(albumArtTransfer.hqRetryCount)")
+        lines.append("predictiveLastAlbumArtId: \(predictiveAlbumArt.lastAlbumArtId)")
+        lines.append("predictivePendingHq: \(predictiveAlbumArt.pendingHq)")
+        lines.append("predictivePendingHqId: \(predictiveAlbumArt.pendingHqId)")
+        lines.append("predictiveLastSkipReason: \(predictiveAlbumArt.lastSkipReason)")
+        lines.append("predictiveOfferCount: \(predictiveAlbumArt.offerCount)")
+        lines.append("predictiveHqPrefetchScheduled: \(predictiveAlbumArt.hqPrefetchScheduled)")
+        lines.append("predictiveHqPrefetchSent: \(predictiveAlbumArt.hqPrefetchSent)")
+        lines.append("predictiveSkippedCacheHit: \(predictiveAlbumArt.hqPrefetchSkippedCacheHit)")
+        lines.append("predictiveSkippedInFlight: \(predictiveAlbumArt.hqPrefetchSkippedInFlight)")
+        lines.append("predictiveSkippedNotConnected: \(predictiveAlbumArt.hqPrefetchSkippedNotConnected)")
+        lines.append("predictiveCancelledTrackChanged: \(predictiveAlbumArt.hqPrefetchCancelledTrackChanged)")
+        lines.append("predictiveHqArrivedBeforeDisplay: \(predictiveAlbumArt.hqArrivedBeforeDisplayCount)")
+        lines.append("predictiveAvgOfferToHqRequestMs: \(predictiveAlbumArt.avgOfferToHqRequestMs)")
+        lines.append("predictiveAvgOfferToHqReadyMs: \(predictiveAlbumArt.avgOfferToHqReadyMs)")
+        lines.append("predictiveLastOfferToHqRequestMs: \(predictiveAlbumArt.lastOfferToHqRequestMs)")
+        lines.append("predictiveLastOfferToHqReadyMs: \(predictiveAlbumArt.lastOfferToHqReadyMs)")
         for cache in artworkCaches {
             lines.append(
                 "\(cache.quality): exists=\(cache.exists) bytes=\(cache.bytes) " +
@@ -555,6 +593,18 @@ struct SystemHealthSnapshot {
                 .init(title: "transferState", value: transfer.state),
                 .init(title: "lastFailureReason", value: transfer.lastFailureReason),
                 .init(title: "hqUnavailableReason", value: source.hqUnavailableReason.isEmpty ? "-" : source.hqUnavailableReason),
+                .init(title: "predictivePendingHq", value: source.predictiveAlbumArt.pendingHq ? "true" : "false"),
+                .init(title: "predictiveLastSkip", value: source.predictiveAlbumArt.lastSkipReason),
+                .init(
+                    title: "offerToHqRequest",
+                    value: source.predictiveAlbumArt.lastOfferToHqRequestMs > 0 ?
+                        "\(source.predictiveAlbumArt.lastOfferToHqRequestMs)ms" : "unknown"
+                ),
+                .init(
+                    title: "offerToHqReady",
+                    value: source.predictiveAlbumArt.lastOfferToHqReadyMs > 0 ?
+                        "\(source.predictiveAlbumArt.lastOfferToHqReadyMs)ms" : "unknown"
+                ),
                 .init(
                     title: "fallbackScale",
                     value: source.hqUnavailableMinCandidateScale > 0 ? "\(source.hqUnavailableMinCandidateScale)" : "unknown"
