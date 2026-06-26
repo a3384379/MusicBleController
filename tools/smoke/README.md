@@ -95,10 +95,22 @@ CurrentWord long-play output:
 /tmp/current_word_long_play/<timestamp>/
 ```
 
+AlbumArt V2.7 long-play command:
+
+```bash
+./tools/smoke/album_art_v27_long_play_test.sh --duration 120 --json
+```
+
+AlbumArt V2.7 output:
+
+```text
+/tmp/album_art_v27/<timestamp>/
+```
+
 Files:
 
-- `report.md`: human-readable CurrentWord latency and stability report.
-- `report.json`: machine-readable CurrentWord metrics.
+- `report.md`: human-readable CurrentWord or AlbumArt stability report.
+- `report.json`: machine-readable CurrentWord or AlbumArt metrics.
 - `ios_ble.log`: copied iOS app log after the test window.
 - `sony_logcat.log`: Sony logcat captured after the test window.
 - `ios_current_word_filtered.log`: iOS filtered CurrentWord/Lyrics log.

@@ -35,9 +35,11 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.MessageDigest
+import java.util.LinkedHashMap
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -83,6 +85,10 @@ class BleGattServerManager(
             Thread(runnable, "PlaybackHistoryBleThread")
         }
     private val historyQueryPreparing = AtomicBoolean(false)
+    private val albumArtFastPathExecutor =
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "AlbumArtFastPathThread")
+        }
     private val albumArtHandler = Handler(Looper.getMainLooper())
 
     private var gattServer: BluetoothGattServer? = null
@@ -117,6 +123,26 @@ class BleGattServerManager(
     private var pendingAlbumArt: PendingAlbumArt? = null
     @Volatile
     private var albumArtScheduleGeneration = 0L
+    @Volatile
+    private var albumArtTaskGeneration = 0L
+    @Volatile
+    private var albumArtFastPathTask: Future<*>? = null
+    @Volatile
+    private var albumArtFastPathProtocolId: String? = null
+    private val albumArtPendingRequests =
+        ConcurrentHashMap<String, PendingAlbumArtRequest>()
+    private val albumArtCache = object :
+        LinkedHashMap<String, AlbumArtCacheEntry>(ALBUM_ART_CACHE_CAPACITY, 0.75f, true) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<String, AlbumArtCacheEntry>?
+        ): Boolean {
+            val shouldEvict = size > ALBUM_ART_CACHE_CAPACITY
+            if (shouldEvict && eldest != null) {
+                logger("[AlbumArtCache] evict key=${eldest.key} id=${eldest.value.protocolId}")
+            }
+            return shouldEvict
+        }
+    }
     @Volatile
     private var currentAlbumArtPlaybackState: JSONObject? = null
     private var lastAutoPushSongKey: String? = null
@@ -171,6 +197,7 @@ class BleGattServerManager(
                 currentAlbumArtId = null
                 albumArtRequestsInFlight.clear()
                 albumArtRequestsCompleted.clear()
+                albumArtPendingRequests.clear()
                 pendingAlbumArt = null
                 albumArtScheduleGeneration += 1
                 clientSupportsBinaryAlbumArt = false
@@ -461,6 +488,11 @@ class BleGattServerManager(
         albumArtRequestsCompleted.clear()
         pendingAlbumArt = null
         albumArtScheduleGeneration += 1
+        albumArtTaskGeneration += 1
+        albumArtFastPathTask?.cancel(true)
+        albumArtFastPathTask = null
+        albumArtFastPathProtocolId = null
+        albumArtPendingRequests.clear()
         albumArtHandler.removeCallbacksAndMessages(null)
         lastAutoPushSongKey = null
         lastAutoPushPlaying = null
@@ -472,6 +504,7 @@ class BleGattServerManager(
         statusCharacteristic = null
         mediaFieldDumpExecutor.shutdownNow()
         historyExecutor.shutdownNow()
+        albumArtFastPathExecutor.shutdownNow()
 
         try {
             try {
@@ -1284,6 +1317,24 @@ class BleGattServerManager(
             protocolId = protocolId,
             playbackState = JSONObject(playbackState.toString())
         )
+        logger("[AlbumArtFastPath] track_changed start id=$protocolId")
+        val cached = albumArtCacheEntry(protocolId, cacheKey)
+        if (cached != null) {
+            logger(
+                "[AlbumArtFastPath] cache hit id=$protocolId source=${cached.source} " +
+                    "size=${cached.width}x${cached.height} bytes=${cached.byteSize}"
+            )
+            CurrentTrackRuntimeCache.updateAlbumArt(
+                trackId = protocolId,
+                albumArtId = protocolId,
+                albumArtState = "CACHE_HIT",
+                logger = logger
+            )
+            enqueueAlbumArtOfferOrPending(pending)
+            return
+        }
+        logger("[AlbumArtFastPath] cache miss id=$protocolId")
+        startAlbumArtFastPathLoad(pending)
         val generation = ++albumArtScheduleGeneration
         logger("[AlbumArt] scheduled after cooldown id=$protocolId")
         albumArtHandler.postDelayed(
@@ -1358,6 +1409,199 @@ class BleGattServerManager(
         pendingAlbumArt = null
         logger("[AlbumArt] send pending id=${pending.protocolId}")
         enqueueAlbumArtOfferOrPending(pending)
+    }
+
+    private fun startAlbumArtFastPathLoad(pending: PendingAlbumArt) {
+        val oldProtocolId = albumArtFastPathProtocolId
+        val oldTask = albumArtFastPathTask
+        if (oldTask != null && !oldTask.isDone && oldProtocolId != pending.protocolId) {
+            oldTask.cancel(true)
+            logger(
+                "[AlbumArtTask] cancel oldTrack=${oldProtocolId.orEmpty()} " +
+                    "newTrack=${pending.protocolId}"
+            )
+        }
+        val generation = ++albumArtTaskGeneration
+        albumArtFastPathProtocolId = pending.protocolId
+        CurrentTrackRuntimeCache.updateAlbumArt(
+            trackId = pending.protocolId,
+            albumArtId = pending.protocolId,
+            albumArtState = "LOAD_STARTED",
+            logger = logger
+        )
+        logger("[AlbumArtFastPath] load start id=${pending.protocolId}")
+        val startedAt = SystemClock.elapsedRealtime()
+        albumArtFastPathTask = albumArtFastPathExecutor.submit {
+            val albumArt = try {
+                albumArtTestManager.readCurrentNotificationAlbumArt()
+            } catch (exception: Exception) {
+                logger("[AlbumArtFastPath] failed reason=${exception.message}")
+                null
+            }
+            if (Thread.currentThread().isInterrupted) {
+                logger("[AlbumArtTask] cancel oldTrack=${pending.protocolId} newTrack=interrupted")
+                return@submit
+            }
+            albumArtHandler.post {
+                synchronized(this) {
+                    if (generation != albumArtTaskGeneration ||
+                        currentAlbumArtId != pending.protocolId
+                    ) {
+                        logger(
+                            "[AlbumArtTask] cancel oldTrack=${pending.protocolId} " +
+                                "newTrack=${currentAlbumArtId.orEmpty()}"
+                        )
+                        return@synchronized
+                    }
+                    if (albumArt == null) {
+                        CurrentTrackRuntimeCache.updateAlbumArt(
+                            trackId = pending.protocolId,
+                            albumArtId = pending.protocolId,
+                            albumArtState = "FAILED",
+                            logger = logger
+                        )
+                        logger("[AlbumArtFastPath] failed reason=no album art candidate")
+                        failPendingAlbumArtRequests(
+                            protocolId = pending.protocolId,
+                            reason = "no notification largeIcon"
+                        )
+                        return@synchronized
+                    }
+                    if (isLikelyPlaceholderAlbumArt(albumArt.bitmap)) {
+                        CurrentTrackRuntimeCache.updateAlbumArt(
+                            trackId = pending.protocolId,
+                            albumArtId = pending.protocolId,
+                            albumArtState = "FAILED",
+                            logger = logger
+                        )
+                        logger("[AlbumArtFastPath] failed reason=placeholder album art")
+                        failPendingAlbumArtRequests(
+                            protocolId = pending.protocolId,
+                            reason = "placeholder album art"
+                        )
+                        return@synchronized
+                    }
+                    val costMs = SystemClock.elapsedRealtime() - startedAt
+                    putAlbumArtCache(
+                        protocolId = pending.protocolId,
+                        cacheKey = pending.cacheKey,
+                        bitmap = albumArt.bitmap,
+                        source = albumArt.source
+                    )
+                    CurrentTrackRuntimeCache.updateAlbumArt(
+                        trackId = pending.protocolId,
+                        albumArtId = pending.protocolId,
+                        albumArtState = "PREVIEW_READY",
+                        logger = logger
+                    )
+                    logger(
+                        "[AlbumArtFastPath] preview ready costMs=$costMs " +
+                            "size=${albumArt.bitmap.width}x${albumArt.bitmap.height}"
+                    )
+                    CurrentTrackRuntimeCache.updateAlbumArt(
+                        trackId = pending.protocolId,
+                        albumArtId = pending.protocolId,
+                        albumArtState = "HQ_READY",
+                        logger = logger
+                    )
+                    logger(
+                        "[AlbumArtFastPath] hq ready costMs=$costMs " +
+                            "size=${albumArt.bitmap.width}x${albumArt.bitmap.height}"
+                    )
+                    fulfillPendingAlbumArtRequests(pending.protocolId)
+                }
+            }
+        }
+    }
+
+    private fun albumArtCacheEntry(
+        protocolId: String,
+        cacheKey: String?
+    ): AlbumArtCacheEntry? {
+        val now = SystemClock.elapsedRealtime()
+        val keys = listOfNotNull(
+            albumArtPrimaryCacheKey(protocolId),
+            cacheKey?.let(::albumArtFallbackCacheKey)
+        )
+        synchronized(albumArtCache) {
+            for (key in keys) {
+                val entry = albumArtCache[key] ?: continue
+                if (now - entry.createdAtElapsedMs <= ALBUM_ART_CACHE_TTL_MS) {
+                    logger("[AlbumArtCache] hit key=$key id=${entry.protocolId}")
+                    return entry
+                }
+                albumArtCache.remove(key)
+                logger("[AlbumArtCache] evict key=$key reason=ttl")
+            }
+        }
+        logger("[AlbumArtCache] miss id=$protocolId")
+        return null
+    }
+
+    private fun putAlbumArtCache(
+        protocolId: String,
+        cacheKey: String,
+        bitmap: Bitmap,
+        source: String
+    ) {
+        val entry = AlbumArtCacheEntry(
+            protocolId = protocolId,
+            cacheKey = cacheKey,
+            bitmap = bitmap,
+            source = source,
+            width = bitmap.width,
+            height = bitmap.height,
+            byteSize = bitmap.allocationByteCount,
+            createdAtElapsedMs = SystemClock.elapsedRealtime()
+        )
+        synchronized(albumArtCache) {
+            albumArtCache[albumArtPrimaryCacheKey(protocolId)] = entry
+            albumArtCache[albumArtFallbackCacheKey(cacheKey)] = entry
+        }
+        logger(
+            "[AlbumArtCache] put id=$protocolId source=$source " +
+                "size=${bitmap.width}x${bitmap.height} bytes=${bitmap.allocationByteCount}"
+        )
+    }
+
+    private fun fulfillPendingAlbumArtRequests(protocolId: String) {
+        val cacheKey = currentAlbumArtPlaybackState?.let(::buildAlbumArtCacheKey)
+        val entry = albumArtCacheEntry(protocolId, cacheKey) ?: return
+        val pending = albumArtPendingRequests.values
+            .filter { it.protocolId == protocolId }
+            .toList()
+        pending.forEach { request ->
+            albumArtPendingRequests.remove(request.requestKey)
+            logger(
+                "[AlbumArtSend] pending request fulfilled id=$protocolId " +
+                    "quality=${request.quality.wireValue}"
+            )
+            sendAlbumArtFromBitmap(
+                device = request.device,
+                protocolId = request.protocolId,
+                quality = request.quality,
+                requestKey = request.requestKey,
+                bitmap = entry.bitmap,
+                selectedSource = entry.source,
+                playbackState = currentAlbumArtPlaybackState
+            )
+        }
+    }
+
+    private fun failPendingAlbumArtRequests(protocolId: String, reason: String) {
+        val pending = albumArtPendingRequests.values
+            .filter { it.protocolId == protocolId }
+            .toList()
+        pending.forEach { request ->
+            albumArtPendingRequests.remove(request.requestKey)
+            albumArtRequestsInFlight.remove(request.requestKey)
+            sendAlbumArtUnavailable(
+                device = request.device,
+                protocolId = request.protocolId,
+                quality = request.quality,
+                reason = reason
+            )
+        }
     }
 
     @Synchronized
@@ -1436,6 +1680,34 @@ class BleGattServerManager(
             logger("[AlbumArtDebug] unavailable reason=no iPhone subscriber")
             return
         }
+        val cached = albumArtCacheEntry(protocolId, buildAlbumArtCacheKeyFromProtocol(protocolId))
+        if (cached != null) {
+            logger("[AlbumArtSend] immediate from cache id=$protocolId quality=${quality.wireValue}")
+            sendAlbumArtFromBitmap(
+                device = device,
+                protocolId = protocolId,
+                quality = quality,
+                requestKey = requestKey,
+                bitmap = cached.bitmap,
+                selectedSource = cached.source,
+                playbackState = currentAlbumArtPlaybackState
+            )
+            return
+        }
+        if (albumArtFastPathProtocolId == protocolId &&
+            albumArtFastPathTask?.isDone == false
+        ) {
+            albumArtPendingRequests[requestKey] = PendingAlbumArtRequest(
+                device = device,
+                protocolId = protocolId,
+                quality = quality,
+                requestKey = requestKey
+            )
+            logger("[AlbumArtSend] pending request quality=${quality.wireValue} id=$protocolId")
+            logger("[AlbumArtFastPath] pending request count=${albumArtPendingRequests.size}")
+            return
+        }
+
         val albumArt = albumArtTestManager.readCurrentNotificationAlbumArt()
         if (albumArt == null) {
             albumArtRequestsInFlight.remove(requestKey)
@@ -1447,17 +1719,7 @@ class BleGattServerManager(
             )
             return
         }
-
-        val bitmap = albumArt.bitmap
-        logger("[AlbumArt][BLE] source=${albumArt.source}")
-        logger("[AlbumArtDebug] source ${albumArt.source} exists=true")
-        logger(
-            "[AlbumArt][BLE] original width=${bitmap.width} height=${bitmap.height}"
-        )
-        logger(
-            "[AlbumArtDebug] bitmap width=${bitmap.width} height=${bitmap.height}"
-        )
-        if (isLikelyPlaceholderAlbumArt(bitmap)) {
+        if (isLikelyPlaceholderAlbumArt(albumArt.bitmap)) {
             albumArtRequestsInFlight.remove(requestKey)
             sendAlbumArtUnavailable(
                 device = device,
@@ -1467,6 +1729,40 @@ class BleGattServerManager(
             )
             return
         }
+        putAlbumArtCache(
+            protocolId = protocolId,
+            cacheKey = buildAlbumArtCacheKeyFromProtocol(protocolId),
+            bitmap = albumArt.bitmap,
+            source = albumArt.source
+        )
+        sendAlbumArtFromBitmap(
+            device = device,
+            protocolId = protocolId,
+            quality = quality,
+            requestKey = requestKey,
+            bitmap = albumArt.bitmap,
+            selectedSource = albumArt.source,
+            playbackState = currentAlbumArtPlaybackState
+        )
+    }
+
+    private fun sendAlbumArtFromBitmap(
+        device: BluetoothDevice,
+        protocolId: String,
+        quality: AlbumArtQuality,
+        requestKey: String,
+        bitmap: Bitmap,
+        selectedSource: String,
+        playbackState: JSONObject?
+    ) {
+        logger("[AlbumArt][BLE] source=$selectedSource")
+        logger("[AlbumArtDebug] source $selectedSource exists=true")
+        logger(
+            "[AlbumArt][BLE] original width=${bitmap.width} height=${bitmap.height}"
+        )
+        logger(
+            "[AlbumArtDebug] bitmap width=${bitmap.width} height=${bitmap.height}"
+        )
         val useBinaryAlbumArt =
             (quality == AlbumArtQuality.PREVIEW || quality == AlbumArtQuality.HQ) &&
                 clientSupportsBinaryAlbumArt
@@ -1513,8 +1809,8 @@ class BleGattServerManager(
         val totalChunks = albumPackets.totalChunks
         exportAlbumArtDiagnostics(
             protocolId = protocolId,
-            playbackState = currentAlbumArtPlaybackState,
-            selectedSource = albumArt.source,
+            playbackState = playbackState,
+            selectedSource = selectedSource,
             sourceBitmap = bitmap,
             compressed = compressedAlbumArt,
             quality = quality,
@@ -2188,9 +2484,19 @@ class BleGattServerManager(
         return listOf(
             playbackState.optString("title"),
             playbackState.optString("artist"),
-            playbackState.optString("album")
+            playbackState.optString("album"),
+            (playbackState.optLong("duration") / 2_000L).toString()
         ).joinToString("|")
     }
+
+    private fun buildAlbumArtCacheKeyFromProtocol(protocolId: String): String {
+        return currentAlbumArtPlaybackState?.let(::buildAlbumArtCacheKey)
+            ?: "protocol:$protocolId"
+    }
+
+    private fun albumArtPrimaryCacheKey(protocolId: String): String = "track:$protocolId"
+
+    private fun albumArtFallbackCacheKey(cacheKey: String): String = "identity:$cacheKey"
 
     private fun buildAlbumArtProtocolId(playbackState: JSONObject): String {
         return buildAlbumArtProtocolId(
@@ -3575,6 +3881,8 @@ class BleGattServerManager(
         private const val ALBUM_ART_HQ_MAX_SEND_MS = 8000L
         private const val ALBUM_ART_FULL_MAX_SEND_MS = 3500L
         private const val ALBUM_ART_COOLDOWN_AFTER_TRACK_CHANGE_MS = 1500L
+        private const val ALBUM_ART_CACHE_CAPACITY = 20
+        private const val ALBUM_ART_CACHE_TTL_MS = 30 * 60 * 1_000L
         private const val MAX_TRACK_INFO_TEXT_LENGTH = 300
         private const val MAX_TRACK_INFO_CHUNK_BYTES = 300
         private const val MAX_ALBUM_CHUNK_RAW_BYTES = 60
@@ -3649,6 +3957,24 @@ class BleGattServerManager(
         val cacheKey: String,
         val protocolId: String,
         val playbackState: JSONObject
+    )
+
+    private data class PendingAlbumArtRequest(
+        val device: BluetoothDevice,
+        val protocolId: String,
+        val quality: AlbumArtQuality,
+        val requestKey: String
+    )
+
+    private data class AlbumArtCacheEntry(
+        val protocolId: String,
+        val cacheKey: String,
+        val bitmap: Bitmap,
+        val source: String,
+        val width: Int,
+        val height: Int,
+        val byteSize: Int,
+        val createdAtElapsedMs: Long
     )
 
     private enum class AlbumArtQuality(val wireValue: String) {
