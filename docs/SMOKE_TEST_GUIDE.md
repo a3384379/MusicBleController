@@ -31,6 +31,7 @@
 
 - `tools/smoke/run_all_smoke_tests.sh`：检测 iPhone/Sony，调用 iOS 和 Android 子 suite，支持自动降级。
 - `tools/smoke/generate_all_report.py`：读取子报告并生成总 `report.md` / `report.json`。
+- `tools/smoke/current_word_long_play_test.sh`：手动长播放窗口测试，采集 iOS + Sony 日志，验证 V2.3 `currentWord` 是否持续推送、iOS 是否持续 accepted，以及 playbackState 是否明显低于 currentWord。
 
 ## iOS-only 核心文件
 
@@ -58,6 +59,7 @@
 
 - [run_all_smoke_tests.sh](/Volumes/雷电/project/MusicBleController/tools/smoke/run_all_smoke_tests.sh)
 - [generate_all_report.py](/Volumes/雷电/project/MusicBleController/tools/smoke/generate_all_report.py)
+- [current_word_long_play_test.sh](/Volumes/雷电/project/MusicBleController/tools/smoke/current_word_long_play_test.sh)
 - [README.md](/Volumes/雷电/project/MusicBleController/tools/smoke/README.md)
 
 ## iOS-only 数据流
@@ -94,6 +96,34 @@
 4. 只存在一台时自动只跑对应 suite，另一个 suite 标记 `SKIPPED`。
 5. 子报告输出到 `<output>/ios/` 和 `<output>/android/`。
 6. 总报告输出到 `/tmp/music_ble_smoke/<timestamp>/report.md` 和 `report.json`。
+
+## CurrentWord 长播放测试
+
+命令：
+
+```bash
+./tools/smoke/current_word_long_play_test.sh --duration 90 --json
+```
+
+用途：
+
+- 验证 Latency Optimization V2.3 在真实播放窗口中是否持续发送 `currentWord`。
+- 比较 Sony `CurrentWordPush` 和 iOS accepted `currentWord`。
+- 统计 `playbackState` 与 `currentWord` 比例、stale discard、main stall、execution gap、receive interval 和 latency。
+
+前提：
+
+- iPhone USB 连接、解锁，iOS App 已连接 Sony。
+- Sony USB 连接，PlayerAgent BLE service 已启动。
+- QQ音乐正在播放有逐字时间的歌曲，最好是快歌。
+- 测试窗口建议 60-120 秒。
+
+报告：
+
+- 默认输出 `/tmp/current_word_long_play/<timestamp>/report.md` 和 `report.json`。
+- 同时保存 `ios_ble.log`、`sony_logcat.log`、`ios_current_word_filtered.log`、`sony_current_word_filtered.log`。
+
+该测试不接入普通 Required smoke，因为它依赖人工保证当前歌曲、播放状态和测试时长。
 
 ## iOS-only 关键状态
 
@@ -173,3 +203,4 @@
 - 改 Debug-only service control receiver：跑 Android full，并验证 release manifest 不包含 receiver。
 - 改 cross-device 总入口：跑 `./tools/smoke/run_all_smoke_tests.sh --quick --json`。
 - 跨端相关改动且两台设备都连接：优先跑 `./tools/smoke/run_all_smoke_tests.sh --quick --json`。
+- 验证 CurrentWord V2.3 实时效果：手动跑 `./tools/smoke/current_word_long_play_test.sh --duration 90 --json`，不要把它当作每次 quick smoke 的 Required。

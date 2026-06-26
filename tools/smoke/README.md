@@ -50,6 +50,14 @@ Specified devices:
   --quick --json
 ```
 
+CurrentWord long-play validation:
+
+```bash
+./tools/smoke/current_word_long_play_test.sh --duration 90 --json
+```
+
+Use this when validating Latency Optimization V2.3. It requires both iPhone and Sony over USB, the iOS app connected to Sony, and QQMusic actively playing a track with word timing. It is intentionally not part of the normal quick/full smoke suites because it is a manual 60-120 second performance window.
+
 ## Device Behavior
 
 When neither `--ios-only` nor `--android-only` is used:
@@ -80,6 +88,21 @@ Default output:
 ```text
 /tmp/music_ble_smoke/<timestamp>/
 ```
+
+CurrentWord long-play output:
+
+```text
+/tmp/current_word_long_play/<timestamp>/
+```
+
+Files:
+
+- `report.md`: human-readable CurrentWord latency and stability report.
+- `report.json`: machine-readable CurrentWord metrics.
+- `ios_ble.log`: copied iOS app log after the test window.
+- `sony_logcat.log`: Sony logcat captured after the test window.
+- `ios_current_word_filtered.log`: iOS filtered CurrentWord/Lyrics log.
+- `sony_current_word_filtered.log`: Sony filtered CurrentWord/PlaybackDiff log.
 
 Files:
 
