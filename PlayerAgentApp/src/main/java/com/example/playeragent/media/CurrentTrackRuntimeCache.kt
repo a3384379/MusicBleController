@@ -39,10 +39,17 @@ data class CurrentWordState(
     val trackId: String,
     val lineIndex: Int,
     val wordIndex: Int,
+    val wordText: String,
+    val wordStartMs: Long,
+    val wordEndMs: Long,
+    val hasWordTiming: Boolean,
     val positionMs: Long,
     val timestampMs: Long,
     val version: Int = 1
-)
+) {
+    val wordKey: String
+        get() = "$trackId|$lineIndex|$wordIndex|$wordStartMs"
+}
 
 object CurrentTrackRuntimeCache {
     private val lock = Any()
@@ -101,6 +108,7 @@ object CurrentTrackRuntimeCache {
                 durationMs = durationMs,
                 isPlaying = isPlaying,
                 currentLine = currentLine,
+                currentWord = findCurrentWord(base.lyricLines, positionMs),
                 lyricSource = lyricSource,
                 lastPlaybackState = lastPlaybackState.toString(),
                 diagnosticSnapshot = diagnosticSnapshot,
@@ -134,6 +142,7 @@ object CurrentTrackRuntimeCache {
                     lyricLines = runtimeLines,
                     translationLines = runtimeLines.map { it.translation },
                     romanizationLines = runtimeLines.map { it.romanization },
+                    currentWord = findCurrentWord(runtimeLines, previous.positionMs),
                     lastUpdatedAtMs = now
                 )
             }
@@ -258,6 +267,7 @@ object CurrentTrackRuntimeCache {
                         ?.words
                         ?.getOrNull(it.wordIndex)
                 } ?: track.currentWord,
+                currentWordState = wordState,
                 lyricStatus = track.lyricSource,
                 recoveryState = track.recoveryState,
                 albumArtState = track.albumArtState,
@@ -370,11 +380,17 @@ object CurrentTrackRuntimeCache {
         } else {
             rawPosition.coerceAtLeast(0L)
         }
-        val indexed = findCurrentWordIndexed(track.lyricLines, position) ?: return null
+        val indexed = findCurrentWordIndexed(track.lyricLines, position)
+            ?: findCurrentLineIndexed(track.lyricLines, position)
+            ?: return null
         return CurrentWordState(
             trackId = track.trackId,
             lineIndex = indexed.lineIndex,
             wordIndex = indexed.wordIndex,
+            wordText = indexed.word.text,
+            wordStartMs = indexed.word.startMs,
+            wordEndMs = indexed.word.startMs + indexed.word.durationMs.coerceAtLeast(0L),
+            hasWordTiming = indexed.hasWordTiming,
             positionMs = position,
             timestampMs = timestampMs
         )
@@ -399,10 +415,45 @@ object CurrentTrackRuntimeCache {
         return fallback
     }
 
+    private fun findCurrentLineIndexed(
+        lines: List<RuntimeLyricLine>,
+        positionMs: Long
+    ): IndexedRuntimeWord? {
+        var fallback: IndexedRuntimeWord? = null
+        lines.forEachIndexed { lineIndex, line ->
+            if (line.text.isBlank()) {
+                return@forEachIndexed
+            }
+            if (positionMs >= line.timeMs) {
+                val lineEndMs = when {
+                    line.durationMs > 0L -> line.timeMs + line.durationMs
+                    lineIndex + 1 < lines.size -> lines[lineIndex + 1].timeMs
+                    else -> line.timeMs
+                }
+                val indexed = IndexedRuntimeWord(
+                    lineIndex = lineIndex,
+                    wordIndex = -1,
+                    word = RuntimeLyricWord(
+                        startMs = line.timeMs,
+                        durationMs = (lineEndMs - line.timeMs).coerceAtLeast(0L),
+                        text = line.text
+                    ),
+                    hasWordTiming = false
+                )
+                fallback = indexed
+                if (positionMs < lineEndMs) {
+                    return indexed
+                }
+            }
+        }
+        return fallback
+    }
+
     private data class IndexedRuntimeWord(
         val lineIndex: Int,
         val wordIndex: Int,
-        val word: RuntimeLyricWord
+        val word: RuntimeLyricWord,
+        val hasWordTiming: Boolean = true
     )
 
     private fun LyricManager.LyricLine.toRuntimeLine(): RuntimeLyricLine {

@@ -34,18 +34,18 @@ class CurrentWordPushEngine(
             return null
         }
         val outgoingTrackId = normalizeTrackId(state.trackId)
-        val key = "$outgoingTrackId|${state.lineIndex}|${state.wordIndex}"
+        val key = "$outgoingTrackId|${state.lineIndex}|${state.wordIndex}|${state.wordStartMs}"
 
         synchronized(lock) {
             val now = SystemClock.elapsedRealtime()
             if (key == lastPushedKey) {
-                recordSkipLocked("same word", now)
+                recordSkipLocked("same word", now, state, key)
                 return null
             }
             if (lastPushElapsedMs > 0L &&
                 now - lastPushElapsedMs < MIN_CURRENT_WORD_INTERVAL_MS
             ) {
-                recordSkipLocked("rate limited", now)
+                recordSkipLocked("rate limited", now, state, key)
                 return null
             }
         }
@@ -62,7 +62,7 @@ class CurrentWordPushEngine(
         val sent = sendStatusMessage(payload.toString())
         synchronized(lock) {
             if (!sent) {
-                recordSkipLocked("send failed", SystemClock.elapsedRealtime())
+                recordSkipLocked("send failed", SystemClock.elapsedRealtime(), state, key)
                 return null
             }
             val now = SystemClock.elapsedRealtime()
@@ -82,7 +82,10 @@ class CurrentWordPushEngine(
             logger(
                 "[CurrentWordPush] push trackId=$outgoingTrackId$normalizedSuffix " +
                     "line=${state.lineIndex} word=${state.wordIndex} " +
-                    "position=${state.positionMs} costMs=$lastPushCostMs"
+                    "wordText=${state.wordText.take(MAX_LOG_WORD_TEXT)} " +
+                    "wordStartMs=${state.wordStartMs} wordEndMs=${state.wordEndMs} " +
+                    "hasWordTiming=${state.hasWordTiming} positionMs=${state.positionMs} " +
+                    "currentWordKey=$key costMs=$lastPushCostMs"
             )
         }
         return state
@@ -125,16 +128,35 @@ class CurrentWordPushEngine(
         }
     }
 
-    private fun recordSkipLocked(reason: String, now: Long) {
+    private fun recordSkipLocked(
+        reason: String,
+        now: Long,
+        state: CurrentWordState? = null,
+        currentWordKey: String = ""
+    ) {
         skipCount += 1
         if (now - lastSkipLogAtMs >= SKIP_LOG_INTERVAL_MS) {
             lastSkipLogAtMs = now
-            logger("[CurrentWordPush] skip reason=$reason")
+            val detail = if (state != null) {
+                " positionMs=${state.positionMs}" +
+                    " lineIndex=${state.lineIndex}" +
+                    " wordIndex=${state.wordIndex}" +
+                    " wordText=${state.wordText.take(MAX_LOG_WORD_TEXT)}" +
+                    " wordStartMs=${state.wordStartMs}" +
+                    " wordEndMs=${state.wordEndMs}" +
+                    " hasWordTiming=${state.hasWordTiming}" +
+                    " lastPushedWordKey=$lastPushedKey" +
+                    " currentWordKey=$currentWordKey"
+            } else {
+                ""
+            }
+            logger("[CurrentWordPush] skip reason=$reason$detail")
         }
     }
 
     private companion object {
         private const val MIN_CURRENT_WORD_INTERVAL_MS = 60L
         private const val SKIP_LOG_INTERVAL_MS = 5_000L
+        private const val MAX_LOG_WORD_TEXT = 24
     }
 }

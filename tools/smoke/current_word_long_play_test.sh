@@ -447,7 +447,14 @@ normalized_accepted = len(re.findall(r"currentWord accepted by normalized trackI
 playback_state_count = len(re.findall(r'\{"type":"playbackState"', ios_window))
 main_stall_count = len(re.findall(r"main stall detected", ios_window, flags=re.I))
 execution_gap_count = len(re.findall(r"execution gap", ios_window, flags=re.I))
-live_activity_updates = len(re.findall(r"\[LiveActivity\].*update", ios_window))
+live_activity_update_requests = len(re.findall(r"\[LiveActivity\]\s+update request", ios_window))
+live_activity_update_sent = len(re.findall(r"\[LiveActivity\]\s+update sent", ios_window))
+live_activity_current_word_sent = len(
+    re.findall(r"\[LiveActivity\]\s+update sent reason=currentWord", ios_window)
+)
+current_word_payload_too_large = len(
+    re.findall(r"status notify skipped: payload=\d+ max=\d+ type=currentWord", sony_text)
+)
 
 playing = bool(re.search(r'"playing"\s*:\s*true|playing=true', ios_window, flags=re.I))
 track = ""
@@ -483,62 +490,102 @@ ios_accepted = len(accepted_lines)
 ios_stale = len(stale_samples)
 latency_known = bool(latencies)
 
-issues = []
-warnings = []
+current_word_issues = []
+current_word_warnings = []
+live_activity_issues = []
+live_activity_warnings = []
 if not playing:
-    warnings.append("playing=true not detected in the test window")
+    current_word_warnings.append("playing=true not detected in the test window")
 if playing and sony_push_count > 0 and ios_accepted == 0:
-    issues.append("Sony pushed currentWord but iOS accepted none")
+    current_word_issues.append("Sony pushed currentWord but iOS accepted none")
 elif not playing and sony_push_count > 0 and ios_accepted == 0:
-    warnings.append("Sony currentWord push was seen, but playing=true was not detected")
+    current_word_warnings.append("Sony currentWord push was seen, but playing=true was not detected")
+if current_word_payload_too_large > 0:
+    current_word_issues.append(
+        f"currentWord payload exceeded MTU ({current_word_payload_too_large})"
+    )
 if ios_stale > 0:
     stale_ratio = ios_stale / max(ios_raw, ios_stale, 1)
     if stale_ratio >= 0.1 or ios_stale >= 3:
-        issues.append(f"stale discard ratio is high ({stale_ratio:.2f})")
+        current_word_issues.append(f"stale discard ratio is high ({stale_ratio:.2f})")
     else:
-        warnings.append(f"stale discard observed ({ios_stale})")
+        current_word_warnings.append(f"stale discard observed ({ios_stale})")
 if main_stall_count > 0:
-    issues.append(f"main stall detected ({main_stall_count})")
+    current_word_issues.append(f"main stall detected ({main_stall_count})")
 if ios_accepted > 0 and ios_accepted <= playback_state_count:
-    warnings.append("playbackState count is not lower than accepted currentWord count")
+    current_word_warnings.append("playbackState count is not lower than accepted currentWord count")
 if not latency_known:
-    warnings.append("latency unavailable")
+    current_word_warnings.append("latency unavailable")
 if notify_queue_busy > 0:
-    warnings.append(f"notify queue busy indicators found ({notify_queue_busy})")
-if live_activity_updates > max(20, ios_accepted // 2) and ios_accepted > 10:
-    issues.append("LiveActivity update count is unexpectedly high")
+    current_word_warnings.append(f"notify queue busy indicators found ({notify_queue_busy})")
 
-if issues:
-    result = "FAIL"
+live_activity_sent_threshold = max(30, int(duration_sec * 0.45))
+current_word_live_activity_threshold = max(5, int(duration_sec / 1.0) + 5)
+if live_activity_current_word_sent > current_word_live_activity_threshold:
+    live_activity_issues.append(
+        "LiveActivity currentWord updates exceed throttle threshold "
+        f"({live_activity_current_word_sent}>{current_word_live_activity_threshold})"
+    )
+if live_activity_update_sent > live_activity_sent_threshold:
+    live_activity_warnings.append(
+        "LiveActivity update count is above expected line-change threshold "
+        f"({live_activity_update_sent}>{live_activity_sent_threshold})"
+    )
+
+if current_word_issues:
+    current_word_result = "FAIL"
 elif ios_accepted == 0:
-    result = "WARN"
-    warnings.append("no accepted currentWord in the test window")
+    current_word_result = "WARN"
+    current_word_warnings.append("no accepted currentWord in the test window")
 elif ios_accepted < 10:
-    result = "PASS_WITH_LOW_ACTIVITY"
-    warnings.append("currentWord accepted, but sample count is low")
+    current_word_result = "PASS_WITH_LOW_ACTIVITY"
+    current_word_warnings.append("currentWord accepted, but sample count is low")
 elif receive_intervals and avg(receive_intervals) > 120:
-    result = "PASS_WITH_LOW_ACTIVITY"
-    warnings.append("average interval is above 120ms; track may have slow word changes")
+    current_word_result = "PASS_WITH_LOW_ACTIVITY"
+    current_word_warnings.append("average interval is above 120ms; track may have slow word changes")
+else:
+    current_word_result = "PASS"
+
+if live_activity_issues:
+    live_activity_result = "FAIL"
+elif live_activity_warnings:
+    live_activity_result = "WARN"
+else:
+    live_activity_result = "PASS"
+
+if current_word_result == "FAIL":
+    result = "FAIL"
+elif live_activity_result != "PASS" or current_word_warnings:
+    result = "WARN"
+elif current_word_result == "PASS_WITH_LOW_ACTIVITY":
+    result = "WARN"
 else:
     result = "PASS"
 
-if result == "PASS":
+warnings = current_word_warnings + live_activity_warnings
+issues = current_word_issues
+
+if current_word_result == "PASS":
     conclusion = "currentWord lightweight push is active and stable in this window."
-elif result == "PASS_WITH_LOW_ACTIVITY":
+elif current_word_result == "PASS_WITH_LOW_ACTIVITY":
     conclusion = "currentWord lightweight push is active, but this window has too few or slow word changes for high-rate validation."
-elif result == "WARN":
+elif current_word_result == "WARN":
     conclusion = "The test completed, but the playback window was not sufficient to prove currentWord behavior."
 else:
     conclusion = "currentWord lightweight push did not meet the long-play acceptance criteria."
 
 summary = {
     "result": result,
+    "currentWordResult": current_word_result,
+    "liveActivityResult": live_activity_result,
     "durationSec": duration_sec,
     "track": track,
     "playing": playing,
     "conclusion": conclusion,
     "warnings": warnings,
     "issues": issues,
+    "liveActivityWarnings": live_activity_warnings,
+    "liveActivityIssues": live_activity_issues,
 }
 sony = {
     "currentWordPushCount": sony_push_count,
@@ -564,7 +611,10 @@ ios = {
     "executionGapCount": execution_gap_count,
     "currentWordAvgReceiveIntervalMs": avg(receive_intervals),
     "currentWordP95ReceiveIntervalMs": percentile(receive_intervals, 95),
-    "liveActivityUpdateCount": live_activity_updates,
+    "liveActivityUpdateRequestCount": live_activity_update_requests,
+    "liveActivityUpdateSentCount": live_activity_update_sent,
+    "liveActivityCurrentWordUpdateSentCount": live_activity_current_word_sent,
+    "liveActivityUpdateSentThreshold": live_activity_sent_threshold,
     "trackIdMismatchSamples": stale_samples[:5],
     "currentWordTrackIdSamples": sorted(set(ios_raw_track_ids))[:5],
 }
@@ -609,6 +659,8 @@ report_lines = [
     "## Summary",
     "",
     f"Result: {result}",
+    f"CurrentWord Result: {current_word_result}",
+    f"LiveActivity Result: {live_activity_result}",
     "",
     "| Metric | Value |",
     "|---|---:|",
@@ -620,9 +672,14 @@ report_lines = [
     f"| iOS currentWord raw | {ios_raw} |",
     f"| iOS currentWord accepted | {ios_accepted} |",
     f"| iOS playbackState | {playback_state_count} |",
+    f"| currentWord payload too large | {current_word_payload_too_large} |",
     f"| stale discard | {ios_stale} |",
     f"| main stall | {main_stall_count} |",
     f"| execution gap | {execution_gap_count} |",
+    f"| LiveActivity update requests | {live_activity_update_requests} |",
+    f"| LiveActivity update sent | {live_activity_update_sent} |",
+    f"| LiveActivity currentWord sent | {live_activity_current_word_sent} |",
+    f"| LiveActivity sent threshold | {live_activity_sent_threshold} |",
     f"| avg interval | {ios['currentWordAvgReceiveIntervalMs']} ms |",
     f"| p95 interval | {ios['currentWordP95ReceiveIntervalMs']} ms |",
     f"| latency avg | {latency['latencyAvgMs'] if latency_known else 'unknown'} |",
@@ -640,6 +697,15 @@ if warnings:
 if issues:
     report_lines.extend(["## Issues", ""])
     report_lines.extend(f"- {item}" for item in issues)
+    report_lines.append("")
+if live_activity_warnings or live_activity_issues:
+    report_lines.extend(["## LiveActivity Frequency", ""])
+    report_lines.append(f"Result: {live_activity_result}")
+    report_lines.append("")
+    if live_activity_warnings:
+        report_lines.extend(f"- WARN: {item}" for item in live_activity_warnings)
+    if live_activity_issues:
+        report_lines.extend(f"- FAIL: {item}" for item in live_activity_issues)
     report_lines.append("")
 report_lines.extend([
     "## Artifacts",

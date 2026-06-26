@@ -210,6 +210,7 @@ final class BLETestManager: NSObject, ObservableObject {
     private var lastLiveActivityLyricTrackID = ""
     private var lastLiveActivityLyricLineIndex = Int.min
     private var lastLiveActivityLyricText = ""
+    private var lastLiveActivityCurrentWordSkipLogAtMs: Int64 = 0
     private var requestedFullLyricsTrackIDs: Set<String> = []
     private var fullLyricsUnavailableTrackIDs: Set<String> = []
     private var fullLyricsDelayedRetryTrackIDs: Set<String> = []
@@ -3409,9 +3410,14 @@ extension BLETestManager: CBPeripheralDelegate {
             fullLyrics: fullLyrics,
             playbackStateLyric: lyric
         )
-        guard resolved.trackId != lastLiveActivityLyricTrackID ||
+        let lineChanged = resolved.trackId != lastLiveActivityLyricTrackID ||
             resolved.lineIndex != lastLiveActivityLyricLineIndex ||
-            resolved.text != lastLiveActivityLyricText else {
+            resolved.text != lastLiveActivityLyricText
+
+        guard lineChanged else {
+            if reason == "currentWord" {
+                logLiveActivityCurrentWordSkipped(resolved: resolved)
+            }
             return false
         }
 
@@ -3430,6 +3436,18 @@ extension BLETestManager: CBPeripheralDelegate {
         )
         updateLiveActivity(force: false, reason: "lyricChanged")
         return true
+    }
+
+    private func logLiveActivityCurrentWordSkipped(resolved: ResolvedLyric) {
+        let nowMs = currentTimeMs()
+        guard nowMs - lastLiveActivityCurrentWordSkipLogAtMs >= 5_000 else { return }
+        lastLiveActivityCurrentWordSkipLogAtMs = nowMs
+        let throttleMs = appLifecycleState == "active" ? 1_000 : 1_800
+        log(
+            "[LiveActivityPerf] currentWord same-line skipped " +
+                "trackId=\(resolved.trackId) lineIndex=\(resolved.lineIndex) " +
+                "appState=\(appLifecycleState) throttleMs=\(throttleMs)"
+        )
     }
 
     private func shouldRequestLiveActivityProgressUpdate(oldPositionMs: Int64) -> Bool {
@@ -4043,7 +4061,6 @@ extension BLETestManager: CBPeripheralDelegate {
         lastCurrentWordReceivedAtMs = nowMs
         currentWordLastLatencyMs = timestampMs > 0 ? max(nowMs - timestampMs, 0) : 0
 
-        let oldLyric = lyric
         let lineByOffset = fullLyrics.indices.contains(lineIndex) ? fullLyrics[lineIndex] : nil
         if isSameTrackId(incoming: trackID, current: fullLyricsTrackId),
            let line = fullLyrics.first(where: { $0.index == lineIndex }) ?? lineByOffset {
@@ -4064,9 +4081,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 "count=\(currentWordPushCount) avgIntervalMs=\(currentWordAverageUpdateIntervalMs)"
         )
 
-        if oldLyric != lyric {
-            _ = updateLiveActivityForCurrentLyricIfNeeded(reason: "currentWord")
-        }
+        _ = updateLiveActivityForCurrentLyricIfNeeded(reason: "currentWord")
     }
 
     private func isSameTrackId(incoming: String, current: String) -> Bool {

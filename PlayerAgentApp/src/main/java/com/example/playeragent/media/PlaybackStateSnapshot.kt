@@ -11,6 +11,7 @@ data class PlaybackStateSnapshot(
     val albumArtId: String?,
     val currentLine: String,
     val currentWord: RuntimeLyricWord?,
+    val currentWordState: CurrentWordState? = null,
     val lyricStatus: String,
     val recoveryState: String,
     val albumArtState: String,
@@ -19,7 +20,7 @@ data class PlaybackStateSnapshot(
     val lastUpdatedAtMs: Long
 ) {
     val currentWordKey: String
-        get() = currentWord?.let {
+        get() = currentWordState?.wordKey ?: currentWord?.let {
             "${it.startMs}|${it.durationMs}|${it.text}"
         }.orEmpty()
 }
