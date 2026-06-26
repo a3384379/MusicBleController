@@ -125,6 +125,7 @@ def build_failure_excerpt(out_dir: Path, should_extract: bool) -> str:
         return ""
     keywords = [
         "PlayerAgent", "BLE-A", "BLE-ADV", "BLE-GATT", "BLE-RECOVERY",
+        "ControlServiceAutoStart", "BleGattServer", "MediaSessionReader",
         "Qrc", "Lyric", "AlbumArt", "FullLyrics", "PlaybackDiff", "FATAL EXCEPTION",
         "ANR", "AndroidRuntime", "failed", "error",
     ]
@@ -159,6 +160,7 @@ def main():
     git = git_info(root)
     device = read_device(out_dir)
     debug_control = read_debug_control(out_dir)
+    control_service_autostart = read_json_file(out_dir / "control_service_autostart.json")
     playback_diff_flow = read_json_file(out_dir / "playback_diff_flow.json")
     current_word_flow = read_json_file(out_dir / "current_word_flow.json")
 
@@ -168,6 +170,7 @@ def main():
     filtered = out_dir / "sony_filtered.log"
     playback_diff_flow_path = out_dir / "playback_diff_flow.json"
     current_word_flow_path = out_dir / "current_word_flow.json"
+    control_service_autostart_path = out_dir / "control_service_autostart.json"
 
     report = [
         "# Android Smoke Test Report",
@@ -205,6 +208,16 @@ def main():
         f"- available: `{str(debug_control.get('debugControlAvailable', False)).lower()}`",
         f"- startAttempted: `{str(debug_control.get('debugControlStartAttempted', False)).lower()}`",
         f"- startResult: `{debug_control.get('debugControlStartResult', 'unknown')}`",
+        "",
+        "## Control Service Auto-start",
+        "",
+        f"- result: `{control_service_autostart.get('result', 'not recorded')}`",
+        f"- reason: {control_service_autostart.get('reason', 'not recorded')}",
+        f"- enabled: `{str(control_service_autostart.get('enabled', False)).lower()}`",
+        f"- startRequested: `{str(control_service_autostart.get('startRequested', False)).lower()}`",
+        f"- serviceStarted: `{str(control_service_autostart.get('serviceStarted', False)).lower()}`",
+        f"- gattStartedCount: `{control_service_autostart.get('gattStartedCount', 0)}`",
+        f"- mediaRegisteredCount: `{control_service_autostart.get('mediaRegisteredCount', 0)}`",
         "",
         "## PlaybackDiff Flow",
         "",
@@ -272,9 +285,11 @@ def main():
             "filtered_logcat": str(filtered) if filtered.exists() else "",
             "playback_diff_flow": str(playback_diff_flow_path) if playback_diff_flow_path.exists() else "",
             "current_word_flow": str(current_word_flow_path) if current_word_flow_path.exists() else "",
+            "control_service_autostart": str(control_service_autostart_path) if control_service_autostart_path.exists() else "",
             "failure_excerpt": failure_excerpt,
         },
         "debugControl": debug_control,
+        "controlServiceAutoStart": control_service_autostart,
         "playbackDiffFlow": playback_diff_flow,
         "currentWordFlow": current_word_flow,
     }

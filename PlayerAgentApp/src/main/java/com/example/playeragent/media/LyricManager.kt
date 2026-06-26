@@ -5,6 +5,7 @@ import android.os.Environment
 import com.example.playeragent.logging.LogConfig
 import java.io.File
 import java.nio.charset.Charset
+import java.util.LinkedHashMap
 import java.util.Locale
 import java.util.concurrent.Executors
 
@@ -19,6 +20,9 @@ class LyricManager(
     private var activeTitle: String = ""
     private var activeArtist: String = ""
     private var activeAlbum: String = ""
+    private var activeTrackId: String = ""
+    private var activeDurationMs: Long = 0L
+    private var activePositionMs: Long = 0L
     private var activeTrackChangedAtMs: Long = 0L
     private var loadedSongKey: String? = null
     private var loadingSongKey: String? = null
@@ -40,12 +44,57 @@ class LyricManager(
     private var lastWatcherRetryAtMs: Long = 0L
     private var lazyWaitSongKey: String? = null
     private var lazyWaitStartedAtMs: Long = 0L
+    private var lyricsReadyState: LyricsReadyState = LyricsReadyState.EMPTY
+    private var activeLyricsTaskId: Long = 0L
     private val lyricExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "QrcLyricLoaderThread")
+    }
+    private val parsedCache = object : LinkedHashMap<String, LyricsParsedCacheEntry>(
+        PARSED_CACHE_MAX_KEYS,
+        0.75f,
+        true
+    ) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<String, LyricsParsedCacheEntry>?
+        ): Boolean {
+            val shouldEvict = size > PARSED_CACHE_MAX_KEYS
+            if (shouldEvict && eldest != null) {
+                logger(
+                    "[LyricsParsedCache] evict key=${eldest.key} " +
+                        "songKey=${eldest.value.request.key}"
+                )
+            }
+            return shouldEvict
+        }
     }
     private val qrcLyricManager = QrcLyricManager(
         context = appContext,
         logger = logger
+    )
+    private val predictiveLyricsPipeline = PredictiveLyricsPipeline(
+        logger = logger,
+        loader = { track ->
+            val result = qrcLyricManager.loadWithResult(track.title, track.artist, track.album)
+            val lines = if (result.success) {
+                result.lines.map {
+                    LyricLine(
+                        timeMs = it.timeMs,
+                        text = it.text,
+                        durationMs = it.durationMs,
+                        words = it.words,
+                        translation = it.translation,
+                        romanization = it.romanization
+                    )
+                }
+            } else {
+                emptyList()
+            }
+            PredictiveLyricsLoadResult(
+                lines = lines,
+                source = if (result.success) LyricSource.QRC.name else LyricSource.NONE.name,
+                reason = result.reason
+            )
+        }
     )
     private val recoveryEngine = LyricRecoveryEngine(
         logger = logger,
@@ -124,6 +173,9 @@ class LyricManager(
         title: String,
         artist: String,
         album: String = "",
+        trackId: String = "",
+        durationMs: Long = 0L,
+        positionMs: Long = 0L,
         force: Boolean = false,
         reason: String = "playback state"
     ) {
@@ -132,6 +184,9 @@ class LyricManager(
             activeTitle = title
             activeArtist = artist
             activeAlbum = album
+            activeTrackId = trackId
+            activeDurationMs = durationMs
+            activePositionMs = positionMs
             return
         }
         if (!force &&
@@ -156,10 +211,20 @@ class LyricManager(
         }
 
         if (key != activeSongKey) {
+            val oldTrack = activeSongKey.orEmpty()
+            activeLyricsTaskId += 1
+            lyricsReadyState = LyricsReadyState.EMPTY
+            if (loadingSongKey != null && loadingSongKey != key) {
+                logger("[LyricsTask] cancel oldTrack=$oldTrack newTrack=$key")
+            }
+            logger("[LyricsFastPath] track_changed start songKey=$key trackId=$trackId")
             activeSongKey = key
             activeTitle = title
             activeArtist = artist
             activeAlbum = album
+            activeTrackId = trackId
+            activeDurationMs = durationMs
+            activePositionMs = positionMs
             activeTrackChangedAtMs = System.currentTimeMillis()
             cachedKey = key
             cachedLines = emptyList()
@@ -175,14 +240,22 @@ class LyricManager(
             lazyWaitSongKey = null
             lazyWaitStartedAtMs = 0L
             lastLoggedLine = null
+            if (!force && applyPredictiveLyricsLocked(key, title, artist, album, trackId, durationMs, positionMs)) {
+                lyricsReadyState = LyricsReadyState.READY
+                return
+            }
         } else {
             activeTitle = title
             activeArtist = artist
             activeAlbum = album
+            activeTrackId = trackId
+            activeDurationMs = durationMs
+            activePositionMs = positionMs
         }
 
         if (title.isBlank() && artist.isBlank()) {
             loadedSongKey = key
+            lyricsReadyState = LyricsReadyState.FAILED
             return
         }
         if (key == loadingSongKey) {
@@ -198,14 +271,36 @@ class LyricManager(
             key = key,
             title = title,
             artist = artist,
-            album = album
+            album = album,
+            trackId = trackId,
+            durationMs = durationMs,
+            positionMs = positionMs,
+            taskId = activeLyricsTaskId
         )
         lastAttemptAtMs = System.currentTimeMillis()
+        lyricsReadyState = LyricsReadyState.LOOKUP_STARTED
         logger("[LyricAsync] scheduled songKey=$key reason=$reason force=$force")
+        logger("[LyricsFastPath] lookup start songKey=$key reason=$reason")
         if (loadingSongKey != null && loadingSongKey != key) {
             logger("[LyricAsync] latest song promoted songKey=$key")
         }
         startNextLyricLoadLocked()
+    }
+
+    @Synchronized
+    fun preloadPredictiveLyrics(candidate: PredictiveLyricsCandidate) {
+        val track = candidate.track
+        if (track.title.isBlank()) {
+            return
+        }
+        if (loadingSongKey != null) {
+            logger(
+                "[PredictiveLyrics] preload miss track=${track.title} " +
+                    "reason=current lyric loading"
+            )
+            return
+        }
+        predictiveLyricsPipeline.onCandidate(candidate)
     }
 
     @Synchronized
@@ -474,16 +569,17 @@ class LyricManager(
         val request = pendingRequest ?: return
         pendingRequest = null
         loadingSongKey = request.key
+        lyricsReadyState = LyricsReadyState.LOOKUP_STARTED
         logger(
             "[LyricAsync] task start songKey=${request.key} " +
                 "title=${request.title} artist=${request.artist}"
         )
         lyricExecutor.execute {
             val startedAt = System.currentTimeMillis()
-            val result = loadLyricBlocking(request)
+            val result = loadLyricFastPath(request)
             synchronized(this) {
                 val costMs = System.currentTimeMillis() - startedAt
-                if (activeSongKey == request.key) {
+                if (activeSongKey == request.key && request.taskId == activeLyricsTaskId) {
                     applyLoadedLyricLocked(request, result)
                     if (result.lineCount > 0) {
                         logger(
@@ -503,6 +599,10 @@ class LyricManager(
                 } else {
                     logger(
                         "[LyricAsync] stale result discarded songKey=${request.key}"
+                    )
+                    logger(
+                        "[LyricsTask] cancel oldTrack=${request.key} " +
+                            "newTrack=${activeSongKey.orEmpty()}"
                     )
                     logger("[Lyric] async load discarded title=${request.title}")
                 }
@@ -540,13 +640,28 @@ class LyricManager(
                 "[LyricAsync] success marked loaded songKey=${request.key} " +
                     "lines=${result.lineCount}"
             )
+            predictiveLyricsPipeline.putLoadedTrack(
+                track = activePredictiveTrackLocked(request),
+                lines = cachedLines,
+                source = result.source.name,
+                buildTimeMs = 0L
+            )
+            lyricsReadyState = LyricsReadyState.RUNTIME_APPLIED
+            val runtimeApplyStartedAt = System.currentTimeMillis()
             CurrentTrackRuntimeCache.updateLyrics(
                 songKey = request.key,
                 lines = cachedLines,
                 lyricSource = result.source.name,
                 logger = logger
             )
+            logger(
+                "[LyricsFastPath] runtime apply done songKey=${request.key} " +
+                    "costMs=${System.currentTimeMillis() - runtimeApplyStartedAt} " +
+                    "lines=${cachedLines.size} hasWordTiming=${cachedLines.any { it.words.isNotEmpty() }}"
+            )
+            lyricsReadyState = LyricsReadyState.READY
         } else if (result.retryable) {
+            lyricsReadyState = LyricsReadyState.FAILED
             retryableFailureSongKey = request.key
             retryableFailureReason = result.failureReason.ifBlank { "lyrics retry pending" }
             retryableFailureAtMs = System.currentTimeMillis()
@@ -577,6 +692,7 @@ class LyricManager(
                     "songKey=${request.key} reason=$retryableFailureReason"
             )
         } else {
+            lyricsReadyState = LyricsReadyState.FAILED
             finalEmptySongKey = request.key
             finalEmptyReason = result.failureReason.ifBlank { "no lyrics final" }
             loadedSongKey = request.key
@@ -694,6 +810,200 @@ class LyricManager(
             retryable = false,
             failureReason = if (parsedLines.isEmpty()) "empty lrc" else ""
         )
+    }
+
+    private fun loadLyricFastPath(request: LyricLoadRequest): LyricLoadResult {
+        val totalStartedAt = System.currentTimeMillis()
+        parsedCacheGet(request)?.let { cached ->
+            val costMs = System.currentTimeMillis() - totalStartedAt
+            logger(
+                "[LyricsFastPath] ready totalCostMs=$costMs " +
+                    "songKey=${request.key} source=parsed_cache lines=${cached.result.lineCount}"
+            )
+            return cached.result
+        }
+
+        val lookupStartedAt = System.currentTimeMillis()
+        logger("[LyricsFastPath] lookup start songKey=${request.key}")
+        val result = loadLyricBlocking(request)
+        val lookupCostMs = System.currentTimeMillis() - lookupStartedAt
+        logger(
+            "[LyricsFastPath] lookup done songKey=${request.key} " +
+                "costMs=$lookupCostMs lines=${result.lineCount} source=${result.source}"
+        )
+
+        if (result.lines.isNotEmpty()) {
+            val parseStartedAt = System.currentTimeMillis()
+            lyricsReadyState = LyricsReadyState.PARSE_STARTED
+            val parseCostMs = System.currentTimeMillis() - parseStartedAt
+            logger(
+                "[LyricsFastPath] parse done songKey=${request.key} " +
+                    "costMs=$parseCostMs lines=${result.lineCount}"
+            )
+
+            val indexStartedAt = System.currentTimeMillis()
+            lyricsReadyState = LyricsReadyState.INDEX_BUILT
+            val hasWordTiming = result.lines.any { it.words.isNotEmpty() }
+            val indexCostMs = System.currentTimeMillis() - indexStartedAt
+            logger(
+                "[LyricsFastPath] index build done songKey=${request.key} " +
+                    "costMs=$indexCostMs hasWordTiming=$hasWordTiming"
+            )
+            parsedCachePut(request, result)
+        } else {
+            lyricsReadyState = LyricsReadyState.FAILED
+            logger(
+                "[LyricsFastPath] failed songKey=${request.key} " +
+                    "reason=${result.failureReason.ifBlank { "empty lyrics" }}"
+            )
+        }
+
+        logger(
+            "[LyricsFastPath] ready totalCostMs=${System.currentTimeMillis() - totalStartedAt} " +
+                "songKey=${request.key} lines=${result.lineCount}"
+        )
+        return result
+    }
+
+    private fun applyPredictiveLyricsLocked(
+        key: String,
+        title: String,
+        artist: String,
+        album: String,
+        trackId: String,
+        durationMs: Long,
+        positionMs: Long
+    ): Boolean {
+        val track = PredictiveLyricsTrack(
+            trackId = trackId,
+            songKey = key,
+            title = title,
+            artist = artist,
+            album = album,
+            durationMs = durationMs
+        )
+        val result = predictiveLyricsPipeline.applyIfAvailable(track) ?: return false
+        cachedKey = key
+        cachedLines = result.entry.lines
+        loadedSongKey = key
+        lastSource = runCatching { LyricSource.valueOf(result.entry.source) }
+            .getOrDefault(LyricSource.QRC)
+        retryableFailureSongKey = null
+        retryableFailureReason = ""
+        retryableFailureAtMs = 0L
+        finalEmptySongKey = null
+        finalEmptyReason = ""
+        lazyWaitSongKey = null
+        lazyWaitStartedAtMs = 0L
+        lastLoggedLine = null
+        recoveryEngine.onLyricLoaded(key, cachedLines.size)
+        logger(
+            "[PredictiveLyrics] apply hit songKey=$key applyCostMs=${result.applyCostMs} " +
+                "linesCount=${cachedLines.size} " +
+                "hasWordTiming=${cachedLines.any { it.words.isNotEmpty() }}"
+        )
+        lyricsReadyState = LyricsReadyState.RUNTIME_APPLIED
+        val runtimeApplyStartedAt = System.currentTimeMillis()
+        CurrentTrackRuntimeCache.applyPredictiveLyrics(
+            songKey = key,
+            lines = cachedLines,
+            lyricSource = result.entry.source,
+            positionMs = positionMs,
+            logger = logger
+        )
+        logger(
+            "[LyricsFastPath] runtime apply done songKey=$key " +
+                "costMs=${System.currentTimeMillis() - runtimeApplyStartedAt} " +
+                "lines=${cachedLines.size} hasWordTiming=${cachedLines.any { it.words.isNotEmpty() }}"
+        )
+        lyricsReadyState = LyricsReadyState.READY
+        return cachedLines.isNotEmpty()
+    }
+
+    private fun parsedCacheGet(request: LyricLoadRequest): LyricsParsedCacheEntry? {
+        synchronized(this) {
+            evictExpiredParsedCacheLocked()
+            parsedCacheKeys(request).forEach { key ->
+                val entry = parsedCache[key]
+                if (entry != null && entry.matches(request)) {
+                    logger(
+                        "[LyricsParsedCache] hit key=$key songKey=${request.key} " +
+                            "lines=${entry.result.lineCount}"
+                    )
+                    return entry
+                }
+            }
+            logger("[LyricsParsedCache] miss songKey=${request.key}")
+            return null
+        }
+    }
+
+    private fun parsedCachePut(
+        request: LyricLoadRequest,
+        result: LyricLoadResult
+    ) {
+        if (result.lines.isEmpty()) {
+            return
+        }
+        synchronized(this) {
+            evictExpiredParsedCacheLocked()
+            val entry = LyricsParsedCacheEntry(
+                request = request,
+                result = result,
+                cachedAtMs = System.currentTimeMillis(),
+                hasWordTiming = result.lines.any { it.words.isNotEmpty() }
+            )
+            parsedCacheKeys(request).forEach { key ->
+                parsedCache[key] = entry
+            }
+            logger(
+                "[LyricsParsedCache] put songKey=${request.key} " +
+                    "keys=${parsedCacheKeys(request).joinToString(",")} " +
+                    "lines=${result.lineCount} hasWordTiming=${entry.hasWordTiming}"
+            )
+        }
+    }
+
+    private fun evictExpiredParsedCacheLocked() {
+        val now = System.currentTimeMillis()
+        val iterator = parsedCache.entries.iterator()
+        while (iterator.hasNext()) {
+            val item = iterator.next()
+            if (now - item.value.cachedAtMs > PARSED_CACHE_TTL_MS) {
+                logger(
+                    "[LyricsParsedCache] evict key=${item.key} " +
+                        "reason=ttl songKey=${item.value.request.key}"
+                )
+                iterator.remove()
+            }
+        }
+    }
+
+    private fun parsedCacheKeys(request: LyricLoadRequest): List<String> {
+        val keys = mutableListOf<String>()
+        if (request.trackId.isNotBlank()) {
+            keys += "track:${request.trackId}"
+        }
+        keys += "fallback:${normalizeCachePart(request.title)}|" +
+            "${normalizeCachePart(request.artist)}|${request.durationMs / 2_000L}"
+        keys += "song:${request.key}"
+        return keys.distinct()
+    }
+
+    private fun LyricsParsedCacheEntry.matches(request: LyricLoadRequest): Boolean {
+        if (this.request.trackId.isNotBlank() && request.trackId.isNotBlank()) {
+            return this.request.trackId == request.trackId
+        }
+        if (normalizeCachePart(this.request.title) != normalizeCachePart(request.title)) {
+            return false
+        }
+        if (normalizeCachePart(this.request.artist) != normalizeCachePart(request.artist)) {
+            return false
+        }
+        if (this.request.durationMs > 0L && request.durationMs > 0L) {
+            return this.request.durationMs / 2_000L == request.durationMs / 2_000L
+        }
+        return true
     }
 
     @Synchronized
@@ -819,6 +1129,18 @@ class LyricManager(
             "[Lyric] incremental lyrics applied " +
                 "songKey=${currentTrack.songKey} lines=${lines.size}"
         )
+        predictiveLyricsPipeline.putLoadedTrack(
+            track = PredictiveLyricsTrack(
+                trackId = currentTrack.trackId,
+                songKey = activeKey,
+                title = currentTrack.title,
+                artist = currentTrack.artist,
+                album = currentTrack.album
+            ),
+            lines = lines,
+            source = LyricSource.QRC.name,
+            buildTimeMs = 0L
+        )
         CurrentTrackRuntimeCache.updateLyrics(
             songKey = activeKey,
             lines = lines,
@@ -826,6 +1148,11 @@ class LyricManager(
             logger = logger
         )
         return true
+    }
+
+    @Synchronized
+    fun predictiveMetricsSnapshot(): PredictiveLyricsMetrics {
+        return predictiveLyricsPipeline.metricsSnapshot()
     }
 
     @Synchronized
@@ -1263,6 +1590,17 @@ class LyricManager(
         return "${title.trim()}|${artist.trim()}|${album.trim()}"
     }
 
+    private fun activePredictiveTrackLocked(request: LyricLoadRequest): PredictiveLyricsTrack {
+        return PredictiveLyricsTrack(
+            trackId = activeTrackId,
+            songKey = request.key,
+            title = request.title,
+            artist = request.artist,
+            album = request.album,
+            durationMs = activeDurationMs
+        )
+    }
+
     data class LyricLine(
         val timeMs: Long,
         val text: String,
@@ -1313,7 +1651,11 @@ class LyricManager(
         val key: String,
         val title: String,
         val artist: String,
-        val album: String
+        val album: String,
+        val trackId: String = "",
+        val durationMs: Long = 0L,
+        val positionMs: Long = 0L,
+        val taskId: Long = 0L
     )
 
     private data class LyricLoadResult(
@@ -1323,6 +1665,23 @@ class LyricManager(
         val retryable: Boolean = false,
         val failureReason: String = ""
     )
+
+    private data class LyricsParsedCacheEntry(
+        val request: LyricLoadRequest,
+        val result: LyricLoadResult,
+        val cachedAtMs: Long,
+        val hasWordTiming: Boolean
+    )
+
+    private enum class LyricsReadyState {
+        EMPTY,
+        LOOKUP_STARTED,
+        PARSE_STARTED,
+        INDEX_BUILT,
+        RUNTIME_APPLIED,
+        READY,
+        FAILED
+    }
 
     private enum class LyricSource {
         NONE,
@@ -1351,9 +1710,15 @@ class LyricManager(
         private const val WATCHER_RETRY_MIN_INTERVAL_MS = 30_000L
         private const val LAZY_WAIT_WINDOW_MS = 3 * 60_000L
         private const val MAX_RETRIES_PER_WINDOW = 2
+        private const val PARSED_CACHE_MAX_KEYS = 40
+        private const val PARSED_CACHE_TTL_MS = 30 * 60_000L
         private const val WAITING_QQMUSIC_LYRIC_CACHE_REASON = "waiting qqmusic lyric cache"
         @Volatile
         private var scannedCache: ScannedLyricCache? = null
+
+        private fun normalizeCachePart(value: String): String {
+            return value.trim().lowercase(Locale.ROOT).replace(WHITESPACE_REGEX, " ")
+        }
 
         private fun decodeAttempts(): List<DecodeAttempt> {
             return listOf(

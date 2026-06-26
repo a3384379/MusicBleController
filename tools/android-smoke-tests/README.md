@@ -72,14 +72,29 @@ In quick mode, build/install are marked PASS as skipped by request.
 ## Optional Tests
 
 - BLE Service
+- Control Service Auto-start
 - PlaybackDiff Flow
 - CurrentWord Flow
 - QRC Cache
 - QQMusic Dir
 
-Optional WARN means the device may not have started the foreground service or may not have QQMusic/QRC cache ready. This does not necessarily mean PlayerAgent is broken.
+Optional WARN means the device may not have started the foreground service, may be missing runtime permissions, or may not have QQMusic/QRC cache ready. This does not necessarily mean PlayerAgent is broken.
 
 Optional FAIL is reserved for severe evidence such as FATAL/ANR or GATT/advertising failure without recovery success.
+
+`Control Service Auto-start` reads Sony logcat after app launch and checks that
+the main app requested the foreground control service without the user pressing
+the start button. It verifies:
+
+- `[ControlServiceAutoStart] enabled=true`
+- `[ControlServiceAutoStart] start requested` or `skip reason=already_started`
+- `Foreground service started`
+- `[BleGattServer] started` or `already started`
+- `[MediaSessionReader] registered` or `already registered`
+
+If Bluetooth/notification permissions are missing it returns WARN with
+`permission_missing`. If no adb device is online, Device Check fails with
+`adb_device_missing`.
 
 `PlaybackDiff Flow` reads Sony logcat only. It reports:
 

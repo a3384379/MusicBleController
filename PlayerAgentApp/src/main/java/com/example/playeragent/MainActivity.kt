@@ -82,6 +82,9 @@ class MainActivity : Activity() {
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var controllerScannerManager: ControllerScannerManager? = null
     private var rfcommClientManager: RfcommClientManager? = null
+    private var userStoppedControlServiceThisRun = false
+    private var autoStartControlServiceRequestedThisRun = false
+    private var autoStartControlServiceRequestedAtMs = 0L
     private var artworkDiscoveryManager: QQMusicArtworkDiscoveryManager? = null
     private var qrcV2RebuildManager: QrcLyricV2RebuildManager? = null
     private var qrcStaleCacheRebuildManager: QrcStaleCacheRebuildManager? = null
@@ -163,6 +166,7 @@ class MainActivity : Activity() {
         appendLog("[UI] setContent complete costMs=${System.currentTimeMillis() - startedAt}")
         initializeBluetooth()
         requestRequiredPermissions()
+        maybeAutoStartControlService("onCreate")
         appendLog("[PlayerAgent] UI ready")
         appendLog("[UI] first lightweight render ready costMs=${System.currentTimeMillis() - startedAt}")
         scheduleDebugStatsLoad()
@@ -185,6 +189,7 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        maybeAutoStartControlService("onResume")
         if (::currentSongTextView.isInitialized) {
             refreshCurrentMedia()
             refreshAccessibilityStatus()
@@ -458,24 +463,76 @@ class MainActivity : Activity() {
     }
 
     private fun startPlayerAgentService() {
+        userStoppedControlServiceThisRun = false
+        autoStartControlServiceRequestedThisRun = false
+        autoStartControlServiceRequestedAtMs = 0L
         if (!ensureRequiredPermissions()) {
             appendLog("[PlayerAgent] Please grant permissions, then start service again")
             return
         }
+        requestStartPlayerAgentService()
+        statusTextView.text = "控制服务：启动请求已发送"
+        appendLog("[PlayerAgent] Start service requested")
+    }
+
+    private fun maybeAutoStartControlService(trigger: String) {
+        val preferences = controlServicePreferences()
+        if (!preferences.contains(KEY_AUTO_START_CONTROL_SERVICE)) {
+            preferences.edit()
+                .putBoolean(KEY_AUTO_START_CONTROL_SERVICE, true)
+                .apply()
+        }
+        val enabled = preferences.getBoolean(KEY_AUTO_START_CONTROL_SERVICE, true)
+        appendLog("[ControlServiceAutoStart] enabled=$enabled trigger=$trigger")
+        if (!enabled) {
+            appendLog("[ControlServiceAutoStart] skip reason=disabled")
+            return
+        }
+        if (userStoppedControlServiceThisRun) {
+            appendLog("[ControlServiceAutoStart] skip reason=user_stopped")
+            return
+        }
+        if (PlayerAgentForegroundService.isRunning()) {
+            appendLog("[ControlServiceAutoStart] skip reason=already_started")
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (autoStartControlServiceRequestedThisRun &&
+            now - autoStartControlServiceRequestedAtMs < AUTO_START_PENDING_GUARD_MS
+        ) {
+            appendLog("[ControlServiceAutoStart] skip reason=already_started")
+            return
+        }
+        if (!hasRequiredPermissions()) {
+            appendLog("[ControlServiceAutoStart] failed reason=permission_missing")
+            return
+        }
+
+        appendLog("[ControlServiceAutoStart] start requested")
+        autoStartControlServiceRequestedThisRun = true
+        autoStartControlServiceRequestedAtMs = now
+        requestStartPlayerAgentService()
+        statusTextView.text = "控制服务：自动启动请求已发送"
+        appendLog("[ControlServiceAutoStart] service started")
+    }
+
+    private fun requestStartPlayerAgentService() {
         val intent = Intent(this, PlayerAgentForegroundService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
         } else {
             startService(intent)
         }
-        statusTextView.text = "控制服务：启动请求已发送"
-        appendLog("[PlayerAgent] Start service requested")
     }
 
     private fun stopPlayerAgentService() {
+        userStoppedControlServiceThisRun = true
+        autoStartControlServiceRequestedThisRun = false
+        autoStartControlServiceRequestedAtMs = 0L
         stopService(Intent(this, PlayerAgentForegroundService::class.java))
         statusTextView.text = "控制服务：已停止"
         appendLog("[PlayerAgent] Stop service requested")
+        appendLog("[ControlServiceAutoStart] skip reason=user_stopped")
     }
 
     private fun refreshCurrentMedia() {
@@ -1522,8 +1579,28 @@ class MainActivity : Activity() {
         return true
     }
 
+    private fun hasRequiredPermissions(): Boolean {
+        return requiredPermissions().all {
+            checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun controlServicePreferences() =
+        getSharedPreferences(PREFS_CONTROL_SERVICE, MODE_PRIVATE)
+
     private fun requestRequiredPermissions() {
         ensureRequiredPermissions()
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_PERMISSIONS) {
+            maybeAutoStartControlService("permissions_result")
+        }
     }
 
     private fun requiredPermissions(): List<String> {
@@ -1586,5 +1663,8 @@ class MainActivity : Activity() {
         private const val REQUEST_EXPORT_LOG = 1002
         private const val DEBUG_STATS_INITIAL_DELAY_MS = 700L
         private const val DEBUG_STATS_THROTTLE_MS = 2_000L
+        private const val PREFS_CONTROL_SERVICE = "control_service_preferences"
+        private const val KEY_AUTO_START_CONTROL_SERVICE = "autoStartControlService"
+        private const val AUTO_START_PENDING_GUARD_MS = 5_000L
     }
 }

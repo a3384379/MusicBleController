@@ -35,7 +35,7 @@ if requested:
     selected = matches[0]
 else:
     if not rows:
-        print("No adb device found. Connect Sony and enable USB debugging.", file=sys.stderr)
+        print("adb_device_missing: No adb device found. Connect Sony and enable USB debugging.", file=sys.stderr)
         sys.exit(1)
     device_rows = [row for row in rows if row[1] == "device"]
     unauthorized = [row for row in rows if row[1] == "unauthorized"]
@@ -43,7 +43,7 @@ else:
         print("adb device unauthorized. Confirm USB debugging authorization on Sony.", file=sys.stderr)
         sys.exit(1)
     if len(device_rows) == 0:
-        print("No online adb device found.", file=sys.stderr)
+        print("adb_device_missing: No online adb device found.", file=sys.stderr)
         sys.exit(1)
     if len(device_rows) > 1:
         print("Multiple adb devices found. Set ANDROID_DEVICE_ID or pass --device.", file=sys.stderr)

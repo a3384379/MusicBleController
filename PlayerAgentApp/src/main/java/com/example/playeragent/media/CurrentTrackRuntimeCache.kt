@@ -149,6 +149,41 @@ object CurrentTrackRuntimeCache {
         }
     }
 
+    fun applyPredictiveLyrics(
+        songKey: String,
+        lines: List<LyricManager.LyricLine>,
+        lyricSource: String,
+        positionMs: Long,
+        logger: ((String) -> Unit)? = null
+    ) {
+        val runtimeLines = lines.map { it.toRuntimeLine() }
+        mutate(logger) { previous, now, _ ->
+            if (previous == null || previous.songKey != songKey) {
+                previous
+            } else {
+                val currentLine = findCurrentLineText(runtimeLines, positionMs)
+                val currentWord = findCurrentWord(runtimeLines, positionMs)
+                logger?.invoke(
+                    "[RuntimeCache] predictive lyrics applied songKey=$songKey " +
+                        "lines=${runtimeLines.size} source=$lyricSource " +
+                        "positionMs=$positionMs currentLine=${currentLine.take(24)} " +
+                        "hasWordTiming=${runtimeLines.any { it.words.isNotEmpty() }}"
+                )
+                previous.copy(
+                    hasLyrics = runtimeLines.isNotEmpty(),
+                    lyricSource = lyricSource,
+                    lyricLines = runtimeLines,
+                    translationLines = runtimeLines.map { it.translation },
+                    romanizationLines = runtimeLines.map { it.romanization },
+                    positionMs = positionMs,
+                    currentLine = currentLine,
+                    currentWord = currentWord,
+                    lastUpdatedAtMs = now
+                )
+            }
+        }
+    }
+
     fun updateCurrentLine(
         songKey: String,
         positionMs: Long,
@@ -361,6 +396,14 @@ object CurrentTrackRuntimeCache {
         positionMs: Long
     ): RuntimeLyricWord? {
         return findCurrentWordIndexed(lines, positionMs)?.word
+    }
+
+    private fun findCurrentLineText(
+        lines: List<RuntimeLyricLine>,
+        positionMs: Long
+    ): String {
+        val lineIndex = findCurrentLineIndexed(lines, positionMs)?.lineIndex ?: return ""
+        return lines.getOrNull(lineIndex)?.text.orEmpty()
     }
 
     private fun findCurrentWordStateLocked(

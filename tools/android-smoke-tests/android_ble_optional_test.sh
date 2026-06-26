@@ -45,7 +45,7 @@ if [[ "$DEBUG_CONTROL_ENABLED" == true ]]; then
     set -e
     sleep 3
     "$ADB_BIN" -s "$DEVICE_ID" logcat -d > "$LOG_PATH" || true
-    grep -E "PlayerAgent|BLE-A|BLE-ADV|BLE-GATT|BLE-RECOVERY|BLE-DIAG|DebugControl|Qrc|Lyric|AlbumArt|FullLyrics|FATAL EXCEPTION|ANR|AndroidRuntime" \
+    grep -E "PlayerAgent|ControlServiceAutoStart|MediaSessionReader|BleGattServer|BLE-A|BLE-ADV|BLE-GATT|BLE-RECOVERY|BLE-DIAG|DebugControl|Qrc|Lyric|AlbumArt|FullLyrics|FATAL EXCEPTION|ANR|AndroidRuntime" \
       "$LOG_PATH" > "$OUT_DIR/sony_filtered.log" || true
     if grep -q "\[DebugControl\] received action=com.example.playeragent.debug.START_BLE_SERVICE" "$LOG_PATH"; then
       DEBUG_CONTROL_AVAILABLE=true

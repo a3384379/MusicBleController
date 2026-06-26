@@ -372,6 +372,8 @@ class BleGattServerManager(
     fun start(): Boolean {
         if (started && gattServer != null) {
             logger("[BLE-A] GATT server already started; skip initialization")
+            logger("[BleGattServer] already started")
+            logger("[MediaSessionReader] already registered")
             return true
         }
         updateServerState(ServerState.STARTING)
@@ -394,6 +396,8 @@ class BleGattServerManager(
 
         started = true
         logger("[BLE-A] GATT server started")
+        logger("[BleGattServer] started")
+        logger("[MediaSessionReader] registered")
 
         val service = BluetoothGattService(
             PlayerAgentUuids.SERVICE_UUID,
@@ -555,6 +559,9 @@ class BleGattServerManager(
             "VOLUME_UP",
             "VOLUME_DOWN" -> {
                 cancelHistoryTransfersForControl(command)
+                if (command == "NEXT") {
+                    playbackStateReader.notifyManualNextHint(seq)
+                }
                 mediaCommandExecutor.execute(command, seq)
             }
 
@@ -739,6 +746,25 @@ class BleGattServerManager(
                 "positionJump=${playbackDiffMetrics.positionJumpCount} " +
                 "positionSmall=${playbackDiffMetrics.positionSmallSkipCount} " +
                 "identical=${playbackDiffMetrics.identicalSkipCount}"
+        )
+        val predictiveMetrics = playbackStateReader.predictiveLyricsMetricsSnapshot()
+        logger(
+            "[PredictiveLyrics] metrics candidates=${predictiveMetrics.candidateCount} " +
+                "queueCandidates=${predictiveMetrics.mediaSessionQueueCandidateCount} " +
+                "manualNextHints=${predictiveMetrics.manualNextHintCount} " +
+                "historyCandidates=${predictiveMetrics.historyTransitionCandidateCount} " +
+                "selected=${predictiveMetrics.selectedCount} " +
+                "rejected=${predictiveMetrics.rejectedCount} " +
+                "preloadStart=${predictiveMetrics.preloadStartCount} " +
+                "preloadHit=${predictiveMetrics.preloadHitCount} " +
+                "preloadMiss=${predictiveMetrics.preloadMissCount} " +
+                "preloadSuccess=${predictiveMetrics.preloadSuccessCount} " +
+                "preloadFailed=${predictiveMetrics.preloadFailedCount} " +
+                "applyHit=${predictiveMetrics.applyHitCount} " +
+                "applyMiss=${predictiveMetrics.applyMissCount} " +
+                "identityMismatch=${predictiveMetrics.identityMismatchCount} " +
+                "preloadCostMaxMs=${predictiveMetrics.preloadCostMaxMs} " +
+                "applyCostMaxMs=${predictiveMetrics.applyCostMaxMs}"
         )
         currentWordPushEngine.logMetrics()
     }
@@ -2889,6 +2915,17 @@ class BleGattServerManager(
         if (lines.isEmpty()) {
             val unavailableReason = playbackStateReader.lyricUnavailableReason()
             val diagnostic = playbackStateReader.lyricDiagnosticSnapshot()
+            if (unavailableReason == "lyrics loading" &&
+                !request.optBoolean("_lyricsReadyRetry", false)
+            ) {
+                logger("[FullLyrics] pending request reason=lyrics loading")
+                val retryRequest = JSONObject(request.toString())
+                    .put("_lyricsReadyRetry", true)
+                albumArtHandler.postDelayed({
+                    logger("[FullLyrics] pending retry after lyrics loading")
+                    sendFullLyrics(retryRequest)
+                }, FULL_LYRICS_PENDING_RETRY_DELAY_MS)
+            }
             val unavailable = JSONObject()
                 .put("type", "fullLyricsUnavailable")
                 .put("trackId", trackId)
@@ -3565,6 +3602,7 @@ class BleGattServerManager(
         private const val ALBUM_ART_JOB_TYPE = "albumArt"
         private const val TRACK_INFO_JOB_TYPE = "trackInfo"
         private const val FULL_LYRICS_JOB_TYPE = "fullLyrics"
+        private const val FULL_LYRICS_PENDING_RETRY_DELAY_MS = 900L
         private const val LYRIC_SECONDARY_JOB_TYPE = "lyricSecondary"
         private const val MAX_LYRIC_TEXT_LENGTH = 30
         private const val REMOTE_LOG_JOB_TYPE = "remoteLog"

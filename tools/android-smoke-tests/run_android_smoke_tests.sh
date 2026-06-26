@@ -263,6 +263,17 @@ if [[ -f "$OUT_DIR/file_checks.tsv" ]]; then
 fi
 
 start="$(now_ms)"
+"$SCRIPT_DIR/android_control_service_autostart_test.sh" "$OUT_DIR/sony_logcat.log" \
+  >"$OUT_DIR/android_control_service_autostart_stdout.log" \
+  2>"$OUT_DIR/android_control_service_autostart_stderr.log" || true
+autostart_cost="$(elapsed_ms "$start")"
+if [[ -s "$OUT_DIR/android_control_service_autostart_stdout.log" ]]; then
+  awk -F'\t' -v cost="$autostart_cost" 'BEGIN {OFS="\t"} {$4=cost; print $0}' "$OUT_DIR/android_control_service_autostart_stdout.log" >> "$OPTIONAL_RESULTS"
+else
+  record_optional "Control Service Auto-start" "WARN" "$autostart_cost" "optional analyzer produced no result"
+fi
+
+start="$(now_ms)"
 DEBUG_CONTROL_ENABLED="$DEBUG_CONTROL" \
   "$SCRIPT_DIR/android_ble_optional_test.sh" "$OUT_DIR/sony_logcat.log" \
   >"$OUT_DIR/android_ble_optional_stdout.log" \

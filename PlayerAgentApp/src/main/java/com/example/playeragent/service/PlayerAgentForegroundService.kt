@@ -59,6 +59,7 @@ class PlayerAgentForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        running = true
         serviceStopping = false
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification("PlayerAgent is running"))
@@ -89,6 +90,7 @@ class PlayerAgentForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        running = false
         serviceStopping = true
         mainHandler.removeCallbacksAndMessages(null)
         runCatching { unregisterReceiver(bluetoothStateReceiver) }
@@ -166,6 +168,7 @@ class PlayerAgentForegroundService : Service() {
 
         if (!hasBluetoothRuntimePermissions()) {
             log("Missing Bluetooth runtime permission")
+            log("[ControlServiceAutoStart] failed reason=permission_missing")
             return
         }
 
@@ -212,6 +215,7 @@ class PlayerAgentForegroundService : Service() {
             log("[BLE-RECOVERY] restart existing gatt server")
             existingGattServerManager.start()
         } else {
+            log("[BleGattServer] already started")
             logVerbose("GATT server already running; initialization skipped")
         }
 
@@ -554,5 +558,9 @@ class PlayerAgentForegroundService : Service() {
         private const val NOTIFICATION_ID = 10001
         private const val ADVERTISING_RESTORE_DIAG_DELAY_MS = 1_000L
         private const val BLE_RECOVERY_DELAY_MS = 1_200L
+        @Volatile
+        private var running = false
+
+        fun isRunning(): Boolean = running
     }
 }
