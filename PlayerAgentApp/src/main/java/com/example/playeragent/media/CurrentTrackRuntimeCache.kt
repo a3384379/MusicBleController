@@ -261,6 +261,7 @@ object CurrentTrackRuntimeCache {
                 playing = track.isPlaying,
                 albumArtId = track.albumArtId,
                 currentLine = track.currentLine,
+                currentLineIndex = wordState?.lineIndex ?: -1,
                 currentWord = wordState?.let {
                     track.lyricLines
                         .getOrNull(it.lineIndex)

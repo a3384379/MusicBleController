@@ -10,6 +10,7 @@ data class PlaybackStateSnapshot(
     val playing: Boolean,
     val albumArtId: String?,
     val currentLine: String,
+    val currentLineIndex: Int = -1,
     val currentWord: RuntimeLyricWord?,
     val currentWordState: CurrentWordState? = null,
     val lyricStatus: String,

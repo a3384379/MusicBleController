@@ -94,6 +94,12 @@ class BleGattServerManager(
         sendStatusMessage = { message -> sendStatusMessage(message) },
         normalizeTrackId = { trackId -> normalizeCurrentWordTrackId(trackId) }
     )
+    private val playbackStateBuffer = PlaybackStateBuffer(
+        logger = logger,
+        flush = { source, snapshot, diff, reason, coalesceCount ->
+            flushBufferedPlaybackState(source, snapshot, diff, reason, coalesceCount)
+        }
+    )
     private val notifyQueue = BleNotifyQueue(
         serverProvider = { gattServer },
         characteristicProvider = { statusCharacteristic },
@@ -730,7 +736,9 @@ class BleGattServerManager(
                 "skip=${playbackDiffMetrics.skipCount} " +
                 "trackChanged=${playbackDiffMetrics.trackChangedCount} " +
                 "wordChanged=${playbackDiffMetrics.wordChangedCount} " +
-                "positionJump=${playbackDiffMetrics.positionJumpCount}"
+                "positionJump=${playbackDiffMetrics.positionJumpCount} " +
+                "positionSmall=${playbackDiffMetrics.positionSmallSkipCount} " +
+                "identical=${playbackDiffMetrics.identicalSkipCount}"
         )
         currentWordPushEngine.logMetrics()
     }
@@ -836,6 +844,7 @@ class BleGattServerManager(
         logger("[BLE-A][AutoPush] started")
         CurrentTrackRuntimeCache.resetPlaybackDiffState()
         currentWordPushEngine.reset()
+        playbackStateBuffer.reset()
         startCurrentWordPush()
         autoPushExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
             Thread(runnable, "BlePlaybackStateAutoPushThread")
@@ -864,6 +873,7 @@ class BleGattServerManager(
         executor.shutdownNow()
         autoPushExecutor = null
         stopCurrentWordPush()
+        playbackStateBuffer.reset()
         CurrentTrackRuntimeCache.resetPlaybackDiffState()
         currentWordPushEngine.logMetrics()
         logger("[BLE-A][AutoPush] stopped")
@@ -884,6 +894,15 @@ class BleGattServerManager(
             )
             val diff = snapshot?.let {
                 CurrentTrackRuntimeCache.diffFromLastSent(it)
+            }
+            if (diff != null) {
+                logger(
+                    "[PlaybackDiff] candidate reason=${diff.reason} " +
+                        "type=${diff.type} shouldPush=${diff.shouldPush} " +
+                        "positionMs=${diff.positionMs} lastPositionMs=${diff.lastPositionMs} " +
+                        "lineIndex=${diff.lineIndex} lastLineIndex=${diff.lastLineIndex} " +
+                        "currentWordKeyChanged=${diff.currentWordKeyChanged}"
+                )
             }
             val diffTrackChanged = diff?.type == PlaybackStateDiffType.TrackChanged
             if (songChanged || diffTrackChanged) {
@@ -911,21 +930,33 @@ class BleGattServerManager(
                 }
             } else if (diff == null || diff.shouldPush) {
                 logger(
-                    "[PlaybackDiff] push playback type=${diff?.type ?: "unknown"} " +
+                    "[PlaybackDiff] push reason=${diff?.reason ?: "unknown"} " +
+                        "type=${diff?.type ?: "unknown"} " +
                         "fields=${diff?.changedFields.orEmpty()} " +
-                        "deltaMs=${diff?.positionDeltaMs ?: 0L}"
+                        "deltaMs=${diff?.positionDeltaMs ?: 0L} " +
+                        "positionMs=${diff?.positionMs ?: source.optLong("position")} " +
+                        "lastPositionMs=${diff?.lastPositionMs ?: 0L} " +
+                        "lineIndex=${diff?.lineIndex ?: -1} " +
+                        "lastLineIndex=${diff?.lastLineIndex ?: -1} " +
+                        "currentWordKeyChanged=${diff?.currentWordKeyChanged ?: false}"
                 )
-                val sent = sendCompactPlaybackState(source)
-                if (sent && snapshot != null && diff != null) {
-                    CurrentTrackRuntimeCache.markPlaybackSnapshotSent(snapshot)
+                if (snapshot != null && diff != null) {
+                    playbackStateBuffer.offer(source, snapshot, diff)
+                } else {
+                    sendCompactPlaybackState(source)
                 }
-                sent
+                true
             } else {
                 CurrentTrackRuntimeCache.markPlaybackSnapshotSkipped(diff)
                 if (LogConfig.DEBUG_VERBOSE_LOG) {
                     verboseLogger(
-                        "[PlaybackDiff] skip identical " +
-                            "deltaMs=${diff.positionDeltaMs}"
+                        "[PlaybackDiff] skip reason=${diff.reason} " +
+                            "deltaMs=${diff.positionDeltaMs} " +
+                            "positionMs=${diff.positionMs} " +
+                            "lastPositionMs=${diff.lastPositionMs} " +
+                            "lineIndex=${diff.lineIndex} " +
+                            "lastLineIndex=${diff.lastLineIndex} " +
+                            "currentWordKeyChanged=${diff.currentWordKeyChanged}"
                     )
                 } else {
                     val now = SystemClock.elapsedRealtime()
@@ -933,7 +964,14 @@ class BleGattServerManager(
                         PLAYBACK_DIFF_SKIP_LOG_INTERVAL_MS
                     ) {
                         lastPlaybackDiffSkipLogAtMs = now
-                        logger("[PlaybackDiff] skip identical")
+                        logger(
+                            "[PlaybackDiff] skip reason=${diff.reason} " +
+                                "positionMs=${diff.positionMs} " +
+                                "lastPositionMs=${diff.lastPositionMs} " +
+                                "lineIndex=${diff.lineIndex} " +
+                                "lastLineIndex=${diff.lastLineIndex} " +
+                                "currentWordKeyChanged=${diff.currentWordKeyChanged}"
+                        )
                     }
                 }
                 true
@@ -1010,32 +1048,73 @@ class BleGattServerManager(
         return songChanged
     }
 
+    private fun flushBufferedPlaybackState(
+        source: JSONObject,
+        snapshot: com.example.playeragent.media.PlaybackStateSnapshot,
+        diff: com.example.playeragent.media.PlaybackStateDiff,
+        reason: String,
+        coalesceCount: Int
+    ): Boolean {
+        val sent = sendCompactPlaybackState(source)
+        val payloadSize = compactPlaybackStatePayload(source)
+            .toString()
+            .toByteArray(Charsets.UTF_8)
+            .size
+        logger(
+            "[PlaybackBuffer] sent reason=$reason diffReason=${diff.reason} " +
+                "coalesce=$coalesceCount payloadSize=$payloadSize " +
+                "positionMs=${diff.positionMs} lastPositionMs=${diff.lastPositionMs} " +
+                "lineIndex=${diff.lineIndex} lastLineIndex=${diff.lastLineIndex} " +
+                "currentWordKeyChanged=${diff.currentWordKeyChanged}"
+        )
+        if (sent) {
+            CurrentTrackRuntimeCache.markPlaybackSnapshotSent(snapshot)
+        }
+        return sent
+    }
+
     private fun sendCompactPlaybackState(source: JSONObject): Boolean {
-        val compactState = JSONObject()
+        val compactState = compactPlaybackStatePayload(source)
+        val payloadSizeBeforeFit = compactState.toString().toByteArray(Charsets.UTF_8).size
+        val maximumPayload = subscribedDevices.values.firstOrNull()?.let(::maximumPayloadFor) ?: 0
+        logger(
+            "[PlaybackState] compact payloadSize=$payloadSizeBeforeFit " +
+                "maxPayload=$maximumPayload positionMs=${source.optLong("position")} " +
+                "lyricLength=${source.optString("lyric").length}"
+        )
+        val device = subscribedDevices.values.firstOrNull()
+        if (device != null) {
+            val fitted = fitCompactPlaybackState(compactState, maximumPayloadFor(device))
+            return sendStatusMessage(fitted.toString())
+        }
+        return sendStatusMessage(compactState.toString())
+    }
+
+    private fun compactPlaybackStatePayload(source: JSONObject): JSONObject {
+        return JSONObject()
             .put("type", "playbackState")
             .put("playing", source.optBoolean("playing"))
             .put("position", source.optLong("position"))
             .put("duration", source.optLong("duration"))
-        val lyric = source.optString("lyric").take(MAX_LYRIC_TEXT_LENGTH)
-        compactState.put("lyric", lyric)
-        val device = subscribedDevices.values.firstOrNull()
-        if (device != null) {
-            val maximumPayload = maximumPayloadFor(device)
-            var fittedLyric = lyric
-            while (fittedLyric.isNotEmpty() &&
-                compactState.toString().toByteArray(Charsets.UTF_8).size >
-                maximumPayload
-            ) {
-                fittedLyric = fittedLyric.dropLast(1)
-                compactState.put("lyric", fittedLyric)
-            }
-            if (compactState.toString().toByteArray(Charsets.UTF_8).size >
-                maximumPayload
-            ) {
-                compactState.remove("lyric")
-            }
+            .put("lyric", source.optString("lyric").take(MAX_LYRIC_TEXT_LENGTH))
+    }
+
+    private fun fitCompactPlaybackState(
+        compactState: JSONObject,
+        maximumPayload: Int
+    ): JSONObject {
+        var fittedLyric = compactState.optString("lyric")
+        while (fittedLyric.isNotEmpty() &&
+            compactState.toString().toByteArray(Charsets.UTF_8).size >
+            maximumPayload
+        ) {
+            fittedLyric = fittedLyric.dropLast(1)
+            compactState.put("lyric", fittedLyric)
         }
-        return sendStatusMessage(compactState.toString())
+        if (compactState.toString().toByteArray(Charsets.UTF_8).size > maximumPayload) {
+            compactState.remove("lyric")
+        }
+        return compactState
     }
 
     private fun sendTrackInfo(source: JSONObject) {

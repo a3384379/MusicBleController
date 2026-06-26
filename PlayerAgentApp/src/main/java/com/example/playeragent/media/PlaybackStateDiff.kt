@@ -17,6 +17,12 @@ data class PlaybackStateDiff(
     val type: PlaybackStateDiffType,
     val changedFields: Set<String> = emptySet(),
     val positionDeltaMs: Long = 0L,
+    val reason: String = type.name,
+    val lastPositionMs: Long = 0L,
+    val positionMs: Long = 0L,
+    val lastLineIndex: Int = -1,
+    val lineIndex: Int = -1,
+    val currentWordKeyChanged: Boolean = false,
     val shouldPush: Boolean = type != PlaybackStateDiffType.NoChange,
     val lightweight: Boolean = type == PlaybackStateDiffType.CurrentWordChanged
 )
@@ -28,5 +34,7 @@ data class PlaybackDiffMetrics(
     val skipCount: Long = 0L,
     val trackChangedCount: Long = 0L,
     val wordChangedCount: Long = 0L,
-    val positionJumpCount: Long = 0L
+    val positionJumpCount: Long = 0L,
+    val positionSmallSkipCount: Long = 0L,
+    val identicalSkipCount: Long = 0L
 )
