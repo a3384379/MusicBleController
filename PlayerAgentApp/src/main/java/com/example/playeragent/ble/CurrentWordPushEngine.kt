@@ -27,7 +27,10 @@ class CurrentWordPushEngine(
     private var lastPushCostMs: Long = 0L
     private var lastSkipLogAtMs: Long = 0L
 
-    fun pushCurrentWord(): CurrentWordState? {
+    fun pushCurrentWord(
+        reason: String = "diff",
+        force: Boolean = false
+    ): CurrentWordState? {
         val startedAt = SystemClock.elapsedRealtime()
         val state = CurrentTrackRuntimeCache.currentWordState() ?: run {
             recordSkip("missing")
@@ -38,11 +41,12 @@ class CurrentWordPushEngine(
 
         synchronized(lock) {
             val now = SystemClock.elapsedRealtime()
-            if (key == lastPushedKey) {
+            if (!force && key == lastPushedKey) {
                 recordSkipLocked("same word", now, state, key)
                 return null
             }
-            if (lastPushElapsedMs > 0L &&
+            if (!force &&
+                lastPushElapsedMs > 0L &&
                 now - lastPushElapsedMs < MIN_CURRENT_WORD_INTERVAL_MS
             ) {
                 recordSkipLocked("rate limited", now, state, key)
@@ -85,7 +89,7 @@ class CurrentWordPushEngine(
                     "wordText=${state.wordText.take(MAX_LOG_WORD_TEXT)} " +
                     "wordStartMs=${state.wordStartMs} wordEndMs=${state.wordEndMs} " +
                     "hasWordTiming=${state.hasWordTiming} positionMs=${state.positionMs} " +
-                    "currentWordKey=$key costMs=$lastPushCostMs"
+                    "currentWordKey=$key reason=$reason force=$force costMs=$lastPushCostMs"
             )
         }
         return state

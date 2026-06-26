@@ -58,6 +58,14 @@ CurrentWord long-play validation:
 
 Use this when validating Latency Optimization V2.3. It requires both iPhone and Sony over USB, the iOS app connected to Sony, and QQMusic actively playing a track with word timing. It is intentionally not part of the normal quick/full smoke suites because it is a manual 60-120 second performance window.
 
+Reconnect Sync V2.8 validation:
+
+```bash
+./tools/smoke/reconnect_sync_v28_test.sh --duration 30 --json
+```
+
+Use this when validating reconnect recovery. It relaunches the iOS app to trigger a reconnect window, then reads only iOS `ios_ble.log` and Sony `logcat` to verify reconnect `playbackState`, `currentWord`, and `albumArtOffer` recovery. It does not change BLE UUIDs or payload protocols.
+
 ## Device Behavior
 
 When neither `--ios-only` nor `--android-only` is used:
@@ -107,6 +115,12 @@ AlbumArt V2.7 output:
 /tmp/album_art_v27/<timestamp>/
 ```
 
+Reconnect Sync V2.8 output:
+
+```text
+/tmp/reconnect_sync_v28/<timestamp>/
+```
+
 Files:
 
 - `report.md`: human-readable CurrentWord or AlbumArt stability report.
@@ -115,6 +129,8 @@ Files:
 - `sony_logcat.log`: Sony logcat captured after the test window.
 - `ios_current_word_filtered.log`: iOS filtered CurrentWord/Lyrics log.
 - `sony_current_word_filtered.log`: Sony filtered CurrentWord/PlaybackDiff log.
+- `ios_reconnect_filtered.log`: iOS filtered reconnect recovery log.
+- `sony_reconnect_filtered.log`: Sony filtered reconnect sync log.
 
 Files:
 

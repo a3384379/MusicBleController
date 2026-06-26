@@ -281,6 +281,9 @@ final class BLETestManager: NSObject, ObservableObject {
     private var lastPlaybackStateAt: Date?
     private var lastSuccessfulWriteAt: Date?
     private var lastNotifySubscribedAt: Date?
+    private var reconnectStateSyncWindowUntilMs: Int64 = 0
+    private var reconnectStateSyncPlaybackLogged = false
+    private var reconnectStateSyncRequestedFullLyricsTrackIDs: Set<String> = []
     private var connectionReadyAt: Date?
     private var lastHealthProbeAt: Date?
     private var healthProbeStartedAt: Date?
@@ -2524,8 +2527,11 @@ extension BLETestManager: CBCentralManagerDelegate {
         lastStatusNotifyAt = nil
         lastPlaybackStateAt = nil
         healthProbeStartedAt = nil
+        reconnectStateSyncWindowUntilMs = 0
+        reconnectStateSyncPlaybackLogged = false
         log("[BLE] connected")
         log("[BLE-iOS] didConnect")
+        log("[Reconnect] connected")
         connectedDeviceName = peripheral.name ?? connectedDeviceName
         log("[BLE-Reconnect] restore services")
         let subscribeTimeout = DispatchWorkItem { [weak self, weak peripheral] in
@@ -2590,6 +2596,8 @@ extension BLETestManager: CBCentralManagerDelegate {
         log("[BLE] disconnected error=\(errorText)")
         log("[BLE-iOS] didDisconnect error=\(errorText)")
         log("[BLE-Reconnect] disconnected error=\(errorText)")
+        reconnectStateSyncWindowUntilMs = 0
+        reconnectStateSyncPlaybackLogged = false
         stopHealthMonitoring(reason: "didDisconnect")
         setConnectionHealth(.disconnected, reason: "didDisconnect")
         sonyPeripheral = nil
@@ -2747,6 +2755,7 @@ extension BLETestManager: CBPeripheralDelegate {
             setStatus(characteristic.isNotifying ? "已连接" : "连接中")
             log("[BLE] status notify subscribed")
             log("[BLE-Reconnect] notify subscribed")
+            log("[Reconnect] subscribed")
             guard characteristic.isNotifying else {
                 performHardReconnect(reason: "notify disabled", manual: false)
                 return
@@ -2754,6 +2763,8 @@ extension BLETestManager: CBPeripheralDelegate {
             subscribeNotifyTimeoutWorkItem?.cancel()
             subscribeNotifyTimeoutWorkItem = nil
             lastNotifySubscribedAt = Date()
+            reconnectStateSyncWindowUntilMs = currentTimeMs() + 5_000
+            reconnectStateSyncPlaybackLogged = false
             connectionReadyAt = Date()
             autoReconnectLastSubscribeCostMs = currentTimeMs() - subscribeStartedAtMs
             setAutoReconnectState(.syncing)
@@ -2865,6 +2876,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 let oldLyric = self.lyric
                 let oldIsPlaying = self.isPlaying
                 let oldPositionMs = self.positionMs
+                let reconnectSyncWindow = self.isInReconnectStateSyncWindow()
                 self.isPlaying = object["playing"] as? Bool ?? false
                 self.durationMs = Self.int64Value(object["duration"])
                 self.updateLightweightLyricDiagnostic(from: object)
@@ -2877,6 +2889,20 @@ extension BLETestManager: CBPeripheralDelegate {
                     if !scheduledDelayedRetry,
                        !lyric.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                        self.fullLyrics.isEmpty {
+                        if reconnectSyncWindow,
+                           !self.currentTrackID.isEmpty,
+                           !self.reconnectStateSyncRequestedFullLyricsTrackIDs.contains(
+                            self.currentTrackID
+                           ) {
+                            self.reconnectStateSyncRequestedFullLyricsTrackIDs.insert(
+                                self.currentTrackID
+                            )
+                            self.log(
+                                "[Reconnect] request fullLyrics " +
+                                    "reason=lyricsReadyWithoutLocalLyrics " +
+                                    "trackId=\(self.currentTrackID)"
+                            )
+                        }
                         self.requestFullLyricsIfNeeded(after: 0.1)
                     }
                 }
@@ -2891,6 +2917,14 @@ extension BLETestManager: CBPeripheralDelegate {
                     "[iOS][Status] playbackState " +
                         "position=\(self.positionMs) duration=\(self.durationMs)"
                 )
+                if reconnectSyncWindow, !self.reconnectStateSyncPlaybackLogged {
+                    self.reconnectStateSyncPlaybackLogged = true
+                    self.log("[Reconnect] state sync received")
+                    self.log(
+                        "[Reconnect] playbackState accepted " +
+                            "position=\(self.positionMs) duration=\(self.durationMs)"
+                    )
+                }
                 if self.appLifecycleState != "active",
                    oldLyric != self.lyric,
                    !self.lyric.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -4030,6 +4064,12 @@ extension BLETestManager: CBPeripheralDelegate {
                 "[Lyrics-iOS] currentWord discarded stale trackId=\(trackID) " +
                     "current=\(currentTrackID)"
             )
+            if isInReconnectStateSyncWindow() {
+                log(
+                    "[Reconnect] stale discard after reconnect " +
+                        "trackId=\(trackID) current=\(currentTrackID)"
+                )
+            }
             return
         }
         if trackID != currentTrackID {
@@ -4080,8 +4120,18 @@ extension BLETestManager: CBPeripheralDelegate {
                 "position=\(remotePositionMs) latencyMs=\(currentWordLastLatencyMs) " +
                 "count=\(currentWordPushCount) avgIntervalMs=\(currentWordAverageUpdateIntervalMs)"
         )
+        if isInReconnectStateSyncWindow() {
+            log(
+                "[Reconnect] currentWord accepted after reconnect " +
+                    "line=\(lineIndex) word=\(wordIndex)"
+            )
+        }
 
         _ = updateLiveActivityForCurrentLyricIfNeeded(reason: "currentWord")
+    }
+
+    private func isInReconnectStateSyncWindow() -> Bool {
+        reconnectStateSyncWindowUntilMs > 0 && currentTimeMs() <= reconnectStateSyncWindowUntilMs
     }
 
     private func isSameTrackId(incoming: String, current: String) -> Bool {

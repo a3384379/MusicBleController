@@ -85,6 +85,10 @@ class BleGattServerManager(
             Thread(runnable, "PlaybackHistoryBleThread")
         }
     private val historyQueryPreparing = AtomicBoolean(false)
+    private val reconnectSyncExecutor =
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "ReconnectStateSyncThread")
+        }
     private val albumArtFastPathExecutor =
         Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "AlbumArtFastPathThread")
@@ -148,6 +152,7 @@ class BleGattServerManager(
     private var lastAutoPushSongKey: String? = null
     private var lastAutoPushPlaying: Boolean? = null
     private var lastPlaybackDiffSkipLogAtMs: Long = 0L
+    private val reconnectSyncLastAtByAddress = ConcurrentHashMap<String, Long>()
     @Volatile
     private var clientSupportsBinaryAlbumArt = false
     @Volatile
@@ -179,6 +184,7 @@ class BleGattServerManager(
             if (newState == BluetoothProfile.STATE_CONNECTED && device != null) {
                 connectedDeviceAddresses.add(address)
                 mtuByAddress[address] = DEFAULT_MTU
+                logger("[ReconnectSync] central connected device=$address")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 val hasUsableAddress = address.isNotBlank() && address != "unknown"
                 if (hasUsableAddress) {
@@ -358,7 +364,9 @@ class BleGattServerManager(
                 ) == true -> {
                     subscribedDevices[device.address] = device
                     logger("[BLE-A] status notify subscribed: device=${device.address}")
+                    logger("[ReconnectSync] notify subscribed device=${device.address}")
                     startAutoPush()
+                    scheduleReconnectStateSync(device, "notify_subscribed")
                 }
 
                 value?.contentEquals(
@@ -504,6 +512,7 @@ class BleGattServerManager(
         statusCharacteristic = null
         mediaFieldDumpExecutor.shutdownNow()
         historyExecutor.shutdownNow()
+        reconnectSyncExecutor.shutdownNow()
         albumArtFastPathExecutor.shutdownNow()
 
         try {
@@ -686,6 +695,67 @@ class BleGattServerManager(
         sendCompactPlaybackState(source)
         if (includeAlbumArt) {
             sendAlbumArtIfSongChanged(source)
+        }
+    }
+
+    private fun scheduleReconnectStateSync(device: BluetoothDevice, reason: String) {
+        val address = device.address ?: "unknown"
+        val now = SystemClock.elapsedRealtime()
+        val previous = reconnectSyncLastAtByAddress[address] ?: 0L
+        if (now - previous < RECONNECT_SYNC_COOLDOWN_MS) {
+            logger(
+                "[ReconnectSync] skip reason=cooldown device=$address " +
+                    "ageMs=${now - previous}"
+            )
+            return
+        }
+        reconnectSyncLastAtByAddress[address] = now
+        reconnectSyncExecutor.execute {
+            performReconnectStateSync(address, reason)
+        }
+    }
+
+    private fun performReconnectStateSync(address: String, reason: String) {
+        val startedAt = SystemClock.elapsedRealtime()
+        logger("[ReconnectSync] start reason=$reason device=$address")
+        try {
+            val source = playbackStateReader.readPlaybackState()
+            onPlaybackUiState(source)
+            sendTrackInfo(source)
+            val sentPlayback = sendCompactPlaybackState(source)
+            logger(
+                "[ReconnectSync] send playbackState reason=reconnect_sync " +
+                    "sent=$sentPlayback positionMs=${source.optLong("position")} " +
+                    "playing=${source.optBoolean("playing")}"
+            )
+
+            val currentWord = currentWordPushEngine.pushCurrentWord(
+                reason = "reconnect_sync",
+                force = true
+            )
+            if (currentWord != null) {
+                logger(
+                    "[ReconnectSync] send currentWord reason=reconnect_sync " +
+                        "line=${currentWord.lineIndex} word=${currentWord.wordIndex}"
+                )
+            } else {
+                logger("[ReconnectSync] skip currentWord reason=not_available")
+            }
+
+            val pending = PendingAlbumArt(
+                cacheKey = buildAlbumArtCacheKey(source),
+                protocolId = buildAlbumArtProtocolId(source),
+                playbackState = JSONObject(source.toString())
+            )
+            enqueueAlbumArtOfferOrPending(pending)
+            logger(
+                "[ReconnectSync] send albumArtOffer reason=reconnect_sync " +
+                    "id=${pending.protocolId}"
+            )
+        } catch (exception: Exception) {
+            logger("[ReconnectSync] failed reason=${exception.message}")
+        } finally {
+            logger("[ReconnectSync] done costMs=${SystemClock.elapsedRealtime() - startedAt}")
         }
     }
 
@@ -3871,6 +3941,7 @@ class BleGattServerManager(
         private const val ASSUMED_IOS_ALBUM_ART_PAYLOAD_BYTES = 182
         private const val AUTO_PUSH_INTERVAL_MS = 1000L
         private const val CURRENT_WORD_PUSH_INTERVAL_MS = 60L
+        private const val RECONNECT_SYNC_COOLDOWN_MS = 1_000L
         private const val PLAYBACK_DIFF_SKIP_LOG_INTERVAL_MS = 10_000L
         private const val ALBUM_ART_ENABLED = true
         private const val DEBUG_ART_DIAGNOSTICS = true
