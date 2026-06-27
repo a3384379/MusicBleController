@@ -405,8 +405,144 @@ final class BLETestManager: NSObject, ObservableObject {
                   preferences.autoReconnectEnabled {
             log("[SmokeTest] preferences persisted")
         }
+        if arguments.contains("--smoke-control-e2e") {
+            scheduleControlE2ESmokeTest()
+        }
         #endif
     }
+
+    #if DEBUG
+    private func scheduleControlE2ESmokeTest() {
+        log("[ControlE2E] scheduled")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.runControlE2EWhenReady(attempt: 0)
+        }
+    }
+
+    private func runControlE2EWhenReady(attempt: Int) {
+        let ready = sonyPeripheral?.state == .connected &&
+            sonyCommandCharacteristic != nil &&
+            sonyStatusCharacteristic != nil &&
+            isConnectionHealthyOrSuspect
+        guard ready else {
+            if attempt >= 30 {
+                log(
+                    "[ControlE2E] abort reason=not_ready " +
+                        "attempt=\(attempt) connected=\(sonyPeripheral?.state == .connected) " +
+                        "commandReady=\(sonyCommandCharacteristic != nil) " +
+                        "statusReady=\(sonyStatusCharacteristic != nil) " +
+                        "health=\(connectionHealthState)"
+                )
+                return
+            }
+            log(
+                "[ControlE2E] waiting connection attempt=\(attempt) " +
+                    "connected=\(sonyPeripheral?.state == .connected) " +
+                    "commandReady=\(sonyCommandCharacteristic != nil) " +
+                    "statusReady=\(sonyStatusCharacteristic != nil) " +
+                    "health=\(connectionHealthState)"
+            )
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.runControlE2EWhenReady(attempt: attempt + 1)
+            }
+            return
+        }
+        runControlE2ESequence()
+    }
+
+    private func runControlE2ESequence() {
+        let startMs = currentTimeMs()
+        log(
+            "[ControlE2E] start timeMs=\(startMs) " +
+                "trackId=\(currentTrackID) title=\(title.prefix(40)) " +
+                "position=\(displayPositionMs) duration=\(durationMs)"
+        )
+        var delay: TimeInterval = 0
+        scheduleControlE2EStep(name: "GET_PLAYBACK_STATE", delay: delay) { [weak self] in
+            self?.sendGetPlaybackState()
+        }
+        delay += 1.0
+        scheduleControlE2EStep(name: "GET_VOLUME", delay: delay) { [weak self] in
+            self?.sendGetVolume()
+        }
+        delay += 1.0
+        scheduleControlE2EStep(name: "PLAY_PAUSE", delay: delay) { [weak self] in
+            self?.sendPlayPause()
+        }
+        delay += 2.0
+        scheduleControlE2EStep(name: "PLAY_PAUSE_RESTORE", delay: delay) { [weak self] in
+            self?.sendPlayPause()
+        }
+        delay += 2.0
+        scheduleControlE2EStep(name: "NEXT", delay: delay) { [weak self] in
+            self?.sendNext()
+        }
+        delay += 4.0
+        scheduleControlE2EStep(name: "PREVIOUS", delay: delay) { [weak self] in
+            self?.sendPrevious()
+        }
+        delay += 4.0
+        scheduleControlE2EStep(name: "VOLUME_UP", delay: delay) { [weak self] in
+            self?.sendVolumeUp()
+        }
+        delay += 1.5
+        scheduleControlE2EStep(name: "VOLUME_DOWN", delay: delay) { [weak self] in
+            self?.sendVolumeDown()
+        }
+        delay += 1.5
+        scheduleControlE2EStep(name: "SEEK_TO", delay: delay) { [weak self] in
+            guard let self else { return }
+            let current = self.displayPositionMs
+            let duration = self.durationMs
+            let target: Int64
+            if duration > 30_000 {
+                target = min(max(current + 15_000, 0), max(duration - 5_000, 0))
+            } else {
+                target = max(current + 15_000, 0)
+            }
+            self.log(
+                "[ControlE2E] seek target=\(target) " +
+                    "from=\(current) duration=\(duration)"
+            )
+            self.seek(to: target)
+            self.refreshPlaybackState(after: 0.7)
+        }
+        delay += 2.0
+        scheduleControlE2EStep(name: "GET_FULL_LYRICS", delay: delay) { [weak self] in
+            self?.sendGetFullLyrics(force: true)
+        }
+        delay += 2.0
+        scheduleControlE2EStep(name: "REQUEST_HQ_ALBUM_ART", delay: delay) { [weak self] in
+            guard let self else { return }
+            let requested = self.requestCurrentHqAlbumArt()
+            self.log("[ControlE2E] albumArt request result=\(requested)")
+        }
+        delay += 2.0
+        scheduleControlE2EStep(name: "FINAL_GET_PLAYBACK_STATE", delay: delay) { [weak self] in
+            self?.sendGetPlaybackState()
+        }
+        delay += 1.0
+        scheduleControlE2EStep(name: "END", delay: delay) { [weak self] in
+            guard let self else { return }
+            self.log(
+                "[ControlE2E] end timeMs=\(self.currentTimeMs()) " +
+                    "trackId=\(self.currentTrackID) position=\(self.displayPositionMs)"
+            )
+        }
+    }
+
+    private func scheduleControlE2EStep(
+        name: String,
+        delay: TimeInterval,
+        action: @escaping () -> Void
+    ) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.log("[ControlE2E] step=\(name) action=start delayMs=\(Int(delay * 1_000))")
+            action()
+            self?.log("[ControlE2E] step=\(name) action=sent")
+        }
+    }
+    #endif
 
     deinit {
         LiveActivityCommandBridge.shared.unregister(self)

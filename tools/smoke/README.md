@@ -66,6 +66,14 @@ Reconnect Sync V2.8 validation:
 
 Use this when validating reconnect recovery. It relaunches the iOS app to trigger a reconnect window, then reads only iOS `ios_ble.log` and Sony `logcat` to verify reconnect `playbackState`, `currentWord`, and `albumArtOffer` recovery. It does not change BLE UUIDs or payload protocols.
 
+Control E2E V2.9 validation:
+
+```bash
+./tools/smoke/control_e2e_v29_test.sh --duration 75 --json
+```
+
+Use this when validating the real iOS -> Sony -> iOS interaction loop. It launches the iOS Debug app with the DEBUG-only `--smoke-control-e2e` argument, sends PLAY/PAUSE, NEXT, PREVIOUS, volume, seek, FullLyrics, and AlbumArt requests through the normal BLE command path, then verifies the results from iOS `ios_ble.log` and Sony `logcat`. `PREVIOUS` and AlbumArt can WARN because player history and artwork availability are content dependent; core controls failing is a FAIL.
+
 ## Device Behavior
 
 When neither `--ios-only` nor `--android-only` is used:
@@ -121,6 +129,12 @@ Reconnect Sync V2.8 output:
 /tmp/reconnect_sync_v28/<timestamp>/
 ```
 
+Control E2E V2.9 output:
+
+```text
+/tmp/control_e2e_smoke/<timestamp>/
+```
+
 Files:
 
 - `report.md`: human-readable CurrentWord or AlbumArt stability report.
@@ -131,6 +145,8 @@ Files:
 - `sony_current_word_filtered.log`: Sony filtered CurrentWord/PlaybackDiff log.
 - `ios_reconnect_filtered.log`: iOS filtered reconnect recovery log.
 - `sony_reconnect_filtered.log`: Sony filtered reconnect sync log.
+- `ios_control_e2e_filtered.log`: iOS filtered control E2E log.
+- `sony_control_e2e_filtered.log`: Sony filtered control E2E log.
 
 Files:
 

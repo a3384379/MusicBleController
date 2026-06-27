@@ -32,6 +32,7 @@
 - `tools/smoke/run_all_smoke_tests.sh`：检测 iPhone/Sony，调用 iOS 和 Android 子 suite，支持自动降级。
 - `tools/smoke/generate_all_report.py`：读取子报告并生成总 `report.md` / `report.json`。
 - `tools/smoke/current_word_long_play_test.sh`：手动长播放窗口测试，采集 iOS + Sony 日志，验证 V2.3 `currentWord` 是否持续推送、iOS 是否持续 accepted，以及 playbackState 是否明显低于 currentWord。
+- `tools/smoke/control_e2e_v29_test.sh`：真实交互 E2E 测试，启动 iOS Debug App 的测试参数，实际发送播放控制、音量、Seek、FullLyrics、AlbumArt 请求，再从 iOS/Sony 双端日志闭环判定。
 
 ## iOS-only 核心文件
 
@@ -60,6 +61,7 @@
 - [run_all_smoke_tests.sh](/Volumes/雷电/project/MusicBleController/tools/smoke/run_all_smoke_tests.sh)
 - [generate_all_report.py](/Volumes/雷电/project/MusicBleController/tools/smoke/generate_all_report.py)
 - [current_word_long_play_test.sh](/Volumes/雷电/project/MusicBleController/tools/smoke/current_word_long_play_test.sh)
+- [control_e2e_v29_test.sh](/Volumes/雷电/project/MusicBleController/tools/smoke/control_e2e_v29_test.sh)
 - [README.md](/Volumes/雷电/project/MusicBleController/tools/smoke/README.md)
 
 ## iOS-only 数据流
@@ -124,6 +126,40 @@
 - 同时保存 `ios_ble.log`、`sony_logcat.log`、`ios_current_word_filtered.log`、`sony_current_word_filtered.log`。
 
 该测试不接入普通 Required smoke，因为它依赖人工保证当前歌曲、播放状态和测试时长。
+
+## Control E2E V2.9 真实交互测试
+
+命令：
+
+```bash
+./tools/smoke/control_e2e_v29_test.sh --duration 75 --json
+```
+
+用途：
+
+- 验证 iOS 真实发送命令、Sony 真实收到命令、iOS 再收到状态变化的完整闭环。
+- 覆盖 `PLAY_PAUSE`、`NEXT`、`PREVIOUS`、`VOLUME_UP`、`VOLUME_DOWN`、`SEEK_TO`、`GET_FULL_LYRICS`、AlbumArt 请求。
+- 统计 command sent/received/success、playbackState、trackChanged、currentWord、fullLyrics、albumArt binary、stale discard、payload too large、main stall、命令延迟和命令后状态延迟。
+
+前提：
+
+- iPhone USB 连接、解锁，安装 DEBUG iOS App。
+- Sony USB 连接，PlayerAgent 控制服务已启动并 advertising。
+- QQ音乐正在播放，并且 MediaSession 可用。
+
+结果规则：
+
+- 核心控制 `PLAY_PAUSE`、`NEXT`、`VOLUME_UP`、`VOLUME_DOWN`、`SEEK_TO`、`GET_FULL_LYRICS` 失败时整体 FAIL。
+- `PREVIOUS` 允许 WARN，因为播放器播放历史可能不足。
+- AlbumArt 允许 WARN，因为当前歌曲可能没有封面或 HQ 不可用，但必须输出明确 reason。
+- `stale discard`、`payload too large`、`main stall` 任一出现时整体 FAIL。
+
+报告：
+
+- 默认输出 `/tmp/control_e2e_smoke/<timestamp>/report.md` 和 `report.json`。
+- 同时保存 `ios_ble.log`、`sony_logcat.log`、`ios_control_e2e_filtered.log`、`sony_control_e2e_filtered.log`。
+
+该测试与普通 full smoke 不同：full smoke 证明构建、安装、启动和基础日志正常；Control E2E 证明真实 BLE 交互链路能完成用户操作。
 
 ## iOS-only 关键状态
 
@@ -204,3 +240,4 @@
 - 改 cross-device 总入口：跑 `./tools/smoke/run_all_smoke_tests.sh --quick --json`。
 - 跨端相关改动且两台设备都连接：优先跑 `./tools/smoke/run_all_smoke_tests.sh --quick --json`。
 - 验证 CurrentWord V2.3 实时效果：手动跑 `./tools/smoke/current_word_long_play_test.sh --duration 90 --json`，不要把它当作每次 quick smoke 的 Required。
+- 验证真实控制链路：手动跑 `./tools/smoke/control_e2e_v29_test.sh --duration 75 --json`，不要把它当作每次 quick smoke 的 Required。
