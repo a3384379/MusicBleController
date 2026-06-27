@@ -208,7 +208,7 @@ final class AlbumArtReceiver {
             updateArtworkEnhancementStatus(message: "cache miss")
             delegate?.albumArtClearLiveArtwork(reason: "cacheMiss", shouldUpdate: false)
             requestAlbumArt(id: id, quality: "preview")
-            schedulePredictiveHqPrefetch(id: id, delay: 0.65, reason: "offer cache miss")
+            schedulePredictiveHqPrefetch(id: id, delay: 2.2, reason: "offer cache miss")
             notifyStateChanged()
         }
     }
@@ -400,6 +400,25 @@ final class AlbumArtReceiver {
         }
         log("[AlbumArt] unavailable id=\(id) quality=\(quality) reason=\(reason)")
         notifyStateChanged()
+    }
+
+    @discardableResult
+    func requestCurrentPreviewAlbumArt() -> Bool {
+        let id = currentAlbumArtID
+        guard !id.isEmpty else {
+            log("[AlbumArt] preview request skipped reason=no artwork id")
+            return false
+        }
+        guard delegate?.albumArtConnectionDisplayState == "connected",
+              delegate?.albumArtCharacteristicReady == true else {
+            log(
+                "[AlbumArt] preview request skipped reason=not ready " +
+                    "display=\(delegate?.albumArtConnectionDisplayState ?? "-") ready=\(delegate?.albumArtCharacteristicReady == true)"
+            )
+            return false
+        }
+        requestAlbumArt(id: id, quality: "preview")
+        return true
     }
 
     @discardableResult

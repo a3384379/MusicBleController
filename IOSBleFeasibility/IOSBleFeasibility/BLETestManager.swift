@@ -19,6 +19,7 @@ private let CONNECTION_HEALTH_HARD_RECONNECT_MIN_INTERVAL_MS: Int64 = 5_000
 private let CONNECTION_SUBSCRIBE_NOTIFY_TIMEOUT_MS: Int64 = 5_000
 private let CONNECTION_DISPLAY_CONNECTED_MIN_HOLD_MS: Int64 = 5_000
 private let CONNECTION_DISPLAY_DISCONNECTED_CONFIRM_MS: Int64 = 1_000
+private let FULL_LYRICS_REQUEST_DEDUP_WINDOW_MS: Int64 = 1_500
 
 struct LyricWord: Identifiable, Equatable {
     let id: Int
@@ -226,6 +227,7 @@ final class BLETestManager: NSObject, ObservableObject {
     private var fullLyricsChunks: [Int: LyricLine] = [:]
     private var fullLyricsTimeoutWorkItem: DispatchWorkItem?
     private var lastFullLyricsPartialPublishAtMs: Int64 = 0
+    private var fullLyricsRequestCreatedAtMs: [String: Int64] = [:]
     private var lyricTraceTrackInfoAtMs: [String: Int64] = [:]
     private var lyricTraceFullLyricsRequestAtMs: [String: Int64] = [:]
     private var lyricTraceFullLyricsStartAtMs: [String: Int64] = [:]
@@ -415,10 +417,163 @@ final class BLETestManager: NSObject, ObservableObject {
         if arguments.contains("--smoke-source-capability") {
             scheduleSourceCapabilitySmokeTest()
         }
+        if arguments.contains("--smoke-track-matrix-v31") {
+            scheduleTrackMatrixV31SmokeTest()
+        }
         #endif
     }
 
     #if DEBUG
+    private func scheduleTrackMatrixV31SmokeTest() {
+        log("[TrackMatrixV31] scheduled")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.runTrackMatrixV31WhenReady(attempt: 0)
+        }
+    }
+
+    private func runTrackMatrixV31WhenReady(attempt: Int) {
+        let ready = sonyPeripheral?.state == .connected &&
+            sonyCommandCharacteristic != nil &&
+            sonyStatusCharacteristic != nil &&
+            isConnectionHealthyOrSuspect
+        guard ready else {
+            if attempt >= 40 {
+                log(
+                    "[TrackMatrixV31] abort reason=not_ready " +
+                        "attempt=\(attempt) connected=\(sonyPeripheral?.state == .connected) " +
+                        "commandReady=\(sonyCommandCharacteristic != nil) " +
+                        "statusReady=\(sonyStatusCharacteristic != nil) " +
+                        "health=\(connectionHealthState)"
+                )
+                return
+            }
+            log(
+                "[TrackMatrixV31] waiting connection attempt=\(attempt) " +
+                    "connected=\(sonyPeripheral?.state == .connected) " +
+                    "commandReady=\(sonyCommandCharacteristic != nil) " +
+                    "statusReady=\(sonyStatusCharacteristic != nil) " +
+                    "health=\(connectionHealthState)"
+            )
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.runTrackMatrixV31WhenReady(attempt: attempt + 1)
+            }
+            return
+        }
+        log("[TrackMatrixV31] start totalTracks=10 dwellMs=10000")
+        runTrackMatrixV31Sample(index: 1, previousTrackID: "")
+    }
+
+    private func runTrackMatrixV31Sample(index: Int, previousTrackID: String) {
+        guard index <= 10 else {
+            log("[TrackMatrixV31] end timeMs=\(currentTimeMs())")
+            return
+        }
+        let trackID = currentTrackID
+        log(
+            "[TrackMatrixV31] sampleStart index=\(index) timeMs=\(currentTimeMs()) " +
+                "trackId=\(trackID) previousTrackId=\(previousTrackID) " +
+                "title=\(title.prefix(60)) artist=\(artist.prefix(60)) " +
+                "position=\(displayPositionMs) duration=\(durationMs)"
+        )
+        sendGetPlaybackState()
+        let lyricRequestAt = currentTimeMs()
+        sendGetFullLyrics(force: true)
+        log(
+            "[TrackMatrixV31] requestFullLyrics index=\(index) " +
+                "trackId=\(trackID) timeMs=\(lyricRequestAt)"
+        )
+        let artRequestAt = currentTimeMs()
+        let artRequested = albumArtReceiver.requestCurrentPreviewAlbumArt()
+        log(
+            "[TrackMatrixV31] requestAlbumArt index=\(index) " +
+                "trackId=\(trackID) timeMs=\(artRequestAt) quality=preview result=\(artRequested)"
+        )
+        guard index < 10 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) { [weak self] in
+            guard let self else { return }
+            let beforeNext = self.currentTrackID
+            self.log(
+                "[TrackMatrixV31] next index=\(index) " +
+                    "fromTrackId=\(beforeNext) timeMs=\(self.currentTimeMs())"
+            )
+            self.sendNext()
+            self.waitTrackMatrixV31TrackChange(
+                nextIndex: index + 1,
+                previousTrackID: beforeNext,
+                attempt: 0,
+                retriedNext: false,
+                forceRetryCount: 0
+            )
+        }
+    }
+
+    private func waitTrackMatrixV31TrackChange(
+        nextIndex: Int,
+        previousTrackID: String,
+        attempt: Int,
+        retriedNext: Bool,
+        forceRetryCount: Int
+    ) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            let current = self.currentTrackID
+            if !current.isEmpty, !previousTrackID.isEmpty, current != previousTrackID {
+                self.log(
+                    "[TrackMatrixV31] trackChanged nextIndex=\(nextIndex) " +
+                        "previousTrackId=\(previousTrackID) currentTrackId=\(current) " +
+                        "attempt=\(attempt) timeMs=\(self.currentTimeMs())"
+                )
+                self.runTrackMatrixV31Sample(index: nextIndex, previousTrackID: previousTrackID)
+                return
+            }
+            if attempt == 4, !retriedNext {
+                self.log(
+                    "[TrackMatrixV31] retryNext nextIndex=\(nextIndex) " +
+                        "previousTrackId=\(previousTrackID) currentTrackId=\(current)"
+                )
+                self.sendNext()
+                self.waitTrackMatrixV31TrackChange(
+                    nextIndex: nextIndex,
+                    previousTrackID: previousTrackID,
+                    attempt: attempt + 1,
+                    retriedNext: true,
+                    forceRetryCount: forceRetryCount
+                )
+                return
+            }
+            if attempt >= 14 {
+                self.log(
+                    "[TrackMatrixV31] track_not_changed nextIndex=\(nextIndex) " +
+                        "previousTrackId=\(previousTrackID) currentTrackId=\(current) " +
+                        "forceRetryCount=\(forceRetryCount)"
+                )
+                if forceRetryCount >= 3 {
+                    self.log(
+                        "[TrackMatrixV31] abort reason=track_not_changed " +
+                            "nextIndex=\(nextIndex) previousTrackId=\(previousTrackID)"
+                    )
+                    return
+                }
+                self.sendNext()
+                self.waitTrackMatrixV31TrackChange(
+                    nextIndex: nextIndex,
+                    previousTrackID: previousTrackID,
+                    attempt: 0,
+                    retriedNext: false,
+                    forceRetryCount: forceRetryCount + 1
+                )
+                return
+            }
+            self.waitTrackMatrixV31TrackChange(
+                nextIndex: nextIndex,
+                previousTrackID: previousTrackID,
+                attempt: attempt + 1,
+                retriedNext: retriedNext,
+                forceRetryCount: forceRetryCount
+            )
+        }
+    }
+
     private func scheduleSourceCapabilitySmokeTest() {
         log("[SourceCapabilitySmoke] scheduled")
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
@@ -3802,16 +3957,35 @@ extension BLETestManager: CBPeripheralDelegate {
     ) {
         let trackID = currentTrackID
         guard !trackID.isEmpty else { return }
+        let nowMs = currentTimeMs()
         if !force,
            fullLyricsTrackId == trackID,
            !fullLyrics.isEmpty {
             return
         }
-        if !force,
-           requestedFullLyricsTrackIDs.contains(trackID) {
+        if isFullLyricsReceiving,
+           fullLyricsReceivingTrackID == trackID {
+            log(
+                "[FullLyrics] request skipped reason=receiving " +
+                    "trackId=\(trackID) force=\(force)"
+            )
             return
         }
+        if requestedFullLyricsTrackIDs.contains(trackID) {
+            let previousMs = fullLyricsRequestCreatedAtMs[trackID] ??
+                lyricTraceFullLyricsRequestAtMs[trackID] ??
+                nowMs
+            let ageMs = nowMs - previousMs
+            if !force || ageMs < FULL_LYRICS_REQUEST_DEDUP_WINDOW_MS {
+                log(
+                    "[FullLyrics] request skipped reason=dedup " +
+                        "trackId=\(trackID) force=\(force) ageMs=\(ageMs)"
+                )
+                return
+            }
+        }
         requestedFullLyricsTrackIDs.insert(trackID)
+        fullLyricsRequestCreatedAtMs[trackID] = nowMs
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             guard self.currentTrackID == trackID else { return }

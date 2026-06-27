@@ -28,6 +28,8 @@ class CurrentWordPushEngine(
     private var intervalCount: Long = 0L
     private var lastPushCostMs: Long = 0L
     private var lastSkipLogAtMs: Long = 0L
+    private var lastObservedGeneration: Long = -1L
+    private var generationFirstSeenAtMs: Long = 0L
 
     fun pushCurrentWord(
         reason: String = "diff",
@@ -59,6 +61,27 @@ class CurrentWordPushEngine(
 
         synchronized(lock) {
             val now = SystemClock.elapsedRealtime()
+            if (state.trackGeneration != lastObservedGeneration) {
+                lastObservedGeneration = state.trackGeneration
+                generationFirstSeenAtMs = now
+            }
+            val generationAgeMs = now - generationFirstSeenAtMs
+            if (!force && generationAgeMs < TRACK_SWITCH_BASELINE_HOLDOFF_MS) {
+                recordSkipLocked(
+                    "track_switch_baseline_pending",
+                    now,
+                    state,
+                    key,
+                    extra = " generationAgeMs=$generationAgeMs"
+                )
+                logger(
+                    "[CurrentWordFence] skip reason=track_switch_baseline_pending " +
+                        "trackId=$outgoingTrackId generation=${state.trackGeneration} " +
+                        "generationAgeMs=$generationAgeMs " +
+                        "holdoffMs=$TRACK_SWITCH_BASELINE_HOLDOFF_MS"
+                )
+                return null
+            }
             if (!force && key == lastPushedKey) {
                 recordSkipLocked("same word", now, state, key)
                 return null
@@ -122,6 +145,8 @@ class CurrentWordPushEngine(
         synchronized(lock) {
             lastPushedKey = ""
             lastPushElapsedMs = 0L
+            lastObservedGeneration = -1L
+            generationFirstSeenAtMs = 0L
         }
     }
 
@@ -159,7 +184,8 @@ class CurrentWordPushEngine(
         reason: String,
         now: Long,
         state: CurrentWordState? = null,
-        currentWordKey: String = ""
+        currentWordKey: String = "",
+        extra: String = ""
     ) {
         skipCount += 1
         if (now - lastSkipLogAtMs >= SKIP_LOG_INTERVAL_MS) {
@@ -174,9 +200,10 @@ class CurrentWordPushEngine(
                     " wordEndMs=${state.wordEndMs}" +
                     " hasWordTiming=${state.hasWordTiming}" +
                     " lastPushedWordKey=$lastPushedKey" +
-                    " currentWordKey=$currentWordKey"
+                    " currentWordKey=$currentWordKey" +
+                    extra
             } else {
-                ""
+                extra
             }
             logger("[CurrentWordPush] skip reason=$reason$detail")
         }
@@ -184,6 +211,7 @@ class CurrentWordPushEngine(
 
     private companion object {
         private const val MIN_CURRENT_WORD_INTERVAL_MS = 60L
+        private const val TRACK_SWITCH_BASELINE_HOLDOFF_MS = 450L
         private const val SKIP_LOG_INTERVAL_MS = 5_000L
         private const val MAX_LOG_WORD_TEXT = 24
     }
