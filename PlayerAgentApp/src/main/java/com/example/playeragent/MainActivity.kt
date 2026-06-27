@@ -110,6 +110,7 @@ class MainActivity : Activity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile private var debugStatsLoading = false
     @Volatile private var lastDebugStatsLoadAt = 0L
+    private var debugStatsLoadRunnable: Runnable? = null
     private var lastPlayerUiSongKey: String = ""
     private var lastPlayerUiLyric: String = ""
     private var lastPlayerUiLyricStatus: String = ""
@@ -171,10 +172,10 @@ class MainActivity : Activity() {
             appendLog(message, storeInBuffer = false)
             when {
                 message.contains("Foreground service started") ->
-                    statusTextView.text = "控制服务：运行中"
+                    setControlServiceStatus("运行中")
 
                 message.contains("Foreground service stopped") ->
-                    statusTextView.text = "控制服务：已停止"
+                    setControlServiceStatus("已停止")
 
                 message.startsWith("[AccessibilityLyric] candidate=") ->
                     appendLog("[PlayerUI] 无障碍候选歌词已记录，当前歌词仍以播放状态为准")
@@ -195,6 +196,7 @@ class MainActivity : Activity() {
         initializeBluetooth()
         requestRequiredPermissions()
         maybeAutoStartControlService("onCreate")
+        refreshControlServiceStatus()
         appendLog("[PlayerAgent] UI ready")
         appendLog("[UI] first lightweight render ready costMs=${System.currentTimeMillis() - startedAt}")
         scheduleDebugStatsLoad()
@@ -213,11 +215,13 @@ class MainActivity : Activity() {
         } else {
             registerReceiver(logReceiver, filter)
         }
+        refreshControlServiceStatus()
     }
 
     override fun onResume() {
         super.onResume()
         maybeAutoStartControlService("onResume")
+        refreshControlServiceStatus()
         if (::currentSongTextView.isInitialized) {
             refreshCurrentMedia()
             refreshAccessibilityStatus()
@@ -557,8 +561,8 @@ class MainActivity : Activity() {
             !canStop -> "提示：当前没有运行中的任务"
             else -> "提示：可停止当前任务"
         }
-        buildTaskBadgeTextView.text = "状态：$buildStatusLabel"
-        buildTaskStatusTextView.text =
+        buildTaskBadgeTextView.setTextIfChanged("状态：$buildStatusLabel")
+        buildTaskStatusTextView.setTextIfChanged(
             "当前构建：${if (activeBuildTask || build.running) "V2_BUILD" else "无"}\n" +
             "构建状态：$buildStatusLabel\n" +
             "全局维护：${activeTaskName ?: "无"}\n" +
@@ -567,6 +571,7 @@ class MainActivity : Activity() {
             "跳过无 QRC：${build.skippedNoQrc} 重复：${build.duplicate}\n" +
             "已运行：${state.runningSeconds}s\n" +
             buildHint
+        )
 
         val buildPrimary = buildPrimaryButtonText(state)
         setActionButtonState(
@@ -581,7 +586,7 @@ class MainActivity : Activity() {
         )
 
         val indexBusy = state.activeTask == MaintenanceTaskType.QRC_INDEX_REBUILD
-        qrcIndexBadgeTextView.text = "状态：${if (indexBusy) "构建中" else "空闲"}"
+        qrcIndexBadgeTextView.setTextIfChanged("状态：${if (indexBusy) "构建中" else "空闲"}")
         setActionButtonState(
             qrcIndexPrimaryButton,
             if (indexBusy) "停止任务" else "重建索引",
@@ -594,8 +599,8 @@ class MainActivity : Activity() {
             state.activeTask != null -> "等待"
             else -> "空闲"
         }
-        lyricsWarmupBadgeTextView.text = "状态：$warmupStatus"
-        lyricsWarmupStatusTextView.text =
+        lyricsWarmupBadgeTextView.setTextIfChanged("状态：$warmupStatus")
+        lyricsWarmupStatusTextView.setTextIfChanged(
             "当前预热：$warmupStatus\n" +
             "全局维护：${activeTaskName ?: "无"}\n" +
             "已运行：${if (warmupBusy) state.runningSeconds else 0}s\n" +
@@ -605,6 +610,7 @@ class MainActivity : Activity() {
                 else -> "未启动预热"
             }}\n" +
             lastLyricCacheStatsText
+        )
         setActionButtonState(
             lyricsWarmupPrimaryButton,
             if (warmupBusy) "取消预热" else "预热歌词缓存",
@@ -613,13 +619,15 @@ class MainActivity : Activity() {
 
         val repair = state.oldCacheRepairStatus
         val repairPercent = if (repair.total > 0) repair.processed * 100 / repair.total else 0
-        cacheMaintenanceBadgeTextView.text =
+        cacheMaintenanceBadgeTextView.setTextIfChanged(
             "状态：${if (repair.running) "修复中" else repair.status}"
-        cacheMaintenanceStatusTextView.text =
+        )
+        cacheMaintenanceStatusTextView.setTextIfChanged(
             "旧歌词缓存修复：${repair.status}\n" +
             "进度：${repair.processed} / ${repair.total} ($repairPercent%)\n" +
             "重建：${repair.rebuilt} 跳过：${repair.skipped} 失败：${repair.failed}\n" +
             "当前：${repair.currentGroupId.ifBlank { "-" }}"
+        )
         val repairBusy = repair.running || state.activeTask == MaintenanceTaskType.CACHE_REPAIR
         setActionButtonState(
             cacheMaintenancePrimaryButton,
@@ -627,17 +635,19 @@ class MainActivity : Activity() {
             canRunTask(MaintenanceTaskType.CACHE_REPAIR, state) || repairBusy
         )
 
-        currentTrackBadgeTextView.text = "状态：${state.currentLyricsStatus ?: "unknown"}"
-        currentTrackDebugStatusTextView.text =
+        currentTrackBadgeTextView.setTextIfChanged("状态：${state.currentLyricsStatus ?: "unknown"}")
+        currentTrackDebugStatusTextView.setTextIfChanged(
             "当前歌曲：${state.currentTrackTitle ?: "未检测"}\n" +
             "歌词状态：${state.currentLyricsStatus ?: "unknown"}\n" +
             "封面状态：${state.currentAlbumArtStatus ?: "unknown"}"
+        )
 
-        maintenanceSummaryTextView.text =
+        maintenanceSummaryTextView.setTextIfChanged(
             "增量成功：${state.watcherStatus.incrementalSuccess}    " +
             "增量失败：${state.watcherStatus.incrementalFailed}\n" +
             "Watcher pending：${state.watcherStatus.pendingGroups}    " +
             "索引 builtAt：见 QRC 索引卡片"
+        )
     }
 
     private fun buildMaintenanceUiState(): MaintenanceUiState {
@@ -766,10 +776,21 @@ class MainActivity : Activity() {
         label: String,
         enabled: Boolean
     ) {
-        button.text = label
-        button.isEnabled = enabled
-        button.alpha = if (enabled) 1.0f else 0.48f
+        button.setTextIfChanged(label)
+        if (button.isEnabled != enabled) {
+            button.isEnabled = enabled
+        }
+        val alpha = if (enabled) 1.0f else 0.48f
+        if (button.alpha != alpha) {
+            button.alpha = alpha
+        }
         button.setTextColor(Color.WHITE)
+    }
+
+    private fun TextView.setTextIfChanged(value: String) {
+        if (text.toString() != value) {
+            text = value
+        }
     }
 
     private fun actionButton(
@@ -868,7 +889,7 @@ class MainActivity : Activity() {
             return
         }
         requestStartPlayerAgentService()
-        statusTextView.text = "控制服务：启动请求已发送"
+        setControlServiceStatus("启动请求已发送")
         appendLog("[PlayerAgent] Start service requested")
     }
 
@@ -891,6 +912,7 @@ class MainActivity : Activity() {
         }
         if (PlayerAgentForegroundService.isRunning()) {
             appendLog("[ControlServiceAutoStart] skip reason=already_started")
+            setControlServiceStatus("运行中")
             return
         }
         val now = System.currentTimeMillis()
@@ -909,8 +931,12 @@ class MainActivity : Activity() {
         autoStartControlServiceRequestedThisRun = true
         autoStartControlServiceRequestedAtMs = now
         requestStartPlayerAgentService()
-        statusTextView.text = "控制服务：自动启动请求已发送"
+        setControlServiceStatus("自动启动请求已发送")
         appendLog("[ControlServiceAutoStart] service started")
+        mainHandler.postDelayed(
+            ::refreshControlServiceStatus,
+            CONTROL_SERVICE_STATUS_VERIFY_DELAY_MS
+        )
     }
 
     private fun requestStartPlayerAgentService() {
@@ -927,9 +953,24 @@ class MainActivity : Activity() {
         autoStartControlServiceRequestedThisRun = false
         autoStartControlServiceRequestedAtMs = 0L
         stopService(Intent(this, PlayerAgentForegroundService::class.java))
-        statusTextView.text = "控制服务：已停止"
+        setControlServiceStatus("已停止")
         appendLog("[PlayerAgent] Stop service requested")
         appendLog("[ControlServiceAutoStart] skip reason=user_stopped")
+    }
+
+    private fun refreshControlServiceStatus() {
+        if (!::statusTextView.isInitialized) {
+            return
+        }
+        setControlServiceStatus(
+            if (PlayerAgentForegroundService.isRunning()) "运行中" else "未启动"
+        )
+    }
+
+    private fun setControlServiceStatus(status: String) {
+        if (::statusTextView.isInitialized) {
+            statusTextView.setTextIfChanged("控制服务：$status")
+        }
     }
 
     private fun refreshCurrentMedia() {
@@ -1627,7 +1668,12 @@ class MainActivity : Activity() {
         runOnUiThread {
             lastQrcV2BuildProgress = progress
             refreshMaintenanceUiState()
-            refreshQrcCacheOverview()
+            if (progress.status == QrcV2RebuildStatus.COMPLETED ||
+                progress.status == QrcV2RebuildStatus.FAILED ||
+                progress.status == QrcV2RebuildStatus.STOPPED
+            ) {
+                refreshQrcCacheOverview()
+            }
         }
     }
 
@@ -1635,7 +1681,9 @@ class MainActivity : Activity() {
         runOnUiThread {
             lastQrcStaleCacheRebuildProgress = progress
             refreshMaintenanceUiState()
-            refreshQrcCacheOverview()
+            if (!progress.running) {
+                refreshQrcCacheOverview()
+            }
         }
     }
 
@@ -1744,8 +1792,10 @@ class MainActivity : Activity() {
     }
 
     private fun scheduleDebugStatsLoad(force: Boolean = false) {
-        appendLog("[UI] debug stats load scheduled")
-        mainHandler.postDelayed({
+        debugStatsLoadRunnable?.let { mainHandler.removeCallbacks(it) }
+        val delayMs = if (force) DEBUG_STATS_FORCE_DELAY_MS else DEBUG_STATS_INITIAL_DELAY_MS
+        val runnable = Runnable {
+            debugStatsLoadRunnable = null
             StartupGuard.runWhenHeavyTaskAllowed(
                 taskName = "debug stats",
                 handler = mainHandler,
@@ -1753,7 +1803,9 @@ class MainActivity : Activity() {
             ) {
                 loadDebugStatsAsync(force)
             }
-        }, DEBUG_STATS_INITIAL_DELAY_MS)
+        }
+        debugStatsLoadRunnable = runnable
+        mainHandler.postDelayed(runnable, delayMs)
     }
 
     private fun loadDebugStatsAsync(force: Boolean = false) {
@@ -1768,10 +1820,7 @@ class MainActivity : Activity() {
         }
         debugStatsLoading = true
         lastDebugStatsLoadAt = now
-        if (::qrcCacheOverviewTextView.isInitialized) {
-            qrcCacheOverviewTextView.text = "缓存统计：loading..."
-        }
-        if (::lyricCacheStatsTextView.isInitialized) {
+        if (::lyricCacheStatsTextView.isInitialized && lastLyricCacheStatsText == "歌词统计：loading...") {
             lastLyricCacheStatsText = "歌词统计：loading..."
             refreshMaintenanceUiState()
         }
@@ -1788,7 +1837,7 @@ class MainActivity : Activity() {
                 debugStatsLoading = false
                 result.onSuccess { stats ->
                     if (::qrcCacheOverviewTextView.isInitialized) {
-                        qrcCacheOverviewTextView.text = stats.qrcOverview
+                        qrcCacheOverviewTextView.setTextIfChanged(stats.qrcOverview)
                     }
                     if (::lyricCacheStatsTextView.isInitialized) {
                         lastLyricCacheStatsText = stats.lyricStats
@@ -1797,7 +1846,9 @@ class MainActivity : Activity() {
                     appendLog("[DebugStats] load done costMs=${System.currentTimeMillis() - startedAt}")
                 }.onFailure { exception ->
                     if (::qrcCacheOverviewTextView.isInitialized) {
-                        qrcCacheOverviewTextView.text = "缓存统计：加载失败 ${exception.message}"
+                        qrcCacheOverviewTextView.setTextIfChanged(
+                            "缓存统计：加载失败 ${exception.message}"
+                        )
                     }
                     if (::lyricCacheStatsTextView.isInitialized) {
                         lastLyricCacheStatsText = "歌词统计：加载失败 ${exception.message}"
@@ -2116,9 +2167,11 @@ class MainActivity : Activity() {
         private const val REQUEST_PERMISSIONS = 1001
         private const val REQUEST_EXPORT_LOG = 1002
         private const val DEBUG_STATS_INITIAL_DELAY_MS = 700L
+        private const val DEBUG_STATS_FORCE_DELAY_MS = 180L
         private const val DEBUG_STATS_THROTTLE_MS = 2_000L
         private const val PREFS_CONTROL_SERVICE = "control_service_preferences"
         private const val KEY_AUTO_START_CONTROL_SERVICE = "autoStartControlService"
         private const val AUTO_START_PENDING_GUARD_MS = 5_000L
+        private const val CONTROL_SERVICE_STATUS_VERIFY_DELAY_MS = 800L
     }
 }
