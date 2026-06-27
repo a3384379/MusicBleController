@@ -195,6 +195,19 @@ final class ArtworkEnhancementManager {
         }
     }
 
+    func clearCachedArtwork(artworkId: String, completion: (() -> Void)? = nil) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let latestURL = self.latestMetadataURL(artworkId: artworkId)
+            if let metadata = self.readMetadata(from: latestURL) {
+                try? FileManager.default.removeItem(at: self.imageURL(cacheKey: metadata.cacheKey))
+                try? FileManager.default.removeItem(at: self.metadataURL(cacheKey: metadata.cacheKey))
+            }
+            try? FileManager.default.removeItem(at: latestURL)
+            completion?()
+        }
+    }
+
     func cacheStats() -> (files: Int, bytes: Int64) {
         let directory = cacheDirectory()
         guard let urls = try? FileManager.default.contentsOfDirectory(

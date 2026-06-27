@@ -527,7 +527,7 @@ struct SystemHealthOverviewView: View {
                                     refreshSnapshot(after: 0.35)
                                 }
                                 actionButton("重试封面", "arrow.clockwise.circle") {
-                                    let accepted = bleManager.requestCurrentHqAlbumArt()
+                                    let accepted = bleManager.forceRefreshCurrentAlbumArt()
                                     actionStatus = accepted ? "已重试封面" : "当前无法重试封面"
                                     refreshSnapshot(after: 0.35)
                                 }

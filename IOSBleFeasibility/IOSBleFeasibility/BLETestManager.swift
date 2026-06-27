@@ -977,6 +977,11 @@ final class BLETestManager: NSObject, ObservableObject {
         albumArtReceiver.requestCurrentHqAlbumArt()
     }
 
+    @discardableResult
+    func forceRefreshCurrentAlbumArt() -> Bool {
+        albumArtReceiver.forceRefreshCurrentAlbumArt()
+    }
+
     func noteNowPlayingDiagnosticsCopied(trackId: String) {
         log("[NowDiag] copied diagnostics trackId=\(trackId)")
     }
