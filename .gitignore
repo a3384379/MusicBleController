@@ -17,3 +17,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local deploy state
+tools/deploy/last_deploy.json

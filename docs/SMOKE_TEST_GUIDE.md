@@ -33,6 +33,7 @@
 - `tools/smoke/generate_all_report.py`：读取子报告并生成总 `report.md` / `report.json`。
 - `tools/smoke/current_word_long_play_test.sh`：手动长播放窗口测试，采集 iOS + Sony 日志，验证 V2.3 `currentWord` 是否持续推送、iOS 是否持续 accepted，以及 playbackState 是否明显低于 currentWord。
 - `tools/smoke/control_e2e_v29_test.sh`：真实交互 E2E 测试，启动 iOS Debug App 的测试参数，实际发送播放控制、音量、Seek、FullLyrics、AlbumArt 请求，再从 iOS/Sony 双端日志闭环判定。
+- `tools/smoke/source_capability_v30_test.sh`：源数据可用性诊断测试，采集 3-5 首歌的歌词/封面来源、ready 延迟和 unavailable reason，区分 BLE/缓存问题与 Sony/QQ音乐源头未提供。
 
 ## iOS-only 核心文件
 
@@ -62,6 +63,7 @@
 - [generate_all_report.py](/Volumes/雷电/project/MusicBleController/tools/smoke/generate_all_report.py)
 - [current_word_long_play_test.sh](/Volumes/雷电/project/MusicBleController/tools/smoke/current_word_long_play_test.sh)
 - [control_e2e_v29_test.sh](/Volumes/雷电/project/MusicBleController/tools/smoke/control_e2e_v29_test.sh)
+- [source_capability_v30_test.sh](/Volumes/雷电/project/MusicBleController/tools/smoke/source_capability_v30_test.sh)
 - [README.md](/Volumes/雷电/project/MusicBleController/tools/smoke/README.md)
 
 ## iOS-only 数据流
@@ -161,6 +163,44 @@
 
 该测试与普通 full smoke 不同：full smoke 证明构建、安装、启动和基础日志正常；Control E2E 证明真实 BLE 交互链路能完成用户操作。
 
+## iOS BLE 硬前置校验
+
+所有会依赖 iOS BLE 的真实链路测试，都必须先通过 [ios_ble_precheck.sh](/Volumes/雷电/project/MusicBleController/tools/smoke/ios_ble_precheck.sh)。
+
+硬性条件：
+
+- iOS App launched。
+- BLE connected。
+- notify subscribed。
+- 5 秒内收到至少 1 条 `playbackState`。
+
+如果前置校验失败，脚本必须立即 FAIL，`precheckFailReason=ios_ble_not_connected`，并且不得继续执行 `GET_FULL_LYRICS`、AlbumArt 请求、`NEXT`、`VOLUME`、`SEEK` 等动作。报告必须输出 `iosAppLaunched`、`iosBleConnected`、`notifySubscribed`、`firstPlaybackStateReceived`、`firstPlaybackStateLatencyMs`、`precheckResult`、`precheckFailReason`。
+
+## Source Capability V3.0 源可用性诊断
+
+命令：
+
+```bash
+./tools/smoke/source_capability_v30_test.sh --duration 150 --json
+```
+
+用途：
+
+- 聚合 Sony `[TrackCapability]` 结构化日志和 iOS 日志，判断每首歌歌词/封面是 READY_FAST、READY_SLOW、UNAVAILABLE、PARSE_FAILED、LOAD_FAILED 还是 SOURCE_NOT_PROVIDED。
+- 统计 qrc lookup、parse、albumArt load 的 avg/p95，以及 FullLyrics/AlbumArt 请求后发送延迟。
+- 统计 `CurrentWordFence` 拦截、iOS stale discard、payload too large、main stall。
+
+前提：
+
+- iPhone USB 连接、解锁，安装 DEBUG iOS App。
+- Sony USB 连接，PlayerAgent 控制服务已启动。
+- QQ音乐正在播放。测试窗口内建议手动切 3-5 首歌，每首至少停留 30 秒。
+
+结果：
+
+- 报告输出 `/tmp/music_ble_capability/<timestamp>/report.md` 和 `report.json`。
+- 如果 source fields 均缺失且歌词/封面不可用，报告会标记 `SOURCE_NOT_PROVIDED`，用于说明瓶颈在 Sony/QQ音乐/MediaSession 源头，而不是 BLE 传输。
+
 ## iOS-only 关键状态
 
 - Required tests：
@@ -241,3 +281,4 @@
 - 跨端相关改动且两台设备都连接：优先跑 `./tools/smoke/run_all_smoke_tests.sh --quick --json`。
 - 验证 CurrentWord V2.3 实时效果：手动跑 `./tools/smoke/current_word_long_play_test.sh --duration 90 --json`，不要把它当作每次 quick smoke 的 Required。
 - 验证真实控制链路：手动跑 `./tools/smoke/control_e2e_v29_test.sh --duration 75 --json`，不要把它当作每次 quick smoke 的 Required。
+- 诊断歌词/封面源头可用性：手动跑 `./tools/smoke/source_capability_v30_test.sh --duration 150 --json`，测试期间切 3-5 首歌。

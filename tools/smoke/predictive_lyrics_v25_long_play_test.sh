@@ -142,6 +142,7 @@ base_ios = base_report.get("ios", {})
 base_sony = base_report.get("sony", {})
 base_summary = base_report.get("summary", {})
 base_latency = base_report.get("latency", {})
+precheck = base_report.get("precheck", {})
 
 current_word_raw = int(base_ios.get("currentWordRawCount", 0) or 0)
 current_word_accepted = int(base_ios.get("currentWordAcceptedCount", 0) or 0)
@@ -169,7 +170,14 @@ report = {
         "track": base_summary.get("track", ""),
         "playing": bool(base_summary.get("playing", False)),
         "warnings": [],
-        "issues": []
+        "issues": [],
+        "iosAppLaunched": precheck.get("iosAppLaunched", False),
+        "iosBleConnected": precheck.get("iosBleConnected", False),
+        "notifySubscribed": precheck.get("notifySubscribed", False),
+        "firstPlaybackStateReceived": precheck.get("firstPlaybackStateReceived", False),
+        "firstPlaybackStateLatencyMs": precheck.get("firstPlaybackStateLatencyMs", 0),
+        "precheckResult": precheck.get("precheckResult", "UNKNOWN"),
+        "precheckFailReason": precheck.get("precheckFailReason", "")
     },
     "predictiveLyrics": {
         "trackChangedCount": track_changed_count,
@@ -226,6 +234,7 @@ report = {
         "sonyCurrentWordPushCount": sony_current_word_push
     },
     "baseCurrentWord": base_report,
+    "precheck": precheck,
     "artifacts": {
         "report_json": str(out_dir / "report.json"),
         "report_md": str(out_dir / "report.md"),

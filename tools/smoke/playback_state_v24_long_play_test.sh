@@ -83,6 +83,7 @@ base_dir = Path(sys.argv[2])
 base = json.loads((base_dir / "report.json").read_text(encoding="utf-8"))
 sony_log = Path(base["artifacts"]["sony_logcat"]).read_text(encoding="utf-8", errors="replace")
 ios_log = Path(base["artifacts"]["ios_ble_log"]).read_text(encoding="utf-8", errors="replace")
+precheck = base.get("precheck", {})
 
 candidate_lines = re.findall(r"\[PlaybackDiff\]\s+candidate\b.*", sony_log)
 push_lines = re.findall(r"\[PlaybackDiff\]\s+push reason=([^\s]+).*", sony_log)
@@ -158,6 +159,13 @@ payload = {
         "playing": base["summary"].get("playing", False),
         "warnings": warnings,
         "issues": issues,
+        "iosAppLaunched": precheck.get("iosAppLaunched", False),
+        "iosBleConnected": precheck.get("iosBleConnected", False),
+        "notifySubscribed": precheck.get("notifySubscribed", False),
+        "firstPlaybackStateReceived": precheck.get("firstPlaybackStateReceived", False),
+        "firstPlaybackStateLatencyMs": precheck.get("firstPlaybackStateLatencyMs", 0),
+        "precheckResult": precheck.get("precheckResult", "UNKNOWN"),
+        "precheckFailReason": precheck.get("precheckFailReason", ""),
     },
     "playbackState": {
         "candidateCount": candidate_count,
@@ -183,6 +191,7 @@ payload = {
         "mainStallCount": main_stall,
     },
     "baseCurrentWord": base,
+    "precheck": precheck,
     "artifacts": {
         "report_json": str(out_dir / "report.json"),
         "report_md": str(out_dir / "report.md"),

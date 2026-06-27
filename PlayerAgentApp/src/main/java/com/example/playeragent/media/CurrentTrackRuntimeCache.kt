@@ -37,6 +37,7 @@ data class CurrentTrackRuntimeCacheSnapshot(
 
 data class CurrentWordState(
     val trackId: String,
+    val trackGeneration: Long,
     val lineIndex: Int,
     val wordIndex: Int,
     val wordText: String,
@@ -48,7 +49,7 @@ data class CurrentWordState(
     val version: Int = 1
 ) {
     val wordKey: String
-        get() = "$trackId|$lineIndex|$wordIndex|$wordStartMs"
+        get() = "$trackId|$trackGeneration|$lineIndex|$wordIndex|$wordStartMs"
 }
 
 object CurrentTrackRuntimeCache {
@@ -62,6 +63,7 @@ object CurrentTrackRuntimeCache {
     private var lastTrackSwitchCostMs = 0L
     private var lastSnapshot: PlaybackStateSnapshot? = null
     private var lastSentSnapshot: PlaybackStateSnapshot? = null
+    private var currentTrackGeneration: Long = 0L
 
     fun updatePlaybackState(
         trackId: String,
@@ -83,8 +85,10 @@ object CurrentTrackRuntimeCache {
                 previous.trackId != trackId ||
                 previous.songKey != songKey
             val base = if (trackChanged) {
+                currentTrackGeneration += 1
                 logger?.invoke(
-                    "[RuntimeCache] track changed trackId=$trackId songKey=$songKey title=$title"
+                    "[RuntimeCache] track changed trackId=$trackId songKey=$songKey " +
+                        "title=$title generation=$currentTrackGeneration"
                 )
                 CurrentTrackSnapshot(
                     trackId = trackId,
@@ -93,7 +97,8 @@ object CurrentTrackRuntimeCache {
                     artist = artist,
                     album = album,
                     trackChangedAtMs = System.currentTimeMillis(),
-                    hasLyrics = false
+                    hasLyrics = false,
+                    currentTrackGeneration = currentTrackGeneration
                 )
             } else {
                 previous!!
@@ -324,6 +329,12 @@ object CurrentTrackRuntimeCache {
         }
     }
 
+    fun currentGeneration(): Long {
+        synchronized(lock) {
+            return currentTrackGeneration
+        }
+    }
+
     fun diffFromLastSent(snapshot: PlaybackStateSnapshot): PlaybackStateDiff {
         synchronized(lock) {
             return PlaybackStateDiffEngine.diff(lastSentSnapshot, snapshot)
@@ -376,7 +387,8 @@ object CurrentTrackRuntimeCache {
                 artist = "",
                 album = "",
                 trackChangedAtMs = 0L,
-                hasLyrics = false
+                hasLyrics = false,
+                currentTrackGeneration = currentTrackGeneration
             )
         }
     }
@@ -429,6 +441,7 @@ object CurrentTrackRuntimeCache {
             ?: return null
         return CurrentWordState(
             trackId = track.trackId,
+            trackGeneration = track.currentTrackGeneration,
             lineIndex = indexed.lineIndex,
             wordIndex = indexed.wordIndex,
             wordText = indexed.word.text,

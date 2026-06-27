@@ -200,7 +200,8 @@ data class CurrentTrackSnapshot(
     val lastUpdatedAtMs: Long = 0L,
     val recoveryState: String = "",
     val albumArtState: String = "",
-    val diagnosticSnapshot: String = ""
+    val diagnosticSnapshot: String = "",
+    val currentTrackGeneration: Long = 0L
 )
 
 data class IncrementalLyricsReady(

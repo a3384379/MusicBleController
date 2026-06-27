@@ -98,6 +98,7 @@ base_ios = base_report.get("ios", {})
 base_sony = base_report.get("sony", {})
 base_summary = base_report.get("summary", {})
 base_latency = base_report.get("latency", {})
+precheck = base_report.get("precheck", {})
 
 lookup_costs = values(r"\[LyricsFastPath\] lookup done .*costMs=(\d+)", sony_text)
 parse_costs = values(r"\[LyricsFastPath\] parse done .*costMs=(\d+)", sony_text)
@@ -138,7 +139,14 @@ report = {
         "track": base_summary.get("track", ""),
         "playing": bool(base_summary.get("playing", False)),
         "warnings": [],
-        "issues": []
+        "issues": [],
+        "iosAppLaunched": precheck.get("iosAppLaunched", False),
+        "iosBleConnected": precheck.get("iosBleConnected", False),
+        "notifySubscribed": precheck.get("notifySubscribed", False),
+        "firstPlaybackStateReceived": precheck.get("firstPlaybackStateReceived", False),
+        "firstPlaybackStateLatencyMs": precheck.get("firstPlaybackStateLatencyMs", 0),
+        "precheckResult": precheck.get("precheckResult", "UNKNOWN"),
+        "precheckFailReason": precheck.get("precheckFailReason", "")
     },
     "lyricsFastPath": {
         "trackChangedCount": track_changed,
@@ -177,6 +185,7 @@ report = {
         "sonyCurrentWordPushCount": base_sony.get("currentWordPushCount", 0)
     },
     "baseCurrentWord": base_report,
+    "precheck": precheck,
     "artifacts": {
         "report_json": str(out_dir / "report.json"),
         "report_md": str(out_dir / "report.md"),

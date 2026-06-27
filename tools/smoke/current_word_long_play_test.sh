@@ -211,6 +211,22 @@ copy_ios_log() {
     2>"$OUT_DIR/devicectl_copy_$(basename "$dest").err"
 }
 
+run_ios_ble_precheck() {
+  OUT_DIR="$OUT_DIR" IOS_DEVICE_ID="$IOS_DEVICE_ID" BUNDLE_ID="$BUNDLE_ID" \
+    "$SCRIPT_DIR/ios_ble_precheck.sh" --timeout 5 --json \
+    >"$OUT_DIR/ios_ble_precheck_stdout.json" \
+    2>"$OUT_DIR/ios_ble_precheck_stderr.log"
+}
+
+precheck_json_object() {
+  if [[ -s "$OUT_DIR/ios_ble_precheck.json" ]]; then
+    cat "$OUT_DIR/ios_ble_precheck.json"
+  else
+    printf '{}'
+  fi
+}
+
+
 fail_with_report() {
   local reason="$1"
   python3 - "$OUT_DIR" "$reason" <<'PY'
@@ -236,6 +252,18 @@ payload = {
         "report_json": str(out_dir / "report.json"),
     },
 }
+precheck_path = out_dir / "ios_ble_precheck.json"
+precheck = json.loads(precheck_path.read_text()) if precheck_path.exists() else {}
+payload["precheck"] = precheck
+payload["summary"].update({
+    "iosAppLaunched": precheck.get("iosAppLaunched", False),
+    "iosBleConnected": precheck.get("iosBleConnected", False),
+    "notifySubscribed": precheck.get("notifySubscribed", False),
+    "firstPlaybackStateReceived": precheck.get("firstPlaybackStateReceived", False),
+    "firstPlaybackStateLatencyMs": precheck.get("firstPlaybackStateLatencyMs", 0),
+    "precheckResult": precheck.get("precheckResult", "FAIL" if reason == "ios_ble_not_connected" else "UNKNOWN"),
+    "precheckFailReason": precheck.get("precheckFailReason", reason if reason == "ios_ble_not_connected" else ""),
+})
 (out_dir / "report.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 (out_dir / "report.md").write_text(f"# CurrentWord Long Play Test\n\nResult: FAIL\n\n{reason}\n", encoding="utf-8")
 print(json.dumps({
@@ -252,6 +280,9 @@ if ! detect_ios; then
 fi
 if ! detect_android; then
   fail_with_report "$(cat "$OUT_DIR/android_detect_reason.txt" 2>/dev/null || echo "Android device unavailable")"
+fi
+if ! run_ios_ble_precheck; then
+  fail_with_report "ios_ble_not_connected"
 fi
 
 log "output=$OUT_DIR"
@@ -635,8 +666,20 @@ artifacts = {
     "ios_filtered": str(out_dir / "ios_current_word_filtered.log"),
     "sony_filtered": str(out_dir / "sony_current_word_filtered.log"),
 }
+precheck_path = out_dir / "ios_ble_precheck.json"
+precheck = json.loads(precheck_path.read_text()) if precheck_path.exists() else {}
+summary.update({
+    "iosAppLaunched": precheck.get("iosAppLaunched", False),
+    "iosBleConnected": precheck.get("iosBleConnected", False),
+    "notifySubscribed": precheck.get("notifySubscribed", False),
+    "firstPlaybackStateReceived": precheck.get("firstPlaybackStateReceived", False),
+    "firstPlaybackStateLatencyMs": precheck.get("firstPlaybackStateLatencyMs", 0),
+    "precheckResult": precheck.get("precheckResult", "UNKNOWN"),
+    "precheckFailReason": precheck.get("precheckFailReason", ""),
+})
 payload = {
     "summary": summary,
+    "precheck": precheck,
     "sony": sony,
     "ios": ios,
     "latency": latency,

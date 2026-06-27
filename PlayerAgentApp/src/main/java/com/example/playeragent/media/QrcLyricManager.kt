@@ -39,7 +39,14 @@ class QrcLyricManager(
     }
 
     @Synchronized
-    fun loadWithResult(title: String, artist: String, album: String): QrcLoadResult {
+    fun loadWithResult(
+        title: String,
+        artist: String,
+        album: String,
+        traceId: String = "",
+        shouldCancel: () -> Boolean = { false },
+        allowIndexRefresh: Boolean = true
+    ): QrcLoadResult {
         val normalizedTitle = normalizeForMatch(title)
         val normalizedArtist = normalizeForMatch(artist)
         val normalizedAlbum = normalizeForMatch(album)
@@ -48,7 +55,12 @@ class QrcLyricManager(
             normalizedArtist,
             normalizedAlbum
         )
+        if (shouldCancel()) {
+            trace(traceId, "qrcLookup", "result=cancelled stage=start")
+            return cancelledResult()
+        }
         if (songKey == cachedSongKey && cachedLines.isNotEmpty()) {
+            trace(traceId, "qrcL1", "result=hit reason=current memory lines=${cachedLines.size}")
             return QrcLoadResult(
                 success = true,
                 lines = cachedLines,
@@ -73,7 +85,7 @@ class QrcLyricManager(
         logger("[QrcLyric] load title=$title artist=$artist album=$album")
         logger("[QrcLyric] findBestGroup start title=$title")
 
-        cacheManager.get(title, artist, album)?.let { cached ->
+        cacheManager.get(title, artist, album, traceId, shouldCancel)?.let { cached ->
             cachedLines = cached.lines.map {
                 LyricLine(
                     timeMs = it.timeMs,
@@ -89,12 +101,22 @@ class QrcLyricManager(
                 "[QrcLyric] parsed lines=${cachedLines.size} " +
                     "totalCostMs=${System.currentTimeMillis() - startedAt}"
             )
+            trace(
+                traceId,
+                "qrcL2",
+                "result=hit groupId=${cached.groupId} lines=${cachedLines.size} " +
+                    "costMs=${System.currentTimeMillis() - startedAt}"
+            )
             return QrcLoadResult(
                 success = cachedLines.isNotEmpty(),
                 lines = cachedLines,
                 retryable = false,
                 reason = "cache hit"
             )
+        }
+        if (shouldCancel()) {
+            trace(traceId, "qrcLookup", "result=cancelled stage=cache")
+            return cancelledResult()
         }
 
         songLinesCache[songKey]?.let { lines ->
@@ -105,6 +127,12 @@ class QrcLyricManager(
                 "[QrcLyric] parsed lines=${lines.size} " +
                     "totalCostMs=${System.currentTimeMillis() - startedAt}"
             )
+            trace(
+                traceId,
+                "qrcL1",
+                "result=hit reason=song memory lines=${lines.size} " +
+                    "costMs=${System.currentTimeMillis() - startedAt}"
+            )
             return QrcLoadResult(
                 success = lines.isNotEmpty(),
                 lines = lines,
@@ -112,10 +140,15 @@ class QrcLyricManager(
                 reason = "song memory cache"
             )
         }
+        if (shouldCancel()) {
+            trace(traceId, "qrcLookup", "result=cancelled stage=songMemory")
+            return cancelledResult()
+        }
 
         if (negativeCacheManager.isNegative(songKey)) {
             cacheManager.recordNegativeHit()
             logger("[QrcLyric] best group=none score=0")
+            trace(traceId, "negative", "result=hit songKey=$songKey")
             return QrcLoadResult(
                 success = false,
                 retryable = false,
@@ -124,6 +157,7 @@ class QrcLyricManager(
         }
         if (isUncertainCooldownActive(songKey)) {
             logger("[QrcLyric] best group=none score=0")
+            trace(traceId, "cooldown", "result=hit songKey=$songKey")
             return QrcLoadResult(
                 success = false,
                 retryable = true,
@@ -131,12 +165,28 @@ class QrcLyricManager(
             )
         }
 
+        val indexStartedAt = System.currentTimeMillis()
         val entries = getIndexEntries(forceRefresh = false)
+        trace(
+            traceId,
+            "qrcIndex",
+            "result=${if (entries.isNotEmpty()) "hit" else "miss"} " +
+                "entries=${entries.size} costMs=${System.currentTimeMillis() - indexStartedAt}"
+        )
         logger("[QrcLyric] scan groups count=${entries.size}")
+        if (shouldCancel()) {
+            trace(traceId, "qrcLookup", "result=cancelled stage=qrcIndex")
+            return cancelledResult()
+        }
         if (entries.isEmpty()) {
             logger("[QrcLyric] best group=none score=0")
             logger("[QrcLyric] skip negative cache reason=no qrc entries")
             val retryable = cacheManager.isFuzzyIndexWarming()
+            trace(
+                traceId,
+                "fuzzy",
+                "result=skipped reason=${if (retryable) "fuzzy index warming" else "no qrc entries"}"
+            )
             return QrcLoadResult(
                 success = false,
                 retryable = retryable,
@@ -146,6 +196,10 @@ class QrcLyricManager(
 
         songGroupCache[songKey]?.let { groupId ->
             entries.firstOrNull { it.groupId == groupId }?.let { entry ->
+                if (shouldCancel()) {
+                    trace(traceId, "decrypt", "result=cancelled stage=group_memory")
+                    return cancelledResult()
+                }
                 val parsed = decryptAndParseQrc(entry)
                 if (parsed != null &&
                     parsedMatchesTitle(parsed, normalizedTitle)
@@ -170,20 +224,36 @@ class QrcLyricManager(
             entries = entries,
             normalizedTitle = normalizedTitle,
             normalizedArtist = normalizedArtist,
-            normalizedAlbum = normalizedAlbum
+            normalizedAlbum = normalizedAlbum,
+            shouldCancel = shouldCancel,
+            traceId = traceId
         )
+        if (shouldCancel()) {
+            trace(traceId, "qrcLookup", "result=cancelled stage=find_best_group")
+            return cancelledResult()
+        }
         if (searchResult.best == null && searchResult.producerCandidateCount == 0) {
-            val refreshedEntries = refreshIndexIfChanged(
-                reason = "no producer candidate"
-            )
-            if (refreshedEntries != null) {
+            val refreshedEntries = if (allowIndexRefresh) {
+                refreshIndexIfChanged(reason = "no producer candidate")
+            } else {
+                trace(traceId, "qrcIndex", "result=refresh_skipped reason=foreground_no_producer_candidate")
+                persistentIndexManager.rebuildAsync("foreground no producer candidate")
+                null
+            }
+            if (refreshedEntries != null && !shouldCancel()) {
                 logger("[QrcLyric] retry after index refresh")
                 searchResult = findBestGroup(
                     entries = refreshedEntries,
                     normalizedTitle = normalizedTitle,
                     normalizedArtist = normalizedArtist,
-                    normalizedAlbum = normalizedAlbum
+                    normalizedAlbum = normalizedAlbum,
+                    shouldCancel = shouldCancel,
+                    traceId = traceId
                 )
+                if (shouldCancel()) {
+                    trace(traceId, "qrcLookup", "result=cancelled stage=find_best_group_refresh")
+                    return cancelledResult()
+                }
             }
         }
         val best = searchResult.best
@@ -196,21 +266,32 @@ class QrcLyricManager(
             saveUncertainCooldown(songKey)
             val retryable = searchResult.producerCandidateCount == 0 ||
                 cacheManager.isFuzzyIndexWarming()
+            val reason = if (retryable && searchResult.producerCandidateCount == 0) {
+                "waiting qqmusic lyric cache"
+            } else {
+                "no safe qrc candidate"
+            }
+            trace(
+                traceId,
+                "fuzzy",
+                "result=miss reason=$reason producerCandidates=${searchResult.producerCandidateCount}"
+            )
             return QrcLoadResult(
                 success = false,
                 retryable = retryable,
-                reason = if (retryable && searchResult.producerCandidateCount == 0) {
-                    "waiting qqmusic lyric cache"
-                } else {
-                    "no safe qrc candidate"
-                }
+                reason = reason
             )
         }
 
+        if (shouldCancel()) {
+            trace(traceId, "decrypt", "result=cancelled stage=best")
+            return cancelledResult()
+        }
         val parsed = best.parsed ?: decryptAndParseQrc(best.entry)
         if (parsed == null || !parsedMatchesTitle(parsed, normalizedTitle)) {
             logger("[QrcLyric] best group=none score=0")
             logger("[QrcLyric] skip negative cache reason=decrypt unconfirmed")
+            trace(traceId, "decrypt", "result=fail reason=decrypt unconfirmed")
             return QrcLoadResult(
                 success = false,
                 retryable = false,
@@ -231,11 +312,106 @@ class QrcLyricManager(
             "[QrcLyric] parsed lines=${cachedLines.size} " +
                 "totalCostMs=${System.currentTimeMillis() - startedAt}"
         )
+        trace(
+            traceId,
+            "decrypt",
+            "result=success groupId=${best.entry.groupId} " +
+                "lines=${cachedLines.size} costMs=${System.currentTimeMillis() - startedAt}"
+        )
         return QrcLoadResult(
             success = cachedLines.isNotEmpty(),
             lines = cachedLines,
             retryable = false,
             reason = "qrc parsed"
+        )
+    }
+
+    @Synchronized
+    fun loadCacheOnlyWithResult(
+        title: String,
+        artist: String,
+        album: String,
+        traceId: String = "",
+        shouldCancel: () -> Boolean = { false }
+    ): QrcLoadResult {
+        val normalizedTitle = normalizeForMatch(title)
+        val normalizedArtist = normalizeForMatch(artist)
+        val normalizedAlbum = normalizeForMatch(album)
+        val songKey = buildSongKey(
+            normalizedTitle,
+            normalizedArtist,
+            normalizedAlbum
+        )
+        if (shouldCancel()) {
+            trace(traceId, "qrcLookup", "result=cancelled stage=cache_only_start")
+            return cancelledResult()
+        }
+        if (songKey == cachedSongKey && cachedLines.isNotEmpty()) {
+            trace(traceId, "qrcL1", "result=hit reason=current memory cacheOnly=true lines=${cachedLines.size}")
+            return QrcLoadResult(
+                success = true,
+                lines = cachedLines,
+                retryable = false,
+                reason = "memory cache"
+            )
+        }
+        cacheManager.getExactOrAlias(title, artist, album, traceId, shouldCancel)?.let { cached ->
+            cachedLines = cached.lines.map {
+                LyricLine(
+                    timeMs = it.timeMs,
+                    text = it.text,
+                    durationMs = it.durationMs,
+                    words = it.words,
+                    translation = it.translation,
+                    romanization = it.romanization
+                )
+            }
+            cachedGroupId = cached.groupId
+            trace(
+                traceId,
+                "qrcL2",
+                "result=hit reason=cache_only groupId=${cached.groupId} lines=${cachedLines.size}"
+            )
+            return QrcLoadResult(
+                success = cachedLines.isNotEmpty(),
+                lines = cachedLines,
+                retryable = false,
+                reason = "cache only hit"
+            )
+        }
+        songLinesCache[songKey]?.let { lines ->
+            cachedLines = lines
+            cachedGroupId = songGroupCache[songKey]
+            trace(traceId, "qrcL1", "result=hit reason=song memory cacheOnly=true lines=${lines.size}")
+            return QrcLoadResult(
+                success = lines.isNotEmpty(),
+                lines = lines,
+                retryable = false,
+                reason = "song memory cache"
+            )
+        }
+        trace(traceId, "qrcLookup", "result=miss reason=cache_only_miss")
+        return QrcLoadResult(
+            success = false,
+            lines = emptyList(),
+            retryable = true,
+            reason = "cache only miss"
+        )
+    }
+
+    private fun trace(id: String, stage: String, detail: String) {
+        if (id.isBlank()) {
+            return
+        }
+        logger("[LyricTrace] id=$id stage=$stage $detail")
+    }
+
+    private fun cancelledResult(): QrcLoadResult {
+        return QrcLoadResult(
+            success = false,
+            lines = emptyList(),
+            retryable = false,
+            reason = "stale task"
         )
     }
 
@@ -328,14 +504,21 @@ class QrcLyricManager(
         entries: List<QrcGroupIndexEntry>,
         normalizedTitle: String,
         normalizedArtist: String,
-        normalizedAlbum: String
+        normalizedAlbum: String,
+        shouldCancel: () -> Boolean = { false },
+        traceId: String = ""
     ): SearchResult {
         val startedAt = System.currentTimeMillis()
         val now = System.currentTimeMillis()
-        val producerCandidates = entries.mapNotNull { entry ->
+        val producerCandidates = mutableListOf<ScoredGroup>()
+        for (entry in entries) {
+            if (shouldCancel()) {
+                trace(traceId, "qrcLookup", "result=cancelled stage=producer_candidates")
+                return SearchResult(best = null, producerCandidateCount = producerCandidates.size)
+            }
             val producerText = entry.normalizedProducerText
             if (!containsNormalized(producerText, normalizedTitle)) {
-                return@mapNotNull null
+                continue
             }
 
             var score = 100
@@ -351,39 +534,42 @@ class QrcLyricManager(
             if (entry.hasQrc) score += 10
             if (entry.hasTranslrc) score += 5
             if (entry.hasRomaqrc) score += 5
-            ScoredGroup(entry = entry, score = score)
-        }.sortedWith(
+            producerCandidates += ScoredGroup(entry = entry, score = score)
+        }
+        val sortedProducerCandidates = producerCandidates.sortedWith(
             compareByDescending<ScoredGroup> { it.score }
                 .thenByDescending { it.entry.lastModified }
         )
 
         val producerCostMs = System.currentTimeMillis() - startedAt
         logger(
-            "[QrcLyric] producer match candidates=${producerCandidates.size} " +
+            "[QrcLyric] producer match candidates=${sortedProducerCandidates.size} " +
                 "costMs=$producerCostMs"
         )
 
         val confirmStartedAt = System.currentTimeMillis()
-        val producerConfirmCandidates = producerCandidates
+        val producerConfirmCandidates = sortedProducerCandidates
             .take(DECRYPT_CONFIRM_CANDIDATES)
         var confirmed = confirmCandidates(
             candidates = producerConfirmCandidates,
             normalizedTitle = normalizedTitle,
-            normalizedArtist = normalizedArtist
+            normalizedArtist = normalizedArtist,
+            shouldCancel = shouldCancel,
+            traceId = traceId
         )
         logger(
             "[QrcLyric] decrypt confirm candidates=${producerConfirmCandidates.size} " +
                 "costMs=${System.currentTimeMillis() - confirmStartedAt}"
         )
 
-        if (confirmed == null) {
+        if (confirmed == null && !shouldCancel()) {
             val fallbackStartedAt = System.currentTimeMillis()
             val attemptedGroupIds = producerConfirmCandidates
                 .map { it.entry.groupId }
                 .toSet()
             val fallbackCount = if (
                 normalizedTitle.isNotBlank() &&
-                producerCandidates.isEmpty() &&
+                sortedProducerCandidates.isEmpty() &&
                 hasRecentQrcFiles(entries)
             ) {
                 RECENT_FALLBACK_DECRYPT_CANDIDATES
@@ -404,7 +590,9 @@ class QrcLyricManager(
             confirmed = confirmCandidates(
                 candidates = fallbackCandidates,
                 normalizedTitle = normalizedTitle,
-                normalizedArtist = normalizedArtist
+                normalizedArtist = normalizedArtist,
+                shouldCancel = shouldCancel,
+                traceId = traceId
             )
             logger(
                 "[QrcLyric] fallback decrypt candidates=${fallbackCandidates.size} " +
@@ -413,7 +601,7 @@ class QrcLyricManager(
         }
         return SearchResult(
             best = confirmed,
-            producerCandidateCount = producerCandidates.size
+            producerCandidateCount = sortedProducerCandidates.size
         )
     }
 
@@ -441,9 +629,19 @@ class QrcLyricManager(
     private fun confirmCandidates(
         candidates: List<ScoredGroup>,
         normalizedTitle: String,
-        normalizedArtist: String
+        normalizedArtist: String,
+        shouldCancel: () -> Boolean = { false },
+        traceId: String = ""
     ): ScoredGroup? {
         candidates.forEach { candidate ->
+            if (shouldCancel()) {
+                trace(
+                    traceId,
+                    "decrypt",
+                    "result=cancelled stage=confirm_candidates groupId=${candidate.entry.groupId}"
+                )
+                return null
+            }
             val parsed = decryptAndParseQrc(candidate.entry) ?: return@forEach
             if (!parsedMatchesTitle(parsed, normalizedTitle)) {
                 return@forEach

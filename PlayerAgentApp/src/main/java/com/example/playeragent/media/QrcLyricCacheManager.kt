@@ -33,19 +33,42 @@ class QrcLyricCacheManager(
     private var indexFileCount: Int = -1
 
     @Synchronized
-    fun get(title: String, artist: String, album: String): ParsedLyric? {
+    fun get(
+        title: String,
+        artist: String,
+        album: String,
+        traceId: String = "",
+        shouldCancel: () -> Boolean = { false }
+    ): ParsedLyric? {
+        val startedAt = System.currentTimeMillis()
         sharedQueryCount += 1
         val songKey = QrcLyricUtils.buildSongKey(title, artist, album)
+        if (shouldCancel()) {
+            trace(traceId, "qrcCache", "result=cancelled stage=start")
+            return null
+        }
         memoryCache[songKey]?.let {
             sharedStats.l1Hit += 1
             sharedStats.lastSource = "L1"
             maybeLogStats()
             logger("[QrcCache] L1 hit songKey=$songKey")
+            trace(traceId, "qrcL1", "result=hit songKey=$songKey costMs=${System.currentTimeMillis() - startedAt}")
             return it
         }
 
+        val aliasStartedAt = System.currentTimeMillis()
+        if (shouldCancel()) {
+            trace(traceId, "qrcCache", "result=cancelled stage=alias")
+            return null
+        }
         val aliasTarget = aliasCacheManager.getAlias(songKey)
         if (!aliasTarget.isNullOrBlank()) {
+            trace(
+                traceId,
+                "alias",
+                "result=hit source=$songKey target=$aliasTarget " +
+                    "costMs=${System.currentTimeMillis() - aliasStartedAt}"
+            )
             memoryCache[aliasTarget]?.let { aliased ->
                 val copy = aliased.copy(songKey = songKey)
                 memoryCache[songKey] = copy
@@ -53,6 +76,12 @@ class QrcLyricCacheManager(
                 sharedStats.lastSource = "ALIAS"
                 maybeLogStats()
                 logger("[QrcCache] L1 hit songKey=$aliasTarget")
+                trace(
+                    traceId,
+                    "qrcL1",
+                    "result=hit reason=alias target=$aliasTarget " +
+                        "costMs=${System.currentTimeMillis() - startedAt}"
+                )
                 return copy
             }
             val aliasedDisk = readBySongKey(aliasTarget)
@@ -63,11 +92,29 @@ class QrcLyricCacheManager(
                 sharedStats.lastSource = "ALIAS"
                 maybeLogStats()
                 logger("[QrcCache] L2 hit songKey=$aliasTarget")
+                trace(
+                    traceId,
+                    "qrcL2",
+                    "result=hit reason=alias target=$aliasTarget " +
+                        "costMs=${System.currentTimeMillis() - startedAt}"
+                )
                 return copy
             }
             aliasCacheManager.removeAlias(songKey)
+            trace(traceId, "alias", "result=miss reason=invalid target=$aliasTarget")
+        } else {
+            trace(
+                traceId,
+                "alias",
+                "result=miss costMs=${System.currentTimeMillis() - aliasStartedAt}"
+            )
         }
 
+        val diskStartedAt = System.currentTimeMillis()
+        if (shouldCancel()) {
+            trace(traceId, "qrcCache", "result=cancelled stage=L2")
+            return null
+        }
         val disk = readBySongKey(songKey)
         if (disk != null) {
             memoryCache[songKey] = disk
@@ -75,10 +122,21 @@ class QrcLyricCacheManager(
             sharedStats.lastSource = "L2"
             maybeLogStats()
             logger("[QrcCache] L2 hit songKey=$songKey")
+            trace(
+                traceId,
+                "qrcL2",
+                "result=hit songKey=$songKey costMs=${System.currentTimeMillis() - diskStartedAt}"
+            )
             return disk
         }
+        trace(
+            traceId,
+            "qrcL2",
+            "result=miss songKey=$songKey costMs=${System.currentTimeMillis() - diskStartedAt}"
+        )
 
-        val fuzzy = findFuzzy(title, artist, album, songKey)
+        val fuzzyStartedAt = System.currentTimeMillis()
+        val fuzzy = findFuzzy(title, artist, album, songKey, traceId, shouldCancel)
         if (fuzzy != null) {
             val alias = fuzzy.parsed.copy(
                 songKey = songKey,
@@ -100,12 +158,98 @@ class QrcLyricCacheManager(
                     "artist=${fuzzy.parsed.artist} album=${fuzzy.parsed.album}"
             )
             logger("[QrcCache] lines=${fuzzy.parsed.lines.size}")
+            trace(
+                traceId,
+                "fuzzy",
+                "result=hit score=${fuzzy.score} matched=${fuzzy.parsed.songKey} " +
+                    "lines=${fuzzy.parsed.lines.size} costMs=${System.currentTimeMillis() - fuzzyStartedAt}"
+            )
             return alias
         }
 
         logger("[QrcCache] miss songKey=$songKey")
         sharedStats.lastSource = "NONE"
         maybeLogStats()
+        trace(
+            traceId,
+            "fuzzy",
+            "result=miss songKey=$songKey costMs=${System.currentTimeMillis() - fuzzyStartedAt}"
+        )
+        return null
+    }
+
+    @Synchronized
+    fun getExactOrAlias(
+        title: String,
+        artist: String,
+        album: String,
+        traceId: String = "",
+        shouldCancel: () -> Boolean = { false }
+    ): ParsedLyric? {
+        val startedAt = System.currentTimeMillis()
+        val songKey = QrcLyricUtils.buildSongKey(title, artist, album)
+        if (shouldCancel()) {
+            trace(traceId, "qrcCache", "result=cancelled stage=exact_start")
+            return null
+        }
+        memoryCache[songKey]?.let {
+            sharedStats.l1Hit += 1
+            sharedStats.lastSource = "L1"
+            maybeLogStats()
+            logger("[QrcCache] L1 hit songKey=$songKey")
+            trace(traceId, "qrcL1", "result=hit songKey=$songKey costMs=${System.currentTimeMillis() - startedAt}")
+            return it
+        }
+
+        val aliasTarget = aliasCacheManager.getAlias(songKey)
+        if (!aliasTarget.isNullOrBlank()) {
+            trace(traceId, "alias", "result=hit source=$songKey target=$aliasTarget")
+            memoryCache[aliasTarget]?.let { aliased ->
+                val copy = aliased.copy(songKey = songKey)
+                memoryCache[songKey] = copy
+                sharedStats.aliasHit += 1
+                sharedStats.lastSource = "ALIAS"
+                maybeLogStats()
+                logger("[QrcCache] L1 hit songKey=$aliasTarget")
+                trace(traceId, "qrcL1", "result=hit reason=alias target=$aliasTarget")
+                return copy
+            }
+            if (shouldCancel()) {
+                trace(traceId, "qrcCache", "result=cancelled stage=alias_L2")
+                return null
+            }
+            val aliasedDisk = readBySongKey(aliasTarget)
+            if (aliasedDisk != null) {
+                val copy = aliasedDisk.copy(songKey = songKey)
+                memoryCache[songKey] = copy
+                sharedStats.aliasHit += 1
+                sharedStats.lastSource = "ALIAS"
+                maybeLogStats()
+                logger("[QrcCache] L2 hit songKey=$aliasTarget")
+                trace(traceId, "qrcL2", "result=hit reason=alias target=$aliasTarget")
+                return copy
+            }
+            aliasCacheManager.removeAlias(songKey)
+            trace(traceId, "alias", "result=miss reason=invalid target=$aliasTarget")
+        } else {
+            trace(traceId, "alias", "result=miss")
+        }
+
+        if (shouldCancel()) {
+            trace(traceId, "qrcCache", "result=cancelled stage=exact_L2")
+            return null
+        }
+        val disk = readBySongKey(songKey)
+        if (disk != null) {
+            memoryCache[songKey] = disk
+            sharedStats.l2Hit += 1
+            sharedStats.lastSource = "L2"
+            maybeLogStats()
+            logger("[QrcCache] L2 hit songKey=$songKey")
+            trace(traceId, "qrcL2", "result=hit songKey=$songKey costMs=${System.currentTimeMillis() - startedAt}")
+            return disk
+        }
+        trace(traceId, "qrcL2", "result=miss songKey=$songKey costMs=${System.currentTimeMillis() - startedAt}")
         return null
     }
 
@@ -375,26 +519,52 @@ class QrcLyricCacheManager(
         title: String,
         artist: String,
         album: String,
-        currentSongKey: String
+        currentSongKey: String,
+        traceId: String = "",
+        shouldCancel: () -> Boolean = { false }
     ): FuzzyMatch? {
+        val startedAt = System.currentTimeMillis()
+        if (shouldCancel()) {
+            trace(traceId, "fuzzy", "result=cancelled stage=start")
+            return null
+        }
         val currentTitle = QrcLyricUtils.normalizeForMatch(title)
         if (currentTitle.length < MIN_FUZZY_TITLE_LENGTH ||
             GENERIC_TITLES.contains(currentTitle)
         ) {
             logger("[QrcCache] fuzzy rejected reason=bad title")
+            trace(traceId, "fuzzy", "result=skipped reason=bad_title costMs=${System.currentTimeMillis() - startedAt}")
             return null
         }
         val currentArtistTokens = QrcLyricUtils.splitArtists(artist)
         val currentAlbum = QrcLyricUtils.normalizeForMatch(album)
         val entries = ensureIndex()
-        val candidates = entries.mapNotNull { entry ->
+        if (shouldCancel()) {
+            trace(traceId, "fuzzy", "result=cancelled stage=index")
+            return null
+        }
+        if (entries.isEmpty()) {
+            trace(
+                traceId,
+                "fuzzy",
+                "result=skipped reason=index_unavailable costMs=${System.currentTimeMillis() - startedAt}"
+            )
+            return null
+        }
+        val scoredCandidates = mutableListOf<Pair<CacheIndexEntry, Int>>()
+        for (entry in entries) {
+            if (shouldCancel()) {
+                trace(traceId, "fuzzy", "result=cancelled stage=scoring costMs=${System.currentTimeMillis() - startedAt}")
+                return null
+            }
             scoreEntry(
                 entry = entry,
                 currentTitle = currentTitle,
                 currentArtistTokens = currentArtistTokens,
                 currentAlbum = currentAlbum
-            )?.let { score -> entry to score }
-        }.sortedWith(
+            )?.let { score -> scoredCandidates += entry to score }
+        }
+        val candidates = scoredCandidates.sortedWith(
             compareByDescending<Pair<CacheIndexEntry, Int>> { it.second }
                 .thenByDescending { it.first.linesCount }
                 .thenByDescending { it.first.createdAt }
@@ -403,15 +573,28 @@ class QrcLyricCacheManager(
         val best = candidates.firstOrNull()
         if (best == null) {
             logger("[QrcCache] fuzzy rejected reason=no candidate")
+            trace(traceId, "fuzzy", "result=miss reason=no_candidate costMs=${System.currentTimeMillis() - startedAt}")
             return null
         }
         val second = candidates.getOrNull(1)
         if (second != null && best.second - second.second < MIN_SCORE_GAP) {
             logger("[QrcCache] fuzzy rejected reason=ambiguous")
+            trace(
+                traceId,
+                "fuzzy",
+                "result=miss reason=ambiguous best=${best.second} second=${second.second} " +
+                    "costMs=${System.currentTimeMillis() - startedAt}"
+            )
             return null
         }
         if (best.second < MIN_FUZZY_SCORE) {
             logger("[QrcCache] fuzzy rejected reason=low score")
+            trace(
+                traceId,
+                "fuzzy",
+                "result=miss reason=low_score score=${best.second} " +
+                    "costMs=${System.currentTimeMillis() - startedAt}"
+            )
             return null
         }
 
@@ -420,12 +603,22 @@ class QrcLyricCacheManager(
         val titleExact = best.first.normalizedTitle == currentTitle
         if (!artistMatched && !(candidates.size == 1 && titleExact)) {
             logger("[QrcCache] fuzzy rejected reason=artist mismatch")
+            trace(
+                traceId,
+                "fuzzy",
+                "result=miss reason=artist_mismatch score=${best.second} " +
+                    "costMs=${System.currentTimeMillis() - startedAt}"
+            )
             return null
         }
         if (!artistMatched) {
             logger("[QrcCache] fuzzy warning artist not matched currentSongKey=$currentSongKey")
         }
 
+        if (shouldCancel()) {
+            trace(traceId, "fuzzy", "result=cancelled stage=read costMs=${System.currentTimeMillis() - startedAt}")
+            return null
+        }
         val readResult = readCacheFileDetailed(
             file = best.first.file,
             expectedSongKey = null,
@@ -438,10 +631,17 @@ class QrcLyricCacheManager(
                 cachedSongKey = best.first.songKey,
                 exceptionSummary = readResult.exceptionSummary
             )
+            trace(
+                traceId,
+                "fuzzy",
+                "result=miss reason=read_failed score=${best.second} " +
+                    "costMs=${System.currentTimeMillis() - startedAt}"
+            )
             return null
         }
         if (parsed.lines.isEmpty()) {
             logFuzzyRejected("lines empty", best.first.file, best.first.songKey)
+            trace(traceId, "fuzzy", "result=miss reason=lines_empty costMs=${System.currentTimeMillis() - startedAt}")
             return null
         }
         val parsedTitle = QrcLyricUtils.normalizeForMatch(parsed.title)
@@ -451,6 +651,7 @@ class QrcLyricCacheManager(
                 currentTitle.contains(parsedTitle))
         if (!titleMatches) {
             logFuzzyRejected("title mismatch after read", best.first.file, parsed.songKey)
+            trace(traceId, "fuzzy", "result=miss reason=title_mismatch_after_read costMs=${System.currentTimeMillis() - startedAt}")
             return null
         }
         val parsedArtistTokens = QrcLyricUtils.splitArtists(parsed.artist)
@@ -458,6 +659,7 @@ class QrcLyricCacheManager(
             artistTokenHitCount(currentArtistTokens, parsedArtistTokens) > 0
         if (!parsedArtistMatched && !(candidates.size == 1 && titleExact)) {
             logFuzzyRejected("artist mismatch after read", best.first.file, parsed.songKey)
+            trace(traceId, "fuzzy", "result=miss reason=artist_mismatch_after_read costMs=${System.currentTimeMillis() - startedAt}")
             return null
         }
         if (readResult.staleReason != null) {
@@ -467,6 +669,13 @@ class QrcLyricCacheManager(
             )
         }
         return FuzzyMatch(parsed, best.second)
+    }
+
+    private fun trace(id: String, stage: String, detail: String) {
+        if (id.isBlank()) {
+            return
+        }
+        logger("[LyricTrace] id=$id stage=$stage $detail")
     }
 
     private fun readCacheFileDetailed(

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.musicble.ios-reinstall</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO_ROOT__/tools/deploy/ios_reinstall_if_needed.sh</string>
+    <string>--threshold-hours</string>
+    <string>48</string>
+    <string>__OPTIONAL_DEVICE_ARGS__</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>21</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>__REPO_ROOT__</string>
+  <key>StandardOutPath</key>
+  <string>/tmp/music_ble_deploy/ios-reinstall.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/music_ble_deploy/ios-reinstall.err.log</string>
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

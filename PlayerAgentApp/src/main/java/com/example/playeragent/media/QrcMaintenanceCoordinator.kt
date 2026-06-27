@@ -2,6 +2,7 @@ package com.example.playeragent.media
 
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.CopyOnWriteArrayList
 
 enum class MaintenanceTaskType {
     LYRIC_WARMUP,
@@ -50,6 +51,7 @@ data class MaintenanceSnapshot(
 object QrcMaintenanceCoordinator {
     private val nextId = AtomicLong(1L)
     private val current = AtomicReference<MaintenanceToken?>(null)
+    private val finishListeners = CopyOnWriteArrayList<(MaintenanceToken) -> Unit>()
 
     fun tryStart(
         type: MaintenanceTaskType,
@@ -80,6 +82,9 @@ object QrcMaintenanceCoordinator {
                 "[QrcMaintenance] finish type=${token.type} " +
                     "costMs=${System.currentTimeMillis() - token.startedAt}"
             )
+            finishListeners.forEach { listener ->
+                runCatching { listener(token) }
+            }
         }
     }
 
@@ -98,6 +103,10 @@ object QrcMaintenanceCoordinator {
     fun isRunning(): Boolean = current.get() != null
 
     fun currentToken(): MaintenanceToken? = current.get()
+
+    fun addFinishListener(listener: (MaintenanceToken) -> Unit) {
+        finishListeners += listener
+    }
 
     fun snapshot(): MaintenanceSnapshot {
         val token = current.get()

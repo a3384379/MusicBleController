@@ -98,6 +98,7 @@ class PlaybackStateReader(
         val artist = metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty()
         val album = metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM).orEmpty()
         val duration = metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
+        val mediaId = metadata?.getString(MediaMetadata.METADATA_KEY_MEDIA_ID).orEmpty()
         val currentTrack = predictiveTrack(
             trackId = buildTrackId(title, artist, album),
             title = title,
@@ -106,6 +107,33 @@ class PlaybackStateReader(
             durationMs = duration
         )
         lastTrackId = currentTrack.trackId
+        TrackCapabilityTracker.onTrackSeen(
+            trackId = lastTrackId,
+            protocolId = lastTrackId,
+            title = title,
+            artist = artist,
+            album = album,
+            durationMs = duration,
+            mediaId = mediaId,
+            packageName = selected.packageName.orEmpty(),
+            sourceApp = sourceAppName(selected.packageName.orEmpty())
+        )
+        TrackCapabilityTracker.onMediaMetadata(
+            trackId = lastTrackId,
+            protocolId = lastTrackId,
+            hasBitmap = metadata?.getBitmap(MediaMetadata.METADATA_KEY_ART) != null ||
+                metadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART) != null ||
+                metadata?.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON) != null,
+            hasIconUri = metadata?.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI)
+                .orEmpty()
+                .isNotBlank(),
+            hasAlbumArtUri = metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
+                .orEmpty()
+                .isNotBlank() ||
+                metadata?.getString(MediaMetadata.METADATA_KEY_ART_URI)
+                    .orEmpty()
+                    .isNotBlank()
+        )
         observeTrackTransition(currentTrack)
         if (duration <= 0L && !durationMissingLogged) {
             durationMissingLogged = true
@@ -388,6 +416,14 @@ class PlaybackStateReader(
             .digest(source.toByteArray(Charsets.UTF_8))
             .take(TRACK_ID_HASH_BYTES)
             .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    }
+
+    private fun sourceAppName(packageName: String): String {
+        return when {
+            packageName.contains("qqmusic", ignoreCase = true) -> "QQ音乐"
+            packageName.isBlank() -> "unknown"
+            else -> packageName
+        }
     }
 
     private fun buildLyricSongKey(

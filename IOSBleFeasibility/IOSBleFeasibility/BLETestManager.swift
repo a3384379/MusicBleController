@@ -226,6 +226,10 @@ final class BLETestManager: NSObject, ObservableObject {
     private var fullLyricsChunks: [Int: LyricLine] = [:]
     private var fullLyricsTimeoutWorkItem: DispatchWorkItem?
     private var lastFullLyricsPartialPublishAtMs: Int64 = 0
+    private var lyricTraceTrackInfoAtMs: [String: Int64] = [:]
+    private var lyricTraceFullLyricsRequestAtMs: [String: Int64] = [:]
+    private var lyricTraceFullLyricsStartAtMs: [String: Int64] = [:]
+    private var lyricTraceFirstPlaybackLyricAtMs: [String: Int64] = [:]
     private var remoteLogExpectedChunks = 0
     private var remoteLogExpectedLines = 0
     private var remoteLogChunks: [Int: Data] = [:]
@@ -408,10 +412,69 @@ final class BLETestManager: NSObject, ObservableObject {
         if arguments.contains("--smoke-control-e2e") {
             scheduleControlE2ESmokeTest()
         }
+        if arguments.contains("--smoke-source-capability") {
+            scheduleSourceCapabilitySmokeTest()
+        }
         #endif
     }
 
     #if DEBUG
+    private func scheduleSourceCapabilitySmokeTest() {
+        log("[SourceCapabilitySmoke] scheduled")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.runSourceCapabilityWhenReady(attempt: 0)
+        }
+    }
+
+    private func runSourceCapabilityWhenReady(attempt: Int) {
+        let ready = sonyPeripheral?.state == .connected &&
+            sonyCommandCharacteristic != nil &&
+            sonyStatusCharacteristic != nil &&
+            isConnectionHealthyOrSuspect
+        guard ready else {
+            if attempt >= 40 {
+                log(
+                    "[SourceCapabilitySmoke] abort reason=not_ready " +
+                        "attempt=\(attempt) connected=\(sonyPeripheral?.state == .connected) " +
+                        "commandReady=\(sonyCommandCharacteristic != nil) " +
+                        "statusReady=\(sonyStatusCharacteristic != nil) " +
+                        "health=\(connectionHealthState)"
+                )
+                return
+            }
+            log(
+                "[SourceCapabilitySmoke] waiting connection attempt=\(attempt) " +
+                    "connected=\(sonyPeripheral?.state == .connected) " +
+                    "commandReady=\(sonyCommandCharacteristic != nil) " +
+                    "statusReady=\(sonyStatusCharacteristic != nil) " +
+                    "health=\(connectionHealthState)"
+            )
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.runSourceCapabilityWhenReady(attempt: attempt + 1)
+            }
+            return
+        }
+        runSourceCapabilitySequence()
+    }
+
+    private func runSourceCapabilitySequence() {
+        log("[SourceCapabilitySmoke] start")
+        for index in 0..<5 {
+            let delay = TimeInterval(index * 30)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                self.log(
+                    "[SourceCapabilitySmoke] sample=\(index + 1) " +
+                        "trackId=\(self.currentTrackID) title=\(self.title.prefix(40))"
+                )
+                self.sendGetPlaybackState()
+                self.sendGetFullLyrics(force: true)
+                let requested = self.requestCurrentHqAlbumArt()
+                self.log("[SourceCapabilitySmoke] albumArt request result=\(requested)")
+            }
+        }
+    }
+
     private func scheduleControlE2ESmokeTest() {
         log("[ControlE2E] scheduled")
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
@@ -3036,6 +3099,21 @@ extension BLETestManager: CBPeripheralDelegate {
                 self.updateLightweightLyricDiagnostic(from: object)
                 if let lyric = object["lyric"] as? String {
                     self.lyric = lyric
+                    let lyricEmpty = lyric.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    if !self.currentTrackID.isEmpty {
+                        let nowMs = self.currentTimeMs()
+                        var details =
+                            "[LyricTrace-iOS] id=\(self.currentTrackID) " +
+                            "stage=playbackStateLyric lyricEmpty=\(lyricEmpty)"
+                        if !lyricEmpty,
+                           self.lyricTraceFirstPlaybackLyricAtMs[self.currentTrackID] == nil {
+                            self.lyricTraceFirstPlaybackLyricAtMs[self.currentTrackID] = nowMs
+                            if let trackAt = self.lyricTraceTrackInfoAtMs[self.currentTrackID] {
+                                details += " sinceTrackInfoMs=\(nowMs - trackAt)"
+                            }
+                        }
+                        self.log(details)
+                    }
                     let scheduledDelayedRetry = self.retryFullLyricsIfLyricsBecameAvailable(
                         oldLyric: oldLyric,
                         newLyric: lyric
@@ -3545,6 +3623,12 @@ extension BLETestManager: CBPeripheralDelegate {
         album = newAlbum
         if !trackID.isEmpty {
             currentTrackID = trackID
+            let nowMs = currentTimeMs()
+            lyricTraceTrackInfoAtMs[trackID] = nowMs
+            log(
+                "[LyricTrace-iOS] id=\(trackID) stage=trackInfoReceived " +
+                    "title=\(newTitle.prefix(32)) artist=\(newArtist.prefix(32)) t=\(nowMs)"
+            )
             albumArtReceiver.handleIdentity(id: trackID)
             requestFullLyricsIfNeeded(after: isInStartupLoadWindow() ? 0.9 : 0.3)
         }
@@ -3731,6 +3815,15 @@ extension BLETestManager: CBPeripheralDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             guard self.currentTrackID == trackID else { return }
+            let nowMs = self.currentTimeMs()
+            self.lyricTraceFullLyricsRequestAtMs[trackID] = nowMs
+            var detail =
+                "[LyricTrace-iOS] id=\(trackID) stage=requestFullLyrics " +
+                "positionMs=\(self.displayPositionMs)"
+            if let trackAt = self.lyricTraceTrackInfoAtMs[trackID] {
+                detail += " sinceTrackInfoMs=\(nowMs - trackAt)"
+            }
+            self.log(detail)
             self.log("[LyricsPerf] request fullLyrics trackId=\(trackID)")
             self.sendCommand(
                 cmd: "GET_FULL_LYRICS",
@@ -3783,6 +3876,15 @@ extension BLETestManager: CBPeripheralDelegate {
         fullLyricsChunks.removeAll()
         isFullLyricsReceiving = true
         lastFullLyricsPartialPublishAtMs = 0
+        let nowMs = currentTimeMs()
+        lyricTraceFullLyricsStartAtMs[trackID] = nowMs
+        var traceDetail =
+            "[LyricTrace-iOS] id=\(trackID) stage=fullLyricsStart " +
+            "count=\(fullLyricsExpectedCount)"
+        if let requestAt = lyricTraceFullLyricsRequestAtMs[trackID] {
+            traceDetail += " sinceRequestMs=\(nowMs - requestAt)"
+        }
+        log(traceDetail)
         log("[FullLyrics] start trackId=\(trackID) count=\(fullLyricsExpectedCount)")
         log("[LyricsPerf] receive start count=\(fullLyricsExpectedCount)")
 
@@ -3839,6 +3941,17 @@ extension BLETestManager: CBPeripheralDelegate {
             fullLyricsChunks[$0]
         }
         if lines.count == fullLyricsExpectedCount {
+            let nowMs = currentTimeMs()
+            var traceDetail =
+                "[LyricTrace-iOS] id=\(trackID) stage=fullLyricsFinal " +
+                "lines=\(lines.count)"
+            if let requestAt = lyricTraceFullLyricsRequestAtMs[trackID] {
+                traceDetail += " sinceRequestMs=\(nowMs - requestAt)"
+            }
+            if let startAt = lyricTraceFullLyricsStartAtMs[trackID] {
+                traceDetail += " receiveCostMs=\(nowMs - startAt)"
+            }
+            log(traceDetail)
             publishFullLyrics(
                 lines: lines,
                 trackID: trackID,
@@ -4188,6 +4301,17 @@ extension BLETestManager: CBPeripheralDelegate {
         fullLyrics = sortedLines
         fullLyricsTrackId = trackID
         isFullLyricsCurrent = true
+        let nowMs = currentTimeMs()
+        var traceDetail =
+            "[LyricTrace-iOS] id=\(trackID) stage=uiPublished " +
+            "lines=\(sortedLines.count) final=\(isFinal)"
+        if let trackAt = lyricTraceTrackInfoAtMs[trackID] {
+            traceDetail += " sinceTrackInfoMs=\(nowMs - trackAt)"
+        }
+        if let requestAt = lyricTraceFullLyricsRequestAtMs[trackID] {
+            traceDetail += " sinceRequestMs=\(nowMs - requestAt)"
+        }
+        log(traceDetail)
         let wordsCount = sortedLines.reduce(0) { $0 + $1.words.count }
         let transCount = sortedLines.filter { sanitizedSecondaryText($0.translation) != nil }.count
         let romaCount = sortedLines.filter { sanitizedSecondaryText($0.romanization) != nil }.count
@@ -4217,6 +4341,10 @@ extension BLETestManager: CBPeripheralDelegate {
             log(
                 "[Lyrics-iOS] currentWord discarded stale trackId=\(trackID) " +
                     "current=\(currentTrackID)"
+            )
+            log(
+                "[CurrentWordFence] stale discard trackId=\(trackID) " +
+                    "currentTrackId=\(currentTrackID)"
             )
             if isInReconnectStateSyncWindow() {
                 log(

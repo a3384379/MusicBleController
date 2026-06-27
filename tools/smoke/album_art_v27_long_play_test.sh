@@ -97,6 +97,7 @@ def p95(items):
 base_ios = base_report.get("ios", {})
 base_sony = base_report.get("sony", {})
 base_summary = base_report.get("summary", {})
+precheck = base_report.get("precheck", {})
 
 preview_ready_costs = values(r"\[AlbumArtFastPath\] preview ready costMs=(\d+)", sony_text)
 hq_ready_costs = values(r"\[AlbumArtFastPath\] hq ready costMs=(\d+)", sony_text)
@@ -140,6 +141,13 @@ report = {
         "playing": bool(base_summary.get("playing", False)),
         "warnings": [],
         "issues": [],
+        "iosAppLaunched": precheck.get("iosAppLaunched", False),
+        "iosBleConnected": precheck.get("iosBleConnected", False),
+        "notifySubscribed": precheck.get("notifySubscribed", False),
+        "firstPlaybackStateReceived": precheck.get("firstPlaybackStateReceived", False),
+        "firstPlaybackStateLatencyMs": precheck.get("firstPlaybackStateLatencyMs", 0),
+        "precheckResult": precheck.get("precheckResult", "UNKNOWN"),
+        "precheckFailReason": precheck.get("precheckFailReason", ""),
     },
     "albumArtFastPath": {
         "trackChangedCount": track_changed,
@@ -179,6 +187,7 @@ report = {
         "mainStallCount": main_stall,
     },
     "baseCurrentWord": base_report,
+    "precheck": precheck,
     "artifacts": {
         "report_json": str(out_dir / "report.json"),
         "report_md": str(out_dir / "report.md"),

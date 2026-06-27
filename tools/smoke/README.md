@@ -74,6 +74,25 @@ Control E2E V2.9 validation:
 
 Use this when validating the real iOS -> Sony -> iOS interaction loop. It launches the iOS Debug app with the DEBUG-only `--smoke-control-e2e` argument, sends PLAY/PAUSE, NEXT, PREVIOUS, volume, seek, FullLyrics, and AlbumArt requests through the normal BLE command path, then verifies the results from iOS `ios_ble.log` and Sony `logcat`. `PREVIOUS` and AlbumArt can WARN because player history and artwork availability are content dependent; core controls failing is a FAIL.
 
+Source Capability V3.0 diagnostics:
+
+```bash
+./tools/smoke/source_capability_v30_test.sh --duration 150 --json
+```
+
+Use this when lyrics or artwork are slow/missing and you need to know whether the bottleneck is BLE/cache or the source app/MediaSession. It launches the iOS Debug app with `--smoke-source-capability`, periodically requests playbackState, FullLyrics, and HQ AlbumArt, then aggregates Sony `[TrackCapability]` logs into per-track READY_FAST / READY_SLOW / SOURCE_NOT_PROVIDED / PARSE_FAILED / LOAD_FAILED results. Switch 3-5 songs manually during the test window for best coverage.
+
+## BLE-Dependent Precheck
+
+All tests that perform real iOS BLE operations must pass `ios_ble_precheck.sh` before they send commands or request large payloads. The hard precheck requires:
+
+- iOS app launched.
+- BLE connected.
+- status notify subscribed.
+- at least one `playbackState` received within 5 seconds.
+
+If any of these conditions fail, the test exits immediately with `reason=ios_ble_not_connected` and does not send `GET_FULL_LYRICS`, AlbumArt requests, `NEXT`, volume, or seek commands. Reports include `iosAppLaunched`, `iosBleConnected`, `notifySubscribed`, `firstPlaybackStateReceived`, `firstPlaybackStateLatencyMs`, `precheckResult`, and `precheckFailReason`.
+
 ## Device Behavior
 
 When neither `--ios-only` nor `--android-only` is used:
@@ -135,6 +154,12 @@ Control E2E V2.9 output:
 /tmp/control_e2e_smoke/<timestamp>/
 ```
 
+Source Capability V3.0 output:
+
+```text
+/tmp/music_ble_capability/<timestamp>/
+```
+
 Files:
 
 - `report.md`: human-readable CurrentWord or AlbumArt stability report.
@@ -147,6 +172,8 @@ Files:
 - `sony_reconnect_filtered.log`: Sony filtered reconnect sync log.
 - `ios_control_e2e_filtered.log`: iOS filtered control E2E log.
 - `sony_control_e2e_filtered.log`: Sony filtered control E2E log.
+- `ios_source_capability_filtered.log`: iOS filtered source capability log.
+- `sony_source_capability_filtered.log`: Sony filtered TrackCapability log.
 
 Files:
 
