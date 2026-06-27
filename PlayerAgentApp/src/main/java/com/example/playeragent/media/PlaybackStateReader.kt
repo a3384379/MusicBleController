@@ -370,6 +370,10 @@ class PlaybackStateReader(
         return lyricManager.manualRefreshCurrentLyric()
     }
 
+    fun nudgeLyricRecoveryFromFullLyricsRequest(): Boolean {
+        return lyricManager.nudgeRecoveryFromFullLyricsRequest()
+    }
+
     private fun logController(index: Int, controller: MediaController) {
         val state = controller.playbackState?.state
         val metadata = controller.metadata

@@ -28,6 +28,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import com.example.playeragent.ble.ControllerScannerManager
+import com.example.playeragent.ble.BleHealthState
 import com.example.playeragent.classicbluetooth.RfcommClientManager
 import com.example.playeragent.history.HistorySessionRow
 import com.example.playeragent.history.PlaybackHistoryRepository
@@ -65,6 +66,7 @@ import java.util.Locale
 class MainActivity : Activity() {
 
     private lateinit var statusTextView: TextView
+    private lateinit var bleStatusTextView: TextView
     private lateinit var accessibilityStatusTextView: TextView
     private lateinit var currentSongTextView: TextView
     private lateinit var currentLyricTextView: TextView
@@ -116,6 +118,7 @@ class MainActivity : Activity() {
     private var lastPlayerUiLyricStatus: String = ""
     private var lastPlayerUiAlbumArtStatus: String = "未检测"
     private var albumArtRefreshGeneration = 0L
+    private var controlServiceStatusRefreshRunnable: Runnable? = null
     private var lastQrcV2BuildProgress = QrcV2RebuildProgress()
     private var lastQrcStaleCacheRebuildProgress = QrcStaleCacheRebuildProgress()
     private var lastMaintenanceUiState = MaintenanceUiState()
@@ -222,6 +225,7 @@ class MainActivity : Activity() {
         super.onResume()
         maybeAutoStartControlService("onResume")
         refreshControlServiceStatus()
+        startControlServiceStatusRefresh()
         if (::currentSongTextView.isInitialized) {
             refreshCurrentMedia()
             refreshAccessibilityStatus()
@@ -230,6 +234,7 @@ class MainActivity : Activity() {
 
     override fun onStop() {
         super.onStop()
+        stopControlServiceStatusRefresh()
         unregisterReceiver(logReceiver)
     }
 
@@ -285,8 +290,10 @@ class MainActivity : Activity() {
         })
 
         val serviceCard = collapsibleCard(content, "服务状态", expanded = true)
-        statusTextView = statusValue("控制服务：未启动")
+        statusTextView = statusValue("Service：未启动")
         serviceCard.addView(statusTextView)
+        bleStatusTextView = statusValue("BLE：未启动")
+        serviceCard.addView(bleStatusTextView)
         accessibilityStatusTextView = statusValue("通知读取权限：未知")
         serviceCard.addView(accessibilityStatusTextView)
         serviceCard.addView(buttonGrid(listOf(
@@ -543,23 +550,22 @@ class MainActivity : Activity() {
 
         val build = state.buildProgress
         val buildPercent = if (build.total > 0) build.processed * 100 / build.total else 0
-        val canStop = state.activeTask != null || build.running ||
-            build.status == QrcV2RebuildStatus.PAUSED
         val activeBuildTask = state.activeTask == MaintenanceTaskType.QRC_V2_REBUILD
+        val canStopBuild = activeBuildTask || build.running ||
+            build.status == QrcV2RebuildStatus.PAUSED ||
+            build.status == QrcV2RebuildStatus.VALIDATING
         val activeTaskName = state.activeTask?.let(::maintenanceTaskDisplayName)
         val buildStatusLabel = when {
             activeBuildTask || build.running || build.status == QrcV2RebuildStatus.PAUSED ->
                 state.taskStatus.displayName
-            state.activeTask != null -> "等待"
             else -> "空闲"
         }
         val buildHint = when {
-            state.cancelRequested -> "提示：停止请求已发送，正在等待任务退出"
+            state.cancelRequested && activeBuildTask -> "提示：停止请求已发送，正在等待 V2 构建退出"
             activeBuildTask || build.running -> "提示：可停止当前构建任务"
             state.activeTask != null ->
-                "提示：正在执行 $activeTaskName，构建操作暂不可用"
-            !canStop -> "提示：当前没有运行中的任务"
-            else -> "提示：可停止当前任务"
+                "提示：后台正在执行 $activeTaskName，V2 构建暂不可用"
+            else -> "提示：当前没有运行中的 V2 构建"
         }
         buildTaskBadgeTextView.setTextIfChanged("状态：$buildStatusLabel")
         buildTaskStatusTextView.setTextIfChanged(
@@ -581,16 +587,29 @@ class MainActivity : Activity() {
         )
         setActionButtonState(
             buildTaskStopButton,
-            if (state.cancelRequested) "停止中..." else "停止任务",
-            canStop
+            if (state.cancelRequested && activeBuildTask) "停止中..." else "停止构建",
+            canStopBuild
         )
 
         val indexBusy = state.activeTask == MaintenanceTaskType.QRC_INDEX_REBUILD
-        qrcIndexBadgeTextView.setTextIfChanged("状态：${if (indexBusy) "构建中" else "空闲"}")
+        val incrementalBusy = state.activeTask == MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD ||
+            state.watcherStatus.incrementalRunning
+        val indexStatusLabel = when {
+            indexBusy -> "构建中"
+            incrementalBusy -> "增量预构建"
+            state.watcherStatus.watcherRunning -> "监听中"
+            else -> "空闲"
+        }
+        qrcIndexBadgeTextView.setTextIfChanged("状态：$indexStatusLabel")
         setActionButtonState(
             qrcIndexPrimaryButton,
-            if (indexBusy) "停止任务" else "重建索引",
-            canRunTask(MaintenanceTaskType.QRC_INDEX_REBUILD, state) || indexBusy
+            when {
+                indexBusy -> "停止索引任务"
+                incrementalBusy -> "停止增量预构建"
+                else -> "重建索引"
+            },
+            canRunTask(MaintenanceTaskType.QRC_INDEX_REBUILD, state) ||
+                indexBusy || incrementalBusy
         )
 
         val warmupBusy = state.activeTask == MaintenanceTaskType.LYRIC_WARMUP
@@ -651,6 +670,7 @@ class MainActivity : Activity() {
     }
 
     private fun buildMaintenanceUiState(): MaintenanceUiState {
+        cleanupStaleMaintenanceToken()
         val maintenance = QrcMaintenanceCoordinator.snapshot()
         val current = maintenance.current
         val build = lastQrcV2BuildProgress
@@ -682,6 +702,29 @@ class MainActivity : Activity() {
             currentLyricsStatus = lastPlayerUiLyricStatus.ifBlank { "unknown" },
             currentAlbumArtStatus = lastPlayerUiAlbumArtStatus
         )
+    }
+
+    private fun cleanupStaleMaintenanceToken() {
+        val current = QrcMaintenanceCoordinator.currentToken() ?: return
+        if (current.type == MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD &&
+            !lastQrcWatcherStatus.incrementalRunning &&
+            lastQrcWatcherStatus.pendingGroups == 0
+        ) {
+            QrcMaintenanceCoordinator.finishCurrentIf(
+                MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD,
+                "ui detected incremental idle",
+                ::appendThreadSafeLog
+            )
+        }
+        if (current.type == MaintenanceTaskType.LYRIC_WARMUP &&
+            lyricWarmupManager?.isRunningOrScheduled() != true
+        ) {
+            QrcMaintenanceCoordinator.finishCurrentIf(
+                MaintenanceTaskType.LYRIC_WARMUP,
+                "ui detected warmup idle",
+                ::appendThreadSafeLog
+            )
+        }
     }
 
     private fun buildPrimaryButtonText(state: MaintenanceUiState): String {
@@ -722,6 +765,15 @@ class MainActivity : Activity() {
                 "停止 QRC 索引任务？\n\n当前索引重建会收到取消请求。"
             ) {
                 cancelCurrentMaintenance()
+            }
+        } else if (
+            lastMaintenanceUiState.activeTask == MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD ||
+            lastMaintenanceUiState.watcherStatus.incrementalRunning
+        ) {
+            confirmAction(
+                "停止增量预构建？\n\n会停止 QRC 目录监听和当前增量缓存任务。"
+            ) {
+                stopQrcWatcher()
             }
         } else {
             forceRefreshQrcIndex()
@@ -962,15 +1014,55 @@ class MainActivity : Activity() {
         if (!::statusTextView.isInitialized) {
             return
         }
-        setControlServiceStatus(
-            if (PlayerAgentForegroundService.isRunning()) "运行中" else "未启动"
-        )
+        val serviceRunning = PlayerAgentForegroundService.isRunning()
+        setControlServiceStatus(if (serviceRunning) "运行中" else "未启动")
+        setBleStatus(PlayerAgentForegroundService.bleHealthSnapshot())
     }
 
     private fun setControlServiceStatus(status: String) {
         if (::statusTextView.isInitialized) {
-            statusTextView.setTextIfChanged("控制服务：$status")
+            statusTextView.setTextIfChanged("Service：$status")
         }
+    }
+
+    private fun setBleStatus(snapshot: com.example.playeragent.ble.BleHealthSnapshot) {
+        if (!::bleStatusTextView.isInitialized) {
+            return
+        }
+        val label = when (snapshot.healthState) {
+            BleHealthState.SERVICE_STOPPED -> "未启动"
+            BleHealthState.STARTING -> "启动中"
+            BleHealthState.ADVERTISING -> "可发现，等待 iPhone 连接"
+            BleHealthState.CONNECTED -> "已连接，等待订阅"
+            BleHealthState.SUBSCRIBED -> "已订阅，等待控制心跳"
+            BleHealthState.CONTROLLABLE -> "可控制"
+            BleHealthState.SUSPECT -> "疑似断连，自动恢复中"
+            BleHealthState.RECOVERING -> "疑似异常，正在恢复"
+            BleHealthState.ERROR -> "异常，请点击恢复蓝牙服务"
+        }
+        val detail = "GATT=${snapshot.gattState} ADV=${snapshot.advertisingState} " +
+            "连接=${snapshot.connectedCount} 订阅=${snapshot.subscribedCount} " +
+            "队列=${snapshot.pendingJobs}"
+        bleStatusTextView.setTextIfChanged("BLE：$label\n$detail")
+    }
+
+    private fun startControlServiceStatusRefresh() {
+        if (controlServiceStatusRefreshRunnable != null) {
+            return
+        }
+        val runnable = object : Runnable {
+            override fun run() {
+                refreshControlServiceStatus()
+                mainHandler.postDelayed(this, CONTROL_SERVICE_STATUS_REFRESH_INTERVAL_MS)
+            }
+        }
+        controlServiceStatusRefreshRunnable = runnable
+        mainHandler.postDelayed(runnable, CONTROL_SERVICE_STATUS_REFRESH_INTERVAL_MS)
+    }
+
+    private fun stopControlServiceStatusRefresh() {
+        controlServiceStatusRefreshRunnable?.let { mainHandler.removeCallbacks(it) }
+        controlServiceStatusRefreshRunnable = null
     }
 
     private fun refreshCurrentMedia() {
@@ -1589,14 +1681,21 @@ class MainActivity : Activity() {
     }
 
     private fun cancelCurrentMaintenance() {
+        val currentType = QrcMaintenanceCoordinator.currentToken()?.type
         val cancelled = QrcMaintenanceCoordinator.cancelCurrent(
             "debug button",
             ::appendThreadSafeLog
         )
-        qrcV2RebuildManager?.stop()
-        qrcStaleCacheRebuildManager?.stop()
-        if (QrcMaintenanceCoordinator.currentToken()?.type == com.example.playeragent.media.MaintenanceTaskType.ARTWORK_DISCOVERY) {
-            artworkDiscoveryManager?.cancel()
+        when (currentType) {
+            MaintenanceTaskType.QRC_V2_REBUILD -> qrcV2RebuildManager?.stop()
+            MaintenanceTaskType.CACHE_REPAIR -> qrcStaleCacheRebuildManager?.stop()
+            MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD -> stopQrcWatcher()
+            MaintenanceTaskType.LYRIC_WARMUP -> lyricWarmupManager?.cancel()
+            MaintenanceTaskType.ARTWORK_DISCOVERY -> artworkDiscoveryManager?.cancel()
+            else -> {
+                qrcV2RebuildManager?.stop()
+                qrcStaleCacheRebuildManager?.stop()
+            }
         }
         if (cancelled) {
             appendLog("[QrcMaintenance] cancel requested from UI")
@@ -1638,6 +1737,12 @@ class MainActivity : Activity() {
                 .setAction(PlayerAgentForegroundService.ACTION_STOP_QRC_WATCHER)
         )
         appendLog("[QrcWatcher] stop requested")
+        QrcMaintenanceCoordinator.finishCurrentIf(
+            MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD,
+            "ui stop watcher",
+            ::appendThreadSafeLog
+        )
+        refreshMaintenanceUiState()
     }
 
     private fun refreshCurrentLyric() {
@@ -2173,5 +2278,6 @@ class MainActivity : Activity() {
         private const val KEY_AUTO_START_CONTROL_SERVICE = "autoStartControlService"
         private const val AUTO_START_PENDING_GUARD_MS = 5_000L
         private const val CONTROL_SERVICE_STATUS_VERIFY_DELAY_MS = 800L
+        private const val CONTROL_SERVICE_STATUS_REFRESH_INTERVAL_MS = 3_000L
     }
 }

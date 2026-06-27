@@ -42,6 +42,7 @@ class LyricRecoveryEngine(
     private var session: RecoverySession? = null
     private var timerFuture: ScheduledFuture<*>? = null
     private var debounceFuture: ScheduledFuture<*>? = null
+    private val fastProbeFutures = mutableListOf<ScheduledFuture<*>>()
 
     @Synchronized
     fun onActiveSongNoLyrics(
@@ -87,6 +88,7 @@ class LyricRecoveryEngine(
         logger("[LyricRecovery] start songKey=$songKey reason=$reason expiresInMs=$RECOVERY_WINDOW_MS")
         logger("[LyricRecovery] state IDLE -> ${state.name}")
         scheduleRetryLocked("initial", INITIAL_RETRY_DELAY_MS, bypassRetryableCooldown = true)
+        scheduleFastProbeRetriesLocked()
         scheduleTimerRetryLocked()
     }
 
@@ -229,6 +231,22 @@ class LyricRecoveryEngine(
         logger("[LyricRecovery] retry scheduled reason=timer delayMs=$TIMER_RETRY_INTERVAL_MS")
     }
 
+    private fun scheduleFastProbeRetriesLocked() {
+        fastProbeFutures.forEach { it.cancel(false) }
+        fastProbeFutures.clear()
+        FAST_PROBE_RETRY_DELAYS_MS.forEach { delayMs ->
+            val future = scheduler.schedule(
+                {
+                    fireRetry("fast probe", bypassRetryableCooldown = true)
+                },
+                delayMs,
+                TimeUnit.MILLISECONDS
+            )
+            fastProbeFutures += future
+            logger("[LyricRecovery] retry scheduled reason=fast_probe delayMs=$delayMs")
+        }
+    }
+
     private fun scheduleDebouncedRetryLocked(
         reason: String,
         bypassRetryableCooldown: Boolean
@@ -327,6 +345,8 @@ class LyricRecoveryEngine(
     private fun cancelTimersLocked() {
         timerFuture?.cancel(false)
         debounceFuture?.cancel(false)
+        fastProbeFutures.forEach { it.cancel(false) }
+        fastProbeFutures.clear()
         timerFuture = null
         debounceFuture = null
     }
@@ -387,8 +407,9 @@ class LyricRecoveryEngine(
         private const val RECOVERY_WINDOW_MS = 3 * 60_000L
         private const val TIMER_RETRY_INTERVAL_MS = 30_000L
         private const val INITIAL_RETRY_DELAY_MS = 1_000L
+        private val FAST_PROBE_RETRY_DELAYS_MS = longArrayOf(3_000L, 7_000L, 15_000L, 25_000L)
         private const val WATCHER_DEBOUNCE_MS = 2_000L
         private const val MIN_RETRY_GAP_MS = 30_000L
-        private const val MAX_RETRY_COUNT = 5
+        private const val MAX_RETRY_COUNT = 10
     }
 }

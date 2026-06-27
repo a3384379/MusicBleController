@@ -88,6 +88,29 @@ object QrcMaintenanceCoordinator {
         }
     }
 
+    fun finishCurrentIf(
+        type: MaintenanceTaskType,
+        reason: String,
+        logger: (String) -> Unit
+    ): Boolean {
+        val token = current.get() ?: return false
+        if (token.type != type) {
+            return false
+        }
+        if (!current.compareAndSet(token, null)) {
+            return false
+        }
+        logger(
+            "[QrcMaintenance] force finish type=${token.type} reason=$reason " +
+                "costMs=${System.currentTimeMillis() - token.startedAt} " +
+                "cancelled=${token.cancelled}"
+        )
+        finishListeners.forEach { listener ->
+            runCatching { listener(token) }
+        }
+        return true
+    }
+
     fun fail(token: MaintenanceToken, error: Throwable, logger: (String) -> Unit) {
         logger("[QrcMaintenance] failed type=${token.type} error=${error.message}")
         finish(token, logger)

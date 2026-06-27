@@ -116,7 +116,9 @@ class BleGattServerManager(
         characteristicProvider = { statusCharacteristic },
         logger = logger,
         localOnlyLogger = transientLogger,
-        verboseLogger = verboseLogger
+        verboseLogger = verboseLogger,
+        onNotifySuccess = ::recordNotifySuccess,
+        onNotifyFailure = ::recordNotifyFailure
     )
     @Volatile
     private var lastAlbumArtKey: String? = null
@@ -160,6 +162,18 @@ class BleGattServerManager(
     private var started = false
     @Volatile
     private var serverState = ServerState.STOPPED
+    @Volatile
+    private var lastCommandSuccessAtMs = 0L
+    @Volatile
+    private var lastNotifySuccessAtMs = 0L
+    @Volatile
+    private var lastNotifyFailureAtMs = 0L
+    @Volatile
+    private var notifyFailureCount = 0
+    @Volatile
+    private var lastSubscribedAtMs = 0L
+    @Volatile
+    private var lastHealthSuccessLogAtMs = 0L
 
     init {
         TrackCapabilityTracker.setLogger(logger)
@@ -299,6 +313,7 @@ class BleGattServerManager(
                 "[CTRL-Sony] command parsed seq=$seq cmd=$command " +
                     "parseCostMs=${SystemClock.elapsedRealtime() - parseStartedAtMs}"
             )
+            recordCommandSuccess(command)
             logger("[BLE-A] command received: $command")
             logger(
                 "[CTRL-Sony] before handle seq=$seq cmd=$command " +
@@ -329,6 +344,9 @@ class BleGattServerManager(
                     "[CTRL-Sony] sendResponse end seq=$seq cmd=$command " +
                         "costMs=${SystemClock.elapsedRealtime() - responseStartMs} ok=$ok"
                 )
+                if (ok) {
+                    recordNotifySuccess("writeResponse:$command")
+                }
             }
             logger(
                 "[CTRL-Sony] total cost seq=$seq cmd=$command " +
@@ -368,6 +386,7 @@ class BleGattServerManager(
                     BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 ) == true -> {
                     subscribedDevices[device.address] = device
+                    lastSubscribedAtMs = SystemClock.elapsedRealtime()
                     logger("[BLE-A] status notify subscribed: device=${device.address}")
                     logger("[ReconnectSync] notify subscribed device=${device.address}")
                     startAutoPush()
@@ -557,6 +576,90 @@ class BleGattServerManager(
         )
     }
 
+    fun healthSnapshot(
+        serviceRunning: Boolean,
+        advertisingState: String,
+        lastRecoveryAt: Long,
+        recoveryCount: Int,
+        recovering: Boolean,
+        reason: String? = null
+    ): BleHealthSnapshot {
+        val queueSnapshot = notifyQueue.snapshot()
+        val connectedCount = connectedDeviceAddresses.size
+        val subscribedCount = subscribedDevices.size
+        val healthState = when {
+            !serviceRunning -> BleHealthState.SERVICE_STOPPED
+            recovering -> BleHealthState.RECOVERING
+            serverState == ServerState.FAILED -> BleHealthState.ERROR
+            !started || serverState == ServerState.STARTING -> BleHealthState.STARTING
+            serverState != ServerState.READY -> BleHealthState.STARTING
+            notifyFailureCount >= NOTIFY_FAILURE_SUSPECT_THRESHOLD -> BleHealthState.SUSPECT
+            subscribedWithoutSuccessOlderThan(SUSPECT_NO_SUCCESS_HEARTBEAT_MS) ->
+                BleHealthState.SUSPECT
+            subscribedCount > 0 && isSuccessHeartbeatStale(
+                SystemClock.elapsedRealtime(),
+                SUSPECT_NO_SUCCESS_HEARTBEAT_MS
+            ) -> BleHealthState.SUSPECT
+            subscribedCount > 0 && lastSuccessHeartbeatAtMs() > 0L -> BleHealthState.CONTROLLABLE
+            subscribedCount > 0 -> BleHealthState.SUBSCRIBED
+            connectedCount > 0 -> BleHealthState.CONNECTED
+            advertisingState.equals("STARTED", ignoreCase = true) -> BleHealthState.ADVERTISING
+            else -> BleHealthState.STARTING
+        }
+        return BleHealthSnapshot(
+            healthState = healthState,
+            serviceRunning = serviceRunning,
+            gattStarted = started,
+            gattState = serverState.name,
+            advertisingState = advertisingState,
+            connectedCount = connectedCount,
+            subscribedCount = subscribedCount,
+            notificationInFlight = if (queueSnapshot.notificationInFlight) 1 else 0,
+            pendingJobs = queueSnapshot.pendingJobCount,
+            lastCommandSuccessAt = lastCommandSuccessAtMs,
+            lastNotifySuccessAt = lastNotifySuccessAtMs,
+            lastNotifyFailureAt = lastNotifyFailureAtMs,
+            notifyFailureCount = notifyFailureCount,
+            lastRecoveryAt = lastRecoveryAt,
+            recoveryCount = recoveryCount,
+            reason = reason
+        )
+    }
+
+    fun clearStaleSubscribers(reason: String): Boolean {
+        val staleAddresses = subscribedDevices.keys
+            .filterNot { connectedDeviceAddresses.contains(it) }
+        if (staleAddresses.isEmpty()) {
+            return false
+        }
+        staleAddresses.forEach { address ->
+            subscribedDevices.remove(address)
+            notifyQueue.removeDevice(address)
+        }
+        logger(
+            "[BleHealth] watchdog action=clear_stale_subscribers " +
+                "reason=$reason addresses=$staleAddresses"
+        )
+        if (subscribedDevices.isEmpty()) {
+            stopAutoPushIfUnused()
+        }
+        return true
+    }
+
+    fun hasSuccessHeartbeatOlderThan(ageMs: Long): Boolean {
+        return isSuccessHeartbeatStale(SystemClock.elapsedRealtime(), ageMs)
+    }
+
+    fun subscribedWithoutSuccessOlderThan(ageMs: Long): Boolean {
+        val subscribedAt = lastSubscribedAtMs
+        return subscribedDevices.isNotEmpty() &&
+            lastSuccessHeartbeatAtMs() == 0L &&
+            subscribedAt > 0L &&
+            SystemClock.elapsedRealtime() - subscribedAt > ageMs
+    }
+
+    fun notifyFailureCount(): Int = notifyFailureCount
+
     private fun updateServerState(newState: ServerState) {
         val oldState = serverState
         if (oldState == newState) {
@@ -564,6 +667,41 @@ class BleGattServerManager(
         }
         serverState = newState
         logger("[BLE-GATT] state $oldState -> $newState")
+    }
+
+    private fun recordCommandSuccess(command: String) {
+        lastCommandSuccessAtMs = SystemClock.elapsedRealtime()
+        logger("[BleHealth] state=CONTROLLABLE reason=command_success cmd=$command")
+    }
+
+    private fun recordNotifySuccess(type: String) {
+        lastNotifySuccessAtMs = SystemClock.elapsedRealtime()
+        notifyFailureCount = 0
+        val now = lastNotifySuccessAtMs
+        if (now - lastHealthSuccessLogAtMs >= HEALTH_SUCCESS_LOG_INTERVAL_MS) {
+            lastHealthSuccessLogAtMs = now
+            logger("[BleHealth] state=CONTROLLABLE reason=notify_success type=$type")
+        }
+    }
+
+    private fun recordNotifyFailure(type: String, status: Int, reason: String) {
+        lastNotifyFailureAtMs = SystemClock.elapsedRealtime()
+        notifyFailureCount += 1
+        logger(
+            "[BleHealth] notify failure type=$type status=$status " +
+                "reason=$reason failureCount=$notifyFailureCount " +
+                "connected=${connectedDeviceAddresses.size} " +
+                "subscribed=${subscribedDevices.size}"
+        )
+    }
+
+    private fun lastSuccessHeartbeatAtMs(): Long {
+        return maxOf(lastCommandSuccessAtMs, lastNotifySuccessAtMs)
+    }
+
+    private fun isSuccessHeartbeatStale(nowMs: Long, maxAgeMs: Long): Boolean {
+        val lastSuccess = lastSuccessHeartbeatAtMs()
+        return lastSuccess > 0L && nowMs - lastSuccess > maxAgeMs
     }
 
     private fun logDisconnectDiagnostics(address: String) {
@@ -3400,6 +3538,13 @@ class BleGattServerManager(
         if (lines.isEmpty()) {
             val unavailableReason = playbackStateReader.lyricUnavailableReason()
             val diagnostic = playbackStateReader.lyricDiagnosticSnapshot()
+            val recoveryRetryStarted = if (isFullLyricsRecoveryNudgeReason(unavailableReason) &&
+                !request.optBoolean("_lyricsRecoveryRetry", false)
+            ) {
+                playbackStateReader.nudgeLyricRecoveryFromFullLyricsRequest()
+            } else {
+                false
+            }
             if (unavailableReason == "lyrics loading" &&
                 !request.optBoolean("_lyricsReadyRetry", false)
             ) {
@@ -3410,6 +3555,17 @@ class BleGattServerManager(
                     logger("[FullLyrics] pending retry after lyrics loading")
                     sendFullLyrics(retryRequest)
                 }, FULL_LYRICS_PENDING_RETRY_DELAY_MS)
+            } else if (recoveryRetryStarted) {
+                logger(
+                    "[FullLyrics] pending request reason=$unavailableReason " +
+                        "action=recovery_nudge"
+                )
+                val retryRequest = JSONObject(request.toString())
+                    .put("_lyricsRecoveryRetry", true)
+                albumArtHandler.postDelayed({
+                    logger("[FullLyrics] pending retry after recovery nudge")
+                    sendFullLyrics(retryRequest)
+                }, FULL_LYRICS_RECOVERY_RETRY_DELAY_MS)
             }
             val unavailable = JSONObject()
                 .put("type", "fullLyricsUnavailable")
@@ -3817,6 +3973,15 @@ class BleGattServerManager(
         return null
     }
 
+    private fun isFullLyricsRecoveryNudgeReason(reason: String): Boolean {
+        val normalized = reason.lowercase()
+        return normalized.contains("lyric recovery active") ||
+            normalized.contains("waiting qqmusic lyric cache") ||
+            normalized.contains("qrc cooldown retry pending") ||
+            normalized.contains("lyrics retry pending") ||
+            normalized.contains("no safe qrc candidate")
+    }
+
     private fun buildFittingFullLyricsChunk(
         trackId: String,
         index: Int,
@@ -4107,6 +4272,7 @@ class BleGattServerManager(
         private const val TRACK_INFO_JOB_TYPE = "trackInfo"
         private const val FULL_LYRICS_JOB_TYPE = "fullLyrics"
         private const val FULL_LYRICS_PENDING_RETRY_DELAY_MS = 900L
+        private const val FULL_LYRICS_RECOVERY_RETRY_DELAY_MS = 2_500L
         private const val LYRIC_SECONDARY_JOB_TYPE = "lyricSecondary"
         private const val MAX_LYRIC_TEXT_LENGTH = 30
         private const val REMOTE_LOG_JOB_TYPE = "remoteLog"
@@ -4133,6 +4299,9 @@ class BleGattServerManager(
         private const val HISTORY_MAX_SEND_MS = 8_000L
         private const val MAX_HISTORY_ERROR_CHARS = 100
         private const val CALLBACK_LOG_DEDUP_WINDOW_MS = 500L
+        private const val NOTIFY_FAILURE_SUSPECT_THRESHOLD = 3
+        private const val SUSPECT_NO_SUCCESS_HEARTBEAT_MS = 30_000L
+        private const val HEALTH_SUCCESS_LOG_INTERVAL_MS = 10_000L
     }
 
     private data class CompressionAttempt(

@@ -45,6 +45,7 @@ class LyricManager(
     private var retryCountInWindow: Int = 0
     private var lastRetryAtMs: Long = 0L
     private var lastWatcherRetryAtMs: Long = 0L
+    private var lastFullLyricsRecoveryNudgeAtMs: Long = 0L
     private var lazyWaitSongKey: String? = null
     private var lazyWaitStartedAtMs: Long = 0L
     private var lyricsReadyState: LyricsReadyState = LyricsReadyState.EMPTY
@@ -462,6 +463,48 @@ class LyricManager(
             reason = "manual refresh current lyric"
         )
         return true
+    }
+
+    @Synchronized
+    fun nudgeRecoveryFromFullLyricsRequest(): Boolean {
+        val key = activeSongKey
+        if (key.isNullOrBlank()) {
+            logger("[LyricRecovery] nudge skipped reason=no active song source=fullLyricsRequest")
+            return false
+        }
+        if (cachedLines.isNotEmpty() && loadedSongKey == key) {
+            logger("[LyricRecovery] nudge skipped reason=has lyrics source=fullLyricsRequest songKey=$key")
+            return false
+        }
+        if (isInFlightLocked(key)) {
+            logger("[LyricRecovery] nudge skipped reason=in flight source=fullLyricsRequest songKey=$key")
+            return false
+        }
+        val unavailableReason = currentUnavailableReason()
+        if (!isRecoveryNudgeReason(unavailableReason)) {
+            logger(
+                "[LyricRecovery] nudge skipped reason=not retryable " +
+                    "source=fullLyricsRequest unavailableReason=$unavailableReason songKey=$key"
+            )
+            return false
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastFullLyricsRecoveryNudgeAtMs < FULL_LYRICS_RECOVERY_NUDGE_MIN_INTERVAL_MS) {
+            logger(
+                "[LyricRecovery] nudge skipped reason=rate limited " +
+                    "source=fullLyricsRequest ageMs=${now - lastFullLyricsRecoveryNudgeAtMs} songKey=$key"
+            )
+            return false
+        }
+        lastFullLyricsRecoveryNudgeAtMs = now
+        logger(
+            "[LyricRecovery] nudge source=fullLyricsRequest " +
+                "unavailableReason=$unavailableReason songKey=$key"
+        )
+        return retryActiveSongFromRecovery(
+            reason = "fullLyrics request",
+            bypassRetryableCooldown = true
+        )
     }
 
     @Synchronized
@@ -1494,6 +1537,15 @@ class LyricManager(
         }
     }
 
+    private fun isRecoveryNudgeReason(reason: String): Boolean {
+        val normalized = reason.lowercase(Locale.ROOT)
+        return normalized.contains("lyric recovery active") ||
+            normalized.contains("waiting qqmusic lyric cache") ||
+            normalized.contains("qrc cooldown retry pending") ||
+            normalized.contains("lyrics retry pending") ||
+            normalized.contains("no safe qrc candidate")
+    }
+
     private fun startLazyWaitIfNeededLocked(key: String) {
         if (lazyWaitSongKey == key && lazyWaitStartedAtMs > 0L) {
             return
@@ -2009,6 +2061,7 @@ class LyricManager(
         private const val RETRY_RATE_WINDOW_MS = 30_000L
         private const val RETRYABLE_RECHECK_INTERVAL_MS = 30_000L
         private const val WATCHER_RETRY_MIN_INTERVAL_MS = 30_000L
+        private const val FULL_LYRICS_RECOVERY_NUDGE_MIN_INTERVAL_MS = 8_000L
         private const val LAZY_WAIT_WINDOW_MS = 3 * 60_000L
         private const val MAX_RETRIES_PER_WINDOW = 2
         private const val PARSED_CACHE_MAX_KEYS = 40

@@ -89,6 +89,12 @@ class QrcIncrementalPrebuildManager(
         stopped.set(true)
         executor.shutdownNow()
         setRunning(false)
+        QrcMaintenanceCoordinator.finishCurrentIf(
+            MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD,
+            "incremental manager stopped",
+            logger
+        )
+        logger("[QrcIncremental] stopped")
     }
 
     fun currentStatus(

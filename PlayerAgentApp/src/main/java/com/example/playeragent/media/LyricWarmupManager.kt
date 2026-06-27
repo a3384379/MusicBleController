@@ -40,6 +40,15 @@ class LyricWarmupManager(
         scheduled?.cancel(false)
         scheduled = null
         running.set(false)
+        QrcMaintenanceCoordinator.finishCurrentIf(
+            MaintenanceTaskType.LYRIC_WARMUP,
+            "warmup cancelled",
+            logger
+        )
+    }
+
+    fun isRunningOrScheduled(): Boolean {
+        return running.get() || scheduled?.isDone == false
     }
 
     fun warmupNow() {

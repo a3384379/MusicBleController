@@ -286,6 +286,17 @@ else
 fi
 
 start="$(now_ms)"
+"$SCRIPT_DIR/ble_health_watchdog_test.sh" "$OUT_DIR/sony_logcat.log" \
+  >"$OUT_DIR/ble_health_watchdog_stdout.log" \
+  2>"$OUT_DIR/ble_health_watchdog_stderr.log" || true
+ble_health_cost="$(elapsed_ms "$start")"
+if [[ -s "$OUT_DIR/ble_health_watchdog_stdout.log" ]]; then
+  awk -F'\t' -v cost="$ble_health_cost" 'BEGIN {OFS="\t"} {$4=cost; print $0}' "$OUT_DIR/ble_health_watchdog_stdout.log" >> "$OPTIONAL_RESULTS"
+else
+  record_optional "BLE Health Watchdog" "WARN" "$ble_health_cost" "optional analyzer produced no result"
+fi
+
+start="$(now_ms)"
 "$SCRIPT_DIR/android_playback_diff_flow_test.sh" "$OUT_DIR/sony_logcat.log" \
   >"$OUT_DIR/android_playback_diff_flow_stdout.log" \
   2>"$OUT_DIR/android_playback_diff_flow_stderr.log" || true

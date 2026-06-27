@@ -17,17 +17,22 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import com.example.playeragent.MainActivity
 import com.example.playeragent.StartupGuard
 import com.example.playeragent.ble.BleAdvertiserManager
 import com.example.playeragent.ble.BleGattServerManager
+import com.example.playeragent.ble.BleHealthSnapshot
+import com.example.playeragent.ble.BleHealthState
 import com.example.playeragent.history.PlaybackHistoryMonitor
 import com.example.playeragent.logging.LogConfig
 import com.example.playeragent.logging.LogBuffer
 import com.example.playeragent.media.QrcDirectoryWatcher
 import com.example.playeragent.media.QrcIncrementalPrebuildManager
+import com.example.playeragent.media.QrcMaintenanceCoordinator
 import com.example.playeragent.media.QrcWatcherStatus
+import com.example.playeragent.media.MaintenanceTaskType
 
 class PlayerAgentForegroundService : Service() {
 
@@ -43,6 +48,15 @@ class PlayerAgentForegroundService : Service() {
     @Volatile
     private var bluetoothAvailable = false
     private var recoverRunnable: Runnable? = null
+    private var bleHealthWatchdogRunnable: Runnable? = null
+    @Volatile
+    private var bleRecovering = false
+    @Volatile
+    private var lastBleRecoveryAtMs = 0L
+    @Volatile
+    private var bleRecoveryCount = 0
+    @Volatile
+    private var lastPublishedBleHealthState: BleHealthState? = null
     private val bluetoothStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) {
@@ -69,6 +83,7 @@ class PlayerAgentForegroundService : Service() {
         )
         log("Foreground service started")
         startPlaybackHistoryMonitor()
+        startBleHealthWatchdog()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -76,7 +91,7 @@ class PlayerAgentForegroundService : Service() {
             ACTION_STOP_SERVICE -> stopSelf()
             ACTION_STOP_QRC_WATCHER -> stopQrcWatcher()
             ACTION_START_QRC_WATCHER -> startQrcWatcher()
-            ACTION_RECOVER_BLE_STACK -> recoverBleStack("manual debug")
+            ACTION_RECOVER_BLE_STACK -> recoverBleStack("manual debug", respectCooldown = false)
             ACTION_DUMP_BLE_DIAGNOSTICS -> logBleDiagnostics("debug dump")
             ACTION_REFRESH_CURRENT_LYRIC -> refreshCurrentLyric()
             else -> {
@@ -92,6 +107,7 @@ class PlayerAgentForegroundService : Service() {
         running = false
         serviceStopping = true
         mainHandler.removeCallbacksAndMessages(null)
+        bleHealthWatchdogRunnable = null
         runCatching { unregisterReceiver(bluetoothStateReceiver) }
         stopPlaybackHistoryMonitor()
         stopQrcWatcher()
@@ -99,6 +115,7 @@ class PlayerAgentForegroundService : Service() {
         advertiserManager = null
         gattServerManager?.close("service destroyed")
         gattServerManager = null
+        publishBleHealthSnapshot("service destroyed")
         log("Foreground service stopped")
         super.onDestroy()
     }
@@ -134,15 +151,7 @@ class PlayerAgentForegroundService : Service() {
                 return@post
             }
             ensureBleStackStarted("service start")
-            StartupGuard.runWhenHeavyTaskAllowed(
-                taskName = "qrc watcher",
-                handler = mainHandler,
-                logger = ::log
-            ) {
-                if (!serviceStopping) {
-                    startQrcWatcher()
-                }
-            }
+            log("[QrcWatcher] startup auto watcher disabled; use Debug Tools manual start")
             log("[LyricWarmup] startup auto warmup disabled; use Debug Tools manual warmup")
         }
     }
@@ -171,12 +180,14 @@ class PlayerAgentForegroundService : Service() {
         if (!hasBluetoothRuntimePermissions()) {
             log("Missing Bluetooth runtime permission")
             log("[ControlServiceAutoStart] failed reason=permission_missing")
+            publishBleHealthSnapshot("permission_missing")
             return
         }
 
         if (!adapter.isEnabled) {
             log("Bluetooth is disabled")
             bluetoothAvailable = false
+            publishBleHealthSnapshot("bluetooth_disabled")
             return
         }
         bluetoothAvailable = true
@@ -243,6 +254,7 @@ class PlayerAgentForegroundService : Service() {
             logVerbose("BLE advertising already running; initialization skipped")
         }
         logBleDiagnostics("after ensureBleStackStarted reason=$reason")
+        publishBleHealthSnapshot("ensureBleStackStarted reason=$reason")
     }
 
     private fun handleBluetoothStateChanged(state: Int) {
@@ -271,6 +283,7 @@ class PlayerAgentForegroundService : Service() {
         advertiserManager?.forceMarkStopped("bluetooth off")
         advertiserManager = null
         logBleDiagnostics("bluetooth off")
+        publishBleHealthSnapshot("bluetooth off")
     }
 
     private fun scheduleBleRecovery(reason: String) {
@@ -281,29 +294,191 @@ class PlayerAgentForegroundService : Service() {
         recoverRunnable?.let { mainHandler.removeCallbacks(it) }
         val runnable = Runnable {
             recoverRunnable = null
-            recoverBleStack(reason)
+            recoverBleStack(reason, respectCooldown = false)
         }
         recoverRunnable = runnable
         log("[BLE-RECOVERY] scheduled reason=$reason")
         mainHandler.postDelayed(runnable, BLE_RECOVERY_DELAY_MS)
     }
 
-    private fun recoverBleStack(reason: String) {
+    private fun recoverBleStack(reason: String, respectCooldown: Boolean = false) {
         if (serviceStopping) {
             log("[BLE-RECOVERY] skipped reason=service stopping")
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (respectCooldown && lastBleRecoveryAtMs > 0L &&
+            now - lastBleRecoveryAtMs < BLE_RECOVERY_COOLDOWN_MS
+        ) {
+            val remainingMs = BLE_RECOVERY_COOLDOWN_MS - (now - lastBleRecoveryAtMs)
+            log("[BleHealth] recover skip reason=cooldown remainingMs=$remainingMs trigger=$reason")
+            publishBleHealthSnapshot("recover cooldown")
             return
         }
         val adapter = bluetoothAdapter ?: getSystemService(BluetoothManager::class.java)?.adapter
         if (adapter == null || !adapter.isEnabled) {
             log("[BLE-RECOVERY] skipped reason=bluetooth disabled")
+            publishBleHealthSnapshot("recover skipped bluetooth disabled")
             return
         }
         bluetoothAvailable = true
+        bleRecovering = true
+        lastBleRecoveryAtMs = now
+        bleRecoveryCount += 1
+        val startMs = SystemClock.elapsedRealtime()
+        log("[BleHealth] recover start reason=$reason")
+        publishBleHealthSnapshot("recovering reason=$reason")
         log("[BLE-RECOVERY] start reason=$reason")
         logBleDiagnostics("before recovery reason=$reason")
         ensureBleStackStarted(reason = reason, forceRebuild = true)
+        bleRecovering = false
+        val success = gattServerManager?.isServerReady() == true
         log("[BLE-RECOVERY] done")
+        log("[BleHealth] recover done success=$success costMs=${SystemClock.elapsedRealtime() - startMs}")
         logBleDiagnostics("after recovery reason=$reason")
+        publishBleHealthSnapshot("recover done reason=$reason")
+    }
+
+    private fun startBleHealthWatchdog() {
+        if (bleHealthWatchdogRunnable != null) {
+            return
+        }
+        val runnable = object : Runnable {
+            override fun run() {
+                if (!serviceStopping) {
+                    runBleHealthWatchdog()
+                    mainHandler.postDelayed(this, BLE_HEALTH_WATCHDOG_INTERVAL_MS)
+                }
+            }
+        }
+        bleHealthWatchdogRunnable = runnable
+        mainHandler.postDelayed(runnable, BLE_HEALTH_WATCHDOG_INTERVAL_MS)
+    }
+
+    private fun runBleHealthWatchdog() {
+        val snapshot = publishBleHealthSnapshot("watchdog")
+        if (serviceStopping) {
+            return
+        }
+        if (!bluetoothAvailable || bluetoothAdapter?.isEnabled != true) {
+            return
+        }
+        val manager = gattServerManager
+        if (manager == null || !snapshot.gattStarted || snapshot.gattState != "READY") {
+            log("[BleHealth] watchdog action=recover_gatt reason=gatt_not_ready")
+            recoverBleStack("gatt_not_ready", respectCooldown = true)
+            return
+        }
+
+        if (snapshot.connectedCount == 0 && snapshot.subscribedCount > 0) {
+            manager.clearStaleSubscribers("connected_empty_subscribed_non_empty")
+            log(
+                "[BleHealth] watchdog action=clear_stale_subscribers " +
+                    "reason=connected_empty_subscribed_non_empty"
+            )
+            restartAdvertisingFromWatchdog("connected_empty_subscribed_non_empty")
+            publishBleHealthSnapshot("stale subscribers cleared")
+            return
+        }
+
+        if (snapshot.connectedCount == 0 &&
+            !snapshot.advertisingState.equals("STARTED", ignoreCase = true)
+        ) {
+            restartAdvertisingFromWatchdog("advertising_not_started")
+            return
+        }
+
+        if (snapshot.subscribedCount > 0 &&
+            manager.notifyFailureCount() >= NOTIFY_FAILURE_RECOVERY_THRESHOLD
+        ) {
+            manager.clearStaleSubscribers("notify_failures")
+            restartAdvertisingFromWatchdog("notify_failures")
+            recoverBleStack("notify_failures", respectCooldown = true)
+            return
+        }
+
+        if (snapshot.subscribedCount > 0 &&
+            (manager.hasSuccessHeartbeatOlderThan(SUBSCRIBED_STALE_RECOVERY_MS) ||
+                manager.subscribedWithoutSuccessOlderThan(SUBSCRIBED_STALE_RECOVERY_MS))
+        ) {
+            log("[BleHealth] state=SUSPECT reason=no_success_heartbeat ageMs>=$SUBSCRIBED_STALE_RECOVERY_MS")
+            recoverBleStack("subscribed_stale", respectCooldown = true)
+            return
+        }
+
+        if (snapshot.subscribedCount > 0 &&
+            (manager.hasSuccessHeartbeatOlderThan(SUBSCRIBED_SUSPECT_MS) ||
+                manager.subscribedWithoutSuccessOlderThan(SUBSCRIBED_SUSPECT_MS))
+        ) {
+            log("[BleHealth] state=SUSPECT reason=no_success_heartbeat ageMs>=$SUBSCRIBED_SUSPECT_MS")
+            publishBleHealthSnapshot("subscribed suspect")
+        }
+    }
+
+    private fun restartAdvertisingFromWatchdog(reason: String) {
+        val advertiser = advertiserManager
+        if (advertiser == null) {
+            log("[BleHealth] watchdog action=recover_gatt reason=advertiser_unavailable")
+            recoverBleStack("advertiser_unavailable", respectCooldown = true)
+            return
+        }
+        log("[BleHealth] watchdog action=restart_advertising reason=$reason")
+        advertiser.restartAdvertising("watchdog $reason")
+        mainHandler.postDelayed(
+            { publishBleHealthSnapshot("advertising restart reason=$reason") },
+            ADVERTISING_RESTORE_DIAG_DELAY_MS
+        )
+    }
+
+    private fun publishBleHealthSnapshot(reason: String): BleHealthSnapshot {
+        val snapshot = buildBleHealthSnapshot(reason)
+        latestBleHealthSnapshot = snapshot
+        if (lastPublishedBleHealthState != snapshot.healthState) {
+            lastPublishedBleHealthState = snapshot.healthState
+            log("[BleHealth] state=${snapshot.healthState} reason=${snapshot.reason ?: reason}")
+        }
+        return snapshot
+    }
+
+    private fun buildBleHealthSnapshot(reason: String): BleHealthSnapshot {
+        val manager = gattServerManager
+        val advertisingState = advertiserManager?.getAdvertisingState()?.name ?: "none"
+        if (!running || serviceStopping) {
+            return BleHealthSnapshot.stopped(reason)
+        }
+        if (manager != null) {
+            return manager.healthSnapshot(
+                serviceRunning = true,
+                advertisingState = advertisingState,
+                lastRecoveryAt = lastBleRecoveryAtMs,
+                recoveryCount = bleRecoveryCount,
+                recovering = bleRecovering,
+                reason = reason
+            )
+        }
+        val state = when {
+            bleRecovering -> BleHealthState.RECOVERING
+            !bluetoothAvailable && bluetoothAdapter?.isEnabled == false -> BleHealthState.ERROR
+            else -> BleHealthState.STARTING
+        }
+        return BleHealthSnapshot(
+            healthState = state,
+            serviceRunning = true,
+            gattStarted = false,
+            gattState = "none",
+            advertisingState = advertisingState,
+            connectedCount = 0,
+            subscribedCount = 0,
+            notificationInFlight = 0,
+            pendingJobs = 0,
+            lastCommandSuccessAt = 0L,
+            lastNotifySuccessAt = 0L,
+            lastNotifyFailureAt = 0L,
+            notifyFailureCount = 0,
+            lastRecoveryAt = lastBleRecoveryAtMs,
+            recoveryCount = bleRecoveryCount,
+            reason = reason
+        )
     }
 
     private fun logBleDiagnostics(reason: String) {
@@ -325,6 +500,15 @@ class PlayerAgentForegroundService : Service() {
                 "pendingShortMessages=${gattSnapshot?.pendingShortMessages ?: 0} " +
                 "watcherRunning=${watcher != null}"
         )
+        val health = publishBleHealthSnapshot("diagnostics reason=$reason")
+        log(
+            "[BLE-DIAG] healthState=${health.healthState} " +
+                "notifyFailures=${health.notifyFailureCount} " +
+                "lastCommandSuccessAt=${health.lastCommandSuccessAt} " +
+                "lastNotifySuccessAt=${health.lastNotifySuccessAt} " +
+                "lastRecoveryAt=${health.lastRecoveryAt} " +
+                "recoveryCount=${health.recoveryCount}"
+        )
     }
 
     private fun handleAllClientsDisconnected(reason: String) {
@@ -344,6 +528,7 @@ class PlayerAgentForegroundService : Service() {
             return
         }
         advertiser.restartAdvertising(reason)
+        publishBleHealthSnapshot("all clients disconnected")
         mainHandler.postDelayed(
             {
                 log(
@@ -397,6 +582,11 @@ class PlayerAgentForegroundService : Service() {
         qrcDirectoryWatcher = null
         qrcIncrementalPrebuildManager?.stop()
         qrcIncrementalPrebuildManager = null
+        QrcMaintenanceCoordinator.finishCurrentIf(
+            MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD,
+            "service stop watcher",
+            ::log
+        )
         publishQrcWatcherStatus(
             QrcWatcherStatus(
                 watcherRunning = false,
@@ -560,9 +750,18 @@ class PlayerAgentForegroundService : Service() {
         private const val NOTIFICATION_ID = 10001
         private const val ADVERTISING_RESTORE_DIAG_DELAY_MS = 1_000L
         private const val BLE_RECOVERY_DELAY_MS = 1_200L
+        private const val BLE_HEALTH_WATCHDOG_INTERVAL_MS = 5_000L
+        private const val BLE_RECOVERY_COOLDOWN_MS = 30_000L
+        private const val SUBSCRIBED_SUSPECT_MS = 30_000L
+        private const val SUBSCRIBED_STALE_RECOVERY_MS = 45_000L
+        private const val NOTIFY_FAILURE_RECOVERY_THRESHOLD = 3
         @Volatile
         private var running = false
+        @Volatile
+        private var latestBleHealthSnapshot = BleHealthSnapshot.stopped()
 
         fun isRunning(): Boolean = running
+
+        fun bleHealthSnapshot(): BleHealthSnapshot = latestBleHealthSnapshot
     }
 }

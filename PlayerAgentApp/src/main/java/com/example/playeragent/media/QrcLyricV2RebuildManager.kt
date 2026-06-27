@@ -176,6 +176,13 @@ class QrcLyricV2RebuildManager(
         publish(progress)
         logger("[QrcV2Rebuild] validation start")
         val validation = validateBuildingDirectory(buildingDir)
+        if (validation.cancelled) {
+            progress = progress.copy(status = QrcV2RebuildStatus.STOPPED)
+            saveState(progress)
+            publish(progress)
+            logger("[QrcV2Rebuild] validation cancelled")
+            return
+        }
         if (!validation.ok) {
             progress = progress.copy(status = QrcV2RebuildStatus.FAILED)
             saveState(progress)
@@ -261,6 +268,9 @@ class QrcLyricV2RebuildManager(
         }
         val sample = files.shuffled().take(VALIDATION_SAMPLE_SIZE)
         files.forEach { file ->
+            if (stopRequested) {
+                return ValidationResult(false, "cancelled", files.size, cancelled = true)
+            }
             val parsed = try {
                 JSONObject(file.readText(Charsets.UTF_8))
             } catch (_: Exception) {
@@ -287,6 +297,9 @@ class QrcLyricV2RebuildManager(
             }
         }
         sample.forEach { file: File ->
+            if (stopRequested) {
+                return ValidationResult(false, "cancelled", files.size, cancelled = true)
+            }
             if (!file.canRead() || file.length() <= 0L) {
                 return ValidationResult(false, "sample unreadable ${file.name}", files.size)
             }
@@ -392,7 +405,8 @@ class QrcLyricV2RebuildManager(
     private data class ValidationResult(
         val ok: Boolean,
         val reason: String,
-        val files: Int
+        val files: Int,
+        val cancelled: Boolean = false
     )
 }
 

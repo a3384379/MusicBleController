@@ -18,7 +18,9 @@ class BleNotifyQueue(
     private val characteristicProvider: () -> BluetoothGattCharacteristic?,
     private val logger: (String) -> Unit,
     private val localOnlyLogger: (String) -> Unit,
-    private val verboseLogger: (String) -> Unit
+    private val verboseLogger: (String) -> Unit,
+    private val onNotifySuccess: (type: String) -> Unit = {},
+    private val onNotifyFailure: (type: String, status: Int, reason: String) -> Unit = { _, _, _ -> }
 ) {
 
     private val handler = Handler(Looper.getMainLooper())
@@ -153,15 +155,18 @@ class BleNotifyQueue(
         }
         val packet = job.packets.getOrNull(activePacketIndex)
         if (status != BluetoothGatt.GATT_SUCCESS) {
+            val type = packet?.type ?: job.type
             logger(
                 "[BleNotifyQueue] notify failed " +
-                    "type=${packet?.type ?: job.type} status=$status"
+                    "type=$type status=$status"
             )
+            onNotifyFailure(type, status, "callback_failed")
             markJobFailed(
                 job,
-                "notify callback failed type=${packet?.type ?: job.type} " +
-                    "status=$status"
+                "notify callback failed type=$type status=$status"
             )
+        } else {
+            onNotifySuccess(packet?.type ?: job.type)
         }
         activePacketIndex += 1
         val delay = packet?.delayAfterMs ?: SHORT_MESSAGE_DELAY_MS
@@ -309,6 +314,11 @@ class BleNotifyQueue(
                         interleaved.packet.value
                     )
                     if (!requested) {
+                        onNotifyFailure(
+                            interleaved.packet.type,
+                            NOTIFY_REQUEST_REJECTED_STATUS,
+                            "request_rejected"
+                        )
                         interleavedPacketInFlight = false
                         notificationInFlight = false
                         interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
@@ -405,6 +415,11 @@ class BleNotifyQueue(
         if (!requested) {
             notificationInFlight = false
             logger("[BleNotifyQueue] notify request rejected type=${packet.type}")
+            onNotifyFailure(
+                packet.type,
+                NOTIFY_REQUEST_REJECTED_STATUS,
+                "request_rejected"
+            )
             if (job.isLongJob) {
                 markJobFailed(
                     job,
@@ -617,5 +632,6 @@ class BleNotifyQueue(
         private const val LYRIC_SECONDARY_INTERLEAVE_INTERVAL = 3
         private const val OTHER_LONG_JOB_INTERLEAVE_INTERVAL = 5
         private const val INTERLEAVED_LOG_THROTTLE_MS = 10_000L
+        private const val NOTIFY_REQUEST_REJECTED_STATUS = -1
     }
 }
