@@ -39,6 +39,7 @@ import com.example.playeragent.media.LrcDebugManager
 import com.example.playeragent.media.LyricManager
 import com.example.playeragent.media.LyricSourceTestManager
 import com.example.playeragent.media.LyricWarmupManager
+import com.example.playeragent.media.MaintenanceTaskType
 import com.example.playeragent.media.PlaybackStateReader
 import com.example.playeragent.media.QQMusicArtworkDiscoveryManager
 import com.example.playeragent.media.ArtworkDiscoveryStatus
@@ -52,6 +53,7 @@ import com.example.playeragent.media.QrcPersistentIndexManager
 import com.example.playeragent.media.QrcStaleCacheRebuildManager
 import com.example.playeragent.media.QrcStaleCacheRebuildProgress
 import com.example.playeragent.media.QrcV2RebuildProgress
+import com.example.playeragent.media.QrcV2RebuildStatus
 import com.example.playeragent.media.QrcWatcherStatus
 import com.example.playeragent.service.PlayerAgentForegroundService
 import com.example.playeragent.service.QQMusicLyricAccessibilityService
@@ -79,6 +81,22 @@ class MainActivity : Activity() {
     private lateinit var logTextView: TextView
     private lateinit var logScrollView: ScrollView
     private lateinit var logSectionBody: LinearLayout
+    private lateinit var buildTaskStatusTextView: TextView
+    private lateinit var buildTaskBadgeTextView: TextView
+    private lateinit var buildTaskPrimaryButton: Button
+    private lateinit var buildTaskStopButton: Button
+    private lateinit var qrcIndexStatusTextView: TextView
+    private lateinit var qrcIndexBadgeTextView: TextView
+    private lateinit var qrcIndexPrimaryButton: Button
+    private lateinit var lyricsWarmupStatusTextView: TextView
+    private lateinit var lyricsWarmupBadgeTextView: TextView
+    private lateinit var lyricsWarmupPrimaryButton: Button
+    private lateinit var cacheMaintenanceStatusTextView: TextView
+    private lateinit var cacheMaintenanceBadgeTextView: TextView
+    private lateinit var cacheMaintenancePrimaryButton: Button
+    private lateinit var currentTrackDebugStatusTextView: TextView
+    private lateinit var currentTrackBadgeTextView: TextView
+    private lateinit var maintenanceSummaryTextView: TextView
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var controllerScannerManager: ControllerScannerManager? = null
     private var rfcommClientManager: RfcommClientManager? = null
@@ -94,7 +112,13 @@ class MainActivity : Activity() {
     @Volatile private var lastDebugStatsLoadAt = 0L
     private var lastPlayerUiSongKey: String = ""
     private var lastPlayerUiLyric: String = ""
+    private var lastPlayerUiLyricStatus: String = ""
+    private var lastPlayerUiAlbumArtStatus: String = "未检测"
     private var albumArtRefreshGeneration = 0L
+    private var lastQrcV2BuildProgress = QrcV2RebuildProgress()
+    private var lastQrcStaleCacheRebuildProgress = QrcStaleCacheRebuildProgress()
+    private var lastMaintenanceUiState = MaintenanceUiState()
+    private var lastLyricCacheStatsText = "歌词统计：loading..."
     private var lastQrcWatcherStatus = QrcWatcherStatus(
         watcherRunning = false,
         pendingGroups = 0,
@@ -161,8 +185,12 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         val startedAt = System.currentTimeMillis()
         super.onCreate(savedInstanceState)
+        StartupGuard.markAppOnCreate(::appendLog)
         appendLog("[UI] MainActivity onCreate start")
         setupUi()
+        window.decorView.post {
+            StartupGuard.markFirstFrameDrawn(::appendLog)
+        }
         appendLog("[UI] setContent complete costMs=${System.currentTimeMillis() - startedAt}")
         initializeBluetooth()
         requestRequiredPermissions()
@@ -292,33 +320,7 @@ class MainActivity : Activity() {
         )))
 
         val lyricCard = collapsibleCard(content, "歌词缓存与逐字时间", expanded = false)
-        maintenanceStatusTextView = statusValue(
-            QrcMaintenanceCoordinator.snapshot().displayText()
-        ).also(lyricCard::addView)
-        qrcCacheOverviewTextView = statusValue("缓存统计：loading...").also(lyricCard::addView)
-        qrcCacheBuildTextView = statusValue(QrcV2RebuildProgress().displayText()).also(lyricCard::addView)
-        qrcStaleCacheRebuildTextView = statusValue(
-            QrcStaleCacheRebuildProgress().displayText()
-        ).also(lyricCard::addView)
-        qrcWatcherStatusTextView = statusValue(lastQrcWatcherStatus.displayText()).also(lyricCard::addView)
-        lyricCacheStatsTextView = statusValue("歌词统计：loading...").also(lyricCard::addView)
-        lyricCard.addView(buttonGrid(listOf(
-            "构建 V2 逐字歌词缓存" to { startQrcV2Build(clear = false) },
-            "暂停构建" to ::pauseQrcV2Build,
-            "继续构建" to ::resumeQrcV2Build,
-            "停止构建" to ::stopQrcV2Build,
-            "清空临时构建" to { confirmAction("清空临时构建结果？", ::clearQrcV2Building) },
-            "清空并重新构建" to { confirmAction("清空临时结果并重新构建？") { startQrcV2Build(clear = true) } },
-            "重建 QRC 索引" to ::forceRefreshQrcIndex,
-            "预热歌词缓存" to ::warmupLyricCache,
-            "重建歌词模糊索引" to ::rebuildFuzzyLyricIndex,
-            "刷新当前歌词" to ::refreshCurrentLyric,
-            "刷新缓存统计" to ::refreshLyricStatsText,
-            "修复旧歌词缓存" to ::startQrcStaleCacheRebuild,
-            "停止旧缓存修复" to ::stopQrcStaleCacheRebuild,
-            "取消当前维护任务" to ::cancelCurrentMaintenance,
-            "删除旧缓存备份" to { confirmAction("删除旧缓存备份？", ::deleteOldQrcBackup) }
-        )))
+        setupMaintenancePanel(lyricCard)
 
         val connectionCard = collapsibleCard(content, "连接与兼容", expanded = false)
         connectionCard.addView(buttonGrid(listOf(
@@ -373,6 +375,401 @@ class MainActivity : Activity() {
         )
 
         setContentView(ScrollView(this).apply { addView(content) })
+    }
+
+    private fun setupMaintenancePanel(parent: LinearLayout) {
+        val buildStateCard = stateCard(parent, "构建任务", "未开始")
+        val buildCard = buildStateCard.body
+        buildTaskBadgeTextView = buildStateCard.badge
+        buildTaskStatusTextView = statusValue("")
+        buildCard.addView(buildTaskStatusTextView)
+        buildTaskPrimaryButton = fullWidthActionButton("开始构建") {
+            handleBuildTaskPrimaryAction()
+        }.also(buildCard::addView)
+        buildCard.addView(buttonGrid(listOf(
+            "停止任务" to {
+                confirmAction(
+                    "停止当前构建/维护任务？\n\n正在执行的任务会收到取消请求，未完成的临时结果会保留。"
+                ) {
+                    cancelCurrentMaintenance()
+                }
+            },
+            "清空并重新构建" to {
+                confirmAction(
+                    "清空临时结果并重新构建？\n\n会删除当前临时构建结果，然后重新开始 V2 逐字歌词缓存构建。"
+                ) {
+                    startQrcV2Build(clear = true)
+                }
+            }
+        )))
+        buildTaskStopButton = buildCard.getChildAt(buildCard.childCount - 1)
+            .let { it as GridLayout }
+            .getChildAt(0) as Button
+
+        val indexStateCard = stateCard(parent, "QRC 索引", "空闲")
+        val indexCard = indexStateCard.body
+        qrcIndexBadgeTextView = indexStateCard.badge
+        qrcIndexStatusTextView = statusValue("索引统计：loading...")
+        qrcCacheOverviewTextView = qrcIndexStatusTextView
+        indexCard.addView(qrcIndexStatusTextView)
+        qrcIndexPrimaryButton = fullWidthActionButton("构建索引") {
+            handleQrcIndexPrimaryAction()
+        }.also(indexCard::addView)
+        indexCard.addView(buttonGrid(listOf(
+            "重建模糊索引" to ::rebuildFuzzyLyricIndex
+        )))
+
+        val warmupStateCard = stateCard(parent, "歌词预热", "空闲")
+        val warmupCard = warmupStateCard.body
+        lyricsWarmupBadgeTextView = warmupStateCard.badge
+        lyricsWarmupStatusTextView = statusValue("预热统计：loading...")
+        lyricCacheStatsTextView = lyricsWarmupStatusTextView
+        warmupCard.addView(lyricsWarmupStatusTextView)
+        lyricsWarmupPrimaryButton = fullWidthActionButton("预热歌词缓存") {
+            handleLyricsWarmupPrimaryAction()
+        }.also(warmupCard::addView)
+
+        val repairStateCard = stateCard(parent, "缓存维护", "空闲")
+        val repairCard = repairStateCard.body
+        cacheMaintenanceBadgeTextView = repairStateCard.badge
+        cacheMaintenanceStatusTextView = statusValue("")
+        qrcStaleCacheRebuildTextView = cacheMaintenanceStatusTextView
+        repairCard.addView(cacheMaintenanceStatusTextView)
+        cacheMaintenancePrimaryButton = fullWidthActionButton("修复旧缓存") {
+            handleCacheMaintenancePrimaryAction()
+        }.also(repairCard::addView)
+        repairCard.addView(buttonGrid(listOf(
+            "删除旧缓存备份" to {
+                confirmAction(
+                    "删除旧缓存备份？\n\n只删除旧缓存备份目录，不影响当前活动缓存。"
+                ) {
+                    deleteOldQrcBackup()
+                }
+            },
+            "清空临时构建" to {
+                confirmAction(
+                    "清空临时构建结果？\n\n只清理 V2 构建中的临时结果。"
+                ) {
+                    clearQrcV2Building()
+                }
+            }
+        )))
+
+        val currentTrackStateCard = stateCard(parent, "当前歌曲", "实时")
+        val currentTrackCard = currentTrackStateCard.body
+        currentTrackBadgeTextView = currentTrackStateCard.badge
+        currentTrackDebugStatusTextView = statusValue("当前歌曲：未检测")
+        currentTrackCard.addView(currentTrackDebugStatusTextView)
+        currentTrackCard.addView(fullWidthActionButton("刷新当前歌词", ::refreshCurrentLyric))
+        currentTrackCard.addView(buttonGrid(listOf(
+            "刷新缓存统计" to ::refreshLyricStatsText
+        )))
+
+        maintenanceSummaryTextView = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.rgb(190, 196, 205))
+            setPadding(dp(8), dp(8), dp(8), 0)
+        }
+        parent.addView(maintenanceSummaryTextView)
+
+        maintenanceStatusTextView = buildTaskStatusTextView
+        qrcCacheBuildTextView = buildTaskStatusTextView
+        qrcWatcherStatusTextView = maintenanceSummaryTextView
+        refreshMaintenanceUiState()
+    }
+
+    private fun stateCard(
+        parent: LinearLayout,
+        title: String,
+        badge: String
+    ): StateCardViews {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundedBackground(Color.rgb(24, 25, 29), dp(14))
+            setPadding(dp(12), dp(10), dp(12), dp(12))
+        }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        header.addView(TextView(this).apply {
+            text = title
+            textSize = 16f
+            setTextColor(Color.WHITE)
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        val badgeView = TextView(this).apply {
+            text = "状态：$badge"
+            textSize = 12f
+            setTextColor(Color.rgb(196, 202, 212))
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            background = roundedBackground(Color.rgb(44, 47, 55), dp(10))
+        }
+        header.addView(badgeView)
+        card.addView(header)
+        parent.addView(
+            card,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dp(10)
+            }
+        )
+        return StateCardViews(card, badgeView)
+    }
+
+    private fun fullWidthActionButton(label: String, action: () -> Unit): Button {
+        return actionButton(label, action).apply {
+            minHeight = dp(44)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(8)
+            }
+        }
+    }
+
+    private fun refreshMaintenanceUiState() {
+        if (!::buildTaskStatusTextView.isInitialized) {
+            return
+        }
+        val state = buildMaintenanceUiState()
+        lastMaintenanceUiState = state
+
+        val build = state.buildProgress
+        val buildPercent = if (build.total > 0) build.processed * 100 / build.total else 0
+        val canStop = state.activeTask != null || build.running ||
+            build.status == QrcV2RebuildStatus.PAUSED
+        val activeBuildTask = state.activeTask == MaintenanceTaskType.QRC_V2_REBUILD
+        val activeTaskName = state.activeTask?.let(::maintenanceTaskDisplayName)
+        val buildStatusLabel = when {
+            activeBuildTask || build.running || build.status == QrcV2RebuildStatus.PAUSED ->
+                state.taskStatus.displayName
+            state.activeTask != null -> "等待"
+            else -> "空闲"
+        }
+        val buildHint = when {
+            state.cancelRequested -> "提示：停止请求已发送，正在等待任务退出"
+            activeBuildTask || build.running -> "提示：可停止当前构建任务"
+            state.activeTask != null ->
+                "提示：正在执行 $activeTaskName，构建操作暂不可用"
+            !canStop -> "提示：当前没有运行中的任务"
+            else -> "提示：可停止当前任务"
+        }
+        buildTaskBadgeTextView.text = "状态：$buildStatusLabel"
+        buildTaskStatusTextView.text =
+            "当前构建：${if (activeBuildTask || build.running) "V2_BUILD" else "无"}\n" +
+            "构建状态：$buildStatusLabel\n" +
+            "全局维护：${activeTaskName ?: "无"}\n" +
+            "进度：${build.processed} / ${build.total} ($buildPercent%)\n" +
+            "成功：${build.successWithWords + build.successLineOnly} 失败：${build.failed}\n" +
+            "跳过无 QRC：${build.skippedNoQrc} 重复：${build.duplicate}\n" +
+            "已运行：${state.runningSeconds}s\n" +
+            buildHint
+
+        val buildPrimary = buildPrimaryButtonText(state)
+        setActionButtonState(
+            buildTaskPrimaryButton,
+            buildPrimary,
+            canRunTask(MaintenanceTaskType.QRC_V2_REBUILD, state)
+        )
+        setActionButtonState(
+            buildTaskStopButton,
+            if (state.cancelRequested) "停止中..." else "停止任务",
+            canStop
+        )
+
+        val indexBusy = state.activeTask == MaintenanceTaskType.QRC_INDEX_REBUILD
+        qrcIndexBadgeTextView.text = "状态：${if (indexBusy) "构建中" else "空闲"}"
+        setActionButtonState(
+            qrcIndexPrimaryButton,
+            if (indexBusy) "停止任务" else "重建索引",
+            canRunTask(MaintenanceTaskType.QRC_INDEX_REBUILD, state) || indexBusy
+        )
+
+        val warmupBusy = state.activeTask == MaintenanceTaskType.LYRIC_WARMUP
+        val warmupStatus = when {
+            warmupBusy -> "预热中"
+            state.activeTask != null -> "等待"
+            else -> "空闲"
+        }
+        lyricsWarmupBadgeTextView.text = "状态：$warmupStatus"
+        lyricsWarmupStatusTextView.text =
+            "当前预热：$warmupStatus\n" +
+            "全局维护：${activeTaskName ?: "无"}\n" +
+            "已运行：${if (warmupBusy) state.runningSeconds else 0}s\n" +
+            "提示：${when {
+                warmupBusy -> "正在加载 Alias / Negative / QRC Index / Fuzzy Index"
+                state.activeTask != null -> "其它维护任务运行中，预热暂不可用"
+                else -> "未启动预热"
+            }}\n" +
+            lastLyricCacheStatsText
+        setActionButtonState(
+            lyricsWarmupPrimaryButton,
+            if (warmupBusy) "取消预热" else "预热歌词缓存",
+            canRunTask(MaintenanceTaskType.LYRIC_WARMUP, state) || warmupBusy
+        )
+
+        val repair = state.oldCacheRepairStatus
+        val repairPercent = if (repair.total > 0) repair.processed * 100 / repair.total else 0
+        cacheMaintenanceBadgeTextView.text =
+            "状态：${if (repair.running) "修复中" else repair.status}"
+        cacheMaintenanceStatusTextView.text =
+            "旧歌词缓存修复：${repair.status}\n" +
+            "进度：${repair.processed} / ${repair.total} ($repairPercent%)\n" +
+            "重建：${repair.rebuilt} 跳过：${repair.skipped} 失败：${repair.failed}\n" +
+            "当前：${repair.currentGroupId.ifBlank { "-" }}"
+        val repairBusy = repair.running || state.activeTask == MaintenanceTaskType.CACHE_REPAIR
+        setActionButtonState(
+            cacheMaintenancePrimaryButton,
+            if (repairBusy) "停止修复" else "修复旧缓存",
+            canRunTask(MaintenanceTaskType.CACHE_REPAIR, state) || repairBusy
+        )
+
+        currentTrackBadgeTextView.text = "状态：${state.currentLyricsStatus ?: "unknown"}"
+        currentTrackDebugStatusTextView.text =
+            "当前歌曲：${state.currentTrackTitle ?: "未检测"}\n" +
+            "歌词状态：${state.currentLyricsStatus ?: "unknown"}\n" +
+            "封面状态：${state.currentAlbumArtStatus ?: "unknown"}"
+
+        maintenanceSummaryTextView.text =
+            "增量成功：${state.watcherStatus.incrementalSuccess}    " +
+            "增量失败：${state.watcherStatus.incrementalFailed}\n" +
+            "Watcher pending：${state.watcherStatus.pendingGroups}    " +
+            "索引 builtAt：见 QRC 索引卡片"
+    }
+
+    private fun buildMaintenanceUiState(): MaintenanceUiState {
+        val maintenance = QrcMaintenanceCoordinator.snapshot()
+        val current = maintenance.current
+        val build = lastQrcV2BuildProgress
+        val repair = qrcStaleCacheRebuildManager?.status()
+            ?: lastQrcStaleCacheRebuildProgress
+        val status = when {
+            current?.cancelled == true -> MaintenanceTaskStatus.STOPPING
+            build.running || current?.type == MaintenanceTaskType.QRC_V2_REBUILD ->
+                MaintenanceTaskStatus.RUNNING
+            build.status == QrcV2RebuildStatus.PAUSED -> MaintenanceTaskStatus.PAUSED
+            build.status == QrcV2RebuildStatus.COMPLETED -> MaintenanceTaskStatus.COMPLETED
+            build.status == QrcV2RebuildStatus.FAILED -> MaintenanceTaskStatus.FAILED
+            else -> MaintenanceTaskStatus.IDLE
+        }
+        return MaintenanceUiState(
+            activeTask = current?.type,
+            taskStatus = status,
+            reason = current?.reason,
+            runningSeconds = current?.runningForMs?.div(1000L) ?: 0L,
+            cancelRequested = current?.cancelled == true,
+            buildProgress = build,
+            oldCacheRepairStatus = repair,
+            watcherStatus = lastQrcWatcherStatus,
+            currentTrackTitle = lastPlayerUiSongKey
+                .takeIf { it.isNotBlank() }
+                ?.split("|")
+                ?.firstOrNull()
+                ?.takeIf { it != "-" },
+            currentLyricsStatus = lastPlayerUiLyricStatus.ifBlank { "unknown" },
+            currentAlbumArtStatus = lastPlayerUiAlbumArtStatus
+        )
+    }
+
+    private fun buildPrimaryButtonText(state: MaintenanceUiState): String {
+        if (state.cancelRequested) {
+            return "停止中..."
+        }
+        return when (state.buildProgress.status) {
+            QrcV2RebuildStatus.NOT_STARTED -> "开始构建"
+            QrcV2RebuildStatus.RUNNING,
+            QrcV2RebuildStatus.VALIDATING -> "暂停构建"
+            QrcV2RebuildStatus.PAUSED,
+            QrcV2RebuildStatus.STOPPED -> "继续构建"
+            QrcV2RebuildStatus.COMPLETED,
+            QrcV2RebuildStatus.FAILED -> "重新构建"
+        }
+    }
+
+    private fun handleBuildTaskPrimaryAction() {
+        val state = lastMaintenanceUiState
+        if (state.cancelRequested) {
+            appendLog("[MaintenanceUI] action skipped reason=stopping")
+            return
+        }
+        when (state.buildProgress.status) {
+            QrcV2RebuildStatus.NOT_STARTED -> startQrcV2Build(clear = false)
+            QrcV2RebuildStatus.RUNNING,
+            QrcV2RebuildStatus.VALIDATING -> pauseQrcV2Build()
+            QrcV2RebuildStatus.PAUSED,
+            QrcV2RebuildStatus.STOPPED -> resumeQrcV2Build()
+            QrcV2RebuildStatus.COMPLETED,
+            QrcV2RebuildStatus.FAILED -> startQrcV2Build(clear = false)
+        }
+    }
+
+    private fun handleQrcIndexPrimaryAction() {
+        if (lastMaintenanceUiState.activeTask == MaintenanceTaskType.QRC_INDEX_REBUILD) {
+            confirmAction(
+                "停止 QRC 索引任务？\n\n当前索引重建会收到取消请求。"
+            ) {
+                cancelCurrentMaintenance()
+            }
+        } else {
+            forceRefreshQrcIndex()
+        }
+    }
+
+    private fun handleLyricsWarmupPrimaryAction() {
+        if (lastMaintenanceUiState.activeTask == MaintenanceTaskType.LYRIC_WARMUP) {
+            cancelCurrentMaintenance()
+        } else {
+            warmupLyricCache()
+        }
+    }
+
+    private fun handleCacheMaintenancePrimaryAction() {
+        val repairing = lastMaintenanceUiState.oldCacheRepairStatus.running ||
+            lastMaintenanceUiState.activeTask == MaintenanceTaskType.CACHE_REPAIR
+        if (repairing) {
+            confirmAction(
+                "停止旧缓存修复？\n\n已完成的修复会保留，未处理项稍后可重新修复。"
+            ) {
+                stopQrcStaleCacheRebuild()
+            }
+        } else {
+            startQrcStaleCacheRebuild()
+        }
+    }
+
+    private fun canRunTask(
+        task: MaintenanceTaskType,
+        state: MaintenanceUiState
+    ): Boolean {
+        val active = state.activeTask ?: return true
+        return active == task
+    }
+
+    private fun maintenanceTaskDisplayName(task: MaintenanceTaskType): String {
+        return when (task) {
+            MaintenanceTaskType.LYRIC_WARMUP -> "歌词预热"
+            MaintenanceTaskType.QRC_INDEX_REBUILD -> "QRC 索引"
+            MaintenanceTaskType.FUZZY_INDEX_REBUILD -> "模糊索引"
+            MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD -> "增量预构建"
+            MaintenanceTaskType.CACHE_REPAIR -> "旧缓存修复"
+            MaintenanceTaskType.QRC_V2_REBUILD -> "V2 构建"
+            MaintenanceTaskType.ARTWORK_DISCOVERY -> "封面探测"
+            MaintenanceTaskType.ARTWORK_ENHANCEMENT_DIAG -> "封面增强诊断"
+        }
+    }
+
+    private fun setActionButtonState(
+        button: Button,
+        label: String,
+        enabled: Boolean
+    ) {
+        button.text = label
+        button.isEnabled = enabled
+        button.alpha = if (enabled) 1.0f else 0.48f
+        button.setTextColor(Color.WHITE)
     }
 
     private fun actionButton(
@@ -573,14 +970,18 @@ class MainActivity : Activity() {
                 }
 
                 if (albumArt != null) {
+                    lastPlayerUiAlbumArtStatus =
+                        "READY ${albumArt.bitmap.width}x${albumArt.bitmap.height}"
                     currentAlbumArtImageView.setImageBitmap(albumArt.bitmap)
                     currentAlbumArtTextView.text =
                         "封面：${albumArt.bitmap.width} x ${albumArt.bitmap.height}"
                 } else {
+                    lastPlayerUiAlbumArtStatus = "SOURCE_NOT_PROVIDED"
                     currentAlbumArtImageView
                         .setImageResource(android.R.drawable.ic_media_play)
                     currentAlbumArtTextView.text = "封面：未找到"
                 }
+                refreshMaintenanceUiState()
             }
         }.apply {
             name = "MainStatusRefreshThread"
@@ -635,6 +1036,7 @@ class MainActivity : Activity() {
                     "artist=$safeArtist album=$safeAlbum"
             )
             if (allowAlbumArtRefresh) {
+                lastPlayerUiAlbumArtStatus = "LOADING"
                 currentAlbumArtImageView.setImageResource(android.R.drawable.ic_media_play)
                     currentAlbumArtTextView.text = "封面：加载中..."
                 refreshCurrentAlbumArtForSong(songKey)
@@ -645,6 +1047,7 @@ class MainActivity : Activity() {
             .replace("歌曲名：-\n歌手：-\n专辑：-", "歌曲：未检测")
         val lyricText = lyric.ifBlank { "暂无歌词" }
         val statusText = lyricStatus.ifBlank { "unknown" }
+        lastPlayerUiLyricStatus = statusText
         val hint = if (statusText == "waiting QQMusic lyric cache") {
             "\n提示：QQ音乐可能尚未生成歌词缓存，可在 QQ音乐中打开歌词/桌面歌词后稍等。"
         } else {
@@ -655,6 +1058,7 @@ class MainActivity : Activity() {
             lastPlayerUiLyric = lyricText
             appendLog("[PlayerUI] lyric changed text=$lyricText")
         }
+        refreshMaintenanceUiState()
     }
 
     private fun refreshCurrentAlbumArtForSong(songKey: String) {
@@ -678,6 +1082,8 @@ class MainActivity : Activity() {
                     return@runOnUiThread
                 }
                 if (albumArt != null) {
+                    lastPlayerUiAlbumArtStatus =
+                        "READY ${albumArt.bitmap.width}x${albumArt.bitmap.height}"
                     currentAlbumArtImageView.setImageBitmap(albumArt.bitmap)
                     currentAlbumArtTextView.text =
                         "封面：${albumArt.bitmap.width} x ${albumArt.bitmap.height}"
@@ -687,11 +1093,13 @@ class MainActivity : Activity() {
                             "height=${albumArt.bitmap.height}"
                     )
                 } else {
+                    lastPlayerUiAlbumArtStatus = "SOURCE_NOT_PROVIDED"
                     currentAlbumArtImageView
                         .setImageResource(android.R.drawable.ic_media_play)
                     currentAlbumArtTextView.text = "封面：未找到"
                     appendLog("[PlayerUI] album art changed exists=false")
                 }
+                refreshMaintenanceUiState()
             }
         }.apply {
             name = "MainAlbumArtRefreshThread"
@@ -1217,18 +1625,16 @@ class MainActivity : Activity() {
 
     private fun updateQrcV2BuildProgress(progress: QrcV2RebuildProgress) {
         runOnUiThread {
-            if (::qrcCacheBuildTextView.isInitialized) {
-                qrcCacheBuildTextView.text = progress.displayText()
-            }
+            lastQrcV2BuildProgress = progress
+            refreshMaintenanceUiState()
             refreshQrcCacheOverview()
         }
     }
 
     private fun updateQrcStaleCacheRebuildProgress(progress: QrcStaleCacheRebuildProgress) {
         runOnUiThread {
-            if (::qrcStaleCacheRebuildTextView.isInitialized) {
-                qrcStaleCacheRebuildTextView.text = progress.displayText()
-            }
+            lastQrcStaleCacheRebuildProgress = progress
+            refreshMaintenanceUiState()
             refreshQrcCacheOverview()
         }
     }
@@ -1236,9 +1642,7 @@ class MainActivity : Activity() {
     private fun updateQrcWatcherStatus(status: QrcWatcherStatus) {
         lastQrcWatcherStatus = status
         runOnUiThread {
-            if (::qrcWatcherStatusTextView.isInitialized) {
-                qrcWatcherStatusTextView.text = status.displayText()
-            }
+            refreshMaintenanceUiState()
             refreshMaintenanceStatus()
         }
     }
@@ -1291,8 +1695,20 @@ class MainActivity : Activity() {
         }
         manager.warmupNow()
         Thread {
-            Thread.sleep(1_000L)
+            var polls = 0
+            while (polls < 45) {
+                Thread.sleep(1_000L)
+                runOnUiThread {
+                    refreshMaintenanceUiState()
+                }
+                val current = QrcMaintenanceCoordinator.currentToken()
+                if (current?.type != MaintenanceTaskType.LYRIC_WARMUP) {
+                    break
+                }
+                polls += 1
+            }
             runOnUiThread {
+                refreshMaintenanceUiState()
                 refreshLyricStatsText()
             }
         }.apply {
@@ -1330,7 +1746,13 @@ class MainActivity : Activity() {
     private fun scheduleDebugStatsLoad(force: Boolean = false) {
         appendLog("[UI] debug stats load scheduled")
         mainHandler.postDelayed({
-            loadDebugStatsAsync(force)
+            StartupGuard.runWhenHeavyTaskAllowed(
+                taskName = "debug stats",
+                handler = mainHandler,
+                logger = ::appendLog
+            ) {
+                loadDebugStatsAsync(force)
+            }
         }, DEBUG_STATS_INITIAL_DELAY_MS)
     }
 
@@ -1350,7 +1772,8 @@ class MainActivity : Activity() {
             qrcCacheOverviewTextView.text = "缓存统计：loading..."
         }
         if (::lyricCacheStatsTextView.isInitialized) {
-            lyricCacheStatsTextView.text = "歌词统计：loading..."
+            lastLyricCacheStatsText = "歌词统计：loading..."
+            refreshMaintenanceUiState()
         }
         Thread {
             val startedAt = System.currentTimeMillis()
@@ -1358,8 +1781,7 @@ class MainActivity : Activity() {
             val result = runCatching {
                 DebugStatsText(
                     qrcOverview = qrcCacheOverviewText(),
-                    lyricStats = lyricCacheStatsText(),
-                    maintenance = QrcMaintenanceCoordinator.snapshot().displayText()
+                    lyricStats = lyricCacheStatsText()
                 )
             }
             runOnUiThread {
@@ -1369,18 +1791,17 @@ class MainActivity : Activity() {
                         qrcCacheOverviewTextView.text = stats.qrcOverview
                     }
                     if (::lyricCacheStatsTextView.isInitialized) {
-                        lyricCacheStatsTextView.text = stats.lyricStats
+                        lastLyricCacheStatsText = stats.lyricStats
                     }
-                    if (::maintenanceStatusTextView.isInitialized) {
-                        maintenanceStatusTextView.text = stats.maintenance
-                    }
+                    refreshMaintenanceUiState()
                     appendLog("[DebugStats] load done costMs=${System.currentTimeMillis() - startedAt}")
                 }.onFailure { exception ->
                     if (::qrcCacheOverviewTextView.isInitialized) {
                         qrcCacheOverviewTextView.text = "缓存统计：加载失败 ${exception.message}"
                     }
                     if (::lyricCacheStatsTextView.isInitialized) {
-                        lyricCacheStatsTextView.text = "歌词统计：加载失败 ${exception.message}"
+                        lastLyricCacheStatsText = "歌词统计：加载失败 ${exception.message}"
+                        refreshMaintenanceUiState()
                     }
                     appendLog("[DebugStats] failed error=${exception.message}")
                 }
@@ -1393,9 +1814,7 @@ class MainActivity : Activity() {
     }
 
     private fun refreshMaintenanceStatus() {
-        if (::maintenanceStatusTextView.isInitialized) {
-            maintenanceStatusTextView.text = QrcMaintenanceCoordinator.snapshot().displayText()
-        }
+        refreshMaintenanceUiState()
     }
 
     private fun qrcCacheOverviewText(): String {
@@ -1654,9 +2073,44 @@ class MainActivity : Activity() {
 
     private data class DebugStatsText(
         val qrcOverview: String,
-        val lyricStats: String,
-        val maintenance: String
+        val lyricStats: String
     )
+
+    private data class StateCardViews(
+        val body: LinearLayout,
+        val badge: TextView
+    )
+
+    private data class MaintenanceUiState(
+        val activeTask: MaintenanceTaskType? = null,
+        val taskStatus: MaintenanceTaskStatus = MaintenanceTaskStatus.IDLE,
+        val reason: String? = null,
+        val runningSeconds: Long = 0L,
+        val cancelRequested: Boolean = false,
+        val buildProgress: QrcV2RebuildProgress = QrcV2RebuildProgress(),
+        val oldCacheRepairStatus: QrcStaleCacheRebuildProgress =
+            QrcStaleCacheRebuildProgress(),
+        val watcherStatus: QrcWatcherStatus = QrcWatcherStatus(
+            watcherRunning = false,
+            pendingGroups = 0,
+            incrementalRunning = false,
+            incrementalSuccess = 0,
+            incrementalFailed = 0,
+            incrementalSkipped = 0
+        ),
+        val currentTrackTitle: String? = null,
+        val currentLyricsStatus: String? = null,
+        val currentAlbumArtStatus: String? = null
+    )
+
+    private enum class MaintenanceTaskStatus(val displayName: String) {
+        IDLE("空闲"),
+        RUNNING("运行中"),
+        PAUSED("暂停中"),
+        STOPPING("停止中"),
+        COMPLETED("已完成"),
+        FAILED("失败")
+    }
 
     companion object {
         private const val REQUEST_PERMISSIONS = 1001

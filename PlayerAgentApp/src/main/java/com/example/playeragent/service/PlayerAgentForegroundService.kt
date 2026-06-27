@@ -19,6 +19,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import com.example.playeragent.MainActivity
+import com.example.playeragent.StartupGuard
 import com.example.playeragent.ble.BleAdvertiserManager
 import com.example.playeragent.ble.BleGattServerManager
 import com.example.playeragent.history.PlaybackHistoryMonitor
@@ -27,7 +28,6 @@ import com.example.playeragent.logging.LogBuffer
 import com.example.playeragent.media.QrcDirectoryWatcher
 import com.example.playeragent.media.QrcIncrementalPrebuildManager
 import com.example.playeragent.media.QrcWatcherStatus
-import com.example.playeragent.media.LyricWarmupManager
 
 class PlayerAgentForegroundService : Service() {
 
@@ -36,7 +36,6 @@ class PlayerAgentForegroundService : Service() {
     private var advertiserManager: BleAdvertiserManager? = null
     private var gattServerManager: BleGattServerManager? = null
     private var playbackHistoryMonitor: PlaybackHistoryMonitor? = null
-    private var lyricWarmupManager: LyricWarmupManager? = null
     private var qrcIncrementalPrebuildManager: QrcIncrementalPrebuildManager? = null
     private var qrcDirectoryWatcher: QrcDirectoryWatcher? = null
     @Volatile
@@ -59,6 +58,7 @@ class PlayerAgentForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        StartupGuard.markServiceOnCreate(::log)
         running = true
         serviceStopping = false
         createNotificationChannel()
@@ -81,11 +81,10 @@ class PlayerAgentForegroundService : Service() {
             ACTION_REFRESH_CURRENT_LYRIC -> refreshCurrentLyric()
             else -> {
                 startPlaybackHistoryMonitor()
-                ensureBleStackStarted("service start")
-                startQrcWatcher()
-                scheduleLyricWarmup()
+                scheduleDefaultStartupWork()
             }
         }
+        StartupGuard.markServiceOnStartCommandReturnFast(::log)
         return START_STICKY
     }
 
@@ -94,7 +93,6 @@ class PlayerAgentForegroundService : Service() {
         serviceStopping = true
         mainHandler.removeCallbacksAndMessages(null)
         runCatching { unregisterReceiver(bluetoothStateReceiver) }
-        stopLyricWarmup()
         stopPlaybackHistoryMonitor()
         stopQrcWatcher()
         advertiserManager?.stopAdvertising()
@@ -130,19 +128,23 @@ class PlayerAgentForegroundService : Service() {
         playbackHistoryMonitor = null
     }
 
-    private fun scheduleLyricWarmup() {
-        val manager = lyricWarmupManager ?: LyricWarmupManager(
-            context = this,
-            logger = ::log
-        ).also {
-            lyricWarmupManager = it
+    private fun scheduleDefaultStartupWork() {
+        mainHandler.post {
+            if (serviceStopping) {
+                return@post
+            }
+            ensureBleStackStarted("service start")
+            StartupGuard.runWhenHeavyTaskAllowed(
+                taskName = "qrc watcher",
+                handler = mainHandler,
+                logger = ::log
+            ) {
+                if (!serviceStopping) {
+                    startQrcWatcher()
+                }
+            }
+            log("[LyricWarmup] startup auto warmup disabled; use Debug Tools manual warmup")
         }
-        manager.schedule()
-    }
-
-    private fun stopLyricWarmup() {
-        lyricWarmupManager?.shutdown()
-        lyricWarmupManager = null
     }
 
     private fun initializeBluetooth(
