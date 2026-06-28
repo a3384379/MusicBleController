@@ -87,6 +87,17 @@ class LyricRecoveryEngine(
         )
         logger("[LyricRecovery] start songKey=$songKey reason=$reason expiresInMs=$RECOVERY_WINDOW_MS")
         logger("[LyricRecovery] state IDLE -> ${state.name}")
+        LyricTraceLogger.stage(
+            runId = "unknown",
+            trackId = trackId,
+            songKey = songKey,
+            generation = null,
+            stage = "qrcRetryScheduled",
+            reason = "source_wait",
+            costMs = null,
+            extra = mapOf("delayMs" to INITIAL_RETRY_DELAY_MS.toString(), "trigger" to "initial"),
+            sink = logger
+        )
         scheduleRetryLocked("initial", INITIAL_RETRY_DELAY_MS, bypassRetryableCooldown = true)
         scheduleFastProbeRetriesLocked()
         scheduleTimerRetryLocked()
@@ -162,6 +173,17 @@ class LyricRecoveryEngine(
             current.state = LyricRecoveryState.RESOLVED
             val costMs = System.currentTimeMillis() - current.startedAt
             logger("[LyricRecovery] resolved songKey=$songKey lines=$lineCount costMs=$costMs")
+            LyricTraceLogger.stage(
+                runId = "unknown",
+                trackId = current.trackId,
+                songKey = current.songKey,
+                generation = null,
+                stage = "sourceWaitResolved",
+                reason = current.lastReason.ifBlank { "lyrics_loaded" },
+                costMs = costMs,
+                extra = mapOf("lines" to lineCount.toString()),
+                sink = logger
+            )
             session = null
             cancelTimersLocked()
         }
@@ -180,6 +202,17 @@ class LyricRecoveryEngine(
         }
         current.lastReason = reason
         logger("[LyricRecovery] expired songKey=$songKey retryCount=${current.retryCount} reason=$reason")
+        LyricTraceLogger.stage(
+            runId = "unknown",
+            trackId = current.trackId,
+            songKey = current.songKey,
+            generation = null,
+            stage = "sourceWaitFinalNotProvided",
+            reason = reason,
+            costMs = System.currentTimeMillis() - current.startedAt,
+            extra = mapOf("retryCount" to current.retryCount.toString()),
+            sink = logger
+        )
         cancelTimersLocked()
     }
 
@@ -235,6 +268,19 @@ class LyricRecoveryEngine(
         fastProbeFutures.forEach { it.cancel(false) }
         fastProbeFutures.clear()
         FAST_PROBE_RETRY_DELAYS_MS.forEach { delayMs ->
+            session?.let { current ->
+                LyricTraceLogger.stage(
+                    runId = "unknown",
+                    trackId = current.trackId,
+                    songKey = current.songKey,
+                    generation = null,
+                    stage = "qrcRetryScheduled",
+                    reason = "source_wait",
+                    costMs = null,
+                    extra = mapOf("delayMs" to delayMs.toString(), "trigger" to "fast_probe"),
+                    sink = logger
+                )
+            }
             val future = scheduler.schedule(
                 {
                     fireRetry("fast probe", bypassRetryableCooldown = true)
@@ -275,9 +321,23 @@ class LyricRecoveryEngine(
             TimeUnit.MILLISECONDS
         )
         logger("[LyricRecovery] retry scheduled reason=$reason delayMs=$delayMs")
+        session?.let { current ->
+            LyricTraceLogger.stage(
+                runId = "unknown",
+                trackId = current.trackId,
+                songKey = current.songKey,
+                generation = null,
+                stage = "qrcRetryScheduled",
+                reason = "source_wait",
+                costMs = null,
+                extra = mapOf("delayMs" to delayMs.toString(), "trigger" to reason),
+                sink = logger
+            )
+        }
     }
 
     private fun fireRetry(reason: String, bypassRetryableCooldown: Boolean) {
+        val retryStartedAt = System.currentTimeMillis()
         val target: RecoverySession = synchronized(this) {
             val current = session ?: return
             if (!current.isActive()) {
@@ -306,6 +366,17 @@ class LyricRecoveryEngine(
                 "retry_later"
             }
             logger("[LyricRecovery] retry now reason=$reason songKey=${current.songKey}")
+            LyricTraceLogger.stage(
+                runId = "unknown",
+                trackId = current.trackId,
+                songKey = current.songKey,
+                generation = null,
+                stage = "qrcRetryStart",
+                reason = reason,
+                costMs = null,
+                extra = mapOf("retryCount" to current.retryCount.toString()),
+                sink = logger
+            )
             if (bypassRetryableCooldown) {
                 logger("[LyricRecovery] bypass retryable cooldown reason=$reason")
             } else {
@@ -314,6 +385,17 @@ class LyricRecoveryEngine(
             current.copy()
         }
         val accepted = retryCallback(reason, bypassRetryableCooldown)
+        LyricTraceLogger.stage(
+            runId = "unknown",
+            trackId = target.trackId,
+            songKey = target.songKey,
+            generation = null,
+            stage = "qrcRetryEnd",
+            reason = if (accepted) "accepted" else "not_accepted",
+            costMs = System.currentTimeMillis() - retryStartedAt,
+            extra = mapOf("trigger" to reason),
+            sink = logger
+        )
         synchronized(this) {
             val current = session
             if (current?.songKey != target.songKey) {
@@ -338,6 +420,17 @@ class LyricRecoveryEngine(
         }
         current.state = LyricRecoveryState.EXPIRED
         logger("[LyricRecovery] expired songKey=${current.songKey} retryCount=${current.retryCount}")
+        LyricTraceLogger.stage(
+            runId = "unknown",
+            trackId = current.trackId,
+            songKey = current.songKey,
+            generation = null,
+            stage = "sourceWaitFinalNotProvided",
+            reason = current.lastReason.ifBlank { "expired" },
+            costMs = System.currentTimeMillis() - current.startedAt,
+            extra = mapOf("retryCount" to current.retryCount.toString()),
+            sink = logger
+        )
         cancelTimersLocked()
         return true
     }

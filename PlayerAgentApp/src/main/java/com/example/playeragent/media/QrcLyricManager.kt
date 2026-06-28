@@ -86,6 +86,11 @@ class QrcLyricManager(
         logger("[QrcLyric] findBestGroup start title=$title")
 
         cacheManager.get(title, artist, album, traceId, shouldCancel)?.let { cached ->
+            trace(
+                traceId,
+                "parseOptimizationCacheHit",
+                "source=qrc_l2 groupId=${cached.groupId} lines=${cached.lines.size}"
+            )
             cachedLines = cached.lines.map {
                 LyricLine(
                     timeMs = it.timeMs,
@@ -131,6 +136,11 @@ class QrcLyricManager(
         }
 
         songLinesCache[songKey]?.let { lines ->
+            trace(
+                traceId,
+                "parseOptimizationCacheHit",
+                "source=song_memory groupId=${songGroupCache[songKey].orEmpty()} lines=${lines.size}"
+            )
             cachedLines = lines
             cachedGroupId = songGroupCache[songKey]
             trace(
@@ -192,6 +202,12 @@ class QrcLyricManager(
                 reason = "qrc cooldown retry pending"
             )
         }
+
+        trace(
+            traceId,
+            "parseOptimizationCacheMiss",
+            "songKey=$songKey"
+        )
 
         val indexStartedAt = System.currentTimeMillis()
         val entries = getIndexEntries(forceRefresh = false)

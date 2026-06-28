@@ -769,6 +769,13 @@ for line in sony_text.splitlines():
         "fullLyricsSendStart": "fullLyricsSendStartAt",
         "fullLyricsSendEnd": "fullLyricsSendEndAt",
         "fullLyricsSendSkip": "fullLyricsSendSkipAt",
+        "parseOptimizationCacheHit": "parseOptimizationCacheHitAt",
+        "parseOptimizationCacheMiss": "parseOptimizationCacheMissAt",
+        "qrcRetryScheduled": "qrcRetryScheduledAt",
+        "qrcRetryStart": "qrcRetryStartAt",
+        "qrcRetryEnd": "qrcRetryEndAt",
+        "sourceWaitResolved": "sourceWaitResolvedAt",
+        "sourceWaitFinalNotProvided": "sourceWaitFinalNotProvidedAt",
     }
     if stage == "trackChanged":
         item["title"] = clean_text_value(detail.get("title", item["title"]))
@@ -799,6 +806,15 @@ def delta(item, start, end):
     a = item["events"].get(start, 0)
     b = item["events"].get(end, 0)
     return max(0, b - a) if a and b else 0
+
+def detail_cost_ms(item, event_name, fallback=0):
+    value = item["details"].get(event_name, {}).get("costMs")
+    if value in (None, "", "-"):
+        return fallback
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
 
 segments = [
     ("trackChangedToQrcFileFoundMs", "trackChangedAt", "qrcFileFoundAt"),
@@ -866,21 +882,30 @@ def classify(item):
     details = item["details"]
     qrc_end = details.get("qrcLookupEndAt", {})
     parse_end = details.get("qrcParseEndAt", {})
+    qrc_lookup_ms = detail_cost_ms(item, "qrcLookupEndAt", delta(item, "qrcLookupStartAt", "qrcLookupEndAt"))
+    decrypt_ms = detail_cost_ms(item, "qrcDecryptEndAt", delta(item, "qrcDecryptStartAt", "qrcDecryptEndAt"))
+    parse_ms = detail_cost_ms(item, "qrcParseEndAt", delta(item, "qrcParseStartAt", "qrcParseEndAt"))
+    index_ms = detail_cost_ms(item, "indexBuildEndAt", delta(item, "indexBuildStartAt", "indexBuildEndAt"))
+    qrc_lookup_result = (qrc_end.get("result") or qrc_end.get("reason") or "").lower()
+    qrc_lookup_reason = (qrc_end.get("reason") or "").lower()
+    qrc_found_reason = (details.get("qrcFileFoundAt", {}).get("reason") or "").lower()
     if item.get("missingStages"):
         return "TRACE_INCOMPLETE"
     if item.get("maintenanceReasons"):
         return "BLOCKED_BY_MAINTENANCE"
-    if details.get("qrcLookupEndAt", {}).get("reason", "").lower().find("cooldown") >= 0:
+    if qrc_lookup_reason.find("cooldown") >= 0:
         return "COOLDOWN_BLOCKED"
-    if not events.get("qrcFileFoundAt") and not events.get("iosFullLyricsReceivedAt"):
+    if qrc_lookup_result == "miss" or parse_end.get("result") == "failed":
         return "SOURCE_NOT_PROVIDED"
-    if not events.get("qrcFileFoundAt") or d.get("trackChangedToQrcFileFoundMs", 0) > 1000:
+    if not events.get("qrcFileFoundAt"):
         return "SOURCE_WAIT"
-    decrypt_ms = delta(item, "qrcDecryptStartAt", "qrcDecryptEndAt")
-    parse_ms = delta(item, "qrcParseStartAt", "qrcParseEndAt")
-    if max(decrypt_ms, parse_ms, d.get("qrcFileFoundToParseDoneMs", 0)) > 500:
+    if qrc_lookup_result != "hit" and d.get("trackChangedToQrcFileFoundMs", 0) > 1000:
+        return "SOURCE_WAIT"
+    if qrc_lookup_result == "hit" and qrc_lookup_ms > 1000 and qrc_found_reason != "cache hit":
+        return "SOURCE_WAIT"
+    if decrypt_ms > 300 or parse_ms > 500:
         return "PARSE_SLOW"
-    if delta(item, "indexBuildStartAt", "indexBuildEndAt") > 300:
+    if index_ms > 300:
         return "INDEX_SLOW"
     if d.get("runtimeAppliedToReadyGateMs", 0) > 300:
         return "READY_GATE_DELAY"
@@ -895,8 +920,6 @@ def classify(item):
         delta(item, "fullLyricsSendEndAt", "iosFullLyricsReceivedAt") > 1000
     ):
         return "IOS_RECEIVE_DELAY"
-    if parse_end.get("result") == "failed" or qrc_end.get("result") == "miss":
-        return "SOURCE_NOT_PROVIDED"
     return "READY_FAST"
 
 track_rows = []
@@ -1042,6 +1065,13 @@ trace_stage_counts = Counter(
         "fullLyricsSendStartAt",
         "fullLyricsSendEndAt",
         "fullLyricsSendSkipAt",
+        "parseOptimizationCacheHitAt",
+        "parseOptimizationCacheMissAt",
+        "qrcRetryScheduledAt",
+        "qrcRetryStartAt",
+        "qrcRetryEndAt",
+        "sourceWaitResolvedAt",
+        "sourceWaitFinalNotProvidedAt",
     )
     if t["events"].get(stage)
 )
