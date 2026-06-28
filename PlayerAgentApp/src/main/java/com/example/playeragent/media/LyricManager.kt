@@ -122,6 +122,9 @@ class LyricManager(
             logger("[LyricRetry] scheduled reason=maintenance done current active song type=${token.type}")
             retryActiveSong("maintenance done")
         }
+        MaintenanceGuard.addWindowEndListener {
+            retryActiveSong("maintenance guard window end")
+        }
     }
 
     fun scanLrcFiles(title: String, artist: String, album: String) {
@@ -257,6 +260,7 @@ class LyricManager(
             activeDurationMs = durationMs
             activePositionMs = positionMs
             activeTrackChangedAtMs = System.currentTimeMillis()
+            MaintenanceGuard.onTrackChanged(trackId.ifBlank { key }, logger)
             cachedKey = key
             cachedLines = emptyList()
             loadedSongKey = null
@@ -685,11 +689,20 @@ class LyricManager(
         )
         lyricExecutor.execute {
             val startedAt = System.currentTimeMillis()
+            MaintenanceGuard.onCurrentTrackParseStart(
+                request.trackId.ifBlank { request.key },
+                logger
+            )
             val result = loadLyricFastPath(request)
             synchronized(this) {
                 val costMs = System.currentTimeMillis() - startedAt
                 if (activeSongKey == request.key && request.taskId == activeLyricsTaskId) {
                     applyLoadedLyricLocked(request, result)
+                    MaintenanceGuard.onCurrentTrackParseEnd(
+                        request.trackId.ifBlank { request.key },
+                        result.lineCount > 0,
+                        logger
+                    )
                     if (result.lineCount > 0) {
                         logger(
                             "[LyricAsync] success songKey=${request.key} " +
@@ -721,6 +734,11 @@ class LyricManager(
                         )
                     }
                 } else {
+                    MaintenanceGuard.onCurrentTrackParseEnd(
+                        request.trackId.ifBlank { request.key },
+                        false,
+                        logger
+                    )
                     logger(
                         "[LyricAsync] stale result discarded songKey=${request.key}"
                     )
@@ -760,11 +778,20 @@ class LyricManager(
         )
         foregroundLyricExecutor.execute {
             val startedAt = System.currentTimeMillis()
+            MaintenanceGuard.onCurrentTrackParseStart(
+                request.trackId.ifBlank { request.key },
+                logger
+            )
             val result = loadLyricFastPath(request)
             synchronized(this) {
                 val costMs = System.currentTimeMillis() - startedAt
                 if (activeSongKey == request.key && request.taskId == activeLyricsTaskId) {
                     applyLoadedLyricLocked(request, result)
+                    MaintenanceGuard.onCurrentTrackParseEnd(
+                        request.trackId.ifBlank { request.key },
+                        result.lineCount > 0,
+                        logger
+                    )
                     if (result.lineCount > 0) {
                         logger(
                             "[LyricAsync] foreground success songKey=${request.key} " +
@@ -796,6 +823,11 @@ class LyricManager(
                         )
                     }
                 } else {
+                    MaintenanceGuard.onCurrentTrackParseEnd(
+                        request.trackId.ifBlank { request.key },
+                        false,
+                        logger
+                    )
                     logger(
                         "[LyricAsync] foreground stale result discarded songKey=${request.key}"
                     )
@@ -1009,7 +1041,9 @@ class LyricManager(
                 shouldCancelRequest(request, "qrcLookup")
                 return staleLyricResult()
             }
-            if (QrcMaintenanceCoordinator.isRunning()) {
+            if (QrcMaintenanceCoordinator.isRunning() &&
+                !MaintenanceGuard.currentTrackHasPriority(request.trackId, request.key)
+            ) {
                 logger("[LyricAsync] maintenance busy foreground cache-only songKey=${request.key}")
                 trace(request.traceId, "maintenance", "result=busy action=cache_only")
                 val cacheOnlyResult = qrcLyricManager.loadCacheOnlyWithResult(
@@ -1049,6 +1083,16 @@ class LyricManager(
                     source = LyricSource.NONE,
                     retryable = true,
                     failureReason = "maintenance busy"
+                )
+            } else if (QrcMaintenanceCoordinator.isRunning()) {
+                logger(
+                    "[MaintenanceGuard] current track parse priority=high " +
+                        "trackId=${request.trackId} songKey=${request.key}"
+                )
+                trace(
+                    request.traceId,
+                    "maintenanceGuard",
+                    "result=priority_bypass task=${QrcMaintenanceCoordinator.currentToken()?.type?.name.orEmpty()}"
                 )
             }
             val qrcStartedAt = System.currentTimeMillis()

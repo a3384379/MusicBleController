@@ -58,6 +58,10 @@ object QrcMaintenanceCoordinator {
         reason: String,
         logger: (String) -> Unit
     ): MaintenanceToken? {
+        if (MaintenanceGuard.shouldDeferMaintenance(type, logger)) {
+            logger("[QrcMaintenance] reject type=$type reason=realtime_window")
+            return null
+        }
         val token = MaintenanceToken(
             id = nextId.getAndIncrement(),
             type = type,

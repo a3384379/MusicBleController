@@ -52,7 +52,7 @@ class QrcLyricV2RebuildManager(
                     clearBuildingDirectory()
                 }
                 if (!token.cancelled) {
-                    runRebuild()
+                    runRebuild(token)
                 }
             } catch (exception: Exception) {
                 QrcMaintenanceCoordinator.fail(token, exception, logger)
@@ -109,7 +109,7 @@ class QrcLyricV2RebuildManager(
         return progress.copy(running = running.get())
     }
 
-    private fun runRebuild() {
+    private fun runRebuild(token: MaintenanceToken) {
         val startedAt = System.currentTimeMillis()
         val buildingDir = cacheManager.buildingCacheRoot().apply { mkdirs() }
         val entries = indexManager.getIndex(forceRefresh = true)
@@ -130,6 +130,17 @@ class QrcLyricV2RebuildManager(
 
         entries.forEach { entry ->
             if (stopRequested) {
+                progress = progress.copy(status = QrcV2RebuildStatus.STOPPED)
+                saveState(progress)
+                publish(progress)
+                return
+            }
+            if (!MaintenanceGuard.yieldIfRealtimeWindow(
+                    MaintenanceTaskType.QRC_V2_REBUILD,
+                    token,
+                    logger
+                )
+            ) {
                 progress = progress.copy(status = QrcV2RebuildStatus.STOPPED)
                 saveState(progress)
                 publish(progress)

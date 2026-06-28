@@ -30,6 +30,7 @@ import com.example.playeragent.media.CurrentTrackSnapshot
 import com.example.playeragent.media.IncrementalLyricsReady
 import com.example.playeragent.media.LyricTraceLogger
 import com.example.playeragent.media.LyricsReadyGateSnapshot
+import com.example.playeragent.media.MaintenanceGuard
 import com.example.playeragent.media.PlaybackStateReader
 import com.example.playeragent.media.PlaybackStateDiffType
 import com.example.playeragent.media.ReactiveMediaController
@@ -3559,6 +3560,7 @@ class BleGattServerManager(
         val source = playbackStateReader.readPlaybackState()
         val trackId = buildAlbumArtProtocolId(source)
         val traceId = requestedTrackId.ifBlank { trackId }
+        MaintenanceGuard.onFullLyricsRequested(traceId, logger)
         TrackCapabilityTracker.onFullLyricsRequested(traceId, trackId)
         val title = source.optString("title")
         val artist = source.optString("artist")

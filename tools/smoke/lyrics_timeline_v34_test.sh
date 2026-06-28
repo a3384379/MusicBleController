@@ -236,7 +236,8 @@ start_sony_trace_collector() {
   SONY_TRACE_COLLECTOR_ERR="$OUT_DIR/sony_lyric_trace.err"
   : >"$SONY_TRACE_LOG"
   : >"$SONY_TRACE_COLLECTOR_ERR"
-  "$ADB_BIN" -s "$ANDROID_DEVICE_ID" logcat -v epoch LyricTrace:I '*:S' \
+  "$ADB_BIN" -s "$ANDROID_DEVICE_ID" logcat -v epoch \
+    LyricTrace:I PlayerAgent:I PlayerAgentLogBuffer:I '*:S' \
     >"$SONY_TRACE_LOG" 2>"$SONY_TRACE_COLLECTOR_ERR" &
   SONY_TRACE_PID="$!"
   echo "$SONY_TRACE_PID" >"$OUT_DIR/sony_lyric_trace.pid"
@@ -1047,6 +1048,10 @@ trace_stage_counts = Counter(
 sony_lyric_trace_line_count = sum(1 for line in sony_text.splitlines() if "[LyricTrace]" in line)
 trace_file = out / "sony_lyric_trace.log"
 trace_lines = [line for line in sony_text.splitlines() if "[LyricTrace]" in line]
+maintenance_guard_lines = [line for line in sony_text.splitlines() if "[MaintenanceGuard]" in line]
+maintenance_guard_blocking_tasks = sorted(set(
+    re.findall(r"task=([^ ]+)", "\n".join(maintenance_guard_lines))
+))
 trace_file_bytes = trace_file.stat().st_size if trace_file.exists() else 0
 collector_exit_code_path = out / "sony_lyric_trace.collector_exit_code"
 collector_status_path = out / "sony_lyric_trace.collector_status"
@@ -1103,6 +1108,14 @@ summary = {
     "matrixEndSeen": bool(matrix["end"]),
     "matrixAbortCount": len(matrix["abort"]),
     "maintenanceBusyTrackCount": len(maintenance_tracks),
+    "maintenanceGuardEnabled": bool(maintenance_guard_lines),
+    "realtimeWindowCount": sum("realtime window start" in line for line in maintenance_guard_lines),
+    "maintenancePausedCount": sum("pause task=" in line for line in maintenance_guard_lines),
+    "maintenanceDeferredCount": sum("defer task=" in line for line in maintenance_guard_lines),
+    "maintenanceBlockedCount": sum("block maintenance task=" in line for line in maintenance_guard_lines),
+    "blockingTaskName": ",".join(maintenance_guard_blocking_tasks),
+    "currentTrackParseBlocked": bool(maintenance_tracks),
+    "blockedByMaintenanceAfterFix": len(maintenance_tracks),
     "affectedTracks": [
         {
             "trackId": t["trackId"],
@@ -1215,6 +1228,10 @@ lines = [
     f"READY_SLOW: {summary['readySlowCount']}",
     f"FAILED: {summary['failedCount']}",
     f"Maintenance busy tracks: {summary['maintenanceBusyTrackCount']}",
+    f"MaintenanceGuard: enabled={summary['maintenanceGuardEnabled']} "
+    f"windows={summary['realtimeWindowCount']} paused={summary['maintenancePausedCount']} "
+    f"deferred={summary['maintenanceDeferredCount']} blocked={summary['maintenanceBlockedCount']} "
+    f"blockingTask={summary['blockingTaskName']}",
     f"Classification counts: `{summary['classificationCounts']}`",
     f"Sony LyricTrace lines: {summary['sonyLyricTraceLineCount']}",
     f"Sony stage counts: `{summary['sonyInternalTraceStageCounts']}`",

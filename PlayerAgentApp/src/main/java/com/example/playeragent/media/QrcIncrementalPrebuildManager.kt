@@ -65,6 +65,14 @@ class QrcIncrementalPrebuildManager(
                     if (stopped.get() || token.cancelled) {
                         return@forEachIndexed
                     }
+                    if (!MaintenanceGuard.yieldIfRealtimeWindow(
+                            MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD,
+                            token,
+                            logger
+                        )
+                    ) {
+                        return@forEachIndexed
+                    }
                     processGroup(groupId, cleanGroupIds.size)
                     if ((index + 1) % THROTTLE_INTERVAL == 0) {
                         Thread.sleep(THROTTLE_SLEEP_MS)

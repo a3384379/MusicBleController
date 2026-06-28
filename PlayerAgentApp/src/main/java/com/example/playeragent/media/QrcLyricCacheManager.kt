@@ -447,7 +447,13 @@ class QrcLyricCacheManager(
         }
         fuzzyIndexExecutor.execute {
             try {
-                if (!token.cancelled) {
+                if (!token.cancelled &&
+                    MaintenanceGuard.yieldIfRealtimeWindow(
+                        MaintenanceTaskType.FUZZY_INDEX_REBUILD,
+                        token,
+                        logger
+                    )
+                ) {
                     warmupFuzzyIndex(force = force)
                 }
             } catch (exception: Exception) {
@@ -911,6 +917,11 @@ class QrcLyricCacheManager(
 
         if (!sharedIndexWarming.compareAndSet(false, true)) {
             logger("[QrcCacheIndex] fuzzy skipped reason=index warming")
+            return emptyList()
+        }
+        if (MaintenanceGuard.shouldDeferMaintenance(MaintenanceTaskType.FUZZY_INDEX_REBUILD, logger)) {
+            sharedIndexWarming.set(false)
+            logger("[QrcCacheIndex] fuzzy skipped reason=realtime_window")
             return emptyList()
         }
         logger("[QrcCacheIndex] fuzzy skipped reason=index warming")

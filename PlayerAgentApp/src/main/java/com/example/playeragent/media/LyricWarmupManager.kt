@@ -112,6 +112,10 @@ class LyricWarmupManager(
         logger("[LyricWarmup] start")
         val token = QrcMaintenanceCoordinator.currentToken()
 
+        if (!MaintenanceGuard.yieldIfRealtimeWindow(MaintenanceTaskType.LYRIC_WARMUP, token, logger)) {
+            logger("[LyricWarmup] cancelled during realtime window")
+            return
+        }
         val aliasStartedAt = System.currentTimeMillis()
         val aliasItems = QrcAliasCacheManager(appContext, logger).warmup()
         logger(
@@ -129,6 +133,10 @@ class LyricWarmupManager(
             logger("[LyricWarmup] cancelled after negative cache")
             return
         }
+        if (!MaintenanceGuard.yieldIfRealtimeWindow(MaintenanceTaskType.LYRIC_WARMUP, token, logger)) {
+            logger("[LyricWarmup] cancelled after negative cache during realtime window")
+            return
+        }
 
         val indexStartedAt = System.currentTimeMillis()
         val indexEntries = QrcPersistentIndexManager(appContext, logger).getIndex(
@@ -140,6 +148,10 @@ class LyricWarmupManager(
         )
         if (token?.cancelled == true) {
             logger("[LyricWarmup] cancelled after qrc index")
+            return
+        }
+        if (!MaintenanceGuard.yieldIfRealtimeWindow(MaintenanceTaskType.LYRIC_WARMUP, token, logger)) {
+            logger("[LyricWarmup] cancelled after qrc index during realtime window")
             return
         }
 

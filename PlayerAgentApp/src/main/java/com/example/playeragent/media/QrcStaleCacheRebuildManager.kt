@@ -81,6 +81,16 @@ class QrcStaleCacheRebuildManager(
                     publish()
                     return@forEachIndexed
                 }
+                if (!MaintenanceGuard.yieldIfRealtimeWindow(
+                        MaintenanceTaskType.CACHE_REPAIR,
+                        token,
+                        logger
+                    )
+                ) {
+                    progress = progress.copy(status = "stopped")
+                    publish()
+                    return@forEachIndexed
+                }
                 processGroup(groupId, groupsById)
                 if ((index + 1) % PROGRESS_LOG_INTERVAL == 0) {
                     logger(
