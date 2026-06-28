@@ -847,6 +847,13 @@ class LyricManager(
             )
             lyricsReadyState = LyricsReadyState.READY
             val runtimeApplyStartedAt = System.currentTimeMillis()
+            trace(
+                request.traceId,
+                "runtimeApplyStart",
+                "trackId=${request.trackId.ifBlank { activeTrackId }} " +
+                    "songKey=${request.key} generation=${CurrentTrackRuntimeCache.currentGeneration()} " +
+                    "lines=${cachedLines.size}"
+            )
             CurrentTrackRuntimeCache.updateLyrics(
                 songKey = request.key,
                 lines = cachedLines,
@@ -855,8 +862,10 @@ class LyricManager(
             )
             trace(
                 request.traceId,
-                "runtimeCacheUpdated",
+                "runtimeApplyEnd",
                 "lines=${cachedLines.size} words=${cachedLines.sumOf { it.words.size }} " +
+                    "trackId=${request.trackId.ifBlank { activeTrackId }} songKey=${request.key} " +
+                    "generation=${CurrentTrackRuntimeCache.currentGeneration()} " +
                     "costMs=${System.currentTimeMillis() - runtimeApplyStartedAt}"
             )
             logger(
@@ -871,6 +880,13 @@ class LyricManager(
             )
             logger("[LyricsState] lyricsReady=true")
             lyricsReadyState = LyricsReadyState.READY
+            trace(
+                request.traceId,
+                "lyricsReadyGateReady",
+                "trackId=${request.trackId.ifBlank { activeTrackId }} " +
+                    "generation=${CurrentTrackRuntimeCache.currentGeneration()} " +
+                    "lines=${cachedLines.size}"
+            )
             onLyricsReady(lyricsReadyGateSnapshotLocked())
         } else if (result.retryable) {
             lyricsReadyState = if (isCooldownBlockedReason(result.failureReason)) {
@@ -908,6 +924,13 @@ class LyricManager(
                 "[LyricAsync] retryable empty, not marking loaded " +
                     "songKey=${request.key} reason=$retryableFailureReason"
             )
+            trace(
+                request.traceId,
+                "readyGateFailed",
+                "trackId=${request.trackId.ifBlank { activeTrackId }} songKey=${request.key} " +
+                    "generation=${CurrentTrackRuntimeCache.currentGeneration()} " +
+                    "reason=$retryableFailureReason state=${lyricsReadyState.name}"
+            )
             onLyricsReady(lyricsReadyGateSnapshotLocked())
         } else {
             lyricsReadyState = LyricsReadyState.FAILED
@@ -929,6 +952,13 @@ class LyricManager(
             logger(
                 "[LyricAsync] final empty, marked loaded " +
                     "songKey=${request.key} reason=$finalEmptyReason"
+            )
+            trace(
+                request.traceId,
+                "readyGateFailed",
+                "trackId=${request.trackId.ifBlank { activeTrackId }} songKey=${request.key} " +
+                    "generation=${CurrentTrackRuntimeCache.currentGeneration()} " +
+                    "reason=$finalEmptyReason state=${lyricsReadyState.name}"
             )
             onLyricsReady(lyricsReadyGateSnapshotLocked())
         }
@@ -1023,6 +1053,7 @@ class LyricManager(
             }
             val qrcStartedAt = System.currentTimeMillis()
             trace(request.traceId, "qrcLookup", "result=start")
+            trace(request.traceId, "qrcLookupStart", "songKey=${request.key}")
             TrackCapabilityTracker.onLyricLookupStart(request.key, request.trackId)
             val qrcResult = qrcLyricManager.loadWithResult(
                 title,
@@ -1051,6 +1082,12 @@ class LyricManager(
                 "qrcLookup",
                 "result=${if (qrcResult.success) "hit" else "miss"} " +
                     "reason=${qrcResult.reason} retryable=${qrcResult.retryable} " +
+                    "lines=${qrcLines.size} costMs=${System.currentTimeMillis() - qrcStartedAt}"
+            )
+            trace(
+                request.traceId,
+                "qrcLookupEnd",
+                "result=${if (qrcResult.success) "hit" else "miss"} " +
                     "lines=${qrcLines.size} costMs=${System.currentTimeMillis() - qrcStartedAt}"
             )
             TrackCapabilityTracker.onLyricLookupDone(
@@ -1108,6 +1145,54 @@ class LyricManager(
                 "parsedCache",
                 "result=hit costMs=$costMs lines=${cached.result.lineCount}"
             )
+            trace(
+                request.traceId,
+                "qrcLookupStart",
+                "trackId=${request.trackId} songKey=${request.key} source=parsed_cache"
+            )
+            trace(
+                request.traceId,
+                "qrcFileFound",
+                "trackId=${request.trackId} songKey=${request.key} " +
+                    "source=parsed_cache lines=${cached.result.lineCount}"
+            )
+            trace(
+                request.traceId,
+                "qrcDecryptStart",
+                "trackId=${request.trackId} songKey=${request.key} " +
+                    "source=parsed_cache reason=skip_parsed_cache"
+            )
+            trace(
+                request.traceId,
+                "qrcDecryptEnd",
+                "trackId=${request.trackId} songKey=${request.key} " +
+                    "source=parsed_cache result=skipped reason=skip_parsed_cache costMs=0"
+            )
+            trace(
+                request.traceId,
+                "qrcParseStart",
+                "trackId=${request.trackId} songKey=${request.key} " +
+                    "source=parsed_cache reason=skip_parsed_cache"
+            )
+            trace(
+                request.traceId,
+                "qrcParseEnd",
+                "trackId=${request.trackId} songKey=${request.key} " +
+                    "source=parsed_cache result=skipped lines=${cached.result.lineCount} costMs=0"
+            )
+            trace(
+                request.traceId,
+                "indexBuildStart",
+                "trackId=${request.trackId} songKey=${request.key} " +
+                    "source=parsed_cache lines=${cached.result.lineCount}"
+            )
+            trace(
+                request.traceId,
+                "indexBuildEnd",
+                "trackId=${request.trackId} songKey=${request.key} " +
+                    "source=parsed_cache lines=${cached.result.lineCount} " +
+                    "hasWordTiming=${cached.hasWordTiming} costMs=0"
+            )
             logger(
                 "[LyricsFastPath] ready totalCostMs=$costMs " +
                     "songKey=${request.key} source=parsed_cache lines=${cached.result.lineCount}"
@@ -1127,6 +1212,7 @@ class LyricManager(
 
         val lookupStartedAt = System.currentTimeMillis()
         logger("[LyricsState] parse start trackId=${request.trackId} songKey=${request.key}")
+        trace(request.traceId, "qrcParseStart", "songKey=${request.key} source=fastPath")
         logger("[LyricsFastPath] lookup start songKey=${request.key}")
         if (shouldCancelRequest(request, "lookup")) {
             return staleLyricResult()
@@ -1146,15 +1232,26 @@ class LyricManager(
                 "[LyricsFastPath] parse done songKey=${request.key} " +
                     "costMs=$parseCostMs lines=${result.lineCount}"
             )
+            trace(
+                request.traceId,
+                "qrcParseEnd",
+                "result=success lines=${result.lineCount} costMs=$parseCostMs"
+            )
 
             val indexStartedAt = System.currentTimeMillis()
             logger("[LyricsState] index build start trackId=${request.trackId} songKey=${request.key}")
+            trace(request.traceId, "indexBuildStart", "lines=${result.lineCount}")
             lyricsReadyState = LyricsReadyState.INDEX_BUILDING
             val hasWordTiming = result.lines.any { it.words.isNotEmpty() }
             val indexCostMs = System.currentTimeMillis() - indexStartedAt
             logger(
                 "[LyricsFastPath] index build done songKey=${request.key} " +
                     "costMs=$indexCostMs hasWordTiming=$hasWordTiming"
+            )
+            trace(
+                request.traceId,
+                "indexBuildEnd",
+                "lines=${result.lineCount} hasWordTiming=$hasWordTiming costMs=$indexCostMs"
             )
             TrackCapabilityTracker.onLyricParseDone(
                 songKey = request.key,
@@ -1168,6 +1265,11 @@ class LyricManager(
             parsedCachePut(request, result)
         } else {
             lyricsReadyState = LyricsReadyState.FAILED
+            trace(
+                request.traceId,
+                "qrcParseEnd",
+                "result=failed reason=${result.failureReason.ifBlank { "empty lyrics" }}"
+            )
             TrackCapabilityTracker.onLyricParseDone(
                 songKey = request.key,
                 trackId = request.trackId,
@@ -1247,6 +1349,12 @@ class LyricManager(
         )
         logger("[LyricsState] lyricsReady=true")
         lyricsReadyState = LyricsReadyState.READY
+        trace(
+            activeLyricTraceId.ifBlank { buildLyricTraceId(trackId, key, System.currentTimeMillis()) },
+            "lyricsReadyGateReady",
+            "trackId=$trackId generation=${CurrentTrackRuntimeCache.currentGeneration()} " +
+                "lines=${cachedLines.size}"
+        )
         onLyricsReady(lyricsReadyGateSnapshotLocked())
         return cachedLines.isNotEmpty()
     }
@@ -1334,7 +1442,7 @@ class LyricManager(
         if (id.isBlank()) {
             return
         }
-        logger("[LyricTrace] id=$id stage=$stage $detail")
+        LyricTraceLogger.legacy(id, stage, detail, logger)
     }
 
     private fun staleLyricResult(): LyricLoadResult {
@@ -1535,6 +1643,14 @@ class LyricManager(
                 "generation=${CurrentTrackRuntimeCache.currentGeneration()}"
         )
         logger("[LyricsState] lyricsReady=true")
+        trace(
+            activeLyricTraceId.ifBlank {
+                buildLyricTraceId(currentTrack.trackId, activeKey, System.currentTimeMillis())
+            },
+            "lyricsReadyGateReady",
+            "trackId=${currentTrack.trackId} " +
+                "generation=${CurrentTrackRuntimeCache.currentGeneration()} lines=${lines.size}"
+        )
         onLyricsReady(lyricsReadyGateSnapshotLocked())
         return true
     }

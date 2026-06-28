@@ -28,6 +28,7 @@ import com.example.playeragent.media.MediaFieldDumpManager
 import com.example.playeragent.media.CurrentTrackRuntimeCache
 import com.example.playeragent.media.CurrentTrackSnapshot
 import com.example.playeragent.media.IncrementalLyricsReady
+import com.example.playeragent.media.LyricTraceLogger
 import com.example.playeragent.media.LyricsReadyGateSnapshot
 import com.example.playeragent.media.PlaybackStateReader
 import com.example.playeragent.media.PlaybackStateDiffType
@@ -3534,15 +3535,25 @@ class BleGattServerManager(
 
     private fun sendFullLyrics(request: JSONObject) {
         val device = subscribedDevices.values.firstOrNull() ?: run {
+            val requestedTrackId = request.optString("trackId")
+            if (requestedTrackId.isNotBlank()) {
+                lyricTrace(
+                    stage = "fullLyricsSendSkip",
+                    trackId = requestedTrackId,
+                    reason = "no_subscriber",
+                    extra = mapOf("status" to "no_subscriber")
+                )
+            }
             logger("[FullLyrics] send skipped: no iPhone subscriber")
             return
         }
         val buildStartedAtMs = SystemClock.elapsedRealtime()
         val requestedTrackId = request.optString("trackId")
         if (requestedTrackId.isNotBlank()) {
-            logger(
-                "[LyricTrace] id=$requestedTrackId stage=fullLyricsRequest " +
-                    "trackId=$requestedTrackId positionMs=${request.optLong("positionMs", 0L)}"
+            lyricTrace(
+                stage = "fullLyricsRequest",
+                trackId = requestedTrackId,
+                extra = mapOf("positionMs" to request.optLong("positionMs", 0L).toString())
             )
         }
         val source = playbackStateReader.readPlaybackState()
@@ -3572,13 +3583,20 @@ class BleGattServerManager(
         } else {
             "fullLyricsFromLyricManager"
         }
-        logger(
-            "[LyricTrace] id=$traceId stage=$fullLyricsSourceStage " +
-                "runtimeLines=$runtimeLineCount selectedLines=${lines.size} " +
-                "readyState=${readyGate.state} lyricsReady=${readyGate.lyricsReady} " +
-                "gateAllowed=$gateAllowsSend generation=${readyGate.generation} " +
-                "runtimeGeneration=$runtimeGeneration " +
-                "costMs=${SystemClock.elapsedRealtime() - buildStartedAtMs}"
+        lyricTrace(
+            stage = fullLyricsSourceStage,
+            trackId = traceId,
+            songKey = readyGate.songKey,
+            generation = readyGate.generation,
+            costMs = SystemClock.elapsedRealtime() - buildStartedAtMs,
+            extra = mapOf(
+                "runtimeLines" to runtimeLineCount.toString(),
+                "selectedLines" to lines.size.toString(),
+                "readyState" to readyGate.state.name,
+                "lyricsReady" to readyGate.lyricsReady.toString(),
+                "gateAllowed" to gateAllowsSend.toString(),
+                "runtimeGeneration" to runtimeGeneration.toString()
+            )
         )
         val includeWordsAroundCurrent =
             request.optBoolean("includeWordsAroundCurrent", false)
@@ -3664,9 +3682,13 @@ class BleGattServerManager(
                 "[FullLyrics] unavailable trackId=$trackId " +
                     "reason=$unavailableReason"
             )
-            logger(
-                "[LyricTrace] id=$traceId stage=fullLyricsUnavailable " +
-                    "reason=$unavailableReason status=${diagnostic.status}"
+            lyricTrace(
+                stage = "fullLyricsSendSkip",
+                trackId = traceId,
+                songKey = readyGate.songKey,
+                generation = readyGate.generation,
+                reason = unavailableReason,
+                extra = mapOf("status" to diagnostic.status)
             )
             TrackCapabilityTracker.onFullLyricsSent(traceId, trackId, 0)
             return
@@ -3754,13 +3776,26 @@ class BleGattServerManager(
             "[FullLyricsPerf] build done lines=${lines.size} " +
                 "wordsLines=$wordsLines costMs=${SystemClock.elapsedRealtime() - buildStartedAtMs}"
         )
-        logger(
-            "[LyricTrace] id=$traceId stage=fullLyricsBuildDone " +
-                "lines=${lines.size} wordsLines=$wordsLines " +
-                "costMs=${SystemClock.elapsedRealtime() - buildStartedAtMs}"
+        lyricTrace(
+            stage = "fullLyricsBuildDone",
+            trackId = traceId,
+            songKey = readyGate.songKey,
+            generation = readyGate.generation,
+            costMs = SystemClock.elapsedRealtime() - buildStartedAtMs,
+            extra = mapOf(
+                "lines" to lines.size.toString(),
+                "wordsLines" to wordsLines.toString()
+            )
         )
         val sendStartedAtMs = SystemClock.elapsedRealtime()
         logger("[FullLyrics] send start trackId=$trackId count=${lines.size}")
+        lyricTrace(
+            stage = "fullLyricsSendStart",
+            trackId = traceId,
+            songKey = readyGate.songKey,
+            generation = readyGate.generation,
+            extra = mapOf("lines" to lines.size.toString())
+        )
         notifyQueue.enqueueLongJob(
             type = FULL_LYRICS_JOB_TYPE,
             device = device,
@@ -3771,12 +3806,38 @@ class BleGattServerManager(
                         "${SystemClock.elapsedRealtime() - sendStartedAtMs}"
                 )
                 logger("[FullLyrics] send end trackId=$trackId")
-                logger(
-                    "[LyricTrace] id=$traceId stage=fullLyricsSendEnd " +
-                        "lines=${lines.size} costMs=${SystemClock.elapsedRealtime() - sendStartedAtMs}"
+                lyricTrace(
+                    stage = "fullLyricsSendEnd",
+                    trackId = traceId,
+                    songKey = readyGate.songKey,
+                    generation = readyGate.generation,
+                    costMs = SystemClock.elapsedRealtime() - sendStartedAtMs,
+                    extra = mapOf("lines" to lines.size.toString())
                 )
                 TrackCapabilityTracker.onFullLyricsSent(traceId, trackId, lines.size)
             }
+        )
+    }
+
+    private fun lyricTrace(
+        stage: String,
+        trackId: String,
+        songKey: String = "",
+        generation: Long? = null,
+        reason: String? = null,
+        costMs: Long? = null,
+        extra: Map<String, String> = emptyMap()
+    ) {
+        LyricTraceLogger.stage(
+            runId = "unknown",
+            trackId = trackId,
+            songKey = songKey,
+            generation = generation,
+            stage = stage,
+            reason = reason,
+            costMs = costMs,
+            extra = extra,
+            sink = logger
         )
     }
 
@@ -4113,6 +4174,17 @@ class BleGattServerManager(
                 "requested=$requestedTrackId generation=$generation " +
                 "state=${readyGate.state} reason=$reason"
         )
+        lyricTrace(
+            stage = "pendingQueued",
+            trackId = requestedTrackId.ifBlank { protocolTrackId },
+            songKey = readyGate.songKey,
+            generation = generation,
+            reason = reason,
+            extra = mapOf(
+                "protocolTrackId" to protocolTrackId,
+                "state" to readyGate.state.name
+            )
+        )
     }
 
     private fun clearMatchingPendingFullLyrics(
@@ -4160,6 +4232,16 @@ class BleGattServerManager(
             logger(
                 "[Lyrics] pending flushed trackId=${pending.protocolTrackId} " +
                     "generation=${snapshot.generation}"
+            )
+            lyricTrace(
+                stage = "pendingFlush",
+                trackId = pending.requestedTrackId.ifBlank { pending.protocolTrackId },
+                songKey = snapshot.songKey,
+                generation = snapshot.generation,
+                extra = mapOf(
+                    "protocolTrackId" to pending.protocolTrackId,
+                    "waitMs" to (SystemClock.elapsedRealtime() - pending.createdAtMs).toString()
+                )
             )
             sendFullLyrics(
                 JSONObject(pending.request.toString())

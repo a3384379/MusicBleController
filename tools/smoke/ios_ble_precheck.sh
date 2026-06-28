@@ -63,11 +63,17 @@ log() {
 
 copy_ios_log() {
   local dest="$1"
-  xcrun devicectl device copy from \
+  local timeout_sec="${2:-8}"
+  local source_path="${3:-Documents/Logs/ios_lyrics_timeline.log}"
+  if [[ "$timeout_sec" -lt 5 ]]; then
+    timeout_sec=5
+  fi
+  rm -f "$dest"
+  xcrun devicectl --timeout "$timeout_sec" device copy from \
     --device "$IOS_DEVICE_ID" \
     --domain-type appDataContainer \
     --domain-identifier "$BUNDLE_ID" \
-    --source Documents/Logs/ios_ble.log \
+    --source "$source_path" \
     --destination "$dest" \
     >>"$PRECHECK_LOG" 2>&1
 }
@@ -90,6 +96,7 @@ start_ms = int(sys.argv[5])
 launch_ok = sys.argv[6].lower() == "true"
 timeout_sec = int(float(sys.argv[7]))
 text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+log_copy_available = bool(text.strip())
 
 def parse_ios_ms(line: str):
     match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.(\d{3})", line)
@@ -116,7 +123,7 @@ def first(pattern: str):
 
 _, connected_at = first(r"\[BLE-iOS\]\s+didConnect|\[BLE\]\s+connected|\[Reconnect\]\s+connected")
 _, notify_at = first(r"status notify subscribed|notify subscribed|\[Reconnect\]\s+subscribed")
-_, playback_at = first(r'\{"type":"playbackState"|\[iOS\]\[Status\]\s+playbackState|\[Reconnect\]\s+playbackState accepted')
+_, playback_at = first(r'\{"type":"playbackState"|\[iOS\]\[Status\]\s+playbackState|\[Reconnect\]\s+playbackState accepted|notify received type=playbackState')
 
 display_state = "unknown"
 if re.search(r"didConnect|\[BLE\]\s+connected", window_text, re.I):
@@ -147,6 +154,9 @@ result = {
 if not launch_ok:
     result["precheckResult"] = "FAIL"
     result["precheckFailReason"] = "ios_app_launch_failed"
+elif not log_copy_available:
+    result["precheckResult"] = "FAIL"
+    result["precheckFailReason"] = "ios_device_file_service_unavailable"
 elif not (
     result["iosBleConnected"] and
     result["notifySubscribed"] and
@@ -179,22 +189,25 @@ print(int(time.time() * 1000))
 PY
 )"
 
-log "launch app for BLE precheck timeout=${TIMEOUT_SEC}s args=${LAUNCH_ARGS[*]:-none}"
+launch_args_display="none"
+if [[ "${#LAUNCH_ARGS[@]}" -gt 0 ]]; then
+  launch_args_display="${LAUNCH_ARGS[*]}"
+fi
+log "launch app for BLE precheck timeout=${TIMEOUT_SEC}s args=${launch_args_display}"
 LAUNCH_OK=true
-if ! xcrun devicectl device process launch \
-  --device "$IOS_DEVICE_ID" \
-  --terminate-existing \
-  "$BUNDLE_ID" \
-  "${LAUNCH_ARGS[@]}" \
-  >"$OUT_DIR/ios_ble_precheck_launch.out" \
-  2>"$OUT_DIR/ios_ble_precheck_launch.err"; then
+launch_cmd=(xcrun devicectl device process launch --device "$IOS_DEVICE_ID" --terminate-existing "$BUNDLE_ID")
+if [[ "${#LAUNCH_ARGS[@]}" -gt 0 ]]; then
+  launch_cmd+=("${LAUNCH_ARGS[@]}")
+fi
+if ! "${launch_cmd[@]}" >"$OUT_DIR/ios_ble_precheck_launch.out" 2>"$OUT_DIR/ios_ble_precheck_launch.err"; then
   LAUNCH_OK=false
 fi
 
 last_result=""
 for _ in $(seq 1 "$TIMEOUT_SEC"); do
   sleep 1
-  copy_ios_log "$PRECHECK_IOS_LOG" || true
+  copy_ios_log "$PRECHECK_IOS_LOG" 8 Documents/Logs/ios_ble.log || \
+    copy_ios_log "$PRECHECK_IOS_LOG" 5 Documents/Logs/ios_lyrics_timeline.log || true
   last_result="$(write_result "$LAUNCH_OK" "$PRECHECK_IOS_LOG")"
   if python3 - "$PRECHECK_JSON" <<'PY'
 import json
@@ -212,7 +225,8 @@ PY
   fi
 done
 
-copy_ios_log "$PRECHECK_IOS_LOG" || true
+copy_ios_log "$PRECHECK_IOS_LOG" 8 Documents/Logs/ios_ble.log || \
+  copy_ios_log "$PRECHECK_IOS_LOG" 5 Documents/Logs/ios_lyrics_timeline.log || true
 last_result="$(write_result "$LAUNCH_OK" "$PRECHECK_IOS_LOG")"
 log "FAIL $last_result"
 if [[ "$JSON_OUTPUT" == true ]]; then

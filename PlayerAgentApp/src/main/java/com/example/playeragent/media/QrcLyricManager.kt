@@ -107,6 +107,17 @@ class QrcLyricManager(
                 "result=hit groupId=${cached.groupId} lines=${cachedLines.size} " +
                     "costMs=${System.currentTimeMillis() - startedAt}"
             )
+            trace(
+                traceId,
+                "qrcDecryptStart",
+                "reason=cache_hit_or_plain_text source=qrc_l2 groupId=${cached.groupId}"
+            )
+            trace(
+                traceId,
+                "qrcDecryptEnd",
+                "reason=cache_hit_or_plain_text result=skipped source=qrc_l2 " +
+                    "groupId=${cached.groupId} costMs=0"
+            )
             return QrcLoadResult(
                 success = cachedLines.isNotEmpty(),
                 lines = cachedLines,
@@ -122,6 +133,11 @@ class QrcLyricManager(
         songLinesCache[songKey]?.let { lines ->
             cachedLines = lines
             cachedGroupId = songGroupCache[songKey]
+            trace(
+                traceId,
+                "qrcFileFound",
+                "source=song_memory groupId=${cachedGroupId.orEmpty()} lines=${lines.size}"
+            )
             logger("[QrcLyric] cache hit songKey=$songKey")
             logger(
                 "[QrcLyric] parsed lines=${lines.size} " +
@@ -132,6 +148,16 @@ class QrcLyricManager(
                 "qrcL1",
                 "result=hit reason=song memory lines=${lines.size} " +
                     "costMs=${System.currentTimeMillis() - startedAt}"
+            )
+            trace(
+                traceId,
+                "qrcDecryptStart",
+                "reason=cache_hit_or_plain_text source=song_memory"
+            )
+            trace(
+                traceId,
+                "qrcDecryptEnd",
+                "reason=cache_hit_or_plain_text result=skipped source=song_memory costMs=0"
             )
             return QrcLoadResult(
                 success = lines.isNotEmpty(),
@@ -149,6 +175,7 @@ class QrcLyricManager(
             cacheManager.recordNegativeHit()
             logger("[QrcLyric] best group=none score=0")
             trace(traceId, "negative", "result=hit songKey=$songKey")
+            trace(traceId, "qrcFileNotFound", "reason=negative_cache_hit songKey=$songKey")
             return QrcLoadResult(
                 success = false,
                 retryable = false,
@@ -158,6 +185,7 @@ class QrcLyricManager(
         if (isUncertainCooldownActive(songKey)) {
             logger("[QrcLyric] best group=none score=0")
             trace(traceId, "cooldown", "result=hit songKey=$songKey")
+            trace(traceId, "qrcFileNotFound", "reason=qrc_cooldown_retry_pending songKey=$songKey")
             return QrcLoadResult(
                 success = false,
                 retryable = true,
@@ -184,6 +212,12 @@ class QrcLyricManager(
             val retryable = cacheManager.isFuzzyIndexWarming()
             trace(
                 traceId,
+                "qrcFileNotFound",
+                "reason=${if (retryable) "fuzzy_index_warming" else "no_qrc_entries"} " +
+                    "entries=0"
+            )
+            trace(
+                traceId,
                 "fuzzy",
                 "result=skipped reason=${if (retryable) "fuzzy index warming" else "no qrc entries"}"
             )
@@ -200,7 +234,13 @@ class QrcLyricManager(
                     trace(traceId, "decrypt", "result=cancelled stage=group_memory")
                     return cancelledResult()
                 }
-                val parsed = decryptAndParseQrc(entry)
+                trace(
+                    traceId,
+                    "qrcFileFound",
+                    "groupId=${entry.groupId} source=group_memory " +
+                        "file=${entry.qrcFile?.name.orEmpty()}"
+                )
+                val parsed = decryptAndParseQrc(entry, traceId)
                 if (parsed != null &&
                     parsedMatchesTitle(parsed, normalizedTitle)
                 ) {
@@ -276,6 +316,12 @@ class QrcLyricManager(
                 "fuzzy",
                 "result=miss reason=$reason producerCandidates=${searchResult.producerCandidateCount}"
             )
+            trace(
+                traceId,
+                "qrcFileNotFound",
+                "reason=$reason producerCandidates=${searchResult.producerCandidateCount} " +
+                    "bestScore=${best?.score ?: 0}"
+            )
             return QrcLoadResult(
                 success = false,
                 retryable = retryable,
@@ -287,7 +333,28 @@ class QrcLyricManager(
             trace(traceId, "decrypt", "result=cancelled stage=best")
             return cancelledResult()
         }
-        val parsed = best.parsed ?: decryptAndParseQrc(best.entry)
+        trace(
+            traceId,
+            "qrcFileFound",
+            "groupId=${best.entry.groupId} score=${best.score} " +
+                "file=${best.entry.qrcFile?.name.orEmpty()}"
+        )
+        val parsed = if (best.parsed != null) {
+            trace(
+                traceId,
+                "qrcDecryptStart",
+                "reason=cache_hit_or_plain_text source=best_parsed groupId=${best.entry.groupId}"
+            )
+            trace(
+                traceId,
+                "qrcDecryptEnd",
+                "reason=cache_hit_or_plain_text result=skipped source=best_parsed " +
+                    "groupId=${best.entry.groupId} costMs=0"
+            )
+            best.parsed
+        } else {
+            decryptAndParseQrc(best.entry, traceId)
+        }
         if (parsed == null || !parsedMatchesTitle(parsed, normalizedTitle)) {
             logger("[QrcLyric] best group=none score=0")
             logger("[QrcLyric] skip negative cache reason=decrypt unconfirmed")
@@ -348,6 +415,21 @@ class QrcLyricManager(
         }
         if (songKey == cachedSongKey && cachedLines.isNotEmpty()) {
             trace(traceId, "qrcL1", "result=hit reason=current memory cacheOnly=true lines=${cachedLines.size}")
+            trace(
+                traceId,
+                "qrcFileFound",
+                "reason=cache_only source=memory lines=${cachedLines.size}"
+            )
+            trace(
+                traceId,
+                "qrcDecryptStart",
+                "reason=cache_hit_or_plain_text source=memory"
+            )
+            trace(
+                traceId,
+                "qrcDecryptEnd",
+                "reason=cache_hit_or_plain_text result=skipped source=memory costMs=0"
+            )
             return QrcLoadResult(
                 success = true,
                 lines = cachedLines,
@@ -372,6 +454,21 @@ class QrcLyricManager(
                 "qrcL2",
                 "result=hit reason=cache_only groupId=${cached.groupId} lines=${cachedLines.size}"
             )
+            trace(
+                traceId,
+                "qrcFileFound",
+                "reason=cache_only source=qrc_l2 groupId=${cached.groupId} lines=${cachedLines.size}"
+            )
+            trace(
+                traceId,
+                "qrcDecryptStart",
+                "reason=cache_hit_or_plain_text source=qrc_l2 groupId=${cached.groupId}"
+            )
+            trace(
+                traceId,
+                "qrcDecryptEnd",
+                "reason=cache_hit_or_plain_text result=skipped source=qrc_l2 groupId=${cached.groupId} costMs=0"
+            )
             return QrcLoadResult(
                 success = cachedLines.isNotEmpty(),
                 lines = cachedLines,
@@ -383,6 +480,21 @@ class QrcLyricManager(
             cachedLines = lines
             cachedGroupId = songGroupCache[songKey]
             trace(traceId, "qrcL1", "result=hit reason=song memory cacheOnly=true lines=${lines.size}")
+            trace(
+                traceId,
+                "qrcFileFound",
+                "reason=cache_only source=song_memory lines=${lines.size}"
+            )
+            trace(
+                traceId,
+                "qrcDecryptStart",
+                "reason=cache_hit_or_plain_text source=song_memory"
+            )
+            trace(
+                traceId,
+                "qrcDecryptEnd",
+                "reason=cache_hit_or_plain_text result=skipped source=song_memory costMs=0"
+            )
             return QrcLoadResult(
                 success = lines.isNotEmpty(),
                 lines = lines,
@@ -403,7 +515,7 @@ class QrcLyricManager(
         if (id.isBlank()) {
             return
         }
-        logger("[LyricTrace] id=$id stage=$stage $detail")
+        LyricTraceLogger.legacy(id, stage, detail, logger)
     }
 
     private fun cancelledResult(): QrcLoadResult {
@@ -642,7 +754,13 @@ class QrcLyricManager(
                 )
                 return null
             }
-            val parsed = decryptAndParseQrc(candidate.entry) ?: return@forEach
+            trace(
+                traceId,
+                "qrcFileFound",
+                "groupId=${candidate.entry.groupId} source=fallback " +
+                    "file=${candidate.entry.qrcFile?.name.orEmpty()}"
+            )
+            val parsed = decryptAndParseQrc(candidate.entry, traceId) ?: return@forEach
             if (!parsedMatchesTitle(parsed, normalizedTitle)) {
                 return@forEach
             }
@@ -669,7 +787,10 @@ class QrcLyricManager(
         return null
     }
 
-    private fun decryptAndParseQrc(entry: QrcGroupIndexEntry): ParsedQrc? {
+    private fun decryptAndParseQrc(
+        entry: QrcGroupIndexEntry,
+        traceId: String = ""
+    ): ParsedQrc? {
         val file = entry.qrcFile ?: return null
         val cacheKey = listOf(
             entry.groupId,
@@ -681,9 +802,18 @@ class QrcLyricManager(
             entry.romaqrcFile?.length() ?: 0L
         ).joinToString(":")
         if (parsedQrcCache.containsKey(cacheKey)) {
+            trace(traceId, "qrcDecryptStart", "groupId=${entry.groupId} source=parsed_memory")
+            trace(
+                traceId,
+                "qrcDecryptEnd",
+                "groupId=${entry.groupId} result=cache " +
+                    "lines=${parsedQrcCache[cacheKey]?.lines?.size ?: 0}"
+            )
             return parsedQrcCache[cacheKey]
         }
         return try {
+            val decryptStartedAt = System.currentTimeMillis()
+            trace(traceId, "qrcDecryptStart", "groupId=${entry.groupId} file=${file.name}")
             val encrypted = file.readText(Charsets.US_ASCII)
                 .filterNot(Char::isWhitespace)
             if (!isEncryptedQrcHex(encrypted)) {
@@ -693,6 +823,12 @@ class QrcLyricManager(
                         "error=not encrypted QRC hex"
                 )
                 parsedQrcCache[cacheKey] = null
+                trace(
+                    traceId,
+                    "qrcDecryptEnd",
+                    "groupId=${entry.groupId} result=failed reason=not_encrypted_qrc_hex " +
+                        "costMs=${System.currentTimeMillis() - decryptStartedAt}"
+                )
                 return null
             }
             val decrypted = QrcDecrypter.decrypt(encrypted)
@@ -703,9 +839,29 @@ class QrcLyricManager(
                             "error=decrypt returned empty"
                     )
                     parsedQrcCache[cacheKey] = null
+                    trace(
+                        traceId,
+                        "qrcDecryptEnd",
+                        "groupId=${entry.groupId} result=failed reason=empty_decrypt " +
+                            "costMs=${System.currentTimeMillis() - decryptStartedAt}"
+                    )
                     return null
                 }
+            trace(
+                traceId,
+                "qrcDecryptEnd",
+                "groupId=${entry.groupId} result=success " +
+                    "costMs=${System.currentTimeMillis() - decryptStartedAt}"
+            )
+            val parseStartedAt = System.currentTimeMillis()
+            trace(traceId, "qrcParseStart", "groupId=${entry.groupId}")
             parseQrc(decrypted, entry).also {
+                trace(
+                    traceId,
+                    "qrcParseEnd",
+                    "groupId=${entry.groupId} result=success lines=${it.lines.size} " +
+                        "costMs=${System.currentTimeMillis() - parseStartedAt}"
+                )
                 cacheManager.recordQrcDecrypt(success = it.lines.isNotEmpty())
                 parsedQrcCache[cacheKey] = it
                 trimParsedQrcCache()
@@ -717,6 +873,11 @@ class QrcLyricManager(
                     "error=${exception.message}"
             )
             parsedQrcCache[cacheKey] = null
+            trace(
+                traceId,
+                "qrcDecryptEnd",
+                "groupId=${entry.groupId} result=exception reason=${exception.message.orEmpty()}"
+            )
             null
         }
     }

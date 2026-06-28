@@ -675,7 +675,7 @@ class QrcLyricCacheManager(
         if (id.isBlank()) {
             return
         }
-        logger("[LyricTrace] id=$id stage=$stage $detail")
+        LyricTraceLogger.legacy(id, stage, detail, logger)
     }
 
     private fun readCacheFileDetailed(

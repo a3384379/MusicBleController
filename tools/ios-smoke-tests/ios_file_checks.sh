@@ -33,7 +33,20 @@ copy_path() {
     --domain-identifier "$BUNDLE_ID" \
     --source "$source" \
     --destination "$dest" \
-    >/tmp/ios_smoke_copy_path.out 2>/tmp/ios_smoke_copy_path.err
+    >/tmp/ios_smoke_copy_path.out 2>/tmp/ios_smoke_copy_path.err &
+  local copy_pid="$!"
+  local remaining="${IOS_FILE_COPY_TIMEOUT_SEC:-5}"
+  while kill -0 "$copy_pid" 2>/dev/null; do
+    if [[ "$remaining" -le 0 ]]; then
+      pkill -P "$copy_pid" 2>/dev/null || true
+      kill "$copy_pid" 2>/dev/null || true
+      wait "$copy_pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+    remaining=$((remaining - 1))
+  done
+  wait "$copy_pid"
 }
 
 file_bytes() {
@@ -53,7 +66,21 @@ list_path() {
     --domain-type appDataContainer \
     --domain-identifier "$BUNDLE_ID" \
     --subdirectory "$source" \
-    >"$dest" 2>"$dest.err"
+    >"$dest" 2>"$dest.err" &
+  local list_pid="$!"
+  local remaining="${IOS_FILE_LIST_TIMEOUT_SEC:-5}"
+  while kill -0 "$list_pid" 2>/dev/null; do
+    if [[ "$remaining" -le 0 ]]; then
+      pkill -P "$list_pid" 2>/dev/null || true
+      kill "$list_pid" 2>/dev/null || true
+      wait "$list_pid" 2>/dev/null || true
+      echo "info files timed out for $source" >>"$dest.err"
+      return 124
+    fi
+    sleep 1
+    remaining=$((remaining - 1))
+  done
+  wait "$list_pid"
 }
 
 logs_dir_exists="false"
@@ -88,7 +115,7 @@ for attempt in 1 2 3; do
     fi
     ios_log_device_copy_result="copy_empty_attempt_$attempt"
   else
-    ios_log_device_copy_result="copy_failed_attempt_$attempt"
+    ios_log_device_copy_result="copy_failed_or_timeout_attempt_$attempt"
   fi
   sleep 1
 done

@@ -28,9 +28,19 @@ final class AppLogStore {
         logsDirectoryURL.appendingPathComponent("ios_ble.old.log")
     }
 
+    var timelineLogURL: URL {
+        logsDirectoryURL.appendingPathComponent("ios_lyrics_timeline.log")
+    }
+
     func append(_ message: String) {
         queue.async { [weak self] in
             self?.appendOnQueue(message)
+        }
+    }
+
+    func appendTimeline(_ message: String) {
+        queue.async { [weak self] in
+            self?.appendTimelineOnQueue(message)
         }
     }
 
@@ -55,6 +65,20 @@ final class AppLogStore {
             }
             try? self.fileManager.removeItem(at: self.currentLogURL)
             try? self.fileManager.removeItem(at: self.oldLogURL)
+            try? self.fileManager.removeItem(at: self.timelineLogURL)
+            DispatchQueue.main.async {
+                completion?()
+            }
+        }
+    }
+
+    func clearTimeline(completion: (() -> Void)? = nil) {
+        queue.async { [weak self] in
+            guard let self else {
+                DispatchQueue.main.async { completion?() }
+                return
+            }
+            try? self.fileManager.removeItem(at: self.timelineLogURL)
             DispatchQueue.main.async {
                 completion?()
             }
@@ -84,6 +108,23 @@ final class AppLogStore {
             try handle.close()
         } catch {
             print("[AppLogStore] append failed error=\(error.localizedDescription)")
+        }
+    }
+
+    private func appendTimelineOnQueue(_ message: String) {
+        do {
+            try ensureLogsDirectory()
+            let line = formattedLine(for: message)
+            guard let data = line.data(using: .utf8) else { return }
+            if !fileManager.fileExists(atPath: timelineLogURL.path) {
+                fileManager.createFile(atPath: timelineLogURL.path, contents: nil)
+            }
+            let handle = try FileHandle(forWritingTo: timelineLogURL)
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+            try handle.close()
+        } catch {
+            print("[AppLogStore] append timeline failed error=\(error.localizedDescription)")
         }
     }
 

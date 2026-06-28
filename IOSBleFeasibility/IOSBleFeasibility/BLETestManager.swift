@@ -232,6 +232,10 @@ final class BLETestManager: NSObject, ObservableObject {
     private var lyricTraceFullLyricsRequestAtMs: [String: Int64] = [:]
     private var lyricTraceFullLyricsStartAtMs: [String: Int64] = [:]
     private var lyricTraceFirstPlaybackLyricAtMs: [String: Int64] = [:]
+    #if DEBUG
+    private var trackMatrixV31RunID = ""
+    private var trackMatrixV31Active = false
+    #endif
     private var remoteLogExpectedChunks = 0
     private var remoteLogExpectedLines = 0
     private var remoteLogChunks: [Int: Data] = [:]
@@ -425,52 +429,74 @@ final class BLETestManager: NSObject, ObservableObject {
 
     #if DEBUG
     private func scheduleTrackMatrixV31SmokeTest() {
-        log("[TrackMatrixV31] scheduled")
+        let runID = "\(currentTimeMs())"
+        trackMatrixV31RunID = runID
+        trackMatrixV31Active = true
+        AppLogStore.shared.clear()
+        trackMatrixLog("scheduled")
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            self?.runTrackMatrixV31WhenReady(attempt: 0)
+            self?.runTrackMatrixV31WhenReady(attempt: 0, runID: runID)
         }
     }
 
-    private func runTrackMatrixV31WhenReady(attempt: Int) {
+    private func trackMatrixLog(_ message: String) {
+        log("[TrackMatrixV31] runId=\(trackMatrixV31RunID) \(message)")
+    }
+
+    private func isActiveTrackMatrixRun(_ runID: String) -> Bool {
+        trackMatrixV31Active && runID == trackMatrixV31RunID
+    }
+
+    private func runTrackMatrixV31WhenReady(attempt: Int, runID: String) {
+        guard isActiveTrackMatrixRun(runID) else {
+            log("[TrackMatrixV31] runId=\(runID) ignored reason=stale_run activeRunId=\(trackMatrixV31RunID)")
+            return
+        }
         let ready = sonyPeripheral?.state == .connected &&
             sonyCommandCharacteristic != nil &&
             sonyStatusCharacteristic != nil &&
             isConnectionHealthyOrSuspect
         guard ready else {
             if attempt >= 40 {
-                log(
-                    "[TrackMatrixV31] abort reason=not_ready " +
+                trackMatrixLog(
+                    "abort reason=not_ready " +
                         "attempt=\(attempt) connected=\(sonyPeripheral?.state == .connected) " +
                         "commandReady=\(sonyCommandCharacteristic != nil) " +
                         "statusReady=\(sonyStatusCharacteristic != nil) " +
                         "health=\(connectionHealthState)"
                 )
+                trackMatrixV31Active = false
                 return
             }
-            log(
-                "[TrackMatrixV31] waiting connection attempt=\(attempt) " +
+            trackMatrixLog(
+                "waiting connection attempt=\(attempt) " +
                     "connected=\(sonyPeripheral?.state == .connected) " +
                     "commandReady=\(sonyCommandCharacteristic != nil) " +
                     "statusReady=\(sonyStatusCharacteristic != nil) " +
                     "health=\(connectionHealthState)"
             )
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.runTrackMatrixV31WhenReady(attempt: attempt + 1)
+                self?.runTrackMatrixV31WhenReady(attempt: attempt + 1, runID: runID)
             }
             return
         }
-        log("[TrackMatrixV31] start totalTracks=10 dwellMs=10000")
-        runTrackMatrixV31Sample(index: 1, previousTrackID: "")
+        trackMatrixLog("start totalTracks=10 dwellMs=10000")
+        runTrackMatrixV31Sample(index: 1, previousTrackID: "", runID: runID)
     }
 
-    private func runTrackMatrixV31Sample(index: Int, previousTrackID: String) {
+    private func runTrackMatrixV31Sample(index: Int, previousTrackID: String, runID: String) {
+        guard isActiveTrackMatrixRun(runID) else {
+            log("[TrackMatrixV31] runId=\(runID) ignored reason=stale_sample activeRunId=\(trackMatrixV31RunID)")
+            return
+        }
         guard index <= 10 else {
-            log("[TrackMatrixV31] end timeMs=\(currentTimeMs())")
+            trackMatrixLog("end timeMs=\(currentTimeMs())")
+            trackMatrixV31Active = false
             return
         }
         let trackID = currentTrackID
-        log(
-            "[TrackMatrixV31] sampleStart index=\(index) timeMs=\(currentTimeMs()) " +
+        trackMatrixLog(
+            "sampleStart index=\(index) timeMs=\(currentTimeMs()) " +
                 "trackId=\(trackID) previousTrackId=\(previousTrackID) " +
                 "title=\(title.prefix(60)) artist=\(artist.prefix(60)) " +
                 "position=\(displayPositionMs) duration=\(durationMs)"
@@ -478,22 +504,26 @@ final class BLETestManager: NSObject, ObservableObject {
         sendGetPlaybackState()
         let lyricRequestAt = currentTimeMs()
         sendGetFullLyrics(force: true)
-        log(
-            "[TrackMatrixV31] requestFullLyrics index=\(index) " +
+        trackMatrixLog(
+            "requestFullLyrics index=\(index) " +
                 "trackId=\(trackID) timeMs=\(lyricRequestAt)"
         )
         let artRequestAt = currentTimeMs()
         let artRequested = albumArtReceiver.requestCurrentPreviewAlbumArt()
-        log(
-            "[TrackMatrixV31] requestAlbumArt index=\(index) " +
+        trackMatrixLog(
+            "requestAlbumArt index=\(index) " +
                 "trackId=\(trackID) timeMs=\(artRequestAt) quality=preview result=\(artRequested)"
         )
         guard index < 10 else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) { [weak self] in
             guard let self else { return }
+            guard self.isActiveTrackMatrixRun(runID) else {
+                self.log("[TrackMatrixV31] runId=\(runID) ignored reason=stale_next activeRunId=\(self.trackMatrixV31RunID)")
+                return
+            }
             let beforeNext = self.currentTrackID
-            self.log(
-                "[TrackMatrixV31] next index=\(index) " +
+            self.trackMatrixLog(
+                "next index=\(index) " +
                     "fromTrackId=\(beforeNext) timeMs=\(self.currentTimeMs())"
             )
             self.sendNext()
@@ -502,7 +532,8 @@ final class BLETestManager: NSObject, ObservableObject {
                 previousTrackID: beforeNext,
                 attempt: 0,
                 retriedNext: false,
-                forceRetryCount: 0
+                forceRetryCount: 0,
+                runID: runID
             )
         }
     }
@@ -512,23 +543,28 @@ final class BLETestManager: NSObject, ObservableObject {
         previousTrackID: String,
         attempt: Int,
         retriedNext: Bool,
-        forceRetryCount: Int
+        forceRetryCount: Int,
+        runID: String
     ) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
+            guard self.isActiveTrackMatrixRun(runID) else {
+                self.log("[TrackMatrixV31] runId=\(runID) ignored reason=stale_wait activeRunId=\(self.trackMatrixV31RunID)")
+                return
+            }
             let current = self.currentTrackID
             if !current.isEmpty, !previousTrackID.isEmpty, current != previousTrackID {
-                self.log(
-                    "[TrackMatrixV31] trackChanged nextIndex=\(nextIndex) " +
+                self.trackMatrixLog(
+                    "trackChanged nextIndex=\(nextIndex) " +
                         "previousTrackId=\(previousTrackID) currentTrackId=\(current) " +
                         "attempt=\(attempt) timeMs=\(self.currentTimeMs())"
                 )
-                self.runTrackMatrixV31Sample(index: nextIndex, previousTrackID: previousTrackID)
+                self.runTrackMatrixV31Sample(index: nextIndex, previousTrackID: previousTrackID, runID: runID)
                 return
             }
             if attempt == 4, !retriedNext {
-                self.log(
-                    "[TrackMatrixV31] retryNext nextIndex=\(nextIndex) " +
+                self.trackMatrixLog(
+                    "retryNext nextIndex=\(nextIndex) " +
                         "previousTrackId=\(previousTrackID) currentTrackId=\(current)"
                 )
                 self.sendNext()
@@ -537,21 +573,23 @@ final class BLETestManager: NSObject, ObservableObject {
                     previousTrackID: previousTrackID,
                     attempt: attempt + 1,
                     retriedNext: true,
-                    forceRetryCount: forceRetryCount
+                    forceRetryCount: forceRetryCount,
+                    runID: runID
                 )
                 return
             }
             if attempt >= 14 {
-                self.log(
-                    "[TrackMatrixV31] track_not_changed nextIndex=\(nextIndex) " +
+                self.trackMatrixLog(
+                    "track_not_changed nextIndex=\(nextIndex) " +
                         "previousTrackId=\(previousTrackID) currentTrackId=\(current) " +
                         "forceRetryCount=\(forceRetryCount)"
                 )
                 if forceRetryCount >= 3 {
-                    self.log(
-                        "[TrackMatrixV31] abort reason=track_not_changed " +
+                    self.trackMatrixLog(
+                        "abort reason=track_not_changed " +
                             "nextIndex=\(nextIndex) previousTrackId=\(previousTrackID)"
                     )
+                    self.trackMatrixV31Active = false
                     return
                 }
                 self.sendNext()
@@ -560,7 +598,8 @@ final class BLETestManager: NSObject, ObservableObject {
                     previousTrackID: previousTrackID,
                     attempt: 0,
                     retriedNext: false,
-                    forceRetryCount: forceRetryCount + 1
+                    forceRetryCount: forceRetryCount + 1,
+                    runID: runID
                 )
                 return
             }
@@ -569,7 +608,8 @@ final class BLETestManager: NSObject, ObservableObject {
                 previousTrackID: previousTrackID,
                 attempt: attempt + 1,
                 retriedNext: retriedNext,
-                forceRetryCount: forceRetryCount
+                forceRetryCount: forceRetryCount,
+                runID: runID
             )
         }
     }
@@ -1863,6 +1903,18 @@ final class BLETestManager: NSObject, ObservableObject {
 
     private func log(_ message: String) {
         AppLogStore.shared.append(message)
+        #if DEBUG
+        if message.hasPrefix("[TrackMatrixV31]") ||
+            message.hasPrefix("[LyricTrace-iOS]") ||
+            message.hasPrefix("[BLE-Reconnect]") ||
+            message.hasPrefix("[BLE-Health]") ||
+            message.hasPrefix("[Reconnect]") ||
+            message.hasPrefix("[BLE-iOS]") ||
+            message.hasPrefix("[SmokeTest]") ||
+            message.hasPrefix("[AppMode]") {
+            AppLogStore.shared.appendTimeline(message)
+        }
+        #endif
         DispatchQueue.main.async {
             let formatter = DateFormatter()
             formatter.dateFormat = "HH:mm:ss.SSS"
@@ -2161,6 +2213,7 @@ final class BLETestManager: NSObject, ObservableObject {
 
     private func markStatusNotifyReceived(type: String) {
         let now = Date()
+        log("[BLE-Health] notify received type=\(type)")
         if let lastStatusNotifyAt {
             let gapMs = Int64(now.timeIntervalSince(lastStatusNotifyAt) * 1_000)
             connectionHealthMaxNotifyGapMs = max(connectionHealthMaxNotifyGapMs, gapMs)
@@ -4561,6 +4614,11 @@ extension BLETestManager: CBPeripheralDelegate {
         }
         lastCurrentWordReceivedAtMs = nowMs
         currentWordLastLatencyMs = timestampMs > 0 ? max(nowMs - timestampMs, 0) : 0
+        log(
+            "[LyricTrace-iOS] id=\(trackID) stage=currentWordAccepted " +
+                "line=\(lineIndex) word=\(wordIndex) position=\(remotePositionMs) " +
+                "latencyMs=\(currentWordLastLatencyMs)"
+        )
 
         let lineByOffset = fullLyrics.indices.contains(lineIndex) ? fullLyrics[lineIndex] : nil
         if isSameTrackId(incoming: trackID, current: fullLyricsTrackId),

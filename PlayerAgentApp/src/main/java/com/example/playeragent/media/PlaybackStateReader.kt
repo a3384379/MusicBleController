@@ -46,6 +46,7 @@ class PlaybackStateReader(
     private var lastObservedTrack: PredictiveLyricsTrack? = null
     private var lastCandidateDiagnosticKey: String = ""
     private var lastCandidateDiagnosticAtMs: Long = 0L
+    private var lastReactiveTraceKey: String = ""
     private val transitionStats = mutableMapOf<String, TransitionStat>()
 
     fun readPlaybackState(): JSONObject {
@@ -157,6 +158,47 @@ class PlaybackStateReader(
             durationMs = duration,
             isPlaying = playing
         )
+        if (mediaDecision.trackChanged) {
+            LyricTraceLogger.stage(
+                runId = "unknown",
+                trackId = lastTrackId,
+                songKey = songKey,
+                generation = mediaDecision.generation,
+                stage = "trackChanged",
+                reason = mediaDecision.reason,
+                extra = mapOf(
+                    "title" to title.take(48),
+                    "artist" to artist.take(48),
+                    "durationMs" to duration.toString()
+                ),
+                sink = logger
+            )
+        }
+        val reactiveTraceKey = listOf(
+            mediaDecision.generation.toString(),
+            mediaDecision.trackChanged.toString(),
+            mediaDecision.shouldScheduleLyrics.toString(),
+            mediaDecision.reason
+        ).joinToString("|")
+        if ((mediaDecision.trackChanged || mediaDecision.shouldScheduleLyrics) &&
+            reactiveTraceKey != lastReactiveTraceKey
+        ) {
+            lastReactiveTraceKey = reactiveTraceKey
+            LyricTraceLogger.stage(
+                runId = "unknown",
+                trackId = lastTrackId,
+                songKey = songKey,
+                generation = mediaDecision.generation,
+                stage = "reactiveEvent",
+                reason = mediaDecision.reason,
+                extra = mapOf(
+                    "trackChanged" to mediaDecision.trackChanged.toString(),
+                    "playing" to playing.toString(),
+                    "positionMs" to position.toString()
+                ),
+                sink = logger
+            )
+        }
         if (duration <= 0L && !durationMissingLogged) {
             durationMissingLogged = true
             logger("[PlaybackState] duration missing title=$title")
@@ -166,11 +208,29 @@ class PlaybackStateReader(
         val lyricStartedAtMs = SystemClock.elapsedRealtime()
         val lyric = if (includeLyric) {
             if (mediaDecision.shouldScheduleLyrics) {
+                LyricTraceLogger.stage(
+                    runId = "unknown",
+                    trackId = lastTrackId,
+                    songKey = songKey,
+                    generation = mediaDecision.generation,
+                    stage = "debounceFlush",
+                    reason = mediaDecision.reason,
+                    sink = logger
+                )
                 if (reactiveMediaController.markLyricsTaskStarted(
                         trackId = lastTrackId,
                         generation = mediaDecision.generation
                     )
                 ) {
+                    LyricTraceLogger.stage(
+                        runId = "unknown",
+                        trackId = lastTrackId,
+                        songKey = songKey,
+                        generation = mediaDecision.generation,
+                        stage = "parseScheduled",
+                        reason = mediaDecision.reason,
+                        sink = logger
+                    )
                     lyricManager.requestLyricLoadAsync(
                         title = title,
                         artist = artist,
