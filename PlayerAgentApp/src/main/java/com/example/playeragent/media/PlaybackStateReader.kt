@@ -18,7 +18,9 @@ import java.security.MessageDigest
 class PlaybackStateReader(
     context: Context,
     private val logger: (String) -> Unit,
-    private val includeLyric: Boolean = true
+    private val includeLyric: Boolean = true,
+    private val reactiveMediaController: ReactiveMediaController = ReactiveMediaController(logger),
+    private val onLyricsReady: (LyricsReadyGateSnapshot) -> Unit = {}
 ) {
 
     private val appContext = context.applicationContext
@@ -26,7 +28,16 @@ class PlaybackStateReader(
         appContext.getSystemService(MediaSessionManager::class.java)
     private val lyricManager = LyricManager(
         context = appContext,
-        logger = logger
+        logger = logger,
+        onLyricsReady = { snapshot ->
+            reactiveMediaController.markLyricsTaskFinished(
+                trackId = snapshot.trackId,
+                generation = snapshot.generation,
+                ready = snapshot.lyricsReady,
+                reason = snapshot.reason
+            )
+            onLyricsReady(snapshot)
+        }
     )
     private var metadataMissingLogged = false
     private var durationMissingLogged = false
@@ -135,6 +146,17 @@ class PlaybackStateReader(
                     .isNotBlank()
         )
         observeTrackTransition(currentTrack)
+        val songKey = buildLyricSongKey(title, artist, album)
+        val mediaDecision = reactiveMediaController.onPlaybackObserved(
+            trackId = lastTrackId,
+            songKey = songKey,
+            title = title,
+            artist = artist,
+            album = album,
+            positionMs = position,
+            durationMs = duration,
+            isPlaying = playing
+        )
         if (duration <= 0L && !durationMissingLogged) {
             durationMissingLogged = true
             logger("[PlaybackState] duration missing title=$title")
@@ -143,18 +165,28 @@ class PlaybackStateReader(
         }
         val lyricStartedAtMs = SystemClock.elapsedRealtime()
         val lyric = if (includeLyric) {
-            lyricManager.requestLyricLoadAsync(
-                title = title,
-                artist = artist,
-                album = album,
-                trackId = lastTrackId,
-                durationMs = duration,
-                positionMs = position
-            )
+            if (mediaDecision.shouldScheduleLyrics) {
+                if (reactiveMediaController.markLyricsTaskStarted(
+                        trackId = lastTrackId,
+                        generation = mediaDecision.generation
+                    )
+                ) {
+                    lyricManager.requestLyricLoadAsync(
+                        title = title,
+                        artist = artist,
+                        album = album,
+                        trackId = lastTrackId,
+                        durationMs = duration,
+                        positionMs = position,
+                        reason = mediaDecision.reason
+                    )
+                }
+            }
             lyricManager.getCurrentLine(position)
         } else {
             ""
         }
+        reactiveMediaController.updateCurrentLine(lyric)
         val cachedLyricCostMs = SystemClock.elapsedRealtime() - lyricStartedAtMs
         if (lyric != lastLoggedLyric) {
             lastLoggedLyric = lyric
@@ -195,7 +227,6 @@ class PlaybackStateReader(
             .put("lyricStatus", lyricStatus)
             .put("lyricReason", lyricReason)
             .put("lyricSuggestion", diagnostic.suggestion)
-        val songKey = buildLyricSongKey(title, artist, album)
         CurrentTrackRuntimeCache.updatePlaybackState(
             trackId = lastTrackId,
             songKey = songKey,
@@ -219,9 +250,6 @@ class PlaybackStateReader(
                     lines = loadedLines,
                     lyricSource = diagnostic.source
                 )
-            }
-            predictiveCandidate(selected, currentTrack, PredictiveCandidateMode.AUTO)?.let {
-                lyricManager.preloadPredictiveLyrics(it)
             }
         }
         return response
@@ -360,6 +388,10 @@ class PlaybackStateReader(
 
     fun lyricRecoverySnapshot(): LyricRecoverySnapshot {
         return lyricManager.recoverySnapshot()
+    }
+
+    fun lyricsReadyGateSnapshot(): LyricsReadyGateSnapshot {
+        return lyricManager.lyricsReadyGateSnapshot()
     }
 
     fun predictiveLyricsMetricsSnapshot(): PredictiveLyricsMetrics {

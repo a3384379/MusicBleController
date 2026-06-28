@@ -28,8 +28,10 @@ import com.example.playeragent.media.MediaFieldDumpManager
 import com.example.playeragent.media.CurrentTrackRuntimeCache
 import com.example.playeragent.media.CurrentTrackSnapshot
 import com.example.playeragent.media.IncrementalLyricsReady
+import com.example.playeragent.media.LyricsReadyGateSnapshot
 import com.example.playeragent.media.PlaybackStateReader
 import com.example.playeragent.media.PlaybackStateDiffType
+import com.example.playeragent.media.ReactiveMediaController
 import com.example.playeragent.media.TrackCapabilityTracker
 import org.json.JSONArray
 import org.json.JSONObject
@@ -62,9 +64,12 @@ class BleGattServerManager(
     private val mtuByAddress = ConcurrentHashMap<String, Int>()
     private val recentConnectionCallbacks = ConcurrentHashMap<String, Long>()
     private val recentMtuCallbacks = ConcurrentHashMap<String, Long>()
+    private val reactiveMediaController = ReactiveMediaController(logger)
     private val playbackStateReader = PlaybackStateReader(
         context = appContext,
-        logger = logger
+        logger = logger,
+        reactiveMediaController = reactiveMediaController,
+        onLyricsReady = ::handleLyricsReady
     )
     private val albumArtTestManager = AlbumArtTestManager(
         context = appContext,
@@ -152,6 +157,8 @@ class BleGattServerManager(
     }
     @Volatile
     private var currentAlbumArtPlaybackState: JSONObject? = null
+    @Volatile
+    private var pendingFullLyricsRequest: PendingFullLyricsRequest? = null
     private var lastAutoPushSongKey: String? = null
     private var lastAutoPushPlaying: Boolean? = null
     private var lastPlaybackDiffSkipLogAtMs: Long = 0L
@@ -1560,6 +1567,7 @@ class BleGattServerManager(
         logger("[AlbumArtFastPath] track_changed start id=$protocolId")
         val cached = albumArtCacheEntry(protocolId, cacheKey)
         if (cached != null) {
+            logger("[AlbumArt] cache hit id=$protocolId source=${cached.source}")
             logger(
                 "[AlbumArtFastPath] cache hit id=$protocolId source=${cached.source} " +
                     "size=${cached.width}x${cached.height} bytes=${cached.byteSize}"
@@ -1582,7 +1590,13 @@ class BleGattServerManager(
             return
         }
         logger("[AlbumArtFastPath] cache miss id=$protocolId")
-        startAlbumArtFastPathLoad(pending)
+        val mediaGeneration = reactiveMediaController.generation()
+        if (!reactiveMediaController.tryStartAlbumArtTask(protocolId, mediaGeneration)) {
+            pendingAlbumArt = pending
+            logger("[AlbumArt] pending new id=$protocolId reason=album_art_inflight")
+            return
+        }
+        startAlbumArtFastPathLoad(pending, mediaGeneration)
         val generation = ++albumArtScheduleGeneration
         logger("[AlbumArt] scheduled after cooldown id=$protocolId")
         albumArtHandler.postDelayed(
@@ -1659,7 +1673,10 @@ class BleGattServerManager(
         enqueueAlbumArtOfferOrPending(pending)
     }
 
-    private fun startAlbumArtFastPathLoad(pending: PendingAlbumArt) {
+    private fun startAlbumArtFastPathLoad(
+        pending: PendingAlbumArt,
+        mediaGeneration: Long
+    ) {
         val oldProtocolId = albumArtFastPathProtocolId
         val oldTask = albumArtFastPathTask
         if (oldTask != null && !oldTask.isDone && oldProtocolId != pending.protocolId) {
@@ -1685,6 +1702,12 @@ class BleGattServerManager(
                 albumArtTestManager.readCurrentNotificationAlbumArt()
             } catch (exception: Exception) {
                 logger("[AlbumArtFastPath] failed reason=${exception.message}")
+                reactiveMediaController.markAlbumArtFinished(
+                    trackId = pending.protocolId,
+                    generation = mediaGeneration,
+                    ready = false,
+                    reason = exception.message ?: "load_failed"
+                )
                 TrackCapabilityTracker.onAlbumArtLoadDone(
                     protocolId = pending.protocolId,
                     success = false,
@@ -1697,6 +1720,12 @@ class BleGattServerManager(
                 null
             }
             if (Thread.currentThread().isInterrupted) {
+                reactiveMediaController.markAlbumArtFinished(
+                    trackId = pending.protocolId,
+                    generation = mediaGeneration,
+                    ready = false,
+                    reason = "interrupted"
+                )
                 logger("[AlbumArtTask] cancel oldTrack=${pending.protocolId} newTrack=interrupted")
                 return@submit
             }
@@ -1705,6 +1734,12 @@ class BleGattServerManager(
                     if (generation != albumArtTaskGeneration ||
                         currentAlbumArtId != pending.protocolId
                     ) {
+                        reactiveMediaController.markAlbumArtFinished(
+                            trackId = pending.protocolId,
+                            generation = mediaGeneration,
+                            ready = false,
+                            reason = "generation_mismatch"
+                        )
                         logger(
                             "[AlbumArtTask] cancel oldTrack=${pending.protocolId} " +
                                 "newTrack=${currentAlbumArtId.orEmpty()}"
@@ -1712,6 +1747,12 @@ class BleGattServerManager(
                         return@synchronized
                     }
                     if (albumArt == null) {
+                        reactiveMediaController.markAlbumArtFinished(
+                            trackId = pending.protocolId,
+                            generation = mediaGeneration,
+                            ready = false,
+                            reason = "no album art candidate"
+                        )
                         CurrentTrackRuntimeCache.updateAlbumArt(
                             trackId = pending.protocolId,
                             albumArtId = pending.protocolId,
@@ -1735,6 +1776,12 @@ class BleGattServerManager(
                         return@synchronized
                     }
                     if (isLikelyPlaceholderAlbumArt(albumArt.bitmap)) {
+                        reactiveMediaController.markAlbumArtFinished(
+                            trackId = pending.protocolId,
+                            generation = mediaGeneration,
+                            ready = false,
+                            reason = "placeholder album art"
+                        )
                         CurrentTrackRuntimeCache.updateAlbumArt(
                             trackId = pending.protocolId,
                             albumArtId = pending.protocolId,
@@ -1764,6 +1811,7 @@ class BleGattServerManager(
                         bitmap = albumArt.bitmap,
                         source = albumArt.source
                     )
+                    logger("[AlbumArt] fallback notification id=${pending.protocolId}")
                     CurrentTrackRuntimeCache.updateAlbumArt(
                         trackId = pending.protocolId,
                         albumArtId = pending.protocolId,
@@ -1791,6 +1839,12 @@ class BleGattServerManager(
                     logger(
                         "[AlbumArtFastPath] hq ready costMs=$costMs " +
                             "size=${albumArt.bitmap.width}x${albumArt.bitmap.height}"
+                    )
+                    reactiveMediaController.markAlbumArtFinished(
+                        trackId = pending.protocolId,
+                        generation = mediaGeneration,
+                        ready = true,
+                        reason = albumArt.source
                     )
                     fulfillPendingAlbumArtRequests(pending.protocolId)
                 }
@@ -3499,10 +3553,20 @@ class BleGattServerManager(
         val artist = source.optString("artist")
         val runtimeSnapshot = playbackStateReader.runtimeCacheSnapshot()
         val runtimeLineCount = runtimeSnapshot.track?.lyricLines?.size ?: 0
+        val runtimeGeneration = runtimeSnapshot.track?.currentTrackGeneration ?: 0L
+        val readyGate = playbackStateReader.lyricsReadyGateSnapshot()
         val allLines = playbackStateReader.runtimeLyricLinesSnapshot()
-        val lines = allLines
+        val candidateLines = allLines
             .filter { it.text.isNotBlank() }
             .take(MAX_FULL_LYRICS_LINES)
+        val gateAllowsSend = lyricsReadyGateAllowsFullLyrics(
+            gate = readyGate,
+            requestedTrackId = requestedTrackId,
+            protocolTrackId = trackId,
+            runtimeGeneration = runtimeGeneration,
+            lineCount = candidateLines.size
+        )
+        val lines = if (gateAllowsSend) candidateLines else emptyList()
         val fullLyricsSourceStage = if (runtimeLineCount > 0) {
             "fullLyricsFromRuntime"
         } else {
@@ -3511,6 +3575,9 @@ class BleGattServerManager(
         logger(
             "[LyricTrace] id=$traceId stage=$fullLyricsSourceStage " +
                 "runtimeLines=$runtimeLineCount selectedLines=${lines.size} " +
+                "readyState=${readyGate.state} lyricsReady=${readyGate.lyricsReady} " +
+                "gateAllowed=$gateAllowsSend generation=${readyGate.generation} " +
+                "runtimeGeneration=$runtimeGeneration " +
                 "costMs=${SystemClock.elapsedRealtime() - buildStartedAtMs}"
         )
         val includeWordsAroundCurrent =
@@ -3538,6 +3605,16 @@ class BleGattServerManager(
         if (lines.isEmpty()) {
             val unavailableReason = playbackStateReader.lyricUnavailableReason()
             val diagnostic = playbackStateReader.lyricDiagnosticSnapshot()
+            if (!readyGate.lyricsReady || candidateLines.isEmpty()) {
+                rememberPendingFullLyricsRequest(
+                    request = request,
+                    requestedTrackId = requestedTrackId,
+                    protocolTrackId = trackId,
+                    generation = runtimeGeneration,
+                    reason = unavailableReason,
+                    readyGate = readyGate
+                )
+            }
             val recoveryRetryStarted = if (isFullLyricsRecoveryNudgeReason(unavailableReason) &&
                 !request.optBoolean("_lyricsRecoveryRetry", false)
             ) {
@@ -3594,6 +3671,7 @@ class BleGattServerManager(
             TrackCapabilityTracker.onFullLyricsSent(traceId, trackId, 0)
             return
         }
+        clearMatchingPendingFullLyrics(requestedTrackId, trackId, runtimeGeneration)
 
         val maximumPayload = maximumPayloadFor(device)
         val packets = mutableListOf<BleNotifyQueue.Packet>()
@@ -3982,6 +4060,128 @@ class BleGattServerManager(
             normalized.contains("no safe qrc candidate")
     }
 
+    private fun lyricsReadyGateAllowsFullLyrics(
+        gate: LyricsReadyGateSnapshot,
+        requestedTrackId: String,
+        protocolTrackId: String,
+        runtimeGeneration: Long,
+        lineCount: Int
+    ): Boolean {
+        if (!gate.lyricsReady || lineCount <= 0) {
+            return false
+        }
+        if (!isSameProtocolTrackId(gate.trackId, protocolTrackId) &&
+            (requestedTrackId.isBlank() || !isSameProtocolTrackId(gate.trackId, requestedTrackId))
+        ) {
+            logger(
+                "[LyricsState] ready gate blocked reason=track_mismatch " +
+                    "gateTrackId=${gate.trackId} requested=$requestedTrackId protocol=$protocolTrackId"
+            )
+            return false
+        }
+        if (runtimeGeneration > 0L && gate.generation > 0L && runtimeGeneration != gate.generation) {
+            logger(
+                "[LyricsState] ready gate blocked reason=generation_mismatch " +
+                    "gateGeneration=${gate.generation} runtimeGeneration=$runtimeGeneration"
+            )
+            return false
+        }
+        return true
+    }
+
+    private fun rememberPendingFullLyricsRequest(
+        request: JSONObject,
+        requestedTrackId: String,
+        protocolTrackId: String,
+        generation: Long,
+        reason: String,
+        readyGate: LyricsReadyGateSnapshot
+    ) {
+        if (request.optBoolean("_lyricsReadyFlush", false)) {
+            return
+        }
+        pendingFullLyricsRequest = PendingFullLyricsRequest(
+            request = JSONObject(request.toString())
+                .put("_lyricsReadyPending", true),
+            requestedTrackId = requestedTrackId,
+            protocolTrackId = protocolTrackId,
+            generation = generation,
+            createdAtMs = SystemClock.elapsedRealtime()
+        )
+        logger(
+            "[LyricsState] pending request queued trackId=$protocolTrackId " +
+                "requested=$requestedTrackId generation=$generation " +
+                "state=${readyGate.state} reason=$reason"
+        )
+    }
+
+    private fun clearMatchingPendingFullLyrics(
+        requestedTrackId: String,
+        protocolTrackId: String,
+        generation: Long
+    ) {
+        val pending = pendingFullLyricsRequest ?: return
+        val trackMatches = isSameProtocolTrackId(pending.protocolTrackId, protocolTrackId) ||
+            (requestedTrackId.isNotBlank() &&
+                isSameProtocolTrackId(pending.requestedTrackId, requestedTrackId))
+        val generationMatches = pending.generation <= 0L ||
+            generation <= 0L ||
+            pending.generation == generation
+        if (trackMatches && generationMatches) {
+            pendingFullLyricsRequest = null
+        }
+    }
+
+    private fun handleLyricsReady(snapshot: LyricsReadyGateSnapshot) {
+        if (!snapshot.lyricsReady) {
+            return
+        }
+        val pending = pendingFullLyricsRequest ?: return
+        val trackMatches = isSameProtocolTrackId(snapshot.trackId, pending.protocolTrackId) ||
+            isSameProtocolTrackId(snapshot.trackId, pending.requestedTrackId)
+        val generationMatches = pending.generation <= 0L ||
+            snapshot.generation <= 0L ||
+            pending.generation == snapshot.generation
+        if (!trackMatches || !generationMatches) {
+            pendingFullLyricsRequest = null
+            logger(
+                "[LyricsState] pending request dropped reason=stale " +
+                    "readyTrackId=${snapshot.trackId} pendingTrackId=${pending.protocolTrackId} " +
+                    "readyGeneration=${snapshot.generation} pendingGeneration=${pending.generation}"
+            )
+            return
+        }
+        pendingFullLyricsRequest = null
+        albumArtHandler.post {
+            logger(
+                "[LyricsState] pending request flushed trackId=${pending.protocolTrackId} " +
+                    "lines=${snapshot.lineCount} waitMs=${SystemClock.elapsedRealtime() - pending.createdAtMs}"
+            )
+            logger(
+                "[Lyrics] pending flushed trackId=${pending.protocolTrackId} " +
+                    "generation=${snapshot.generation}"
+            )
+            sendFullLyrics(
+                JSONObject(pending.request.toString())
+                    .put("_lyricsReadyFlush", true)
+            )
+        }
+    }
+
+    private fun isSameProtocolTrackId(left: String, right: String): Boolean {
+        val cleanLeft = left.trim()
+        val cleanRight = right.trim()
+        if (cleanLeft.isBlank() || cleanRight.isBlank()) {
+            return false
+        }
+        if (cleanLeft == cleanRight) {
+            return true
+        }
+        val normalizedLeft = normalizeCurrentWordTrackId(cleanLeft)
+        val normalizedRight = normalizeCurrentWordTrackId(cleanRight)
+        return normalizedLeft.isNotBlank() && normalizedLeft == normalizedRight
+    }
+
     private fun buildFittingFullLyricsChunk(
         trackId: String,
         index: Int,
@@ -4329,6 +4529,14 @@ class BleGattServerManager(
         val protocolId: String,
         val quality: AlbumArtQuality,
         val requestKey: String
+    )
+
+    private data class PendingFullLyricsRequest(
+        val request: JSONObject,
+        val requestedTrackId: String,
+        val protocolTrackId: String,
+        val generation: Long,
+        val createdAtMs: Long
     )
 
     private data class AlbumArtCacheEntry(

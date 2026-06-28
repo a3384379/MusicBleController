@@ -204,6 +204,25 @@ data class CurrentTrackSnapshot(
     val currentTrackGeneration: Long = 0L
 )
 
+enum class LyricsReadyState {
+    NOT_STARTED,
+    PARSING,
+    INDEX_BUILDING,
+    READY,
+    FAILED,
+    COOLDOWN_BLOCKED
+}
+
+data class LyricsReadyGateSnapshot(
+    val state: LyricsReadyState = LyricsReadyState.NOT_STARTED,
+    val lyricsReady: Boolean = false,
+    val trackId: String = "",
+    val songKey: String = "",
+    val generation: Long = 0L,
+    val lineCount: Int = 0,
+    val reason: String = ""
+)
+
 data class IncrementalLyricsReady(
     val groupId: String,
     val parsed: ParsedLyric,

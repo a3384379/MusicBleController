@@ -11,7 +11,8 @@ import java.util.concurrent.Executors
 
 class LyricManager(
     context: Context,
-    private val logger: (String) -> Unit
+    private val logger: (String) -> Unit,
+    private val onLyricsReady: (LyricsReadyGateSnapshot) -> Unit = {}
 ) {
 
     private val appContext = context.applicationContext
@@ -48,7 +49,7 @@ class LyricManager(
     private var lastFullLyricsRecoveryNudgeAtMs: Long = 0L
     private var lazyWaitSongKey: String? = null
     private var lazyWaitStartedAtMs: Long = 0L
-    private var lyricsReadyState: LyricsReadyState = LyricsReadyState.EMPTY
+    private var lyricsReadyState: LyricsReadyState = LyricsReadyState.NOT_STARTED
     private var activeLyricsTaskId: Long = 0L
     private val lyricExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "QrcLyricLoaderThread")
@@ -200,9 +201,15 @@ class LyricManager(
             activeTitle = title
             activeArtist = artist
             activeAlbum = album
-            activeTrackId = trackId
-            activeDurationMs = durationMs
-            activePositionMs = positionMs
+            if (trackId.isNotBlank()) {
+                activeTrackId = trackId
+            }
+            if (durationMs > 0L) {
+                activeDurationMs = durationMs
+            }
+            if (positionMs > 0L) {
+                activePositionMs = positionMs
+            }
             return
         }
         if (!force &&
@@ -231,7 +238,7 @@ class LyricManager(
             activeLyricsTaskId += 1
             activeLyricTraceStartedAtMs = System.currentTimeMillis()
             activeLyricTraceId = buildLyricTraceId(trackId, key, activeLyricTraceStartedAtMs)
-            lyricsReadyState = LyricsReadyState.EMPTY
+            lyricsReadyState = LyricsReadyState.NOT_STARTED
             if (loadingSongKey != null && loadingSongKey != key) {
                 logger("[LyricsTask] cancel oldTrack=$oldTrack newTrack=$key")
             }
@@ -277,9 +284,15 @@ class LyricManager(
             activeTitle = title
             activeArtist = artist
             activeAlbum = album
-            activeTrackId = trackId
-            activeDurationMs = durationMs
-            activePositionMs = positionMs
+            if (trackId.isNotBlank()) {
+                activeTrackId = trackId
+            }
+            if (durationMs > 0L) {
+                activeDurationMs = durationMs
+            }
+            if (positionMs > 0L) {
+                activePositionMs = positionMs
+            }
         }
 
         if (title.isBlank() && artist.isBlank()) {
@@ -301,9 +314,9 @@ class LyricManager(
             title = title,
             artist = artist,
             album = album,
-            trackId = trackId,
-            durationMs = durationMs,
-            positionMs = positionMs,
+            trackId = trackId.ifBlank { activeTrackId },
+            durationMs = durationMs.takeIf { it > 0L } ?: activeDurationMs,
+            positionMs = positionMs.takeIf { it > 0L } ?: activePositionMs,
             taskId = activeLyricsTaskId,
             traceId = activeLyricTraceId.ifBlank {
                 buildLyricTraceId(trackId, key, System.currentTimeMillis())
@@ -313,7 +326,7 @@ class LyricManager(
             foreground = true
         )
         lastAttemptAtMs = System.currentTimeMillis()
-        lyricsReadyState = LyricsReadyState.LOOKUP_STARTED
+        lyricsReadyState = LyricsReadyState.PARSING
         logger("[LyricAsync] scheduled songKey=$key reason=$reason force=$force")
             logger("[LyricsFastPath] lookup start songKey=$key reason=$reason")
             TrackCapabilityTracker.onLyricLookupStart(key, trackId)
@@ -517,6 +530,11 @@ class LyricManager(
         return recoveryEngine.snapshot()
     }
 
+    @Synchronized
+    fun lyricsReadyGateSnapshot(): LyricsReadyGateSnapshot {
+        return lyricsReadyGateSnapshotLocked()
+    }
+
     private fun consumeRetrySlotLocked(key: String, now: Long): Boolean {
         if (retryWindowSongKey != key || now - retryWindowStartedAtMs > RETRY_RATE_WINDOW_MS) {
             retryWindowSongKey = key
@@ -654,7 +672,7 @@ class LyricManager(
         val request = pendingRequest ?: return
         pendingRequest = null
         loadingSongKey = request.key
-        lyricsReadyState = LyricsReadyState.LOOKUP_STARTED
+        lyricsReadyState = LyricsReadyState.PARSING
         logger(
             "[LyricAsync] task start songKey=${request.key} " +
                 "title=${request.title} artist=${request.artist}"
@@ -729,7 +747,7 @@ class LyricManager(
             )
         }
         foregroundLoadingSongKey = request.key
-        lyricsReadyState = LyricsReadyState.LOOKUP_STARTED
+        lyricsReadyState = LyricsReadyState.PARSING
         logger(
             "[LyricAsync] foreground task start songKey=${request.key} " +
                 "title=${request.title} artist=${request.artist}"
@@ -827,7 +845,7 @@ class LyricManager(
                 source = result.source.name,
                 buildTimeMs = 0L
             )
-            lyricsReadyState = LyricsReadyState.RUNTIME_APPLIED
+            lyricsReadyState = LyricsReadyState.READY
             val runtimeApplyStartedAt = System.currentTimeMillis()
             CurrentTrackRuntimeCache.updateLyrics(
                 songKey = request.key,
@@ -846,9 +864,21 @@ class LyricManager(
                     "costMs=${System.currentTimeMillis() - runtimeApplyStartedAt} " +
                     "lines=${cachedLines.size} hasWordTiming=${cachedLines.any { it.words.isNotEmpty() }}"
             )
+            logger(
+                "[LyricsState] index ready trackId=${request.trackId.ifBlank { activeTrackId }} " +
+                    "songKey=${request.key} lines=${cachedLines.size} " +
+                    "generation=${CurrentTrackRuntimeCache.currentGeneration()}"
+            )
+            logger("[LyricsState] lyricsReady=true")
             lyricsReadyState = LyricsReadyState.READY
+            onLyricsReady(lyricsReadyGateSnapshotLocked())
         } else if (result.retryable) {
-            lyricsReadyState = LyricsReadyState.FAILED
+            lyricsReadyState = if (isCooldownBlockedReason(result.failureReason)) {
+                logger("[LyricsState] cooldown blocked retry only songKey=${request.key}")
+                LyricsReadyState.COOLDOWN_BLOCKED
+            } else {
+                LyricsReadyState.FAILED
+            }
             retryableFailureSongKey = request.key
             retryableFailureReason = result.failureReason.ifBlank { "lyrics retry pending" }
             retryableFailureAtMs = System.currentTimeMillis()
@@ -878,6 +908,7 @@ class LyricManager(
                 "[LyricAsync] retryable empty, not marking loaded " +
                     "songKey=${request.key} reason=$retryableFailureReason"
             )
+            onLyricsReady(lyricsReadyGateSnapshotLocked())
         } else {
             lyricsReadyState = LyricsReadyState.FAILED
             finalEmptySongKey = request.key
@@ -899,6 +930,7 @@ class LyricManager(
                 "[LyricAsync] final empty, marked loaded " +
                     "songKey=${request.key} reason=$finalEmptyReason"
             )
+            onLyricsReady(lyricsReadyGateSnapshotLocked())
         }
         lastLoggedLine = null
     }
@@ -1094,6 +1126,7 @@ class LyricManager(
         trace(request.traceId, "parsedCache", "result=miss")
 
         val lookupStartedAt = System.currentTimeMillis()
+        logger("[LyricsState] parse start trackId=${request.trackId} songKey=${request.key}")
         logger("[LyricsFastPath] lookup start songKey=${request.key}")
         if (shouldCancelRequest(request, "lookup")) {
             return staleLyricResult()
@@ -1107,7 +1140,7 @@ class LyricManager(
 
         if (result.lines.isNotEmpty()) {
             val parseStartedAt = System.currentTimeMillis()
-            lyricsReadyState = LyricsReadyState.PARSE_STARTED
+            lyricsReadyState = LyricsReadyState.PARSING
             val parseCostMs = System.currentTimeMillis() - parseStartedAt
             logger(
                 "[LyricsFastPath] parse done songKey=${request.key} " +
@@ -1115,7 +1148,8 @@ class LyricManager(
             )
 
             val indexStartedAt = System.currentTimeMillis()
-            lyricsReadyState = LyricsReadyState.INDEX_BUILT
+            logger("[LyricsState] index build start trackId=${request.trackId} songKey=${request.key}")
+            lyricsReadyState = LyricsReadyState.INDEX_BUILDING
             val hasWordTiming = result.lines.any { it.words.isNotEmpty() }
             val indexCostMs = System.currentTimeMillis() - indexStartedAt
             logger(
@@ -1193,7 +1227,7 @@ class LyricManager(
                 "linesCount=${cachedLines.size} " +
                 "hasWordTiming=${cachedLines.any { it.words.isNotEmpty() }}"
         )
-        lyricsReadyState = LyricsReadyState.RUNTIME_APPLIED
+        lyricsReadyState = LyricsReadyState.READY
         val runtimeApplyStartedAt = System.currentTimeMillis()
         CurrentTrackRuntimeCache.applyPredictiveLyrics(
             songKey = key,
@@ -1207,7 +1241,13 @@ class LyricManager(
                 "costMs=${System.currentTimeMillis() - runtimeApplyStartedAt} " +
                 "lines=${cachedLines.size} hasWordTiming=${cachedLines.any { it.words.isNotEmpty() }}"
         )
+        logger(
+            "[LyricsState] index ready trackId=$trackId songKey=$key " +
+                "lines=${cachedLines.size} generation=${CurrentTrackRuntimeCache.currentGeneration()}"
+        )
+        logger("[LyricsState] lyricsReady=true")
         lyricsReadyState = LyricsReadyState.READY
+        onLyricsReady(lyricsReadyGateSnapshotLocked())
         return cachedLines.isNotEmpty()
     }
 
@@ -1488,6 +1528,14 @@ class LyricManager(
             lyricSource = LyricSource.QRC.name,
             logger = logger
         )
+        lyricsReadyState = LyricsReadyState.READY
+        logger(
+            "[LyricsState] index ready trackId=${currentTrack.trackId} " +
+                "songKey=$activeKey lines=${lines.size} " +
+                "generation=${CurrentTrackRuntimeCache.currentGeneration()}"
+        )
+        logger("[LyricsState] lyricsReady=true")
+        onLyricsReady(lyricsReadyGateSnapshotLocked())
         return true
     }
 
@@ -1544,6 +1592,31 @@ class LyricManager(
             normalized.contains("qrc cooldown retry pending") ||
             normalized.contains("lyrics retry pending") ||
             normalized.contains("no safe qrc candidate")
+    }
+
+    private fun isCooldownBlockedReason(reason: String): Boolean {
+        val normalized = reason.lowercase(Locale.ROOT)
+        return normalized.contains("cooldown") ||
+            normalized.contains("retry pending") ||
+            normalized.contains("waiting qqmusic lyric cache") ||
+            normalized.contains("no safe qrc candidate")
+    }
+
+    private fun lyricsReadyGateSnapshotLocked(): LyricsReadyGateSnapshot {
+        val activeKey = activeSongKey.orEmpty()
+        val linesReady = activeKey.isNotBlank() &&
+            activeKey == loadedSongKey &&
+            cachedLines.isNotEmpty() &&
+            lyricsReadyState == LyricsReadyState.READY
+        return LyricsReadyGateSnapshot(
+            state = lyricsReadyState,
+            lyricsReady = linesReady,
+            trackId = activeTrackId,
+            songKey = activeKey,
+            generation = CurrentTrackRuntimeCache.currentGeneration(),
+            lineCount = if (linesReady) cachedLines.size else 0,
+            reason = if (linesReady) "" else currentUnavailableReason()
+        )
     }
 
     private fun startLazyWaitIfNeededLocked(key: String) {
@@ -2025,16 +2098,6 @@ class LyricManager(
         val cachedAtMs: Long,
         val hasWordTiming: Boolean
     )
-
-    private enum class LyricsReadyState {
-        EMPTY,
-        LOOKUP_STARTED,
-        PARSE_STARTED,
-        INDEX_BUILT,
-        RUNTIME_APPLIED,
-        READY,
-        FAILED
-    }
 
     private enum class LyricSource {
         NONE,
