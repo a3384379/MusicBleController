@@ -12,3 +12,15 @@ struct PlayPauseLiveActivityIntent: LiveActivityIntent {
         return .result()
     }
 }
+
+struct ReconnectLiveActivityIntent: LiveActivityIntent {
+    static var title: LocalizedStringResource = "重新连接"
+    static var description = IntentDescription("重新连接 Sony")
+    static var openAppWhenRun: Bool = false
+
+    @MainActor
+    func perform() async throws -> some IntentResult {
+        LiveActivityCommandBridge.shared.performIntent(command: .reconnect)
+        return .result()
+    }
+}

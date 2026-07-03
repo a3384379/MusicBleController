@@ -4,6 +4,7 @@ enum LiveActivityControlCommand: String, Sendable {
     case previous = "PREVIOUS"
     case playPause = "PLAY_PAUSE"
     case next = "NEXT"
+    case reconnect = "RECONNECT"
 }
 
 enum LiveActivityControlResult: String, Sendable {

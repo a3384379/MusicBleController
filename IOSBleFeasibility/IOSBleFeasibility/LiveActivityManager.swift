@@ -5,6 +5,12 @@ import Foundation
 final class LiveActivityManager {
     static let shared = LiveActivityManager()
 
+    private enum DynamicIslandVisualStateReducer {
+        static let minimumPlaybackStateDuration: TimeInterval = 0.8
+        static let loadingConfirmationDuration: TimeInterval = 1.0
+        static let disconnectedConfirmationDuration: TimeInterval = 3.0
+    }
+
     private var activity: Activity<SonyMusicActivityAttributes>?
     private var activityStateTask: Task<Void, Never>?
     private var latestState: SonyMusicActivityAttributes.ContentState?
@@ -17,10 +23,15 @@ final class LiveActivityManager {
     private var pendingLatestVersion: UInt64 = 0
     private var pendingLatestReason = "unknown"
     private var debounceTask: Task<Void, Never>?
+    private var transitionResetTask: Task<Void, Never>?
     private var startInFlight = false
     private var startCooldownUntil = Date.distantPast
     private var updateCounterWindowStart = Date()
     private var updateCounterInWindow = 0
+    private var stableIslandState: IslandState?
+    private var stableIslandStateChangedAt = Date.distantPast
+    private var pendingIslandState: IslandState?
+    private var pendingIslandStateStartedAt = Date.distantPast
 
     private init() {}
 
@@ -58,6 +69,7 @@ final class LiveActivityManager {
             artworkKey: artworkKey,
             artworkRevision: artworkRevision,
             connectionState: connectionState,
+            reason: reason,
             logger: logger
         )
         let merged = mergeLatestState(candidate: state, reason: reason, logger: logger)
@@ -65,7 +77,8 @@ final class LiveActivityManager {
         logger?(
             "[LiveActivity] update request reason=\(reason) " +
                 "appState=\(appState) title=\(merged.title) lyric=\(merged.lyric) " +
-                "lineIndex=\(merged.lyricLineIndex) trackId=\(merged.trackId)"
+                "lineIndex=\(merged.lyricLineIndex) trackId=\(merged.trackId) " +
+                "islandState=\(merged.islandState)"
         )
         logger?("[LiveActivityPerf] payloadBytes=\(payloadBytes)")
         if payloadBytes >= 1_024 {
@@ -102,11 +115,14 @@ final class LiveActivityManager {
         }
 
         enqueue(state: merged, version: stateVersion, reason: reason, logger: logger)
+        scheduleTransitionResetIfNeeded(for: merged, logger: logger)
     }
 
     func end(logger: ((String) -> Void)? = nil) {
         debounceTask?.cancel()
         debounceTask = nil
+        transitionResetTask?.cancel()
+        transitionResetTask = nil
         pendingLatestState = nil
         pendingLatestVersion = 0
         pendingLatestReason = "unknown"
@@ -156,6 +172,9 @@ final class LiveActivityManager {
             merged.anchorDate = candidate.anchorDate
             merged.durationMs = candidate.durationMs
             merged.connectionState = candidate.connectionState
+            merged.islandState = candidate.islandState
+            merged.islandStateChangedAt = candidate.islandStateChangedAt
+            merged.dynamicIslandStyle = candidate.dynamicIslandStyle
             merged.artworkKey = candidate.artworkKey
             merged.artworkRevision = candidate.artworkRevision
         }
@@ -189,6 +208,7 @@ final class LiveActivityManager {
         artworkKey: String?,
         artworkRevision: Int,
         connectionState: String,
+        reason: String,
         logger: ((String) -> Void)?
     ) -> SonyMusicActivityAttributes.ContentState {
         let cleanTitle = trimmed(
@@ -215,11 +235,25 @@ final class LiveActivityManager {
             field: "trackId",
             logger: logger
         )
-        let cleanConnectionState = connectionState == "disconnected" ? "disconnected" : "connected"
+        let cleanConnectionState = normalizedConnectionState(connectionState)
         let cleanArtworkKey = artworkKey.flatMap {
             let value = trimmed($0, limit: 64, field: "artworkKey", logger: logger)
             return value.isEmpty ? nil : value
         }
+
+        let rawIslandState = nextIslandState(
+            reason: reason,
+            title: cleanTitle,
+            isPlaying: isPlaying,
+            durationMs: durationMs,
+            connectionState: cleanConnectionState,
+            trackId: cleanTrackId
+        )
+        let reducedIslandState = reduceIslandState(
+            rawState: rawIslandState,
+            reason: reason,
+            logger: logger
+        )
 
         return SonyMusicActivityAttributes.ContentState(
             trackId: cleanTrackId,
@@ -232,6 +266,9 @@ final class LiveActivityManager {
             anchorDate: Date(),
             durationMs: max(durationMs, 0),
             connectionState: cleanConnectionState,
+            islandState: reducedIslandState.rawValue,
+            islandStateChangedAt: stableIslandStateChangedAt,
+            dynamicIslandStyle: PreferencesStore.shared.dynamicIslandStyle.rawValue,
             artworkKey: cleanArtworkKey,
             artworkRevision: max(artworkRevision, 0)
         )
@@ -291,6 +328,7 @@ final class LiveActivityManager {
         pendingLatestReason = "unknown"
         logger?("[LiveActivityState] pending flush version=\(version)")
         enqueue(state: state, version: version, reason: reason, logger: logger)
+        scheduleTransitionResetIfNeeded(for: state, logger: logger)
     }
 
     private func enqueue(
@@ -483,6 +521,8 @@ final class LiveActivityManager {
             previous.isPlaying != current.isPlaying ||
             previous.durationMs != current.durationMs ||
             previous.connectionState != current.connectionState ||
+            previous.islandState != current.islandState ||
+            previous.dynamicIslandStyle != current.dynamicIslandStyle ||
             previous.artworkKey != current.artworkKey ||
             previous.artworkRevision != current.artworkRevision
     }
@@ -535,7 +575,7 @@ final class LiveActivityManager {
     }
 
     private func staleDate(for state: SonyMusicActivityAttributes.ContentState) -> Date {
-        if state.connectionState == "disconnected" {
+        if state.connectionState == "disconnected" || state.connectionState == "reconnecting" {
             return Date().addingTimeInterval(30)
         }
         return Date().addingTimeInterval(state.isPlaying ? 45 : 5 * 60)
@@ -543,6 +583,104 @@ final class LiveActivityManager {
 
     private func payloadSize(_ state: SonyMusicActivityAttributes.ContentState) -> Int {
         (try? JSONEncoder().encode(state).count) ?? 0
+    }
+
+    private func nextIslandState(
+        reason: String,
+        title: String,
+        isPlaying: Bool,
+        durationMs: Int64,
+        connectionState: String,
+        trackId: String
+    ) -> IslandState {
+        if connectionState == "disconnected" {
+            return .disconnected
+        }
+        if connectionState == "reconnecting" {
+            return .buffering
+        }
+        if reason == "trackInfo",
+           latestState?.trackId != trackId {
+            return .trackChanged
+        }
+        if reason == "seek" {
+            return .seeking
+        }
+        let noUsableTrack = title.isEmpty ||
+            title == "-" ||
+            (title == "Sony Music" && durationMs <= 0)
+        if noUsableTrack {
+            return .connecting
+        }
+        return isPlaying ? .playing : .paused
+    }
+
+    private func baseIslandState(for state: SonyMusicActivityAttributes.ContentState) -> IslandState {
+        if state.connectionState == "disconnected" {
+            return .disconnected
+        }
+        if state.connectionState == "reconnecting" {
+            return .buffering
+        }
+        let noUsableTrack = state.title.isEmpty ||
+            state.title == "-" ||
+            (state.title == "Sony Music" && state.durationMs <= 0)
+        if noUsableTrack {
+            return .connecting
+        }
+        return state.isPlaying ? .playing : .paused
+    }
+
+    private func scheduleTransitionResetIfNeeded(
+        for state: SonyMusicActivityAttributes.ContentState,
+        logger: ((String) -> Void)?
+    ) {
+        let islandState = IslandState.resolved(from: state.islandState)
+        guard islandState.isTransient else { return }
+
+        transitionResetTask?.cancel()
+        let trackId = state.trackId
+        let transientState = state.islandState
+        transitionResetTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            await MainActor.run {
+                self?.finishTransientIslandState(
+                    trackId: trackId,
+                    transientState: transientState,
+                    logger: logger
+                )
+            }
+        }
+    }
+
+    private func finishTransientIslandState(
+        trackId: String,
+        transientState: String,
+        logger: ((String) -> Void)?
+    ) {
+        guard var state = latestState,
+              state.trackId == trackId,
+              state.islandState == transientState else {
+            return
+        }
+
+        let baseState = baseIslandState(for: state)
+        guard baseState.rawValue != state.islandState else { return }
+        acceptIslandState(baseState, now: Date())
+        state.islandState = baseState.rawValue
+        state.islandStateChangedAt = stableIslandStateChangedAt
+        latestState = state
+        stateVersion += 1
+        logger?(
+            "[LiveActivityState] transition reset " +
+                "trackId=\(trackId) from=\(transientState) to=\(baseState.rawValue)"
+        )
+        enqueue(
+            state: state,
+            version: stateVersion,
+            reason: "islandTransitionEnd",
+            logger: logger
+        )
     }
 
     private func recordUpdateSent(logger: ((String) -> Void)?) {
@@ -581,6 +719,116 @@ final class LiveActivityManager {
         reason == "lyric" ? "lyricChanged" : reason
     }
 
+    private func normalizedConnectionState(_ value: String) -> String {
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "disconnected":
+            return "disconnected"
+        case "reconnecting", "connecting", "syncing", "loading", "subscribing", "searching", "stale":
+            return "reconnecting"
+        default:
+            return "connected"
+        }
+    }
+
+    private func reduceIslandState(
+        rawState: IslandState,
+        reason: String,
+        logger: ((String) -> Void)?
+    ) -> IslandState {
+        let now = Date()
+        guard let current = stableIslandState else {
+            acceptIslandState(rawState, now: now)
+            return rawState
+        }
+
+        if rawState == current {
+            pendingIslandState = nil
+            pendingIslandStateStartedAt = Date.distantPast
+            return current
+        }
+
+        if rawState == .disconnected, reason == "disconnect" {
+            acceptIslandState(rawState, now: now)
+            return rawState
+        }
+
+        if rawState == .disconnected,
+           pendingDuration(for: rawState, now: now) <
+            DynamicIslandVisualStateReducer.disconnectedConfirmationDuration {
+            logSuppressedIslandState(
+                old: current,
+                new: rawState,
+                reason: "disconnected_pending",
+                logger: logger
+            )
+            return current
+        }
+
+        if rawState == .buffering || rawState == .connecting {
+            let loadingDuration = pendingDuration(for: rawState, now: now)
+            if loadingDuration < DynamicIslandVisualStateReducer.loadingConfirmationDuration {
+                logSuppressedIslandState(
+                    old: current,
+                    new: rawState,
+                    reason: "loading_pending",
+                    logger: logger
+                )
+                return current
+            }
+        }
+
+        if isPlaybackState(current),
+           isPlaybackState(rawState),
+           now.timeIntervalSince(stableIslandStateChangedAt) <
+            DynamicIslandVisualStateReducer.minimumPlaybackStateDuration {
+            logSuppressedIslandState(
+                old: current,
+                new: rawState,
+                reason: "min_duration",
+                logger: logger
+            )
+            return current
+        }
+
+        acceptIslandState(rawState, now: now)
+        return rawState
+    }
+
+    private func acceptIslandState(_ state: IslandState, now: Date) {
+        if stableIslandState != state {
+            stableIslandState = state
+            stableIslandStateChangedAt = now
+        }
+        pendingIslandState = nil
+        pendingIslandStateStartedAt = Date.distantPast
+    }
+
+    private func pendingDuration(for state: IslandState, now: Date) -> TimeInterval {
+        if pendingIslandState != state {
+            pendingIslandState = state
+            pendingIslandStateStartedAt = now
+            return 0
+        }
+        return now.timeIntervalSince(pendingIslandStateStartedAt)
+    }
+
+    private func isPlaybackState(_ state: IslandState) -> Bool {
+        state == .playing || state == .paused
+    }
+
+    private func logSuppressedIslandState(
+        old: IslandState,
+        new: IslandState,
+        reason: String,
+        logger: ((String) -> Void)?
+    ) {
+        let elapsedMs = Int(Date().timeIntervalSince(stableIslandStateChangedAt) * 1_000)
+        logger?(
+            "[DynamicIslandState] suppress flicker old=\(old.rawValue) " +
+                "new=\(new.rawValue) reason=\(reason) elapsedMs=\(elapsedMs)"
+        )
+    }
+
     private func mergedReason(existing: String, incoming: String) -> String {
         let current = normalizedReason(existing)
         let next = normalizedReason(incoming)
@@ -593,6 +841,7 @@ final class LiveActivityManager {
             "artworkUnavailable": 4,
             "artworkReady": 5,
             "lyricChanged": 6,
+            "connectionState": 7,
             "trackInfo": 7,
             "disconnect": 8
         ]

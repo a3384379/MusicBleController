@@ -1116,6 +1116,11 @@ final class BLETestManager: NSObject, ObservableObject {
         log("[Lyrics-iOS] karaoke offsetMs=\(value)")
     }
 
+    func refreshLiveActivityAppearance() {
+        log("[LiveActivity] refresh appearance requested")
+        updateLiveActivity(force: true, reason: "preferences")
+    }
+
     func copyIOSLogs() {
         AppLogStore.shared.readRecentText { [weak self] text in
             guard let self else { return }
@@ -2083,6 +2088,14 @@ final class BLETestManager: NSObject, ObservableObject {
             } else {
                 log("[BLE-UIState] display \(state.rawValue) reason=\(reason)")
             }
+            switch state {
+            case .connected:
+                updateLiveActivity(force: false, reason: "connectionState")
+            case .reconnecting:
+                updateLiveActivity(force: true, reason: "connectionState")
+            case .disconnected:
+                updateLiveActivityDisconnected()
+            }
         }
     }
 
@@ -2735,6 +2748,8 @@ final class BLETestManager: NSObject, ObservableObject {
             return LIVE_ACTIVITY_PLAY_PAUSE_DEBOUNCE_MS
         case .previous, .next:
             return LIVE_ACTIVITY_TRACK_SKIP_DEBOUNCE_MS
+        case .reconnect:
+            return 2_000
         }
     }
 
@@ -2773,6 +2788,45 @@ extension BLETestManager: LiveActivityBLECommandSending {
             "[LA-CTRL] peripheralState=\(sonyPeripheral?.state.rawValue ?? -1) " +
                 "characteristicReady=\(sonyCommandCharacteristic != nil)"
         )
+
+        if command == .reconnect {
+            guard centralManager.state == .poweredOn else {
+                ctrlLog("[LA-CTRL] reconnect dropped seq=\(seq) reason=bluetoothUnavailable")
+                return recordLiveActivityControlResult(
+                    command: command,
+                    seq: seq,
+                    result: .bluetoothUnavailable,
+                    startedAtMs: startedAtMs
+                )
+            }
+
+            let nowMs = currentTimeMs()
+            let debounceMs = liveActivityDebounceMs(for: command)
+            let lastAcceptedAtMs = lastLiveActivityCommandAcceptedAtMs[command] ?? 0
+            if nowMs - lastAcceptedAtMs < debounceMs {
+                ctrlLog(
+                    "[LA-CTRL] reconnect dropped seq=\(seq) " +
+                        "reason=debounced debounceMs=\(debounceMs)"
+                )
+                return recordLiveActivityControlResult(
+                    command: command,
+                    seq: seq,
+                    result: .debounced,
+                    startedAtMs: startedAtMs
+                )
+            }
+
+            lastLiveActivityCommandAcceptedAtMs[command] = nowMs
+            ctrlLog("[LA-CTRL] reconnect requested seq=\(seq)")
+            forceReconnect()
+            return recordLiveActivityControlResult(
+                command: command,
+                seq: seq,
+                result: .sent,
+                startedAtMs: startedAtMs,
+                inFlight: false
+            )
+        }
 
         guard ageMs <= LIVE_ACTIVITY_COMMAND_TTL_MS else {
             ctrlLog("[LA-CTRL] command dropped seq=\(seq) reason=expired")
@@ -3846,7 +3900,10 @@ extension BLETestManager: CBPeripheralDelegate {
             requestFullLyricsIfNeeded(after: isInStartupLoadWindow() ? 0.9 : 0.3)
         }
         log("[TrackInfo] updated title=\(title) artist=\(artist)")
-        updateLiveActivity(force: true, reason: "trackInfo")
+        updateLiveActivity(
+            force: trackChanged,
+            reason: trackChanged ? "trackInfo" : "trackInfoRefresh"
+        )
     }
 
     private func updateLiveActivity(force: Bool, reason: String) {
@@ -3878,7 +3935,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 trackId: snapshotTrackID,
                 artworkKey: snapshotArtworkKey,
                 artworkRevision: snapshotArtworkRevision,
-                connectionState: "connected",
+                connectionState: self.liveActivityConnectionState,
                 appState: self.appLifecycleState,
                 reason: reason,
                 force: force,
@@ -3954,6 +4011,17 @@ extension BLETestManager: CBPeripheralDelegate {
         }
 
         return false
+    }
+
+    private var liveActivityConnectionState: String {
+        switch connectionDisplayState {
+        case ConnectionDisplayState.connected.rawValue:
+            return "connected"
+        case ConnectionDisplayState.reconnecting.rawValue:
+            return "reconnecting"
+        default:
+            return "disconnected"
+        }
     }
 
     private func currentLyricIndex(lines: [LyricLine], positionMs: Int64) -> Int? {

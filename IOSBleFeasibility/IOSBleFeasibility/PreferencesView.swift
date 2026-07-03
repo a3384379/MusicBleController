@@ -65,6 +65,21 @@ struct PreferencesView: View {
             Text("日常模式保留播放器核心功能；调试模式显示诊断、日志和高级入口。")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.58))
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("灵动岛样式")
+                    .font(.subheadline.weight(.semibold))
+                Picker("灵动岛样式", selection: dynamicIslandStyleBinding) {
+                    ForEach(DynamicIslandStyle.allCases) { style in
+                        Text(style.title).tag(style)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+
+            Text("默认使用歌词优先样式；其它样式先作为本地设置保留，方便后续扩展。")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.58))
         }
     }
 
@@ -218,6 +233,16 @@ struct PreferencesView: View {
         Binding(
             get: { preferences.lyricDisplayMode },
             set: { preferences.lyricDisplayMode = $0 }
+        )
+    }
+
+    private var dynamicIslandStyleBinding: Binding<DynamicIslandStyle> {
+        Binding(
+            get: { preferences.dynamicIslandStyle },
+            set: {
+                preferences.dynamicIslandStyle = $0
+                bleManager.refreshLiveActivityAppearance()
+            }
         )
     }
 

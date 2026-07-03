@@ -57,6 +57,10 @@ final class PreferencesStore: ObservableObject {
         didSet { persistArtworkDisplaySize(oldValue: oldValue) }
     }
 
+    @Published var dynamicIslandStyle: DynamicIslandStyle {
+        didSet { persistDynamicIslandStyle(oldValue: oldValue) }
+    }
+
     private let defaults: UserDefaults
 
     private init(defaults: UserDefaults = .standard) {
@@ -79,6 +83,7 @@ final class PreferencesStore: ObservableObject {
             defaultValue: true
         )
         artworkDisplaySize = Self.loadArtworkDisplaySize(defaults: defaults)
+        dynamicIslandStyle = Self.loadDynamicIslandStyle(defaults: defaults)
         logLoaded()
     }
 
@@ -101,6 +106,7 @@ final class PreferencesStore: ObservableObject {
             defaultValue: true
         )
         artworkDisplaySize = Self.loadArtworkDisplaySize(defaults: defaults)
+        dynamicIslandStyle = Self.loadDynamicIslandStyle(defaults: defaults)
         logLoaded()
     }
 
@@ -111,6 +117,7 @@ final class PreferencesStore: ObservableObject {
         lyricDisplayMode = .originalTranslation
         artworkEnhancementEnabled = true
         artworkDisplaySize = .defaultOption
+        dynamicIslandStyle = .defaultStyle
     }
 
     private static func loadAppExperienceMode(defaults: UserDefaults) -> AppExperienceMode {
@@ -126,6 +133,11 @@ final class PreferencesStore: ObservableObject {
     private static func loadArtworkDisplaySize(defaults: UserDefaults) -> ArtworkDisplaySizeOption {
         let value = defaults.integer(forKey: ArtworkDisplaySizeOption.userDefaultsKey)
         return ArtworkDisplaySizeOption(rawValue: value) ?? .defaultOption
+    }
+
+    private static func loadDynamicIslandStyle(defaults: UserDefaults) -> DynamicIslandStyle {
+        let raw = defaults.string(forKey: DynamicIslandStyle.userDefaultsKey)
+        return raw.flatMap(DynamicIslandStyle.init(rawValue:)) ?? .defaultStyle
     }
 
     private static func loadBool(defaults: UserDefaults, key: String, defaultValue: Bool) -> Bool {
@@ -154,6 +166,12 @@ final class PreferencesStore: ObservableObject {
         logChanged(key: ArtworkDisplaySizeOption.userDefaultsKey, value: "\(artworkDisplaySize.rawValue)")
     }
 
+    private func persistDynamicIslandStyle(oldValue: DynamicIslandStyle) {
+        guard dynamicIslandStyle != oldValue else { return }
+        defaults.set(dynamicIslandStyle.rawValue, forKey: DynamicIslandStyle.userDefaultsKey)
+        logChanged(key: DynamicIslandStyle.userDefaultsKey, value: dynamicIslandStyle.rawValue)
+    }
+
     private func persistBool(_ value: Bool, oldValue: Bool, key: String) {
         guard value != oldValue else { return }
         defaults.set(value, forKey: key)
@@ -172,7 +190,8 @@ final class PreferencesStore: ObservableObject {
                 "autoReconnect=\(autoReconnectEnabled) lyricOffsetMs=\(lyricOffsetMs) " +
                 "lyricDisplayMode=\(lyricDisplayMode.rawValue) " +
                 "artworkEnhancement=\(artworkEnhancementEnabled) " +
-                "artworkDisplaySize=\(artworkDisplaySize.rawValue)"
+                "artworkDisplaySize=\(artworkDisplaySize.rawValue) " +
+                "dynamicIslandStyle=\(dynamicIslandStyle.rawValue)"
         )
     }
 
