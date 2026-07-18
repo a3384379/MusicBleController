@@ -166,12 +166,7 @@ class QrcIncrementalPrebuildManager(
                 )
             }
         }
-        val parsed = try {
-            QrcLyricUtils.decryptAndParseGroup(group, logger)
-        } catch (exception: Exception) {
-            logger("[QrcIncremental] failed groupId=$groupId reason=${exception.message}")
-            null
-        }
+        val parsed = parseGroupWithRetry(group, foreground = shouldTryCurrentTrack)
         if (parsed == null || parsed.lines.isEmpty()) {
             logger("[QrcIncremental] failed groupId=$groupId reason=parse empty")
             persistentIndexManager.markDirty(groupId)
@@ -238,6 +233,53 @@ class QrcIncrementalPrebuildManager(
                 "roma=${parsed.lines.count { !it.romanization.isNullOrBlank() }}"
         )
         incrementSuccess()
+    }
+
+    private fun parseGroupWithRetry(
+        group: QrcFileGroup,
+        foreground: Boolean
+    ): ParsedLyric? {
+        val delays = if (foreground) CURRENT_TRACK_PARSE_RETRY_DELAYS_MS else longArrayOf(0L)
+        delays.forEachIndexed { attempt, delayMs ->
+            if (delayMs > 0L) {
+                Thread.sleep(delayMs)
+            }
+            if (foreground && !isGroupStable(group)) {
+                logger(
+                    "[QrcIncremental] current file not stable " +
+                        "groupId=${group.groupId} attempt=${attempt + 1}"
+                )
+                return@forEachIndexed
+            }
+            val parsed = try {
+                QrcLyricUtils.decryptAndParseGroup(group, logger)
+            } catch (exception: Exception) {
+                logger(
+                    "[QrcIncremental] parse attempt failed groupId=${group.groupId} " +
+                        "attempt=${attempt + 1} reason=${exception.message}"
+                )
+                null
+            }
+            if (parsed != null && parsed.lines.isNotEmpty()) {
+                return parsed
+            }
+        }
+        return null
+    }
+
+    private fun isGroupStable(group: QrcFileGroup): Boolean {
+        val files = listOfNotNull(
+            group.qrcFile,
+            group.producerFile,
+            group.exFile,
+            group.translrcFile,
+            group.romaqrcFile
+        )
+        val first = files.associate { it.absolutePath to (it.length() to it.lastModified()) }
+        Thread.sleep(CURRENT_TRACK_STABILITY_SAMPLE_MS)
+        return files.all { file ->
+            first[file.absolutePath] == (file.length() to file.lastModified())
+        }
     }
 
     private fun isRecentForCurrentTrack(
@@ -397,6 +439,8 @@ class QrcIncrementalPrebuildManager(
         private const val THROTTLE_INTERVAL = 10
         private const val THROTTLE_SLEEP_MS = 200L
         private const val CURRENT_TRACK_MATCH_WINDOW_MS = 90_000L
+        private const val CURRENT_TRACK_STABILITY_SAMPLE_MS = 80L
+        private val CURRENT_TRACK_PARSE_RETRY_DELAYS_MS = longArrayOf(0L, 200L, 500L, 1_000L)
         private val SUPPORTED_SUFFIXES = listOf(
             "qrc",
             "producer",

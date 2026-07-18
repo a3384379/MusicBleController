@@ -68,6 +68,7 @@ class BleNotifyQueue(
         type: String,
         device: BluetoothDevice,
         packets: List<Packet>,
+        priority: Priority = priorityFor(type),
         maxSendDurationMs: Long? = null,
         shouldCancel: (() -> Boolean)? = null,
         onComplete: (() -> Unit)? = null,
@@ -82,6 +83,7 @@ class BleNotifyQueue(
                 device = device,
                 packets = packets,
                 isLongJob = true,
+                priority = priority,
                 maxSendDurationMs = maxSendDurationMs,
                 shouldCancel = shouldCancel,
                 onComplete = onComplete,
@@ -177,6 +179,7 @@ class BleNotifyQueue(
         val packet = job.packets.getOrNull(activePacketIndex)
         if (status != BluetoothGatt.GATT_SUCCESS) {
             val type = packet?.type ?: job.type
+            recordAdaptiveFailure(type)
             logger(
                 "[BleNotifyQueue] notify failed " +
                     "type=$type status=$status"
@@ -186,9 +189,11 @@ class BleNotifyQueue(
             return
         } else {
             onNotifySuccess(packet?.type ?: job.type)
+            packet?.let { recordAdaptiveSuccess(it.type) }
         }
         activePacketIndex += 1
-        val delay = packet?.delayAfterMs ?: SHORT_MESSAGE_DELAY_MS
+        job.packetsSinceYield += 1
+        val delay = packet?.let { adaptiveDelayFor(it) } ?: SHORT_MESSAGE_DELAY_MS
         handler.postDelayed({ sendNextPacket() }, delay)
     }
 
@@ -283,9 +288,12 @@ class BleNotifyQueue(
         }
 
         if (activeJob == null) {
-            activeJob = jobs.pollFirst() ?: return
-            activePacketIndex = 0
-            activeJobStartedAtMs = SystemClock.elapsedRealtime()
+            activeJob = pollNextJob() ?: return
+            activePacketIndex = activeJob?.nextPacketIndex ?: 0
+            activeJobStartedAtMs = activeJob?.startedAtMs
+                ?.takeIf { it > 0L }
+                ?: SystemClock.elapsedRealtime()
+            activeJob?.startedAtMs = activeJobStartedAtMs
             activeJob?.takeIf { it.isLongJob }?.let {
                 if (LogConfig.DEBUG_VERBOSE_LOG) {
                     verboseLogger(
@@ -296,7 +304,22 @@ class BleNotifyQueue(
             }
         }
 
-        val job = activeJob ?: return
+        var job = activeJob ?: return
+        if (shouldYieldToPendingJob(job)) {
+            job.nextPacketIndex = activePacketIndex
+            job.packetsSinceYield = 0
+            jobs.addFirst(job)
+            activeJob = null
+            activePacketIndex = 0
+            activeJobStartedAtMs = 0L
+            activeJob = pollNextJob() ?: return
+            job = activeJob ?: return
+            activePacketIndex = job.nextPacketIndex
+            activeJobStartedAtMs = job.startedAtMs
+                .takeIf { it > 0L }
+                ?: SystemClock.elapsedRealtime()
+            job.startedAtMs = activeJobStartedAtMs
+        }
         if (job.shouldCancel?.invoke() == true) {
             markJobFailed(job, "cancelled")
             job.onFailure?.invoke()
@@ -457,6 +480,7 @@ class BleNotifyQueue(
         if (!requested) {
             notificationInFlight = false
             activeRequestType = null
+            recordAdaptiveFailure(packet.type)
             logger("[BleNotifyQueue] notify request rejected type=${packet.type}")
             onNotifyFailure(
                 packet.type,
@@ -622,6 +646,75 @@ class BleNotifyQueue(
         job.onFailure?.invoke()
     }
 
+    private fun pollNextJob(): SendJob? {
+        val priority = jobs.minOfOrNull { it.priority.rank } ?: return null
+        val selected = jobs.firstOrNull { it.priority.rank == priority } ?: return null
+        jobs.remove(selected)
+        return selected
+    }
+
+    private fun shouldYieldToPendingJob(job: SendJob): Boolean {
+        if (activePacketIndex <= 0 || jobs.isEmpty()) {
+            return false
+        }
+        val waitingPriority = jobs.minOfOrNull { it.priority.rank } ?: return false
+        if (waitingPriority >= job.priority.rank) {
+            return false
+        }
+        return shouldYieldForPriorities(
+            active = job.priority,
+            waiting = Priority.entries.first { it.rank == waitingPriority },
+            packetsSinceYield = job.packetsSinceYield
+        )
+    }
+
+    private fun adaptiveDelayFor(packet: Packet): Long {
+        return when (packet.type) {
+            "fullLyricsBinaryChunk" -> binaryLyricDelayMs
+            "fullLyricsStart", "fullLyricsChunk", "fullLyricsEnd",
+            "fullLyricsBinaryStart", "fullLyricsBinaryEnd",
+            "lyricWindowStart", "lyricWindowChunk", "lyricWindowEnd" ->
+                jsonLyricDelayMs
+            else -> packet.delayAfterMs
+        }
+    }
+
+    private fun recordAdaptiveSuccess(type: String) {
+        when {
+            type == "fullLyricsBinaryChunk" -> {
+                binaryLyricSuccesses += 1
+                if (binaryLyricSuccesses >= ADAPTIVE_SUCCESS_WINDOW) {
+                    binaryLyricDelayMs = (binaryLyricDelayMs - 1L)
+                        .coerceAtLeast(BINARY_LYRIC_MIN_DELAY_MS)
+                    binaryLyricSuccesses = 0
+                }
+            }
+            type in JSON_LYRIC_PACKET_TYPES -> {
+                jsonLyricSuccesses += 1
+                if (jsonLyricSuccesses >= ADAPTIVE_SUCCESS_WINDOW) {
+                    jsonLyricDelayMs = (jsonLyricDelayMs - 1L)
+                        .coerceAtLeast(JSON_LYRIC_MIN_DELAY_MS)
+                    jsonLyricSuccesses = 0
+                }
+            }
+        }
+    }
+
+    private fun recordAdaptiveFailure(type: String) {
+        when {
+            type == "fullLyricsBinaryChunk" -> {
+                binaryLyricDelayMs = (binaryLyricDelayMs + ADAPTIVE_FAILURE_STEP_MS)
+                    .coerceAtMost(ADAPTIVE_MAX_DELAY_MS)
+                binaryLyricSuccesses = 0
+            }
+            type in JSON_LYRIC_PACKET_TYPES -> {
+                jsonLyricDelayMs = (jsonLyricDelayMs + ADAPTIVE_FAILURE_STEP_MS)
+                    .coerceAtMost(ADAPTIVE_MAX_DELAY_MS)
+                jsonLyricSuccesses = 0
+            }
+        }
+    }
+
     private fun interleaveIntervalFor(jobType: String): Int {
         return when (jobType) {
             "albumArt" -> ALBUM_ART_INTERLEAVE_INTERVAL
@@ -709,12 +802,16 @@ class BleNotifyQueue(
         val device: BluetoothDevice,
         val packets: List<Packet>,
         val isLongJob: Boolean,
+        val priority: Priority = Priority.P0_REALTIME,
         val maxSendDurationMs: Long? = null,
         val shouldCancel: (() -> Boolean)? = null,
         val onComplete: (() -> Unit)? = null,
         val onFailure: (() -> Unit)? = null,
         var failed: Boolean = false,
-        var failureLogged: Boolean = false
+        var failureLogged: Boolean = false,
+        var nextPacketIndex: Int = 0,
+        var startedAtMs: Long = 0L,
+        var packetsSinceYield: Int = 0
     ) {
         val chunkCount: Int
             get() = packets.count {
@@ -746,6 +843,10 @@ class BleNotifyQueue(
     }
 
     companion object {
+        private var jsonLyricDelayMs = 5L
+        private var binaryLyricDelayMs = 2L
+        private var jsonLyricSuccesses = 0
+        private var binaryLyricSuccesses = 0
         private const val SHORT_MESSAGE_DELAY_MS = 20L
         private const val CHUNK_PROGRESS_INTERVAL = 20
         private const val ALBUM_ART_INTERLEAVE_INTERVAL = 1
@@ -757,5 +858,58 @@ class BleNotifyQueue(
         private const val NOTIFY_CALLBACK_TIMEOUT_STATUS = -2
         private const val NOTIFY_CALLBACK_TIMEOUT_MS = 2_000L
         private const val CANCELLED_CALLBACK_DRAIN_MS = 750L
+        private const val BULK_YIELD_INTERVAL = 4
+        private const val BACKGROUND_YIELD_INTERVAL = 1
+        private const val JSON_LYRIC_MIN_DELAY_MS = 2L
+        private const val BINARY_LYRIC_MIN_DELAY_MS = 1L
+        private const val ADAPTIVE_FAILURE_STEP_MS = 5L
+        private const val ADAPTIVE_MAX_DELAY_MS = 30L
+        private const val ADAPTIVE_SUCCESS_WINDOW = 20
+        private val JSON_LYRIC_PACKET_TYPES = setOf(
+            "fullLyricsStart",
+            "fullLyricsChunk",
+            "fullLyricsEnd",
+            "fullLyricsBinaryStart",
+            "fullLyricsBinaryEnd",
+            "lyricWindowStart",
+            "lyricWindowChunk",
+            "lyricWindowEnd"
+        )
+
+        fun priorityFor(type: String): Priority {
+            return when (type) {
+                "trackInfo", "playbackState", "currentWord", "pong",
+                "volumeState", "controlResponse" -> Priority.P0_REALTIME
+                "lyricWindow" -> Priority.P1_INTERACTIVE
+                "fullLyrics", "lyricSecondary" -> Priority.P2_BULK
+                "albumArt", "remoteLog", "mediaFieldDump", "qrcDump",
+                "playHistory", "playStats" -> Priority.P3_BACKGROUND
+                else -> Priority.P0_REALTIME
+            }
+        }
+
+        internal fun shouldYieldForPriorities(
+            active: Priority,
+            waiting: Priority,
+            packetsSinceYield: Int
+        ): Boolean {
+            if (waiting.rank >= active.rank) return false
+            return when (active) {
+                Priority.P0_REALTIME -> false
+                Priority.P1_INTERACTIVE -> true
+                Priority.P2_BULK -> {
+                    waiting == Priority.P0_REALTIME ||
+                        packetsSinceYield >= BULK_YIELD_INTERVAL
+                }
+                Priority.P3_BACKGROUND -> packetsSinceYield >= BACKGROUND_YIELD_INTERVAL
+            }
+        }
+    }
+
+    enum class Priority(val rank: Int) {
+        P0_REALTIME(0),
+        P1_INTERACTIVE(1),
+        P2_BULK(2),
+        P3_BACKGROUND(3)
     }
 }

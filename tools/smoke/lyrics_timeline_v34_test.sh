@@ -395,7 +395,7 @@ if [[ "$SONY_ONLY" == true ]]; then
       interval=8
     fi
     for _ in $(seq 1 "$EXPECTED_TRACK_COUNT"); do
-      "$ADB_BIN" -s "$ANDROID_DEVICE_ID" shell input keyevent 87 || true
+      "$ADB_BIN" -s "$ANDROID_DEVICE_ID" shell cmd media_session dispatch next || true
       sleep 1
       "$ADB_BIN" -s "$ANDROID_DEVICE_ID" shell am start-foreground-service \
         -n com.example.playeragent/.service.PlayerAgentForegroundService \

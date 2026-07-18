@@ -25,13 +25,13 @@
 
 1. Sony 从当前歌曲构造 `albumArtId`，通过 status notify 发 `albumArtOffer`。
 2. iOS `BLETestManager.parseStatus` 将 `albumArtOffer` 转交 `albumArtReceiver.handleOffer(id:)`。
-3. `AlbumArtReceiver` 优先查 enhanced cache，再查 HQ cache，再查 preview cache。
+3. `AlbumArtReceiver` 优先查 enhanced/HQ/preview cache。匹配当前 trackId 且可解码的旧缓存立即显示，后台 stale-while-revalidate。
 4. 无可用缓存时请求 `ALBUM_ART_REQUEST quality=preview`。
 5. preview 成功后调度 HQ 请求；HQ 成功后可触发本地 enhanced。
 6. 二进制传输：
    - JSON：`albumArtBinaryStart` / `albumArtBinaryEnd`
    - 二进制 chunk：6 字节 header + payload
-7. iOS 保存 `Documents/AlbumArtCache/`，增强图保存到 Enhanced 子目录。
+7. iOS 在 utility 串行队列原子保存 `Documents/AlbumArtCache/`，不阻塞 CoreBluetooth/UI 主线程；增强图保存到 Enhanced 子目录。
 8. 主 UI 使用最终 `albumArtImage`；Live Activity 使用 App Group 小图。
 
 ## 关键状态
@@ -43,6 +43,10 @@
   - idle chunk：4000ms
   - total：10000ms
 - `AlbumArtSnapshot`：诊断页读取的封面状态，包含 cache、transfer、HQ unavailable 和 enhanced 状态。
+- 缓存最长可展示 30 天；通知来源 30 分钟后复验，稳定 metadata 来源 24 小时后复验。小于 300px 只触发后台刷新，不清空可用图。
+- Sony preview 目标约 112px、Q40～50、最多 1.8KB/12 包；HQ Q70～80、最多 8KB且保持最低优先级。
+- Sony 已编码 JPEG 使用 40 项、16MB、30 分钟内存 LRU，避免同歌曲重复压缩。
+- A1 header 和 quality code 不变；start/end 可带 `transferId`、`generation`、`crc32`，新端支持局部重传，旧端直接忽略新字段。
 
 ## 不允许随便修改的点
 

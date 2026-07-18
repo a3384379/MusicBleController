@@ -9,6 +9,25 @@ IOS_DEVICE=""
 ANDROID_DEVICE=""
 EXTRA_ARGS=()
 
+usage() {
+  cat <<'EOF'
+Usage: album_art_v27_long_play_test.sh [options]
+
+Options:
+  --duration <seconds>       Test window duration. Default: 120.
+  --ios-device <id>          iPhone devicectl identifier.
+  --android-device <id>      Sony adb serial.
+  --output <dir>             Output directory.
+  --json                     Print machine-readable summary only.
+  --no-clear-logcat          Do not clear Sony logcat before the window.
+  --no-clear-ios-log         Do not attempt iOS log clearing; mark by window only.
+  -h, --help                 Show help.
+
+The test reuses the long-play collector and adds album-art fast-path,
+preview/HQ, cache, payload-size, and UI-stall assertions.
+EOF
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --duration)
@@ -31,6 +50,10 @@ while [[ $# -gt 0 ]]; do
       JSON_MODE=1
       EXTRA_ARGS+=("--json")
       shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
       ;;
     *)
       EXTRA_ARGS+=("$1")
@@ -215,7 +238,7 @@ if fast_start == 0:
     warnings.append("no AlbumArtFastPath track_changed start observed")
 if cache_hit and preview_ready_costs and min(preview_ready_costs) >= 100:
     warnings.append("cache hit did not reach <100ms preview-ready target")
-if track_changed and preview_ready == 0 and failed == 0:
+if track_changed and preview_ready == 0 and failed == 0 and immediate_cache == 0:
     warnings.append("track changed but no preview ready or failed result observed")
 if pending_request and pending_fulfilled == 0:
     warnings.append("pending album art request was not fulfilled during window")

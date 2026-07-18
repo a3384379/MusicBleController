@@ -6,6 +6,13 @@ final class AppLogStore {
     private let queue = DispatchQueue(label: "com.sqz.IOSBleFeasibility.AppLogStore")
     private let fileManager = FileManager.default
     private let maxLogBytes: UInt64 = 2 * 1024 * 1024
+    private let flushInterval: TimeInterval = 0.35
+    private let immediateFlushBytes = 64 * 1024
+    private var currentBuffer = Data()
+    private var timelineBuffer = Data()
+    private var currentHandle: FileHandle?
+    private var timelineHandle: FileHandle?
+    private var flushWorkItem: DispatchWorkItem?
     private let timestampFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -50,6 +57,7 @@ final class AppLogStore {
                 DispatchQueue.main.async { completion("") }
                 return
             }
+            self.flushOnQueue()
             let text = self.readTextOnQueue()
             DispatchQueue.main.async {
                 completion(text)
@@ -63,6 +71,7 @@ final class AppLogStore {
                 DispatchQueue.main.async { completion?() }
                 return
             }
+            self.discardBufferedLogsOnQueue()
             try? self.fileManager.removeItem(at: self.currentLogURL)
             try? self.fileManager.removeItem(at: self.oldLogURL)
             try? self.fileManager.removeItem(at: self.timelineLogURL)
@@ -78,6 +87,9 @@ final class AppLogStore {
                 DispatchQueue.main.async { completion?() }
                 return
             }
+            self.timelineBuffer.removeAll(keepingCapacity: true)
+            try? self.timelineHandle?.close()
+            self.timelineHandle = nil
             try? self.fileManager.removeItem(at: self.timelineLogURL)
             DispatchQueue.main.async {
                 completion?()
@@ -94,38 +106,85 @@ final class AppLogStore {
     }
 
     private func appendOnQueue(_ message: String) {
-        do {
-            try ensureLogsDirectory()
-            try rollIfNeeded()
-            let line = formattedLine(for: message)
-            guard let data = line.data(using: .utf8) else { return }
-            if !fileManager.fileExists(atPath: currentLogURL.path) {
-                fileManager.createFile(atPath: currentLogURL.path, contents: nil)
-            }
-            let handle = try FileHandle(forWritingTo: currentLogURL)
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data)
-            try handle.close()
-        } catch {
-            print("[AppLogStore] append failed error=\(error.localizedDescription)")
-        }
+        let line = formattedLine(for: message)
+        guard let data = line.data(using: .utf8) else { return }
+        currentBuffer.append(data)
+        scheduleFlushOnQueue()
     }
 
     private func appendTimelineOnQueue(_ message: String) {
+        let line = formattedLine(for: message)
+        guard let data = line.data(using: .utf8) else { return }
+        timelineBuffer.append(data)
+        scheduleFlushOnQueue()
+    }
+
+    private func scheduleFlushOnQueue() {
+        if currentBuffer.count + timelineBuffer.count >= immediateFlushBytes {
+            flushWorkItem?.cancel()
+            flushWorkItem = nil
+            flushOnQueue()
+            return
+        }
+        guard flushWorkItem == nil else { return }
+        let item = DispatchWorkItem { [weak self] in
+            self?.flushWorkItem = nil
+            self?.flushOnQueue()
+        }
+        flushWorkItem = item
+        queue.asyncAfter(deadline: .now() + flushInterval, execute: item)
+    }
+
+    private func flushOnQueue() {
+        flushWorkItem?.cancel()
+        flushWorkItem = nil
         do {
             try ensureLogsDirectory()
-            let line = formattedLine(for: message)
-            guard let data = line.data(using: .utf8) else { return }
-            if !fileManager.fileExists(atPath: timelineLogURL.path) {
-                fileManager.createFile(atPath: timelineLogURL.path, contents: nil)
+            if !currentBuffer.isEmpty {
+                try rollIfNeeded(additionalBytes: currentBuffer.count)
+                let handle = try writableHandle(
+                    existing: currentHandle,
+                    url: currentLogURL
+                )
+                currentHandle = handle
+                try handle.write(contentsOf: currentBuffer)
+                currentBuffer.removeAll(keepingCapacity: true)
             }
-            let handle = try FileHandle(forWritingTo: timelineLogURL)
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data)
-            try handle.close()
+            if !timelineBuffer.isEmpty {
+                let handle = try writableHandle(
+                    existing: timelineHandle,
+                    url: timelineLogURL
+                )
+                timelineHandle = handle
+                try handle.write(contentsOf: timelineBuffer)
+                timelineBuffer.removeAll(keepingCapacity: true)
+            }
         } catch {
-            print("[AppLogStore] append timeline failed error=\(error.localizedDescription)")
+            print("[AppLogStore] flush failed error=\(error.localizedDescription)")
         }
+    }
+
+    private func writableHandle(existing: FileHandle?, url: URL) throws -> FileHandle {
+        if let existing {
+            return existing
+        }
+        if !fileManager.fileExists(atPath: url.path) {
+            fileManager.createFile(atPath: url.path, contents: nil)
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.seekToEnd()
+        return handle
+    }
+
+    private func discardBufferedLogsOnQueue() {
+        flushWorkItem?.cancel()
+        flushWorkItem = nil
+        currentBuffer.removeAll(keepingCapacity: true)
+        timelineBuffer.removeAll(keepingCapacity: true)
+        try? currentHandle?.close()
+        try? timelineHandle?.close()
+        currentHandle = nil
+        timelineHandle = nil
     }
 
     private func readTextOnQueue() -> String {
@@ -149,15 +208,17 @@ final class AppLogStore {
         }
     }
 
-    private func rollIfNeeded() throws {
+    private func rollIfNeeded(additionalBytes: Int) throws {
         guard let attributes = try? fileManager.attributesOfItem(
             atPath: currentLogURL.path
         ),
             let fileSize = attributes[.size] as? NSNumber,
-            fileSize.uint64Value >= maxLogBytes else {
+            fileSize.uint64Value + UInt64(additionalBytes) >= maxLogBytes else {
             return
         }
 
+        try? currentHandle?.close()
+        currentHandle = nil
         try? fileManager.removeItem(at: oldLogURL)
         try fileManager.moveItem(at: currentLogURL, to: oldLogURL)
     }

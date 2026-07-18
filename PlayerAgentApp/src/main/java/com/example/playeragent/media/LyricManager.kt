@@ -965,6 +965,11 @@ class LyricManager(
                     "lines=${cachedLines.size}"
             )
             onLyricsReady(lyricsReadyGateSnapshotLocked())
+            // Populate the reusable in-memory lookup only after the active
+            // track has been published. parsedCachePut takes the manager lock;
+            // doing it in loadLyricFastPath can otherwise make a ready QRC
+            // result wait behind playback readers before the UI is notified.
+            parsedCachePut(request, result)
         } else if (result.retryable) {
             lyricsReadyState = if (isCooldownBlockedReason(result.failureReason)) {
                 logger("[LyricsState] cooldown blocked retry only songKey=${request.key}")
@@ -1051,6 +1056,82 @@ class LyricManager(
         if (shouldCancelRequest(request, "lrcLookup")) {
             return staleLyricResult()
         }
+
+        // QQ Music's parsed QRC cache is the normal hot path. Read it before
+        // probing local LRC files and before entering QrcLyricManager's coarse
+        // raw-QRC lookup lock. This keeps a previous no-lyrics recovery task
+        // from delaying the newly selected song.
+        val parsedCacheStartedAt = System.currentTimeMillis()
+        val parsedCacheResult = qrcLyricManager.loadParsedCacheWithResult(
+            title = title,
+            artist = artist,
+            album = album,
+            traceId = request.traceId,
+            shouldCancel = { shouldCancelRequest(request, "qrcParsedCacheFast") }
+        )
+        if (parsedCacheResult.success) {
+            val qrcLines = parsedCacheResult.lines.map {
+                LyricLine(
+                    timeMs = it.timeMs,
+                    text = it.text,
+                    durationMs = it.durationMs,
+                    words = it.words,
+                    translation = it.translation,
+                    romanization = it.romanization
+                )
+            }
+            val costMs = System.currentTimeMillis() - parsedCacheStartedAt
+            trace(
+                request.traceId,
+                "parseOptimizationCacheHit",
+                "source=qrc_parsed_fast lines=${qrcLines.size} costMs=$costMs"
+            )
+            trace(
+                request.traceId,
+                "qrcFileFound",
+                "reason=parsed_cache_fast_hit costMs=$costMs retryable=false " +
+                    "lines=${qrcLines.size}"
+            )
+            trace(
+                request.traceId,
+                "qrcDecryptStart",
+                "reason=parsed_cache_fast_hit source=qrc_parsed_fast"
+            )
+            trace(
+                request.traceId,
+                "qrcDecryptEnd",
+                "reason=parsed_cache_fast_hit source=qrc_parsed_fast " +
+                    "result=skipped costMs=0"
+            )
+            trace(
+                request.traceId,
+                "qrcLookupEnd",
+                "result=hit source=qrc_parsed_fast lines=${qrcLines.size} costMs=$costMs"
+            )
+            TrackCapabilityTracker.onLyricLookupDone(
+                songKey = request.key,
+                trackId = request.trackId,
+                success = true,
+                reason = parsedCacheResult.reason,
+                costMs = costMs,
+                lineCount = qrcLines.size
+            )
+            return LyricLoadResult(
+                lines = qrcLines,
+                lineCount = qrcLines.size,
+                source = LyricSource.QRC,
+                retryable = false,
+                failureReason = ""
+            )
+        }
+        if (shouldCancelRequest(request, "qrcParsedCacheFastMiss")) {
+            return staleLyricResult()
+        }
+        trace(
+            request.traceId,
+            "parseOptimizationCacheMiss",
+            "source=qrc_parsed_fast costMs=${System.currentTimeMillis() - parsedCacheStartedAt}"
+        )
         val lrcStartedAt = System.currentTimeMillis()
         if (applyScannedCacheIfAvailable(title, artist)) {
             trace(
@@ -1150,7 +1231,8 @@ class LyricManager(
                 album,
                 request.traceId,
                 shouldCancel = { shouldCancelRequest(request, "qrcLookup") },
-                allowIndexRefresh = false
+                allowIndexRefresh = false,
+                skipParsedCache = true
             )
             val qrcLines = if (qrcResult.success) {
                 qrcResult.lines.map {
@@ -1351,7 +1433,6 @@ class LyricManager(
                 parseCostMs = parseCostMs,
                 reason = ""
             )
-            parsedCachePut(request, result)
         } else {
             lyricsReadyState = LyricsReadyState.FAILED
             trace(

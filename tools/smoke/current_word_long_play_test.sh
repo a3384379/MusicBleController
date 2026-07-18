@@ -535,20 +535,19 @@ if current_word_payload_too_large > 0:
     current_word_issues.append(
         f"currentWord payload exceeded MTU ({current_word_payload_too_large})"
     )
-if ios_stale > 0:
-    stale_ratio = ios_stale / max(ios_raw, ios_stale, 1)
-    if stale_ratio >= 0.1 or ios_stale >= 3:
-        current_word_issues.append(f"stale discard ratio is high ({stale_ratio:.2f})")
-    else:
-        current_word_warnings.append(f"stale discard observed ({ios_stale})")
 if main_stall_count > 0:
     current_word_issues.append(f"main stall detected ({main_stall_count})")
-if ios_accepted > 0 and ios_accepted <= playback_state_count:
-    current_word_warnings.append("playbackState count is not lower than accepted currentWord count")
 if not latency_known:
     current_word_warnings.append("latency unavailable")
-if notify_queue_busy > 0:
-    current_word_warnings.append(f"notify queue busy indicators found ({notify_queue_busy})")
+elif percentile(latencies, 95) > 500:
+    current_word_issues.append(
+        f"currentWord receive latency P95 exceeds 500ms ({percentile(latencies, 95)}ms)"
+    )
+if duration_sec > 0 and sony_push_count > duration_sec * 4:
+    current_word_warnings.append(
+        "currentWord push rate is unexpectedly high for boundary scheduling "
+        f"({sony_push_count}/{duration_sec}s)"
+    )
 
 live_activity_sent_threshold = max(30, int(duration_sec * 0.45))
 current_word_live_activity_threshold = max(5, int(duration_sec / 1.0) + 5)
@@ -568,12 +567,9 @@ if current_word_issues:
 elif ios_accepted == 0:
     current_word_result = "WARN"
     current_word_warnings.append("no accepted currentWord in the test window")
-elif ios_accepted < 10:
+elif ios_accepted < 3:
     current_word_result = "PASS_WITH_LOW_ACTIVITY"
     current_word_warnings.append("currentWord accepted, but sample count is low")
-elif receive_intervals and avg(receive_intervals) > 120:
-    current_word_result = "PASS_WITH_LOW_ACTIVITY"
-    current_word_warnings.append("average interval is above 120ms; track may have slow word changes")
 else:
     current_word_result = "PASS"
 

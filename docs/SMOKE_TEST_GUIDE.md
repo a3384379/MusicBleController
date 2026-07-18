@@ -34,6 +34,8 @@
 - `tools/smoke/current_word_long_play_test.sh`：手动长播放窗口测试，采集 iOS + Sony 日志，验证 V2.3 `currentWord` 是否持续推送、iOS 是否持续 accepted，以及 playbackState 是否明显低于 currentWord。
 - `tools/smoke/control_e2e_v29_test.sh`：真实交互 E2E 测试，启动 iOS Debug App 的测试参数，实际发送播放控制、音量、Seek、FullLyrics、AlbumArt 请求，再从 iOS/Sony 双端日志闭环判定。
 - `tools/smoke/source_capability_v30_test.sh`：源数据可用性诊断测试，采集 3-5 首歌的歌词/封面来源、ready 延迟和 unavailable reason，区分 BLE/缓存问题与 Sony/QQ音乐源头未提供。
+- `tools/smoke/lyrics_timeline_v34_test.sh`：自动切换 10 首 QQ 音乐，关联 TrackInfo、QRC、window、A2/legacy full lyrics、currentWord 与维护任务时间线。
+- `tools/smoke/album_art_v27_long_play_test.sh`：封面长播放与 currentWord 联合验证，缓存立即显示也计为有效成功。
 
 ## iOS-only 核心文件
 
@@ -64,6 +66,8 @@
 - [current_word_long_play_test.sh](/Volumes/雷电/project/MusicBleController/tools/smoke/current_word_long_play_test.sh)
 - [control_e2e_v29_test.sh](/Volumes/雷电/project/MusicBleController/tools/smoke/control_e2e_v29_test.sh)
 - [source_capability_v30_test.sh](/Volumes/雷电/project/MusicBleController/tools/smoke/source_capability_v30_test.sh)
+- [lyrics_timeline_v34_test.sh](/Volumes/雷电/project/MusicBleController/tools/smoke/lyrics_timeline_v34_test.sh)
+- [album_art_v27_long_play_test.sh](/Volumes/雷电/project/MusicBleController/tools/smoke/album_art_v27_long_play_test.sh)
 - [README.md](/Volumes/雷电/project/MusicBleController/tools/smoke/README.md)
 
 ## iOS-only 数据流
@@ -162,6 +166,20 @@
 - 同时保存 `ios_ble.log`、`sony_logcat.log`、`ios_control_e2e_filtered.log`、`sony_control_e2e_filtered.log`。
 
 该测试与普通 full smoke 不同：full smoke 证明构建、安装、启动和基础日志正常；Control E2E 证明真实 BLE 交互链路能完成用户操作。
+
+## V2 实时性能矩阵
+
+```bash
+./tools/smoke/lyrics_timeline_v34_test.sh --duration 145 --json
+./tools/smoke/current_word_long_play_test.sh --duration 90 --json
+./tools/smoke/album_art_v27_long_play_test.sh --duration 90 --json
+```
+
+- 10 首矩阵必须看到实际 10 个不同 trackId、无 duplicate/skipped/trackNotChanged、无旧歌词或旧封面覆盖。
+- `fullLyricsSendStart/End` 同时覆盖 A2 与 legacy，不能因协议升级造成 trace 缺失。
+- 冷测使用调试流程自然换歌，不删除用户真实 QRC/封面缓存。
+- 自动切歌必须通过 iOS BLE 控制或 Android `cmd media_session dispatch next`；不要向无焦点 PlayerAgent Activity 注入 `input keyevent`，否则系统可能产生与业务线程无关的 input-dispatch ANR。
+- iPhone 锁屏导致 `ios_app_launch_failed` 时测试不得执行动作，解锁后整项重跑。
 
 ## iOS BLE 硬前置校验
 

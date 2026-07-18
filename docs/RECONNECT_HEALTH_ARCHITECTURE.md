@@ -22,8 +22,8 @@
 2. 旧 peripheral retrieve 只作为辅助，fast timeout 为 1800ms。
 3. 连接成功后 discovery service/characteristic，订阅 status notify。
 4. 收到任意有效 status notify 后进入 healthy。
-5. Health timer 周期检查 last notify age；suspect 后发送 `GET_PLAYBACK_STATE` probe。
-6. probe 超时或 stale no notify 后 hard reconnect。
+5. Health timer 检查静默时间：播放中 15 秒、暂停中 30 秒才探测。
+6. V2 发送轻量 `PING/PONG`；旧 Sony 回退 `GET_PLAYBACK_STATE`。连续两次探测失败才 hard reconnect，明确断开回调仍立即处理。
 7. `connectionDisplayState` 给 UI，`connectionHealthState` 给诊断和控制保护。
 
 ## 关键状态
@@ -32,8 +32,8 @@
   - `FAST_RETRIEVE_CONNECT_TIMEOUT_MS = 1800`
   - `DEFAULT_CONNECT_TIMEOUT_MS = 8000`
   - `CONNECTION_HEALTH_TICK_MS = 3000`
-  - `CONNECTION_HEALTH_SUSPECT_MS = 6000`
-  - `CONNECTION_HEALTH_STALE_MS = 12000`
+  - 播放静默阈值：15000ms
+  - 暂停静默阈值：30000ms
   - `CONNECTION_HEALTH_PROBE_TIMEOUT_MS = 3000`
   - `CONNECTION_HEALTH_HARD_RECONNECT_MIN_INTERVAL_MS = 5000`
 - `connectionDisplayState`：给 UI 使用，如 `connected`、`reconnecting`、`disconnected`。

@@ -329,6 +329,31 @@ object CurrentTrackRuntimeCache {
         }
     }
 
+    /** Delay to the next word/line boundary, capped for periodic drift correction. */
+    fun nextCurrentWordBoundaryDelayMs(
+        timestampMs: Long = System.currentTimeMillis(),
+        maximumDriftCorrectionMs: Long = 500L
+    ): Long? {
+        synchronized(lock) {
+            val track = current ?: return null
+            if (!track.isPlaying || track.lyricLines.isEmpty()) return null
+            val state = findCurrentWordStateLocked(track, timestampMs) ?: return maximumDriftCorrectionMs
+            val line = track.lyricLines.getOrNull(state.lineIndex)
+            val candidates = mutableListOf<Long>()
+            if (line != null && state.wordIndex >= 0) {
+                line.words.getOrNull(state.wordIndex + 1)?.startMs?.let(candidates::add)
+                if (state.wordEndMs > state.positionMs) candidates += state.wordEndMs
+            }
+            track.lyricLines.getOrNull(state.lineIndex + 1)?.timeMs?.let(candidates::add)
+            val next = candidates.filter { it > state.positionMs }.minOrNull()
+            return if (next == null) {
+                maximumDriftCorrectionMs
+            } else {
+                (next - state.positionMs + 5L).coerceIn(20L, maximumDriftCorrectionMs)
+            }
+        }
+    }
+
     fun currentGeneration(): Long {
         synchronized(lock) {
             return currentTrackGeneration

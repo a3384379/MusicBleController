@@ -8,8 +8,9 @@ private let ALBUM_ART_REQUEST_START_MAX_RETRIES = 2
 private let ALBUM_ART_FIRST_CHUNK_TIMEOUT_MS: Int64 = 3_000
 private let ALBUM_ART_IDLE_CHUNK_TIMEOUT_MS: Int64 = 4_000
 private let ALBUM_ART_TOTAL_TIMEOUT_MS: Int64 = 10_000
-private let ALBUM_ART_TRANSIENT_SOURCE_TTL_MS: Int64 = 5 * 60 * 1_000
-private let ALBUM_ART_STABLE_SOURCE_TTL_MS: Int64 = 30 * 60 * 1_000
+private let ALBUM_ART_TRANSIENT_SOURCE_TTL_MS: Int64 = 30 * 60 * 1_000
+private let ALBUM_ART_STABLE_SOURCE_TTL_MS: Int64 = 24 * 60 * 60 * 1_000
+private let ALBUM_ART_HARD_CACHE_TTL_MS: Int64 = 30 * 24 * 60 * 60 * 1_000
 private let ALBUM_ART_SMALL_CACHE_PIXEL_LIMIT = 300
 
 struct AlbumArtSnapshot {
@@ -88,7 +89,7 @@ private struct AlbumArtCacheValidation {
     }
 
     var shouldDisplayWhileRefreshing: Bool {
-        valid && !expired
+        valid
     }
 }
 
@@ -142,6 +143,8 @@ final class AlbumArtReceiver {
     private(set) var artworkEnhancementTargetPixelSize = 780
     private(set) var artworkEnhancementSharpness = 0.30
     private(set) var currentAlbumArtID = ""
+    private var authoritativeAlbumArtID = ""
+    private var deferredAlbumArtOfferWorkItem: DispatchWorkItem?
 
     private var albumArtID = ""
     private var albumArtQuality = ""
@@ -153,7 +156,12 @@ final class AlbumArtReceiver {
     private var binaryAlbumArtQuality = ""
     private var binaryAlbumArtExpectedSize = 0
     private var binaryAlbumArtExpectedChunks = 0
+    private var binaryAlbumArtTransferID = ""
+    private var binaryAlbumArtExpectedCRC32: UInt32?
+    private var binaryAlbumArtGeneration: Int64?
+    private var binaryAlbumArtRetryCounts: [String: Int] = [:]
     private var binaryAlbumArtChunks: [Int: Data] = [:]
+    private var binaryAlbumArtLastPublishedProgressBucket = -1
     private var binaryAlbumArtSession: AlbumArtTransferSession?
     private var albumArtFirstChunkTimeoutWorkItem: DispatchWorkItem?
     private var albumArtIdleChunkTimeoutWorkItem: DispatchWorkItem?
@@ -196,6 +204,10 @@ final class AlbumArtReceiver {
     private var predictiveOfferTimes: [String: Date] = [:]
     private var predictiveHqRequestTimes: [String: Date] = [:]
     private var sourceRefreshAttemptedAlbumArtIDs: Set<String> = []
+    private let albumArtCacheWriteQueue = DispatchQueue(
+        label: "com.sqz.IOSBleFeasibility.albumArtCacheWrite",
+        qos: .utility
+    )
     private var artworkEnhancementEnabled = PreferencesStore.shared.artworkEnhancementEnabled
     private var artworkEnhancementABOriginalMode = false
 
@@ -210,6 +222,35 @@ final class AlbumArtReceiver {
             log("[AlbumArt] invalid offer")
             return
         }
+        if !authoritativeAlbumArtID.isEmpty,
+           id != authoritativeAlbumArtID {
+            deferredAlbumArtOfferWorkItem?.cancel()
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.deferredAlbumArtOfferWorkItem = nil
+                guard self.authoritativeAlbumArtID == id else {
+                    self.log(
+                        "[AlbumArt-iOS] stale offer discarded " +
+                            "id=\(id) expected=\(self.authoritativeAlbumArtID)"
+                    )
+                    return
+                }
+                self.processAlbumArtOffer(id: id)
+            }
+            deferredAlbumArtOfferWorkItem = workItem
+            log(
+                "[AlbumArt-iOS] offer deferred id=\(id) " +
+                    "expected=\(authoritativeAlbumArtID)"
+            )
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: workItem)
+            return
+        }
+        deferredAlbumArtOfferWorkItem?.cancel()
+        deferredAlbumArtOfferWorkItem = nil
+        processAlbumArtOffer(id: id)
+    }
+
+    private func processAlbumArtOffer(id: String) {
         log("[AlbumArt] offer id=\(id)")
         log("[AlbumArtOffer] id=\(id) currentTitle=\(delegate?.albumArtCurrentTitle ?? "-")")
         recordPredictiveOffer(id: id)
@@ -278,6 +319,8 @@ final class AlbumArtReceiver {
     }
 
     func handleIdentity(id: String) {
+        guard !id.isEmpty else { return }
+        authoritativeAlbumArtID = id
         handleAlbumArtIdentity(id)
     }
 
@@ -286,7 +329,11 @@ final class AlbumArtReceiver {
     /// after QQ Music creates a new media session.
     func clearCurrentIdentity(reason: String) {
         let previousID = currentAlbumArtID
-        guard !previousID.isEmpty || albumArtImage != nil || binaryAlbumArtExpectedChunks > 0 else {
+        guard !previousID.isEmpty ||
+                !authoritativeAlbumArtID.isEmpty ||
+                deferredAlbumArtOfferWorkItem != nil ||
+                albumArtImage != nil ||
+                binaryAlbumArtExpectedChunks > 0 else {
             return
         }
 
@@ -304,6 +351,9 @@ final class AlbumArtReceiver {
         albumArtPreviewRetryCounts.removeAll()
         albumArtHqRetryCounts.removeAll()
         sourceRefreshAttemptedAlbumArtIDs.removeAll()
+        authoritativeAlbumArtID = ""
+        deferredAlbumArtOfferWorkItem?.cancel()
+        deferredAlbumArtOfferWorkItem = nil
         resetAlbumArtTransfer()
         resetBinaryAlbumArtTransfer(reason: reason)
 
@@ -329,6 +379,13 @@ final class AlbumArtReceiver {
               chunks > 0 else {
             resetAlbumArtTransfer()
             log("[AlbumArt] invalid start id=\(id) quality=\(quality) size=\(size) chunks=\(chunks)")
+            return
+        }
+        guard isExpectedAlbumArtPayload(id: id) else {
+            log(
+                "[AlbumArt-iOS] stale legacy start discarded " +
+                    "id=\(id) expected=\(authoritativeAlbumArtID)"
+            )
             return
         }
         handleAlbumArtIdentity(id)
@@ -373,13 +430,28 @@ final class AlbumArtReceiver {
         finishAlbumArtTransfer(id: id, quality: incomingQuality)
     }
 
-    func handleBinaryStart(id: String, quality: String, size: Int, chunks: Int) {
+    func handleBinaryStart(
+        id: String,
+        quality: String,
+        size: Int,
+        chunks: Int,
+        transferId: String? = nil,
+        crc32: String? = nil,
+        generation: Int64? = nil
+    ) {
         guard !id.isEmpty,
               quality == "preview" || quality == "hq" || quality == "full",
               size > 0,
               chunks > 0 else {
             resetBinaryAlbumArtTransfer(reason: "invalid binary start")
             log("[AlbumArtBinary] invalid start")
+            return
+        }
+        guard isExpectedAlbumArtPayload(id: id) else {
+            log(
+                "[AlbumArt-iOS] stale binary start discarded " +
+                    "id=\(id) expected=\(authoritativeAlbumArtID)"
+            )
             return
         }
         handleAlbumArtIdentity(id)
@@ -390,6 +462,10 @@ final class AlbumArtReceiver {
         binaryAlbumArtQuality = quality
         binaryAlbumArtExpectedSize = size
         binaryAlbumArtExpectedChunks = chunks
+        binaryAlbumArtTransferID = transferId ?? ""
+        binaryAlbumArtExpectedCRC32 = crc32.flatMap { UInt32($0, radix: 16) }
+        binaryAlbumArtGeneration = generation
+        binaryAlbumArtLastPublishedProgressBucket = 0
         startBinaryAlbumArtTransferSession(id: id, quality: quality, size: size, chunks: chunks)
         let message = "[AlbumArtBinary] start chunks=\(chunks)"
         log(message)
@@ -439,25 +515,42 @@ final class AlbumArtReceiver {
             albumArtFirstChunkTimeoutWorkItem = nil
             scheduleAlbumArtIdleChunkTimeout(id: session.id, quality: quality)
         }
-        let message =
-            "[AlbumArtBinary] chunk index=\(index) " +
-            "received=\(binaryAlbumArtChunks.count)/\(binaryAlbumArtExpectedChunks)"
-        log(message)
-        if index == 0 ||
+        let shouldLogProgress = index == 0 ||
             index == binaryAlbumArtExpectedChunks - 1 ||
-            index % 10 == 0 {
+            index % 10 == 0
+        if shouldLogProgress {
+            let message =
+                "[AlbumArtBinary] chunk index=\(index) " +
+                "received=\(binaryAlbumArtChunks.count)/\(binaryAlbumArtExpectedChunks)"
+            log(message)
             consoleLog(message)
         }
-        notifyStateChanged()
+        let progressBucket = min(
+            4,
+            binaryAlbumArtChunks.count * 4 / max(binaryAlbumArtExpectedChunks, 1)
+        )
+        if progressBucket > binaryAlbumArtLastPublishedProgressBucket {
+            binaryAlbumArtLastPublishedProgressBucket = progressBucket
+            notifyStateChanged()
+        }
     }
 
-    func handleBinaryEnd(id: String, quality: String?) {
+    func handleBinaryEnd(
+        id: String,
+        quality: String?,
+        transferId: String? = nil,
+        crc32: String? = nil,
+        generation: Int64? = nil
+    ) {
         let incomingQuality = quality ?? binaryAlbumArtQuality
         let message = "[AlbumArtBinary] end received=\(binaryAlbumArtChunks.count)"
         log(message)
         consoleLog(message)
         guard id == binaryAlbumArtID,
-              incomingQuality == binaryAlbumArtQuality else {
+              incomingQuality == binaryAlbumArtQuality,
+              transferId == nil || transferId == binaryAlbumArtTransferID,
+              crc32 == nil || UInt32(crc32 ?? "", radix: 16) == binaryAlbumArtExpectedCRC32,
+              generation == nil || generation == binaryAlbumArtGeneration else {
             let failMessage = "[AlbumArtBinary] decode failed transfer mismatch"
             log(failMessage)
             consoleLog(failMessage)
@@ -481,6 +574,13 @@ final class AlbumArtReceiver {
         bestChunks: Int,
         minCandidateScale: Int
     ) {
+        guard isExpectedAlbumArtPayload(id: id) else {
+            log(
+                "[AlbumArt-iOS] stale unavailable discarded " +
+                    "id=\(id) expected=\(authoritativeAlbumArtID)"
+            )
+            return
+        }
         resetAlbumArtTransfer()
         resetBinaryAlbumArtTransfer(reason: "albumArtUnavailable")
         cancelAlbumArtRequestStartTimeout(id: id, quality: quality)
@@ -501,12 +601,15 @@ final class AlbumArtReceiver {
         if id == currentAlbumArtID,
            quality == "preview" {
             cancelAlbumArtFallback()
-            albumArtImage = nil
-            currentCachedAlbumArtQuality = ""
-            artworkDisplayQuality = .placeholder
-            updateArtworkEnhancementStatus(message: "album art unavailable")
-            delegate?.albumArtClearLiveArtwork(reason: "unavailable", shouldUpdate: false)
-            delegate?.albumArtUpdateLiveActivity(force: true, reason: "albumArt")
+            if albumArtImage == nil {
+                currentCachedAlbumArtQuality = ""
+                artworkDisplayQuality = .placeholder
+                updateArtworkEnhancementStatus(message: "album art unavailable")
+                delegate?.albumArtClearLiveArtwork(reason: "unavailable", shouldUpdate: false)
+                delegate?.albumArtUpdateLiveActivity(force: true, reason: "albumArt")
+            } else {
+                log("[AlbumArtCache] retain stale image after refresh unavailable id=\(id)")
+            }
         }
         log("[AlbumArt] unavailable id=\(id) quality=\(quality) reason=\(reason)")
         notifyStateChanged()
@@ -690,6 +793,7 @@ final class AlbumArtReceiver {
     func resetForReconnect(reason: String) {
         resetAlbumArtTransfer()
         resetBinaryAlbumArtTransfer(reason: reason)
+        binaryAlbumArtRetryCounts.removeAll()
         requestedAlbumArtKeys.removeAll()
         requestedHqAlbumArtIDs.removeAll()
         cancelHqAlbumArtRequest()
@@ -757,13 +861,24 @@ final class AlbumArtReceiver {
     }
 
     private func finishBinaryAlbumArtTransfer(id: String, quality: String) {
+        let missing = (0..<binaryAlbumArtExpectedChunks).filter {
+            binaryAlbumArtChunks[$0] == nil
+        }
         guard binaryAlbumArtExpectedChunks > 0,
+              missing.isEmpty,
               binaryAlbumArtChunks.count == binaryAlbumArtExpectedChunks else {
             let message =
                 "[AlbumArtBinary] decode failed received=\(binaryAlbumArtChunks.count) " +
                 "expected=\(binaryAlbumArtExpectedChunks)"
             log(message)
             consoleLog(message)
+            if requestBinaryAlbumArtRetry(
+                missing: missing,
+                retryAll: missing.count > 32,
+                reason: "missing chunks"
+            ) {
+                return
+            }
             cancelBinaryAlbumArtTransfer(reason: "end before all chunks", shouldRetryPreview: quality == "preview")
             return
         }
@@ -781,13 +896,33 @@ final class AlbumArtReceiver {
             jpegData.append(chunk)
         }
         guard jpegData.count == binaryAlbumArtExpectedSize,
-              let image = UIImage(data: jpegData) else {
+              binaryAlbumArtExpectedCRC32 == nil ||
+                Self.crc32(jpegData) == binaryAlbumArtExpectedCRC32 else {
             let message = "[AlbumArtBinary] decode failed"
             log(message)
             consoleLog(message)
+            if requestBinaryAlbumArtRetry(
+                missing: [],
+                retryAll: true,
+                reason: "size or crc mismatch"
+            ) {
+                return
+            }
             cancelBinaryAlbumArtTransfer(reason: "decode failed", shouldRetryPreview: quality == "preview")
             return
         }
+        guard let image = UIImage(data: jpegData) else {
+            if requestBinaryAlbumArtRetry(
+                missing: [],
+                retryAll: true,
+                reason: "jpeg decode failed"
+            ) {
+                return
+            }
+            cancelBinaryAlbumArtTransfer(reason: "jpeg decode failed", shouldRetryPreview: quality == "preview")
+            return
+        }
+        binaryAlbumArtRetryCounts.removeValue(forKey: binaryAlbumArtTransferID)
         finishDecodedAlbumArt(id: id, quality: quality, data: jpegData, image: image, source: "binary")
         let message = "[AlbumArtBinary] decode success bytes=\(jpegData.count)"
         log(message)
@@ -799,6 +934,40 @@ final class AlbumArtReceiver {
         consoleLog(completeMessage)
         albumArtLastFailureReason = "-"
         resetBinaryAlbumArtTransfer(reason: "complete")
+    }
+
+    @discardableResult
+    private func requestBinaryAlbumArtRetry(
+        missing: [Int],
+        retryAll: Bool,
+        reason: String
+    ) -> Bool {
+        let transferID = binaryAlbumArtTransferID
+        guard !transferID.isEmpty,
+              !binaryAlbumArtID.isEmpty else { return false }
+        let count = binaryAlbumArtRetryCounts[transferID] ?? 0
+        guard count < 1 else { return false }
+        binaryAlbumArtRetryCounts[transferID] = count + 1
+        cancelAlbumArtTransferTimeouts()
+        scheduleAlbumArtTotalTimeout(
+            id: binaryAlbumArtID,
+            quality: binaryAlbumArtQuality
+        )
+        delegate?.albumArtSendCommand(
+            cmd: "RETRY_TRANSFER",
+            extra: [
+                "kind": "albumArt",
+                "trackId": binaryAlbumArtID,
+                "transferId": transferID,
+                "missing": missing,
+                "retryAll": retryAll
+            ]
+        )
+        log(
+            "[AlbumArtBinary] retry reason=\(reason) " +
+                "retryAll=\(retryAll) missing=\(missing.count)"
+        )
+        return true
     }
 
     private func finishDecodedAlbumArt(
@@ -817,13 +986,16 @@ final class AlbumArtReceiver {
             }
             if id == currentAlbumArtID, quality == "preview" {
                 cancelAlbumArtFallback()
-                albumArtImage = nil
-                currentCachedAlbumArtQuality = ""
-                artworkDisplayQuality = .placeholder
-                updateArtworkEnhancementStatus(message: "placeholder")
-                delegate?.albumArtClearLiveArtwork(reason: "placeholder", shouldUpdate: false)
-                delegate?.albumArtUpdateLiveActivity(force: true, reason: "albumArt")
-                notifyStateChanged()
+                if albumArtImage == nil {
+                    currentCachedAlbumArtQuality = ""
+                    artworkDisplayQuality = .placeholder
+                    updateArtworkEnhancementStatus(message: "placeholder")
+                    delegate?.albumArtClearLiveArtwork(reason: "placeholder", shouldUpdate: false)
+                    delegate?.albumArtUpdateLiveActivity(force: true, reason: "albumArt")
+                    notifyStateChanged()
+                } else {
+                    log("[AlbumArtCache] retain stale image after placeholder refresh id=\(id)")
+                }
             }
             requestedAlbumArtKeys.remove("\(id)|\(quality)")
             if source == "binary" {
@@ -886,6 +1058,7 @@ final class AlbumArtReceiver {
         albumArtPreviewRetryCount = 0
         albumArtPreviewRetryCounts.removeAll()
         albumArtHqRetryCounts.removeAll()
+        binaryAlbumArtRetryCounts.removeAll()
         sourceRefreshAttemptedAlbumArtIDs.removeAll()
         resetAlbumArtTransfer()
         resetBinaryAlbumArtTransfer(reason: "track changed")
@@ -923,6 +1096,10 @@ final class AlbumArtReceiver {
         notifyStateChanged()
     }
 
+    private func isExpectedAlbumArtPayload(id: String) -> Bool {
+        authoritativeAlbumArtID.isEmpty || authoritativeAlbumArtID == id
+    }
+
     private func resetAlbumArtTransfer() {
         albumArtID = ""
         albumArtQuality = ""
@@ -942,7 +1119,11 @@ final class AlbumArtReceiver {
         binaryAlbumArtQuality = ""
         binaryAlbumArtExpectedSize = 0
         binaryAlbumArtExpectedChunks = 0
+        binaryAlbumArtTransferID = ""
+        binaryAlbumArtExpectedCRC32 = nil
+        binaryAlbumArtGeneration = nil
         binaryAlbumArtChunks.removeAll()
+        binaryAlbumArtLastPublishedProgressBucket = -1
         binaryAlbumArtSession = nil
         albumArtTransferState = "idle"
         albumArtCurrentTransferQuality = "-"
@@ -1069,6 +1250,7 @@ final class AlbumArtReceiver {
         let total = session.totalChunks
         let id = session.id
         let quality = session.quality
+        binaryAlbumArtRetryCounts.removeValue(forKey: binaryAlbumArtTransferID)
         requestedAlbumArtKeys.remove("\(id)|\(quality)")
         cancelAlbumArtTransferTimeouts()
         binaryAlbumArtID = ""
@@ -1431,25 +1613,21 @@ final class AlbumArtReceiver {
     private func loadCachedAlbumArt(id: String) -> (image: UIImage, quality: String)? {
         let hqValidation = validateAlbumArtCache(id: id, preferredQuality: "hq")
         if let cached = cachedEnhancedAlbumArt(id: id),
-           hqValidation.valid,
-           !hqValidation.shouldRefreshOnOffer {
+           hqValidation.shouldDisplayWhileRefreshing {
             return (cached.image, "enhanced")
         }
         if let image = hqValidation.image,
-           hqValidation.valid,
-           !hqValidation.shouldRefreshOnOffer {
+           hqValidation.shouldDisplayWhileRefreshing {
             return (image, "hq")
         }
         let previewValidation = validateAlbumArtCache(id: id, preferredQuality: "preview")
         if let image = previewValidation.image,
-           previewValidation.valid,
-           !previewValidation.shouldRefreshOnOffer {
+           previewValidation.shouldDisplayWhileRefreshing {
             return (image, "preview")
         }
         let legacyValidation = validateAlbumArtCache(id: id, preferredQuality: nil)
         if let image = legacyValidation.image,
-           legacyValidation.valid,
-           !legacyValidation.shouldRefreshOnOffer {
+           legacyValidation.shouldDisplayWhileRefreshing {
             return (image, legacyValidation.quality)
         }
         return nil
@@ -1695,6 +1873,7 @@ final class AlbumArtReceiver {
             ? max(0, Int64((Date().timeIntervalSince1970 - savedAt) * 1_000))
             : Int64.max
         let expired = ageMs > ttlMs
+        let hardExpired = ageMs > ALBUM_ART_HARD_CACHE_TTL_MS
         let qualityURL = albumArtQualityURL(id: id, quality: preferredQuality)
         let storedQuality = (try? String(contentsOf: qualityURL, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1710,6 +1889,9 @@ final class AlbumArtReceiver {
             valid = false
         } else if let image, isLikelyPlaceholderAlbumArt(image, dataSize: size) {
             reason = "placeholder"
+            valid = false
+        } else if hardExpired {
+            reason = "hard_ttl_expired"
             valid = false
         } else if expired {
             reason = "source_ttl_expired"
@@ -1796,11 +1978,35 @@ final class AlbumArtReceiver {
         let firstRefreshAttempt = sourceRefreshAttemptedAlbumArtIDs.insert(id).inserted
         let selected = hqValidation.valid ? hqValidation : previewValidation
         let reason = selected.reason
-        currentCachedAlbumArtQuality = ""
-        artworkDisplayQuality = .placeholder
-        albumArtImage = nil
-        updateArtworkEnhancementStatus(message: "stale cache")
-        delegate?.albumArtClearLiveArtwork(reason: "staleCache", shouldUpdate: false)
+        if let cached = cachedEnhancedAlbumArt(id: id), hqValidation.valid {
+            setAlbumArtDisplay(
+                image: cached.image,
+                id: id,
+                quality: .enhanced,
+                reason: "stale-while-revalidate"
+            )
+            delegate?.albumArtPublishLiveArtwork(
+                image: cached.image,
+                key: id,
+                reason: "staleWhileRevalidate"
+            )
+        } else if let image = selected.image, selected.valid {
+            let displayQuality = selected.quality == "preview"
+                ? ArtworkDisplayQuality.preview
+                : ArtworkDisplayQuality.hq
+            setAlbumArtDisplay(
+                image: image,
+                id: id,
+                quality: displayQuality,
+                reason: "stale-while-revalidate"
+            )
+            delegate?.albumArtPublishLiveArtwork(
+                image: image,
+                key: id,
+                reason: "staleWhileRevalidate"
+            )
+        }
+        updateArtworkEnhancementStatus(message: "refreshing cache")
         let staleReason = selected.expired ? "source_ttl_expired" : reason
         let staleMessage = "[AlbumArtCache] stale id=\(id) reason=\(staleReason)"
         log(staleMessage)
@@ -1811,12 +2017,6 @@ final class AlbumArtReceiver {
             consoleLog(waitingMessage)
             notifyStateChanged()
             return
-        }
-        removeCachedAlbumArt(id: id, quality: "preview", reason: "stale refresh")
-        removeCachedAlbumArt(id: id, quality: "hq", reason: "stale refresh")
-        ArtworkEnhancementManager.shared.cancel(artworkId: id)
-        ArtworkEnhancementManager.shared.clearCachedArtwork(artworkId: id) { [weak self] in
-            self?.log("[ArtworkEnhance] cache removed id=\(id) reason=stale refresh")
         }
         requestedAlbumArtKeys.remove("\(id)|preview")
         requestedAlbumArtKeys.remove("\(id)|hq")
@@ -1915,33 +2115,54 @@ final class AlbumArtReceiver {
     }
 
     private func saveAlbumArt(_ data: Data, id: String, quality: String, image: UIImage) {
-        do {
-            let directory = albumArtCacheDirectory()
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            try data.write(to: albumArtCacheURL(id: id, quality: quality), options: .atomic)
-            try quality.write(to: albumArtQualityURL(id: id, quality: quality), atomically: true, encoding: .utf8)
-            let metadata = AlbumArtCacheMetadata(
-                id: id,
-                quality: quality,
-                source: inferAlbumArtSource(image: image),
-                savedAt: Date().timeIntervalSince1970,
-                pixelWidth: image.pixelWidth,
-                pixelHeight: image.pixelHeight,
-                bytes: data.count,
-                createdAt: Date().timeIntervalSince1970
-            )
-            let metadataData = try JSONEncoder().encode(metadata)
-            try metadataData.write(to: albumArtMetadataURL(id: id, quality: quality), options: .atomic)
-            let message =
-                "[AlbumArtCache] saved id=\(id) quality=\(quality) " +
-                "source=\(metadata.source ?? "unknown") " +
-                "pixelSize=\(metadata.pixelWidth)x\(metadata.pixelHeight) bytes=\(metadata.bytes)"
-            log(message)
-            consoleLog(message)
-        } catch {
-            let message = "[AlbumArtCache] save failed id=\(id) error=\(error.localizedDescription)"
-            log(message)
-            consoleLog(message)
+        albumArtCacheWriteQueue.async { [weak self] in
+            guard let self else { return }
+            let message: String
+            do {
+                let directory = self.albumArtCacheDirectory()
+                try FileManager.default.createDirectory(
+                    at: directory,
+                    withIntermediateDirectories: true
+                )
+                try data.write(
+                    to: self.albumArtCacheURL(id: id, quality: quality),
+                    options: .atomic
+                )
+                try quality.write(
+                    to: self.albumArtQualityURL(id: id, quality: quality),
+                    atomically: true,
+                    encoding: .utf8
+                )
+                let now = Date().timeIntervalSince1970
+                let metadata = AlbumArtCacheMetadata(
+                    id: id,
+                    quality: quality,
+                    source: self.inferAlbumArtSource(image: image),
+                    savedAt: now,
+                    pixelWidth: image.pixelWidth,
+                    pixelHeight: image.pixelHeight,
+                    bytes: data.count,
+                    createdAt: now
+                )
+                let metadataData = try JSONEncoder().encode(metadata)
+                try metadataData.write(
+                    to: self.albumArtMetadataURL(id: id, quality: quality),
+                    options: .atomic
+                )
+                message =
+                    "[AlbumArtCache] saved id=\(id) quality=\(quality) " +
+                    "source=\(metadata.source ?? "unknown") " +
+                    "pixelSize=\(metadata.pixelWidth)x\(metadata.pixelHeight) " +
+                    "bytes=\(metadata.bytes)"
+            } catch {
+                message =
+                    "[AlbumArtCache] save failed id=\(id) " +
+                    "error=\(error.localizedDescription)"
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.log(message)
+                self?.consoleLog(message)
+            }
         }
     }
 
@@ -2180,6 +2401,17 @@ final class AlbumArtReceiver {
 
     private static func sha256Data(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func crc32(_ data: Data) -> UInt32 {
+        var crc: UInt32 = 0xffff_ffff
+        for byte in data {
+            crc ^= UInt32(byte)
+            for _ in 0..<8 {
+                crc = (crc >> 1) ^ ((crc & 1) == 1 ? 0xedb8_8320 : 0)
+            }
+        }
+        return crc ^ 0xffff_ffff
     }
 
     private func log(_ message: String) {
