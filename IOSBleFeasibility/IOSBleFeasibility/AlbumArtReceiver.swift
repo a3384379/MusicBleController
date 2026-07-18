@@ -2,7 +2,9 @@ import CryptoKit
 import Foundation
 import UIKit
 
-private let DEBUG_ART_DIAGNOSTICS = true
+private let DEBUG_ART_DIAGNOSTICS = false
+private let ALBUM_ART_REQUEST_START_TIMEOUT_MS: Int64 = 3_000
+private let ALBUM_ART_REQUEST_START_MAX_RETRIES = 2
 private let ALBUM_ART_FIRST_CHUNK_TIMEOUT_MS: Int64 = 3_000
 private let ALBUM_ART_IDLE_CHUNK_TIMEOUT_MS: Int64 = 4_000
 private let ALBUM_ART_TOTAL_TIMEOUT_MS: Int64 = 10_000
@@ -164,6 +166,8 @@ final class AlbumArtReceiver {
     private var albumArtHqRetryCounts: [String: Int] = [:]
     private var currentCachedAlbumArtQuality = ""
     private var requestedAlbumArtKeys: Set<String> = []
+    private var albumArtRequestStartTimeouts: [String: DispatchWorkItem] = [:]
+    private var albumArtRequestStartRetryCounts: [String: Int] = [:]
     private var requestedHqAlbumArtIDs: Set<String> = []
     private var hqAlbumArtWorkItem: DispatchWorkItem?
     private var hqAlbumArtUnavailableReason = "-"
@@ -277,6 +281,47 @@ final class AlbumArtReceiver {
         handleAlbumArtIdentity(id)
     }
 
+    /// Clears display and in-flight state when Sony reports that QQ Music has no active track.
+    /// Cached files are deliberately retained so the same track can still use the disk cache
+    /// after QQ Music creates a new media session.
+    func clearCurrentIdentity(reason: String) {
+        let previousID = currentAlbumArtID
+        guard !previousID.isEmpty || albumArtImage != nil || binaryAlbumArtExpectedChunks > 0 else {
+            return
+        }
+
+        if !previousID.isEmpty {
+            ArtworkEnhancementManager.shared.cancel(artworkId: previousID)
+            cancelPredictiveHqPrefetch(reason: reason, oldId: previousID)
+        }
+        cancelAlbumArtFallback()
+        cancelHqAlbumArtRequest()
+        albumArtRequestStartTimeouts.values.forEach { $0.cancel() }
+        albumArtRequestStartTimeouts.removeAll()
+        albumArtRequestStartRetryCounts.removeAll()
+        requestedAlbumArtKeys.removeAll()
+        requestedHqAlbumArtIDs.removeAll()
+        albumArtPreviewRetryCounts.removeAll()
+        albumArtHqRetryCounts.removeAll()
+        sourceRefreshAttemptedAlbumArtIDs.removeAll()
+        resetAlbumArtTransfer()
+        resetBinaryAlbumArtTransfer(reason: reason)
+
+        currentAlbumArtID = ""
+        albumArtImage = nil
+        currentCachedAlbumArtQuality = ""
+        artworkDisplayQuality = .placeholder
+        hqAlbumArtUnavailableReason = "-"
+        hqAlbumArtUnavailableBestBytes = 0
+        hqAlbumArtUnavailableBestChunks = 0
+        hqAlbumArtUnavailableMinCandidateScale = 0
+        artworkEnhancementABOriginalMode = false
+        updateArtworkEnhancementStatus(message: "no active track")
+        delegate?.albumArtClearLiveArtwork(reason: reason, shouldUpdate: false)
+        log("[AlbumArt] cleared current identity reason=\(reason) oldId=\(previousID)")
+        notifyStateChanged()
+    }
+
     func handleLegacyStart(id: String, quality: String, size: Int, chunks: Int) {
         guard !id.isEmpty,
               quality == "preview" || quality == "hq" || quality == "full",
@@ -287,6 +332,8 @@ final class AlbumArtReceiver {
             return
         }
         handleAlbumArtIdentity(id)
+        cancelAlbumArtRequestStartTimeout(id: id, quality: quality)
+        albumArtRequestStartRetryCounts.removeValue(forKey: "\(id)|\(quality)")
         resetAlbumArtTransfer()
         albumArtID = id
         albumArtQuality = quality
@@ -336,6 +383,8 @@ final class AlbumArtReceiver {
             return
         }
         handleAlbumArtIdentity(id)
+        cancelAlbumArtRequestStartTimeout(id: id, quality: quality)
+        albumArtRequestStartRetryCounts.removeValue(forKey: "\(id)|\(quality)")
         resetBinaryAlbumArtTransfer()
         binaryAlbumArtID = id
         binaryAlbumArtQuality = quality
@@ -434,6 +483,7 @@ final class AlbumArtReceiver {
     ) {
         resetAlbumArtTransfer()
         resetBinaryAlbumArtTransfer(reason: "albumArtUnavailable")
+        cancelAlbumArtRequestStartTimeout(id: id, quality: quality)
         requestedAlbumArtKeys.remove("\(id)|\(quality)")
         if id == currentAlbumArtID,
            quality == "hq" {
@@ -1335,6 +1385,47 @@ final class AlbumArtReceiver {
         guard requestedAlbumArtKeys.insert(key).inserted else { return }
         log("[AlbumArt] request \(quality)")
         delegate?.albumArtSendCommand(cmd: "ALBUM_ART_REQUEST", extra: ["id": id, "quality": quality])
+        scheduleAlbumArtRequestStartTimeout(id: id, quality: quality)
+    }
+
+    private func scheduleAlbumArtRequestStartTimeout(id: String, quality: String) {
+        let key = "\(id)|\(quality)"
+        albumArtRequestStartTimeouts[key]?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.currentAlbumArtID == id,
+                  self.requestedAlbumArtKeys.contains(key),
+                  self.albumArtExpectedChunks == 0,
+                  self.binaryAlbumArtExpectedChunks == 0 else {
+                return
+            }
+            self.albumArtRequestStartTimeouts.removeValue(forKey: key)
+            self.requestedAlbumArtKeys.remove(key)
+            if quality == "hq" {
+                self.requestedHqAlbumArtIDs.remove(id)
+            }
+            let attempts = (self.albumArtRequestStartRetryCounts[key] ?? 0) + 1
+            self.albumArtRequestStartRetryCounts[key] = attempts
+            guard attempts <= ALBUM_ART_REQUEST_START_MAX_RETRIES else {
+                self.log("[AlbumArt] request start timeout id=\(id) quality=\(quality), giving up")
+                return
+            }
+            self.log("[AlbumArt] request start timeout id=\(id) quality=\(quality), retry=\(attempts)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self, self.currentAlbumArtID == id else { return }
+                self.requestAlbumArt(id: id, quality: quality)
+            }
+        }
+        albumArtRequestStartTimeouts[key] = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(Int(ALBUM_ART_REQUEST_START_TIMEOUT_MS)),
+            execute: workItem
+        )
+    }
+
+    private func cancelAlbumArtRequestStartTimeout(id: String, quality: String) {
+        let key = "\(id)|\(quality)"
+        albumArtRequestStartTimeouts.removeValue(forKey: key)?.cancel()
     }
 
     private func loadCachedAlbumArt(id: String) -> (image: UIImage, quality: String)? {

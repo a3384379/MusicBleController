@@ -7,6 +7,7 @@ struct PreferencesView: View {
     let onDismiss: () -> Void
 
     @State private var actionStatus = ""
+    private let signingProfile = ProvisioningProfileInfo.current
 
     var body: some View {
         NavigationStack {
@@ -203,6 +204,9 @@ struct PreferencesView: View {
             preferencesRow("App", "Sony Music BLE Controller")
             preferencesRow("版本", appVersion)
             preferencesRow("Build", buildVersion)
+            preferencesRow("签名有效期", signingProfileExpireText, valueColor: signingProfileStatusColor)
+            preferencesRow("剩余时间", signingProfileRemainingText, valueColor: signingProfileStatusColor)
+            preferencesRow("签名 Team", signingProfile?.teamIdentifier ?? "-")
             preferencesRow("当前模式", preferences.appExperienceMode.title)
             preferencesRow("连接设备", bleManager.connectedDeviceName == "-" ? "Sony" : bleManager.connectedDeviceName)
         }
@@ -277,11 +281,55 @@ struct PreferencesView: View {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "-"
     }
 
+    private var signingProfileExpireText: String {
+        guard let expirationDate = signingProfile?.expirationDate else {
+            return "未找到"
+        }
+        return Self.profileDateFormatter.string(from: expirationDate)
+    }
+
+    private var signingProfileRemainingText: String {
+        guard let daysRemaining = signingProfile?.daysRemaining else {
+            return "未知"
+        }
+        if daysRemaining < 0 {
+            return "已过期"
+        }
+        if daysRemaining < 1 {
+            let hours = max(0, Int((daysRemaining * 24).rounded(.down)))
+            return "\(hours) 小时"
+        }
+        return String(format: "%.1f 天", daysRemaining)
+    }
+
+    private var signingProfileStatusColor: Color {
+        guard let daysRemaining = signingProfile?.daysRemaining else {
+            return .orange
+        }
+        if daysRemaining < 0 {
+            return .red
+        }
+        if daysRemaining < 2 {
+            return .orange
+        }
+        return .green
+    }
+
+    private static let profileDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm zzz"
+        return formatter
+    }()
+
     private func offsetLabel(_ value: Int64) -> String {
         value > 0 ? "+\(value)ms" : "\(value)ms"
     }
 
-    private func preferencesRow(_ title: String, _ value: String) -> some View {
+    private func preferencesRow(
+        _ title: String,
+        _ value: String,
+        valueColor: Color = .white.opacity(0.82)
+    ) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Text(title)
                 .font(.caption.weight(.medium))
@@ -289,7 +337,7 @@ struct PreferencesView: View {
                 .frame(width: 96, alignment: .leading)
             Text(value.isEmpty ? "-" : value)
                 .font(.caption.monospacedDigit())
-                .foregroundStyle(.white.opacity(0.82))
+                .foregroundStyle(valueColor)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .lineLimit(2)
         }
@@ -313,6 +361,52 @@ struct PreferencesView: View {
             .frame(maxWidth: .infinity)
             .frame(height: 44)
             .background(.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+    }
+}
+
+private struct ProvisioningProfileInfo {
+    let expirationDate: Date
+    let teamIdentifier: String?
+
+    var daysRemaining: Double {
+        expirationDate.timeIntervalSince(Date()) / 86_400
+    }
+
+    static let current: ProvisioningProfileInfo? = {
+        guard
+            let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+            let data = try? Data(contentsOf: url),
+            let plistData = extractPlistData(from: data),
+            let object = try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil),
+            let plist = object as? [String: Any],
+            let expirationDate = plist["ExpirationDate"] as? Date
+        else {
+            return nil
+        }
+
+        let teamIdentifier = (plist["TeamIdentifier"] as? [String])?.first
+        return ProvisioningProfileInfo(
+            expirationDate: expirationDate,
+            teamIdentifier: teamIdentifier
+        )
+    }()
+
+    private static func extractPlistData(from data: Data) -> Data? {
+        guard
+            let startMarker = "<?xml".data(using: .utf8),
+            let endMarker = "</plist>".data(using: .utf8),
+            let startRange = data.range(of: startMarker),
+            let endRange = data.range(of: endMarker)
+        else {
+            return nil
+        }
+
+        let endIndex = endRange.upperBound
+        guard startRange.lowerBound < endIndex else {
+            return nil
+        }
+
+        return data.subdata(in: startRange.lowerBound..<endIndex)
     }
 }
 

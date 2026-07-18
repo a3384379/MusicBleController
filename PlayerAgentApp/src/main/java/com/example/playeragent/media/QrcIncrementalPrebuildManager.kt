@@ -49,31 +49,48 @@ class QrcIncrementalPrebuildManager(
             if (stopped.get()) {
                 return@execute
             }
+            // A QRC group that QQ Music has just written for the song currently
+            // playing is part of the foreground lyric path, not background cache
+            // maintenance.  Do not let a pending full-lyrics/album-art request
+            // postpone it: doing so leaves QQ Music showing lyrics while the
+            // receiver waits for the cache warm-up to finish.
+            val foregroundGroups = cleanGroupIds.filter(::isForegroundCurrentTrackGroup).toSet()
             val token = QrcMaintenanceCoordinator.tryStart(
                 MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD,
                 "groups=${cleanGroupIds.size}",
                 logger
             )
-            if (token == null) {
+            if (token == null && foregroundGroups.isEmpty()) {
                 logger("[QrcIncremental] skipped reason=maintenance busy groups=${cleanGroupIds.size}")
                 cleanGroupIds.forEach { incrementSkipped() }
                 return@execute
             }
             setRunning(true)
+            val handledGroups = linkedSetOf<String>()
             try {
                 cleanGroupIds.forEachIndexed { index, groupId ->
-                    if (stopped.get() || token.cancelled) {
+                    if (stopped.get() || token?.cancelled == true) {
                         return@forEachIndexed
                     }
-                    if (!MaintenanceGuard.yieldIfRealtimeWindow(
+                    val isForegroundGroup = groupId in foregroundGroups
+                    if (token == null && !isForegroundGroup) {
+                        logger("[QrcIncremental] skipped background groupId=$groupId reason=maintenance busy")
+                        incrementSkipped()
+                        return@forEachIndexed
+                    }
+                    if (!isForegroundGroup && !MaintenanceGuard.yieldIfRealtimeWindow(
                             MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD,
-                            token,
+                            token!!,
                             logger
                         )
                     ) {
                         return@forEachIndexed
                     }
+                    if (isForegroundGroup) {
+                        logger("[QrcIncremental] foreground bypass maintenance groupId=$groupId")
+                    }
                     processGroup(groupId, cleanGroupIds.size)
+                    handledGroups += groupId
                     if ((index + 1) % THROTTLE_INTERVAL == 0) {
                         Thread.sleep(THROTTLE_SLEEP_MS)
                     }
@@ -81,13 +98,13 @@ class QrcIncrementalPrebuildManager(
             } catch (exception: Exception) {
                 logger("[QrcIncremental] failed reason=${exception.message}")
                 incrementFailed()
-                QrcMaintenanceCoordinator.fail(token, exception, logger)
+                token?.let { QrcMaintenanceCoordinator.fail(it, exception, logger) }
                 return@execute
             } finally {
-                QrcMaintenanceCoordinator.finish(token, logger)
+                token?.let { QrcMaintenanceCoordinator.finish(it, logger) }
                 setRunning(false)
-                if (cleanGroupIds.isNotEmpty()) {
-                    onBatchProcessed(cleanGroupIds.toSet())
+                if (handledGroups.isNotEmpty()) {
+                    onBatchProcessed(handledGroups)
                 }
             }
         }
@@ -230,6 +247,14 @@ class QrcIncrementalPrebuildManager(
         val qrcModifiedAt = group.qrcFile?.lastModified() ?: group.lastModified
         return qrcModifiedAt >= currentTrack.trackChangedAtMs ||
             kotlin.math.abs(qrcModifiedAt - currentTrack.trackChangedAtMs) <= CURRENT_TRACK_MATCH_WINDOW_MS
+    }
+
+    private fun isForegroundCurrentTrackGroup(groupId: String): Boolean {
+        val currentTrack = currentTrackProvider() ?: return false
+        if (currentTrack.hasLyrics) {
+            return false
+        }
+        return isRecentForCurrentTrack(findGroup(groupId), currentTrack)
     }
 
     private fun evaluateCurrentTrackMatch(

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ROOT_DIR="${ROOT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 BUNDLE_ID="${BUNDLE_ID:-com.sqz.IOSBleFeasibility}"
 SKIP_BUILD=false
 SKIP_INSTALL=false
@@ -162,7 +162,7 @@ for raw in list_path.read_text(encoding="utf-8", errors="replace").splitlines():
     left = raw[:match.start()].strip()
     right = raw[match.end():].strip()
     state = right.split("  ")[0].strip() if right else ""
-    if "iPhone" not in raw or "available" not in state:
+    if "iPhone" not in raw or ("available" not in state and "connected" not in state):
         continue
     name = left.split("  ")[0].strip() or "iPhone"
     model = right.split("   ")[-1].strip() if right else ""

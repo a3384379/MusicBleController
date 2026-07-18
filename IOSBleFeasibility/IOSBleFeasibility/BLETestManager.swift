@@ -20,6 +20,8 @@ private let CONNECTION_SUBSCRIBE_NOTIFY_TIMEOUT_MS: Int64 = 5_000
 private let CONNECTION_DISPLAY_CONNECTED_MIN_HOLD_MS: Int64 = 5_000
 private let CONNECTION_DISPLAY_DISCONNECTED_CONFIRM_MS: Int64 = 1_000
 private let FULL_LYRICS_REQUEST_DEDUP_WINDOW_MS: Int64 = 1_500
+private let FULL_LYRICS_REQUEST_START_TIMEOUT_MS: Int64 = 3_000
+private let FULL_LYRICS_REQUEST_START_MAX_RETRIES = 2
 
 struct LyricWord: Identifiable, Equatable {
     let id: Int
@@ -226,6 +228,8 @@ final class BLETestManager: NSObject, ObservableObject {
     private var fullLyricsExpectedCount = 0
     private var fullLyricsChunks: [Int: LyricLine] = [:]
     private var fullLyricsTimeoutWorkItem: DispatchWorkItem?
+    private var fullLyricsRequestStartTimeouts: [String: DispatchWorkItem] = [:]
+    private var fullLyricsRequestStartRetryCounts: [String: Int] = [:]
     private var lastFullLyricsPartialPublishAtMs: Int64 = 0
     private var fullLyricsRequestCreatedAtMs: [String: Int64] = [:]
     private var lyricTraceTrackInfoAtMs: [String: Int64] = [:]
@@ -3863,6 +3867,15 @@ extension BLETestManager: CBPeripheralDelegate {
         let newArtist = object["artist"] as? String ?? "-"
         let newAlbum = object["album"] as? String ?? "-"
         let trackID = object["trackId"] as? String ?? ""
+
+        // An empty trackId is Sony's explicit "QQ Music has no active media
+        // session" response. Never retain the preceding track here: doing so
+        // makes subsequent lyric/art requests target an already-stale ID.
+        guard !trackID.isEmpty else {
+            clearNowPlayingForNoActiveTrack()
+            return
+        }
+
         let trackChanged = newTitle != title ||
             newArtist != artist ||
             newAlbum != album ||
@@ -3904,6 +3917,56 @@ extension BLETestManager: CBPeripheralDelegate {
             force: trackChanged,
             reason: trackChanged ? "trackInfo" : "trackInfoRefresh"
         )
+    }
+
+    private func clearNowPlayingForNoActiveTrack() {
+        let hadTrack = !currentTrackID.isEmpty ||
+            title != "-" ||
+            artist != "-" ||
+            album != "-" ||
+            !fullLyrics.isEmpty ||
+            albumArtReceiver.currentAlbumArtID.isEmpty == false
+        guard hadTrack else { return }
+
+        fullLyricsRequestStartTimeouts.values.forEach { $0.cancel() }
+        fullLyricsRequestStartTimeouts.removeAll()
+        fullLyricsRequestStartRetryCounts.removeAll()
+        resetFullLyricsTransfer()
+        requestedFullLyricsTrackIDs.removeAll()
+        fullLyricsUnavailableTrackIDs.removeAll()
+        fullLyricsDelayedRetryTrackIDs.removeAll()
+        fullLyricsOptionalRefreshTrackIDs.removeAll()
+        requestedLyricSecondaryKeys.removeAll()
+        completedLyricSecondaryKeys.removeAll()
+        ignoredLyricSecondaryPlaceholderKeys.removeAll()
+        pendingLyricSecondaryModes.removeAll()
+        lyricSecondaryTransfer = nil
+        lyricTraceFullLyricsRequestAtMs.removeAll()
+        lyricTraceFullLyricsStartAtMs.removeAll()
+        lyricTraceFirstPlaybackLyricAtMs.removeAll()
+
+        currentTrackID = ""
+        title = "-"
+        artist = "-"
+        album = "-"
+        lyric = ""
+        fullLyrics = []
+        fullLyricsTrackId = ""
+        isFullLyricsCurrent = false
+        lyricDiagnostic = nil
+        lyricDiagnosticLoading = false
+        lyricDiagnosticLastUpdatedAt = nil
+        isPlaying = false
+        positionMs = 0
+        displayPositionMs = 0
+        seekPositionMs = 0
+        durationMs = 0
+        basePlaybackPositionMs = 0
+        currentWordLineIndex = -1
+        currentWordIndex = -1
+        albumArtReceiver.clearCurrentIdentity(reason: "no active QQ track")
+        log("[TrackInfo] cleared stale now-playing state reason=no active QQ track")
+        updateLiveActivity(force: true, reason: "noActiveTrack")
     }
 
     private func updateLiveActivity(force: Bool, reason: String) {
@@ -4133,7 +4196,35 @@ extension BLETestManager: CBPeripheralDelegate {
                     "includeWordsAroundCurrent": true
                 ]
             )
+            self.scheduleFullLyricsRequestStartTimeout(trackID: trackID)
         }
+    }
+
+    private func scheduleFullLyricsRequestStartTimeout(trackID: String) {
+        fullLyricsRequestStartTimeouts[trackID]?.cancel()
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.currentTrackID == trackID,
+                  self.requestedFullLyricsTrackIDs.contains(trackID),
+                  !self.isFullLyricsReceiving else {
+                return
+            }
+            self.fullLyricsRequestStartTimeouts.removeValue(forKey: trackID)
+            self.requestedFullLyricsTrackIDs.remove(trackID)
+            let attempts = (self.fullLyricsRequestStartRetryCounts[trackID] ?? 0) + 1
+            self.fullLyricsRequestStartRetryCounts[trackID] = attempts
+            guard attempts <= FULL_LYRICS_REQUEST_START_MAX_RETRIES else {
+                self.log("[FullLyrics] request start timeout trackId=\(trackID), giving up")
+                return
+            }
+            self.log("[FullLyrics] request start timeout trackId=\(trackID), retry=\(attempts)")
+            self.requestFullLyricsIfNeeded(force: true, after: 0.5)
+        }
+        fullLyricsRequestStartTimeouts[trackID] = timeout
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(Int(FULL_LYRICS_REQUEST_START_TIMEOUT_MS)),
+            execute: timeout
+        )
     }
 
     private func retryFullLyricsIfLyricsBecameAvailable(
@@ -4170,6 +4261,8 @@ extension BLETestManager: CBPeripheralDelegate {
             return
         }
         fullLyricsUnavailableTrackIDs.remove(trackID)
+        fullLyricsRequestStartTimeouts.removeValue(forKey: trackID)?.cancel()
+        fullLyricsRequestStartRetryCounts.removeValue(forKey: trackID)
         fullLyricsTimeoutWorkItem?.cancel()
         fullLyricsReceivingTrackID = trackID
         fullLyricsExpectedCount = Self.intValue(object["count"])

@@ -8,6 +8,7 @@ import java.nio.charset.Charset
 import java.util.LinkedHashMap
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 class LyricManager(
     context: Context,
@@ -112,19 +113,53 @@ class LyricManager(
             retryActiveSongFromRecovery(reason, bypassRetryableCooldown)
         }
     )
-
-    init {
-        QrcLyricCacheManager.addFuzzyIndexReadyListener {
+    private val closed = AtomicBoolean(false)
+    private val fuzzyIndexReadyListener: (QrcFuzzyIndexStatus) -> Unit = {
+        if (!closed.get()) {
+            // A miss made while the on-disk cache index was cold is provisional.
+            // Let the just-built index participate in the next foreground lookup.
+            qrcLyricManager.clearUncertainCooldowns("cache index ready")
             recoveryEngine.onFuzzyIndexReady()
             retryActiveSong("fuzzy index ready")
         }
-        QrcMaintenanceCoordinator.addFinishListener { token ->
+    }
+    private val maintenanceFinishListener: (MaintenanceToken) -> Unit = { token ->
+        if (!closed.get()) {
+            // A QRC index refresh can make a previously uncertain match resolvable.
+            qrcLyricManager.clearUncertainCooldowns("maintenance done ${token.type}")
             logger("[LyricRetry] scheduled reason=maintenance done current active song type=${token.type}")
             retryActiveSong("maintenance done")
         }
-        MaintenanceGuard.addWindowEndListener {
+    }
+    private val maintenanceWindowEndListener: () -> Unit = {
+        if (!closed.get()) {
             retryActiveSong("maintenance guard window end")
         }
+    }
+
+    init {
+        QrcLyricCacheManager.addFuzzyIndexReadyListener(fuzzyIndexReadyListener)
+        QrcMaintenanceCoordinator.addFinishListener(maintenanceFinishListener)
+        MaintenanceGuard.addWindowEndListener(maintenanceWindowEndListener)
+    }
+
+    fun close() {
+        if (!closed.compareAndSet(false, true)) {
+            return
+        }
+        QrcLyricCacheManager.removeFuzzyIndexReadyListener(fuzzyIndexReadyListener)
+        QrcMaintenanceCoordinator.removeFinishListener(maintenanceFinishListener)
+        MaintenanceGuard.removeWindowEndListener(maintenanceWindowEndListener)
+        recoveryEngine.shutdown()
+        lyricExecutor.shutdownNow()
+        foregroundLyricExecutor.shutdownNow()
+        qrcLyricManager.close()
+        synchronized(this) {
+            pendingRequest = null
+            cachedLines = emptyList()
+            parsedCache.clear()
+        }
+        logger("[LyricManager] closed")
     }
 
     fun scanLrcFiles(title: String, artist: String, album: String) {
@@ -413,7 +448,11 @@ class LyricManager(
             logger("[LyricRetry] skipped reason=has lyrics songKey=$key")
             return false
         }
-        if (retryableFailureSongKey != key) {
+        val retryableFailure = retryableFailureSongKey == key
+        val qrcMayHaveArrivedAfterFinalMiss =
+            finalEmptySongKey == key &&
+                finalEmptyReason == "no safe qrc candidate"
+        if (!retryableFailure && !qrcMayHaveArrivedAfterFinalMiss) {
             logger("[LyricRetry] skipped reason=no retryable failure songKey=$key")
             return false
         }
@@ -431,6 +470,12 @@ class LyricManager(
             return false
         }
         lastWatcherRetryAtMs = now
+        if (qrcMayHaveArrivedAfterFinalMiss) {
+            finalEmptySongKey = null
+            finalEmptyReason = ""
+            loadedSongKey = null
+            logger("[LyricRetry] retry final qrc miss reason=qrc generation changed")
+        }
         recoveryEngine.onQrcGenerationChanged(
             oldGeneration = recoveryEngine.snapshot().lastQrcGeneration,
             newGeneration = QrcDirectoryGeneration.current()
@@ -1555,14 +1600,19 @@ class LyricManager(
             return ""
         }
 
-        var currentLine = ""
-        for (line in lines) {
-            if (line.timeMs <= safePosition) {
-                currentLine = line.text
+        var low = 0
+        var high = lines.lastIndex
+        var currentIndex = -1
+        while (low <= high) {
+            val mid = (low + high) ushr 1
+            if (lines[mid].timeMs <= safePosition) {
+                currentIndex = mid
+                low = mid + 1
             } else {
-                break
+                high = mid - 1
             }
         }
+        val currentLine = lines.getOrNull(currentIndex)?.text.orEmpty()
 
         if (currentLine != lastLoggedLine) {
             if (LogConfig.DEBUG_VERBOSE_LOG) {
@@ -1749,6 +1799,7 @@ class LyricManager(
         val normalized = reason.lowercase(Locale.ROOT)
         return normalized.contains("lyric recovery active") ||
             normalized.contains("waiting qqmusic lyric cache") ||
+            normalized.contains("cache index warming") ||
             normalized.contains("qrc cooldown retry pending") ||
             normalized.contains("lyrics retry pending") ||
             normalized.contains("no safe qrc candidate")
@@ -2284,7 +2335,12 @@ class LyricManager(
         private const val RETRY_RATE_WINDOW_MS = 30_000L
         private const val RETRYABLE_RECHECK_INTERVAL_MS = 30_000L
         private const val WATCHER_RETRY_MIN_INTERVAL_MS = 30_000L
+        // Full-lyrics requests are also the recovery signal from the iOS client.
+        // Keep the established cadence: a longer throttle can leave a newly written
+        // QQ QRC file unseen for tens of seconds after the first provisional miss.
         private const val FULL_LYRICS_RECOVERY_NUDGE_MIN_INTERVAL_MS = 8_000L
+        // Do not convert a cold-index or delayed QQ write into a final miss early.
+        // Directory and index events still retry immediately, so this is not a poll.
         private const val LAZY_WAIT_WINDOW_MS = 3 * 60_000L
         private const val MAX_RETRIES_PER_WINDOW = 2
         private const val PARSED_CACHE_MAX_KEYS = 40

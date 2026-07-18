@@ -603,12 +603,6 @@ private struct LockScreenLiveActivityView: View {
                         .truncationMode(.tail)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-
-                ExpandedPlaybackButtonView(
-                    visualState: visualState,
-                    size: 42,
-                    iconScale: 0.42
-                )
             }
 
             LiveActivityProgressRow(state: state)

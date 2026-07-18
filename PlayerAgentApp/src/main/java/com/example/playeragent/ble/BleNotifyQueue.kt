@@ -12,6 +12,7 @@ import android.os.SystemClock
 import com.example.playeragent.logging.LogConfig
 import org.json.JSONObject
 import java.util.ArrayDeque
+import java.util.LinkedHashMap
 
 class BleNotifyQueue(
     private val serverProvider: () -> BluetoothGattServer?,
@@ -30,10 +31,16 @@ class BleNotifyQueue(
     private var activeJobStartedAtMs = 0L
     private var notificationInFlight = false
     private var interleavedPacketInFlight = false
+    private var interleavedPacketType: String? = null
     private var interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
-    private var latestInterleavedPacket: InterleavedPacket? = null
+    private val latestInterleavedPackets = LinkedHashMap<String, InterleavedPacket>()
     private var lastInterleavedSavedLogAtMs = 0L
     private var lastInterleavedFlushedLogAtMs = 0L
+    private var activeRequestId = 0L
+    private var activeRequestType: String? = null
+    private var notifyTimeoutRunnable: Runnable? = null
+    private var drainingCancelledCallback = false
+    private var cancelledCallbackDrainRunnable: Runnable? = null
 
     fun enqueueShort(
         device: BluetoothDevice,
@@ -90,11 +97,7 @@ class BleNotifyQueue(
         value: ByteArray,
         delayAfterMs: Long = SHORT_MESSAGE_DELAY_MS
     ) {
-        val current = latestInterleavedPacket
-        if (current?.packet?.type == "trackInfo" && type != "trackInfo") {
-            return
-        }
-        latestInterleavedPacket = InterleavedPacket(
+        latestInterleavedPackets[type] = InterleavedPacket(
             device = device,
             packet = Packet(
                 type = type,
@@ -129,26 +132,44 @@ class BleNotifyQueue(
             activeJob = null
             activePacketIndex = 0
             activeJobStartedAtMs = 0L
-            notificationInFlight = false
             interleavedPacketInFlight = false
+            interleavedPacketType = null
             interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
         }
         if (removedJobs.isNotEmpty() || current?.type in types) {
             handler.removeCallbacksAndMessages(null)
-            sendNextPacket()
+            if (notificationInFlight) {
+                beginCancelledCallbackDrain("cancelled active notify")
+            } else {
+                sendNextPacket()
+            }
         }
     }
 
     @Synchronized
     fun onNotificationSent(status: Int) {
+        if (drainingCancelledCallback) {
+            logger("[BleNotifyQueue] ignored callback status=$status while draining cancelled notify")
+            finishCancelledCallbackDrain()
+            return
+        }
         val job = activeJob ?: return
         if (!notificationInFlight) {
             return
         }
 
+        cancelNotifyTimeout()
         notificationInFlight = false
         if (interleavedPacketInFlight) {
+            val type = interleavedPacketType ?: job.type
             interleavedPacketInFlight = false
+            interleavedPacketType = null
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                onNotifySuccess(type)
+            } else {
+                logger("[BleNotifyQueue] interleaved notify failed type=$type status=$status")
+                onNotifyFailure(type, status, "callback_failed")
+            }
             handler.postDelayed({ sendNextPacket() }, interleavedDelayAfterMs)
             interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
             return
@@ -161,10 +182,8 @@ class BleNotifyQueue(
                     "type=$type status=$status"
             )
             onNotifyFailure(type, status, "callback_failed")
-            markJobFailed(
-                job,
-                "notify callback failed type=$type status=$status"
-            )
+            abortActiveJob(job, "notify callback failed type=$type status=$status")
+            return
         } else {
             onNotifySuccess(packet?.type ?: job.type)
         }
@@ -177,20 +196,25 @@ class BleNotifyQueue(
     fun removeDevice(address: String) {
         val removedJobs = jobs.filter { it.device.address == address }
         jobs.removeAll { it.device.address == address }
-        if (latestInterleavedPacket?.device?.address == address) {
-            latestInterleavedPacket = null
+        latestInterleavedPackets.entries.removeAll { it.value.device.address == address }
+        val activeDeviceRemoved = activeJob?.device?.address == address
+        if (interleavedPacketInFlight) {
             interleavedPacketInFlight = false
+            interleavedPacketType = null
             interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
         }
         removedJobs.forEach { failJob(it, "device disconnected") }
-        if (activeJob?.device?.address == address) {
+        if (activeDeviceRemoved) {
             activeJob?.let { failJob(it, "device disconnected") }
             activeJob = null
             activePacketIndex = 0
-            notificationInFlight = false
         }
         handler.removeCallbacksAndMessages(null)
-        sendNextPacket()
+        if (notificationInFlight && activeDeviceRemoved) {
+            beginCancelledCallbackDrain("device disconnected")
+        } else {
+            sendNextPacket()
+        }
     }
 
     @Synchronized
@@ -200,13 +224,19 @@ class BleNotifyQueue(
         activeJob?.let { failJob(it, reason) }
         jobs.forEach { failJob(it, reason) }
         jobs.clear()
-        latestInterleavedPacket = null
+        latestInterleavedPackets.clear()
         interleavedPacketInFlight = false
+        interleavedPacketType = null
         interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
         activeJob = null
         activePacketIndex = 0
         activeJobStartedAtMs = 0L
         notificationInFlight = false
+        activeRequestType = null
+        activeRequestId += 1
+        cancelNotifyTimeout()
+        drainingCancelledCallback = false
+        cancelledCallbackDrainRunnable = null
     }
 
     @Synchronized
@@ -215,12 +245,18 @@ class BleNotifyQueue(
         activeJob?.let { failJob(it, "queue cleared") }
         jobs.forEach { failJob(it, "queue cleared") }
         jobs.clear()
-        latestInterleavedPacket = null
+        latestInterleavedPackets.clear()
         interleavedPacketInFlight = false
+        interleavedPacketType = null
         interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
         activeJob = null
         activePacketIndex = 0
         notificationInFlight = false
+        activeRequestType = null
+        activeRequestId += 1
+        cancelNotifyTimeout()
+        drainingCancelledCallback = false
+        cancelledCallbackDrainRunnable = null
     }
 
     @Synchronized
@@ -230,7 +266,7 @@ class BleNotifyQueue(
             pendingJobCount = jobs.size,
             activeJobType = activeJob?.type,
             activeDeviceAddress = activeJob?.device?.address,
-            pendingShortMessageCount = if (latestInterleavedPacket == null) 0 else 1
+            pendingShortMessageCount = latestInterleavedPackets.size
         )
     }
 
@@ -242,7 +278,7 @@ class BleNotifyQueue(
 
     @Synchronized
     private fun sendNextPacket() {
-        if (notificationInFlight) {
+        if (notificationInFlight || drainingCancelledCallback) {
             return
         }
 
@@ -292,16 +328,16 @@ class BleNotifyQueue(
             activePacketIndex > 0 &&
             activePacketIndex % interleaveInterval == 0
         ) {
-            val interleaved = latestInterleavedPacket
+            val interleaved = pollInterleavedPacket(job.device.address)
             if (interleaved != null &&
                 interleaved.device.address == job.device.address
             ) {
                 val server = serverProvider()
                 val characteristic = characteristicProvider()
                 if (server != null && characteristic != null) {
-                    latestInterleavedPacket = null
                     interleavedDelayAfterMs = interleaved.packet.delayAfterMs
                     interleavedPacketInFlight = true
+                    interleavedPacketType = interleaved.packet.type
                     notificationInFlight = true
                     logInterleavedEventThrottled(
                         isSavedEvent = false,
@@ -320,14 +356,19 @@ class BleNotifyQueue(
                             "request_rejected"
                         )
                         interleavedPacketInFlight = false
+                        interleavedPacketType = null
                         notificationInFlight = false
                         interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
                         handler.postDelayed(
                             { sendNextPacket() },
                             interleaved.packet.delayAfterMs
                         )
+                    } else {
+                        startNotifyTimeout(interleaved.packet.type)
                     }
                     return
+                } else {
+                    latestInterleavedPackets[interleaved.packet.type] = interleaved
                 }
             }
         }
@@ -375,6 +416,7 @@ class BleNotifyQueue(
         }
 
         notificationInFlight = true
+        activeRequestType = packet.type
         val requested = notify(server, characteristic, job.device, packet.value)
         if (job.type == "albumArt") {
             logAlbumArtPacketProgress(job, packet)
@@ -414,24 +456,103 @@ class BleNotifyQueue(
 
         if (!requested) {
             notificationInFlight = false
+            activeRequestType = null
             logger("[BleNotifyQueue] notify request rejected type=${packet.type}")
             onNotifyFailure(
                 packet.type,
                 NOTIFY_REQUEST_REJECTED_STATUS,
                 "request_rejected"
             )
-            if (job.isLongJob) {
-                markJobFailed(
-                    job,
-                    "notify request rejected type=${packet.type}"
-                )
-            }
-            activePacketIndex += 1
-            handler.postDelayed(
-                { sendNextPacket() },
-                packet.delayAfterMs
-            )
+            abortActiveJob(job, "notify request rejected type=${packet.type}")
+        } else {
+            startNotifyTimeout(packet.type)
         }
+    }
+
+    private fun abortActiveJob(job: SendJob, reason: String) {
+        markJobFailed(job, reason)
+        job.onFailure?.invoke()
+        activeJob = null
+        activePacketIndex = 0
+        activeJobStartedAtMs = 0L
+        activeRequestType = null
+        handler.postDelayed({ sendNextPacket() }, SHORT_MESSAGE_DELAY_MS)
+    }
+
+    private fun startNotifyTimeout(type: String) {
+        cancelNotifyTimeout()
+        val requestId = ++activeRequestId
+        val timeout = Runnable {
+            synchronized(this) {
+                if (!notificationInFlight || requestId != activeRequestId) {
+                    return@synchronized
+                }
+                val job = activeJob
+                logger("[BleNotifyQueue] notify callback timeout type=$type job=${job?.type}")
+                onNotifyFailure(type, NOTIFY_CALLBACK_TIMEOUT_STATUS, "callback_timeout")
+                if (job != null) {
+                    markJobFailed(job, "notify callback timeout type=$type")
+                    job.onFailure?.invoke()
+                    activeJob = null
+                    activePacketIndex = 0
+                    activeJobStartedAtMs = 0L
+                }
+                notificationInFlight = false
+                interleavedPacketInFlight = false
+                interleavedPacketType = null
+                activeRequestType = null
+                beginCancelledCallbackDrain("notify callback timeout")
+            }
+        }
+        notifyTimeoutRunnable = timeout
+        handler.postDelayed(timeout, NOTIFY_CALLBACK_TIMEOUT_MS)
+    }
+
+    private fun cancelNotifyTimeout() {
+        notifyTimeoutRunnable?.let(handler::removeCallbacks)
+        notifyTimeoutRunnable = null
+        activeRequestId += 1
+    }
+
+    private fun beginCancelledCallbackDrain(reason: String) {
+        cancelNotifyTimeout()
+        drainingCancelledCallback = true
+        notificationInFlight = false
+        activeRequestType = null
+        cancelledCallbackDrainRunnable?.let(handler::removeCallbacks)
+        val drain = Runnable {
+            synchronized(this) {
+                if (!drainingCancelledCallback) {
+                    return@synchronized
+                }
+                logger("[BleNotifyQueue] cancelled notify drain elapsed reason=$reason")
+                finishCancelledCallbackDrain()
+            }
+        }
+        cancelledCallbackDrainRunnable = drain
+        handler.postDelayed(drain, CANCELLED_CALLBACK_DRAIN_MS)
+    }
+
+    private fun finishCancelledCallbackDrain() {
+        cancelledCallbackDrainRunnable?.let(handler::removeCallbacks)
+        cancelledCallbackDrainRunnable = null
+        drainingCancelledCallback = false
+        handler.postDelayed({ sendNextPacket() }, SHORT_MESSAGE_DELAY_MS)
+    }
+
+    private fun pollInterleavedPacket(deviceAddress: String): InterleavedPacket? {
+        val preferredTypes = listOf(
+            "trackInfo",
+            "playbackState",
+            "volumeState",
+            "currentWord"
+        )
+        val selectedKey = preferredTypes.firstOrNull { type ->
+            latestInterleavedPackets[type]?.device?.address == deviceAddress
+        } ?: latestInterleavedPackets.entries.firstOrNull {
+            it.value.device.address == deviceAddress
+        }?.key ?: return null
+        return latestInterleavedPackets.remove(selectedKey)
     }
 
     private fun markJobFailed(job: SendJob, reason: String) {
@@ -633,5 +754,8 @@ class BleNotifyQueue(
         private const val OTHER_LONG_JOB_INTERLEAVE_INTERVAL = 5
         private const val INTERLEAVED_LOG_THROTTLE_MS = 10_000L
         private const val NOTIFY_REQUEST_REJECTED_STATUS = -1
+        private const val NOTIFY_CALLBACK_TIMEOUT_STATUS = -2
+        private const val NOTIFY_CALLBACK_TIMEOUT_MS = 2_000L
+        private const val CANCELLED_CALLBACK_DRAIN_MS = 750L
     }
 }

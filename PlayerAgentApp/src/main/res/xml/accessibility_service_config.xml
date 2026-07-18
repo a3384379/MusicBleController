@@ -5,5 +5,5 @@
     android:accessibilityFlags="flagDefault|flagReportViewIds|flagIncludeNotImportantViews"
     android:canRetrieveWindowContent="true"
     android:description="@string/accessibility_service_description"
-    android:notificationTimeout="100"
+    android:notificationTimeout="500"
     android:packageNames="com.tencent.qqmusic" />

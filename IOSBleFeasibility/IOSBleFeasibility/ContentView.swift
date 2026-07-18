@@ -245,10 +245,10 @@ struct ContentView: View {
     }
 
     private var darkTrackInfoSection: some View {
-        HStack(spacing: 34) {
-            albumArtwork(size: 214)
+        HStack(spacing: 27) {
+            albumArtwork(size: 204)
 
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 11) {
                 Text(nowPlayingInfo.title)
                     .font(.system(size: 34, weight: .bold, design: .rounded))
                     .foregroundStyle(.white)
@@ -256,17 +256,17 @@ struct ContentView: View {
                     .minimumScaleFactor(0.58)
 
                 Text(nowPlayingInfo.artist)
-                    .font(.system(size: 22, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.76))
+                    .font(.system(size: 21, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.74))
                     .lineLimit(1)
 
                 Text("专辑 · \(nowPlayingInfo.album)")
-                    .font(.system(size: 16, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.48))
+                    .font(.system(size: 15, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.46))
                     .lineLimit(1)
 
                 DarkPlaybackStatusBadge(state: uiState.playback)
-                    .padding(.top, 10)
+                    .padding(.top, 8)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -276,35 +276,43 @@ struct ContentView: View {
         HStack(spacing: 22) {
             DarkLyricSideDots(color: uiState.playback.accentColor)
 
-            VStack(spacing: 18) {
+            VStack(spacing: 12) {
                 Text(lyricPreviewLine(offset: -1))
-                    .font(.system(size: 20, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.42))
+                    .font(.system(size: 16, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.38))
                     .multilineTextAlignment(.center)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.7)
+                    .truncationMode(.tail)
+                    .minimumScaleFactor(0.78)
+                    .frame(maxWidth: .infinity, minHeight: 20, maxHeight: 20)
 
                 KaraokeLyricText(
                     text: lyricPreviewLine(offset: 0),
                     progress: currentLyricProgress,
                     words: lyricPreviewLineModel(offset: 0)?.words ?? [],
                     positionMs: karaokePositionMs,
-                    highlightColor: uiState.playback.accentColor,
-                    normalColor: Color.white.opacity(0.94),
-                    font: .system(size: 34, weight: .bold, design: .rounded),
+                    highlightColor: uiState.playback.accentColor.opacity(0.92),
+                    normalColor: Color.white.opacity(0.90),
+                    font: .system(size: 27, weight: .semibold, design: .rounded),
                     lineLimit: 2,
                     alignment: .center
                 )
-                .minimumScaleFactor(0.62)
-                .frame(maxWidth: .infinity)
-                .transition(.opacity.combined(with: .move(edge: .bottom)))
+                .minimumScaleFactor(0.76)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, minHeight: 64, maxHeight: 64)
+                .clipped()
+                .id(lyricPreviewIdentity)
+                .transition(.opacity)
+                .animation(.easeInOut(duration: 0.18), value: lyricPreviewIdentity)
 
                 Text(lyricPreviewLine(offset: 1))
-                    .font(.system(size: 21, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.48))
+                    .font(.system(size: 16, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.40))
                     .multilineTextAlignment(.center)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.7)
+                    .truncationMode(.tail)
+                    .minimumScaleFactor(0.78)
+                    .frame(maxWidth: .infinity, minHeight: 20, maxHeight: 20)
 
                 GeometryReader { proxy in
                     DarkLyricRhythmLine(
@@ -314,14 +322,12 @@ struct ContentView: View {
                         wordSignature: "\(bleManager.currentWordLineIndex):\(bleManager.currentWordIndex)",
                         positionMs: karaokePositionMs
                     )
-                        .frame(width: proxy.size.width * 0.5, height: 48)
+                        .frame(width: proxy.size.width * 0.5, height: 36)
                         .frame(maxWidth: .infinity)
                 }
-                .frame(height: 48)
-                .padding(.top, 10)
+                .frame(height: 36)
             }
-            .id(lyricPreviewIdentity)
-            .animation(.easeInOut(duration: 0.24), value: lyricPreviewIdentity)
+            .frame(maxWidth: .infinity, minHeight: 176, maxHeight: 176)
             .contentShape(Rectangle())
             .onTapGesture {
                 if bleManager.fullLyrics.isEmpty {
@@ -407,7 +413,7 @@ struct ContentView: View {
         HStack(spacing: 16) {
             Image(systemName: volumeIcon)
                 .font(.system(size: 20, weight: .semibold))
-                .foregroundStyle(.white)
+                .foregroundStyle(.white.opacity(0.92))
                 .frame(width: 26)
 
             Slider(
@@ -438,9 +444,16 @@ struct ContentView: View {
 
             Text("\(displayedVolume) / \(bleManager.volumeMax)")
                 .font(.system(size: 15, weight: .semibold, design: .rounded).monospacedDigit())
-                .foregroundStyle(.white.opacity(0.84))
+                .foregroundStyle(.white.opacity(0.80))
                 .frame(width: 64, alignment: .trailing)
                 .contentTransition(.numericText())
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 48)
+        .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(.white.opacity(0.07), lineWidth: 1)
         }
         .disabled(!isConnected)
         .opacity(isConnected ? 1 : 0.48)
@@ -1133,17 +1146,17 @@ private struct PlayerBackgroundView: View {
                     Image(uiImage: image)
                         .resizable()
                         .scaledToFill()
-                        .saturation(1.15)
-                        .brightness(-0.08)
+                        .saturation(1.22)
+                        .brightness(-0.12)
                         .frame(width: proxy.size.width, height: proxy.size.height)
                         .clipped()
-                        .blur(radius: 34)
-                        .overlay(Color.black.opacity(0.28))
+                        .blur(radius: 30)
+                        .overlay(Color.black.opacity(0.40))
                 } else {
                     LinearGradient(
                         colors: [
-                            Color(red: 0.04, green: 0.09, blue: 0.16),
-                            Color(red: 0.12, green: 0.18, blue: 0.28),
+                            Color(red: 0.02, green: 0.05, blue: 0.09),
+                            Color(red: 0.08, green: 0.12, blue: 0.18),
                             Color(red: 0.02, green: 0.03, blue: 0.06)
                         ],
                         startPoint: .topLeading,
@@ -1154,12 +1167,23 @@ private struct PlayerBackgroundView: View {
 
                 LinearGradient(
                     colors: [
-                        Color.black.opacity(0.28),
-                        Color.black.opacity(0.12),
-                        Color.black.opacity(0.80)
+                        Color.black.opacity(0.42),
+                        Color.black.opacity(0.10),
+                        Color.black.opacity(0.84)
                     ],
                     startPoint: .top,
                     endPoint: .bottom
+                )
+                .frame(width: proxy.size.width, height: proxy.size.height)
+
+                RadialGradient(
+                    colors: [
+                        .clear,
+                        Color.black.opacity(0.28)
+                    ],
+                    center: .center,
+                    startRadius: min(proxy.size.width, proxy.size.height) * 0.24,
+                    endRadius: max(proxy.size.width, proxy.size.height) * 0.70
                 )
                 .frame(width: proxy.size.width, height: proxy.size.height)
             }
@@ -1338,10 +1362,10 @@ private struct DarkPlaybackStatusBadge: View {
     let state: DarkPlaybackVisualState
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 7) {
             if state == .playing {
-                MicroWaveformBars(color: state.accentColor, height: 18, animated: true)
-                    .frame(width: 25, height: 18)
+                MicroWaveformBars(color: state.accentColor.opacity(0.92), height: 15, animated: true)
+                    .frame(width: 22, height: 15)
             } else if state == .loading || state == .reconnecting {
                 ProgressView()
                     .progressViewStyle(.circular)
@@ -1354,14 +1378,14 @@ private struct DarkPlaybackStatusBadge: View {
             }
 
             Text(state.title)
-                .font(.system(size: 15, weight: .bold, design: .rounded))
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
         }
-        .foregroundStyle(state.accentColor)
-        .padding(.horizontal, 13)
-        .padding(.vertical, 8)
-        .background(state.accentColor.opacity(0.12), in: Capsule())
+        .foregroundStyle(state.accentColor.opacity(0.92))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(state.accentColor.opacity(0.10), in: Capsule())
         .overlay {
-            Capsule().stroke(state.accentColor.opacity(0.14), lineWidth: 1)
+            Capsule().strokeBorder(state.accentColor.opacity(0.12), lineWidth: 1)
         }
     }
 }
@@ -1377,28 +1401,29 @@ private struct DarkDynamicPlayButton: View {
         Button(action: action) {
             ZStack {
                 Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [
-                                state.accentColor.opacity(0.95),
-                                state.accentColor.opacity(0.72),
-                                Color.black.opacity(0.28)
-                            ],
-                            center: .topLeading,
-                            startRadius: 2,
-                            endRadius: 58
-                        )
-                    )
-                    .frame(width: 88, height: 88)
+                    .fill(Color.black.opacity(0.30))
+                    .background(.ultraThinMaterial, in: Circle())
+                    .frame(width: 86, height: 86)
+                    .overlay(alignment: .topLeading) {
+                        Circle()
+                            .fill(state.accentColor.opacity(state == .playing ? 0.18 : 0.10))
+                            .blur(radius: 12)
+                            .padding(12)
+                    }
                     .overlay {
                         Circle()
-                            .strokeBorder(.white.opacity(0.22), lineWidth: 1)
+                            .strokeBorder(state.accentColor.opacity(state == .playing ? 0.72 : 0.52), lineWidth: 1)
+                    }
+                    .overlay {
+                        Circle()
+                            .strokeBorder(.white.opacity(0.09), lineWidth: 1)
+                            .padding(1)
                     }
                     .shadow(
-                        color: state == .playing ? state.accentColor.opacity(isPulsing ? 0.58 : 0.22) : .clear,
-                        radius: state == .playing ? (isPulsing ? 24 : 10) : 0
+                        color: state == .playing ? state.accentColor.opacity(isPulsing ? 0.28 : 0.12) : .clear,
+                        radius: state == .playing ? (isPulsing ? 18 : 8) : 0
                     )
-                    .scaleEffect(state == .playing && isPulsing ? 1.035 : 1.0)
+                    .scaleEffect(state == .playing && isPulsing ? 1.018 : 1.0)
 
                 if state == .loading || state == .reconnecting {
                     ProgressView()
@@ -1407,8 +1432,8 @@ private struct DarkDynamicPlayButton: View {
                         .scaleEffect(1.18)
                 } else {
                     Image(systemName: state.icon)
-                        .font(.system(size: 34, weight: .bold))
-                        .foregroundStyle(.white)
+                        .font(.system(size: 33, weight: .bold))
+                        .foregroundStyle(state == .paused ? .white.opacity(0.94) : .white)
                 }
             }
             .contentShape(Circle())
@@ -1476,13 +1501,13 @@ private struct DarkLyricRhythmLine: View {
     private var opacity: Double {
         switch state {
         case .playing:
-            return 0.78
+            return 0.62
         case .paused:
-            return 0.36
+            return 0.27
         case .loading, .reconnecting:
-            return 0.28
+            return 0.22
         case .stopped:
-            return 0.18
+            return 0.14
         }
     }
 

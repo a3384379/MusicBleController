@@ -30,6 +30,10 @@ class QrcPersistentIndexManager(
     private var metadata: IndexMetadata? = null
     private var dirty = false
 
+    fun shutdown() {
+        rebuildExecutor.shutdownNow()
+    }
+
     fun getIndex(forceRefresh: Boolean = false): List<QrcGroupIndexEntry> {
         val snapshot = directorySnapshot()
         synchronized(lock) {
@@ -88,6 +92,41 @@ class QrcPersistentIndexManager(
         }
         logger("[QrcIndex] rebuild required reason=$reason")
         return rebuild(snapshot)
+    }
+
+    /**
+     * Foreground lyric lookup must never synchronously walk the entire QQ qrc
+     * directory just to validate an index.  On a populated device that walk can
+     * take several seconds and makes the first lyric request look stalled.
+     *
+     * Return the last persisted/memory index immediately and validate it on the
+     * dedicated background executor.  FileObserver marks the index dirty when QQ
+     * writes a new group, so the following lookup sees the refreshed index.
+     */
+    fun getIndexForForeground(): List<QrcGroupIndexEntry> {
+        val inMemory = synchronized(lock) { entries.takeIf { it.isNotEmpty() } }
+        if (inMemory != null) {
+            if (isDirty()) {
+                rebuildAsync("foreground index dirty")
+            }
+            logger("[QrcIndex] foreground memory hit entries=${inMemory.size}")
+            return inMemory
+        }
+
+        val persisted = loadFromDiskAllowStale()
+        if (persisted != null) {
+            synchronized(lock) {
+                entries = persisted.entries
+                metadata = persisted.metadata
+            }
+            logger("[QrcIndex] foreground stale index used entries=${persisted.entries.size}")
+            rebuildAsync("foreground index validation")
+            return persisted.entries
+        }
+
+        logger("[QrcIndex] foreground unavailable reason=index missing")
+        rebuildAsync("foreground index missing")
+        return emptyList()
     }
 
     fun markDirty(groupId: String? = null) {

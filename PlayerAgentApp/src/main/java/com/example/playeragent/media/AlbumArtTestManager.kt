@@ -33,10 +33,13 @@ class AlbumArtTestManager(
         logger("[AlbumArtTest] finished")
     }
 
-    fun readCurrentNotificationAlbumArt(): NotificationAlbumArt? {
+    fun readCurrentNotificationAlbumArt(
+        expectedTitle: String = "",
+        expectedArtist: String = ""
+    ): NotificationAlbumArt? {
         val candidates = mutableListOf<AlbumArtCandidate>()
         candidates += readMediaMetadataCandidates()
-        candidates += readNotificationCandidates()
+        candidates += readNotificationCandidates(expectedTitle, expectedArtist)
         logger("[AlbumArtSource] candidates count=${candidates.size}")
         if (candidates.isEmpty()) {
             logger("[AlbumArtDebug] unavailable reason=no album art candidate")
@@ -60,7 +63,7 @@ class AlbumArtTestManager(
 
         val selected = valid.maxWithOrNull(
             compareBy<AlbumArtCandidate> { it.bitmap.width.toLong() * it.bitmap.height.toLong() }
-                .thenByDescending { it.priority }
+                .thenBy { it.priority }
         ) ?: return null
         valid.filter { it !== selected }.forEach { candidate ->
             logger(
@@ -124,9 +127,7 @@ class AlbumArtTestManager(
             return
         }
 
-        val controller = controllers.firstOrNull {
-            it.playbackState?.state == PlaybackState.STATE_PLAYING
-        } ?: controllers.firstOrNull()
+        val controller = selectQqMusicController(controllers)
         val metadata = controller?.metadata
 
         logBitmap(
@@ -164,9 +165,7 @@ class AlbumArtTestManager(
             logger("[AlbumArtSource] metadata unavailable reason=${exception.message}")
             return emptyList()
         }
-        val controller = controllers.firstOrNull {
-            it.playbackState?.state == PlaybackState.STATE_PLAYING
-        } ?: controllers.firstOrNull()
+        val controller = selectQqMusicController(controllers)
         val metadata = controller?.metadata
         return listOfNotNull(
             albumArtCandidate(
@@ -187,7 +186,10 @@ class AlbumArtTestManager(
         )
     }
 
-    private fun readNotificationCandidates(): List<AlbumArtCandidate> {
+    private fun readNotificationCandidates(
+        expectedTitle: String,
+        expectedArtist: String
+    ): List<AlbumArtCandidate> {
         if (!isNotificationAccessEnabled() ||
             !PlayerNotificationListenerService.isConnected()
         ) {
@@ -195,7 +197,9 @@ class AlbumArtTestManager(
             return emptyList()
         }
         val selected = selectMusicNotification(
-            PlayerNotificationListenerService.activeNotificationsSnapshot()
+            PlayerNotificationListenerService.activeNotificationsSnapshot(),
+            expectedTitle,
+            expectedArtist
         ) ?: run {
             logger("[AlbumArtSource] notificationLargeIcon size=missing")
             return emptyList()
@@ -275,11 +279,32 @@ class AlbumArtTestManager(
     }
 
     private fun selectMusicNotification(
-        notifications: List<StatusBarNotification>
+        notifications: List<StatusBarNotification>,
+        expectedTitle: String = "",
+        expectedArtist: String = ""
     ): StatusBarNotification? {
-        return notifications.firstOrNull {
-            it.packageName == QQ_MUSIC_PACKAGE
+        val qqNotifications = notifications.filter { it.packageName == QQ_MUSIC_PACKAGE }
+        if (expectedTitle.isBlank()) {
+            return qqNotifications.firstOrNull()
         }
+        return qqNotifications.firstOrNull { notification ->
+            val extras = notification.notification.extras
+            val title = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
+            val artist = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
+            title.isBlank() ||
+                (title.equals(expectedTitle, ignoreCase = true) &&
+                    (expectedArtist.isBlank() || artist.isBlank() ||
+                        artist.contains(expectedArtist, ignoreCase = true)))
+        }
+    }
+
+    private fun selectQqMusicController(
+        controllers: List<android.media.session.MediaController>
+    ): android.media.session.MediaController? {
+        val qqControllers = controllers.filter { it.packageName == QQ_MUSIC_PACKAGE }
+        return qqControllers.firstOrNull {
+            it.playbackState?.state == PlaybackState.STATE_PLAYING
+        } ?: qqControllers.firstOrNull()
     }
 
     private fun logNotificationResult(notification: Notification?) {
@@ -401,9 +426,7 @@ class AlbumArtTestManager(
                 )
                 visiblePixels += 1
             }
-            visiblePixels > 0 &&
-                colorBuckets.size <= 10 &&
-                colorfulPixels * 20 <= visiblePixels
+            visiblePixels == 0 || (bitmap.width <= 16 && bitmap.height <= 16)
         } finally {
             if (sampled !== bitmap) sampled.recycle()
         }
@@ -424,6 +447,6 @@ class AlbumArtTestManager(
         private const val QQ_MUSIC_PACKAGE = "com.tencent.qqmusic"
         private const val SOURCE_PRIORITY_METADATA = 2
         private const val SOURCE_PRIORITY_NOTIFICATION = 1
-        private const val DEBUG_ART_DIAGNOSTICS = true
+        private const val DEBUG_ART_DIAGNOSTICS = false
     }
 }

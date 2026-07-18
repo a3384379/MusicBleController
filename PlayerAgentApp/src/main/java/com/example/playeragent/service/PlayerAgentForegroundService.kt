@@ -151,7 +151,8 @@ class PlayerAgentForegroundService : Service() {
                 return@post
             }
             ensureBleStackStarted("service start")
-            log("[QrcWatcher] startup auto watcher disabled; use Debug Tools manual start")
+            startQrcWatcher()
+            log("[QrcWatcher] startup auto watcher enabled")
             log("[LyricWarmup] startup auto warmup disabled; use Debug Tools manual warmup")
         }
     }

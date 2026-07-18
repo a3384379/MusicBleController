@@ -8,6 +8,7 @@ import java.io.FileOutputStream
 import java.util.LinkedHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 class QrcLyricCacheManager(
@@ -255,11 +256,12 @@ class QrcLyricCacheManager(
 
     @Synchronized
     fun readBySongKey(songKey: String): ParsedLyric? {
-        val file = songCacheFile(songKey)
+        val canonicalSongKey = canonicalSongKey(songKey)
+        val file = songCacheFile(canonicalSongKey)
         if (!file.exists()) {
             return null
         }
-        return readCacheFile(file, expectedSongKey = songKey)
+        return readCacheFile(file, expectedSongKey = canonicalSongKey)
     }
 
     @Synchronized
@@ -271,9 +273,29 @@ class QrcLyricCacheManager(
         return readCacheFile(file, expectedSongKey = null)
     }
 
-    @Synchronized
     fun save(parsed: ParsedLyric) {
-        saveToDirectory(parsed, cacheRoot(), updateMemory = true)
+        if (parsed.lines.isEmpty()) {
+            return
+        }
+        val canonicalParsed = parsed.withCanonicalSongKey()
+        synchronized(this) {
+            memoryCache[canonicalParsed.songKey] = canonicalParsed
+            clearSharedFuzzyIndex()
+        }
+        pendingWrites[canonicalParsed.songKey] = canonicalParsed
+        cacheWriteExecutor.execute {
+            val latest = pendingWrites.remove(canonicalParsed.songKey) ?: return@execute
+            synchronized(cacheWriteLock) {
+                runCatching {
+                    saveToDirectory(latest, cacheRoot(), updateMemory = false)
+                }.onFailure { exception ->
+                    logger(
+                        "[QrcCache] async save failed songKey=${latest.songKey} " +
+                            "error=${exception.message}"
+                    )
+                }
+            }
+        }
     }
 
     @Synchronized
@@ -285,24 +307,25 @@ class QrcLyricCacheManager(
         if (parsed.lines.isEmpty()) {
             return
         }
+        val canonicalParsed = parsed.withCanonicalSongKey()
         directory.mkdirs()
-        val existing = readBySongKeyFromDirectory(parsed.songKey, directory)
-        if (existing != null && shouldKeepExisting(existing, parsed)) {
-            logger("[QrcPrebuild] duplicate songKey=${parsed.songKey} keep=existing")
+        val existing = readBySongKeyFromDirectory(canonicalParsed.songKey, directory)
+        if (existing != null && shouldKeepExisting(existing, canonicalParsed)) {
+            logger("[QrcPrebuild] duplicate songKey=${canonicalParsed.songKey} keep=existing")
             return
         }
 
-        val objectValue = toJson(parsed)
+        val objectValue = toJson(canonicalParsed)
         val text = objectValue.toString()
-        val songFile = songCacheFile(parsed.songKey, directory)
-        val groupFile = groupCacheFile(parsed.groupId, directory)
+        val songFile = songCacheFile(canonicalParsed.songKey, directory)
+        val groupFile = groupCacheFile(canonicalParsed.groupId, directory)
         writeAtomic(songFile, text)
         writeAtomic(groupFile, text)
         if (updateMemory) {
-            memoryCache[parsed.songKey] = parsed
+            memoryCache[canonicalParsed.songKey] = canonicalParsed
             clearSharedFuzzyIndex()
         }
-        logger("[QrcCache] saved songKey=${parsed.songKey} lines=${parsed.lines.size}")
+        logger("[QrcCache] saved songKey=${canonicalParsed.songKey} lines=${canonicalParsed.lines.size}")
     }
 
     @Synchronized
@@ -313,7 +336,10 @@ class QrcLyricCacheManager(
 
     @Synchronized
     fun saveAlias(sourceSongKey: String, targetSongKey: String) {
-        aliasCacheManager.saveAlias(sourceSongKey, targetSongKey)
+        aliasCacheManager.saveAlias(
+            canonicalSongKey(sourceSongKey),
+            canonicalSongKey(targetSongKey)
+        )
         sharedStats.aliasSaved += 1
         maybeLogStats()
     }
@@ -495,13 +521,14 @@ class QrcLyricCacheManager(
     }
 
     fun readBySongKeyFromDirectory(songKey: String, directory: File): ParsedLyric? {
-        val file = songCacheFile(songKey, directory)
+        val canonicalSongKey = canonicalSongKey(songKey)
+        val file = songCacheFile(canonicalSongKey, directory)
         if (!file.exists()) {
             return null
         }
         return readCacheFileDetailed(
             file = file,
-            expectedSongKey = songKey,
+            expectedSongKey = canonicalSongKey,
             allowStale = true
         ).parsed
     }
@@ -919,12 +946,10 @@ class QrcLyricCacheManager(
             logger("[QrcCacheIndex] fuzzy skipped reason=index warming")
             return emptyList()
         }
-        if (MaintenanceGuard.shouldDeferMaintenance(MaintenanceTaskType.FUZZY_INDEX_REBUILD, logger)) {
-            sharedIndexWarming.set(false)
-            logger("[QrcCacheIndex] fuzzy skipped reason=realtime_window")
-            return emptyList()
-        }
-        logger("[QrcCacheIndex] fuzzy skipped reason=index warming")
+        // This is the prerequisite for the foreground lyric lookup, not optional
+        // maintenance. Deferring it because that lookup is active creates a
+        // self-lock: every request sees an empty index and no request can warm it.
+        logger("[QrcCacheIndex] foreground bootstrap scheduled")
         fuzzyIndexExecutor.execute {
             try {
                 warmupFuzzyIndex(force = true)
@@ -1029,6 +1054,20 @@ class QrcLyricCacheManager(
         return File(directory, "${QrcLyricUtils.cacheKey(songKey)}.json")
     }
 
+    private fun canonicalSongKey(songKey: String): String {
+        val parts = songKey.split("|", limit = 3)
+        return if (parts.size == 3) {
+            QrcLyricUtils.buildSongKey(parts[0], parts[1], parts[2])
+        } else {
+            QrcLyricUtils.normalizeForMatch(songKey)
+        }
+    }
+
+    private fun ParsedLyric.withCanonicalSongKey(): ParsedLyric {
+        val canonicalSongKey = canonicalSongKey(songKey)
+        return if (canonicalSongKey == songKey) this else copy(songKey = canonicalSongKey)
+    }
+
     private fun groupCacheFile(groupId: String, directory: File): File {
         return File(directory, "group_$groupId.json")
     }
@@ -1126,7 +1165,10 @@ class QrcLyricCacheManager(
 
     private fun writeAtomic(file: File, text: String) {
         file.parentFile?.mkdirs()
-        val temp = File(file.parentFile, "${file.name}.tmp")
+        val temp = File(
+            file.parentFile,
+            ".${file.name}.${System.nanoTime()}.${Thread.currentThread().id}.tmp"
+        )
         FileOutputStream(temp).use { output ->
             val bytes = text.toByteArray(Charsets.UTF_8)
             output.write(bytes)
@@ -1249,9 +1291,20 @@ class QrcLyricCacheManager(
         private var sharedIndexFileCount: Int = -1
         private val sharedIndexWarming = AtomicBoolean(false)
         private val fuzzyIndexReadyListeners = CopyOnWriteArrayList<(QrcFuzzyIndexStatus) -> Unit>()
+        private val cacheWriteLock = Any()
+        private val pendingWrites = ConcurrentHashMap<String, ParsedLyric>()
+        private val cacheWriteExecutor = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "QrcCacheWriteThread").apply {
+                priority = Thread.MIN_PRIORITY
+            }
+        }
 
         fun addFuzzyIndexReadyListener(listener: (QrcFuzzyIndexStatus) -> Unit) {
             fuzzyIndexReadyListeners += listener
+        }
+
+        fun removeFuzzyIndexReadyListener(listener: (QrcFuzzyIndexStatus) -> Unit) {
+            fuzzyIndexReadyListeners -= listener
         }
 
         private fun notifyFuzzyIndexReady(entries: Int) {

@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="760" viewBox="0 0 1120 760">
+  <rect width="1120" height="760" fill="#f4f6f8"/>
+  <text x="560" y="42" text-anchor="middle" font-family="Arial, 'PingFang SC', sans-serif" font-size="28" font-weight="700" fill="#111827">Sony PlayerAgent Debug UI 结构图（由 MainActivity.kt 生成）</text>
+  <text x="560" y="74" text-anchor="middle" font-family="Arial, 'PingFang SC', sans-serif" font-size="15" fill="#667085">服务控制、BLE 健康、当前歌曲、歌词缓存维护与日志诊断集中在 Sony 端调试页</text>
+
+  <g transform="translate(78 112)" font-family="Arial, 'PingFang SC', sans-serif">
+    <rect width="405" height="586" rx="28" fill="#111318"/>
+    <text x="202" y="42" text-anchor="middle" font-size="22" font-weight="700" fill="#fff">PlayerAgent 调试页</text>
+
+    <g transform="translate(24 70)">
+      <rect width="357" height="92" rx="14" fill="#1c2028"/>
+      <text x="18" y="29" font-size="17" font-weight="700" fill="#fff">控制服务</text>
+      <text x="18" y="56" font-size="14" fill="#cbd5e1">Service：运行中 / 未启动</text>
+      <text x="18" y="78" font-size="14" fill="#cbd5e1">BLE：可发现、已订阅、可控制、疑似异常</text>
+      <rect x="250" y="22" width="84" height="32" rx="16" fill="#22c55e"/>
+      <text x="292" y="44" text-anchor="middle" font-size="13" fill="#052e16">可控制</text>
+    </g>
+
+    <g transform="translate(24 178)">
+      <rect width="357" height="76" rx="14" fill="#1c2028"/>
+      <text x="18" y="29" font-size="17" font-weight="700" fill="#fff">当前歌曲</text>
+      <text x="18" y="55" font-size="14" fill="#cbd5e1">标题、歌词状态、封面状态、刷新当前歌词</text>
+    </g>
+
+    <g transform="translate(24 270)">
+      <rect width="357" height="246" rx="14" fill="#1c2028"/>
+      <text x="18" y="31" font-size="18" font-weight="700" fill="#fff">歌词缓存与逐字时间</text>
+      <g transform="translate(18 54)">
+        <rect width="321" height="40" rx="9" fill="#273044"/>
+        <text x="16" y="26" font-size="14" fill="#fff">构建任务：状态、当前任务、进度、提示</text>
+      </g>
+      <g transform="translate(18 104)">
+        <rect width="321" height="40" rx="9" fill="#273044"/>
+        <text x="16" y="26" font-size="14" fill="#fff">QRC 索引：条目、Alias、Negative、Fuzzy</text>
+      </g>
+      <g transform="translate(18 154)">
+        <rect width="321" height="40" rx="9" fill="#273044"/>
+        <text x="16" y="26" font-size="14" fill="#fff">歌词预热：活动缓存、V2 逐字、行级</text>
+      </g>
+      <g transform="translate(18 204)">
+        <rect width="321" height="28" rx="8" fill="#2563eb"/>
+        <text x="160" y="20" text-anchor="middle" font-size="14" fill="#fff">按钮随状态变更：开始 / 暂停 / 继续 / 停止</text>
+      </g>
+    </g>
+
+    <g transform="translate(24 532)">
+      <rect width="357" height="34" rx="10" fill="#0f172a"/>
+      <text x="18" y="23" font-size="13" fill="#cbd5e1">底部摘要：增量成功、失败、Watcher pending、builtAt</text>
+    </g>
+  </g>
+
+  <g transform="translate(560 128)" font-family="Arial, 'PingFang SC', sans-serif">
+    <text x="0" y="0" font-size="22" font-weight="700" fill="#1f2937">状态驱动分区</text>
+    <g font-size="16" fill="#374151">
+      <text x="0" y="42">1. 控制服务：启动 / 停止 / 恢复蓝牙服务</text>
+      <text x="0" y="78">2. BLE 健康：Service 与 BLE 链路分开显示</text>
+      <text x="0" y="114">3. 当前歌曲：歌词状态、封面状态、刷新当前歌词</text>
+      <text x="0" y="150">4. 构建任务：V2 缓存构建、暂停、继续、停止</text>
+      <text x="0" y="186">5. QRC 索引：重建索引、重建模糊索引</text>
+      <text x="0" y="222">6. 歌词预热：预热缓存、取消预热</text>
+      <text x="0" y="258">7. 缓存维护：修复旧缓存、删除备份、清临时构建</text>
+      <text x="0" y="294">8. 日志与统计：可折叠，避免默认占用主界面</text>
+    </g>
+
+    <text x="0" y="360" font-size="22" font-weight="700" fill="#1f2937">UI 约束</text>
+    <rect x="0" y="384" width="460" height="152" rx="16" fill="#ffffff" stroke="#d0d5dd"/>
+    <text x="24" y="422" font-size="16" fill="#344054">• 不再把“服务运行中”等同于“BLE 可控制”</text>
+    <text x="24" y="456" font-size="16" fill="#344054">• 没有任务时，按钮不能显示“正在执行”</text>
+    <text x="24" y="490" font-size="16" fill="#344054">• 刷新任务信息时只更新文本，不让整页闪动</text>
+    <text x="24" y="524" font-size="16" fill="#344054">• 危险操作需要确认，维护任务不能阻塞当前歌曲</text>
+  </g>
+</svg>

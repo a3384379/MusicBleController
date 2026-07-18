@@ -154,7 +154,7 @@ class QrcDirectoryWatcher(
     }
 
     companion object {
-        private const val DEBOUNCE_MS = 5_000L
+        private const val DEBOUNCE_MS = 1_000L
         private const val MAX_BATCH_GROUPS = 20
         private const val EVENT_MASK =
                 FileObserver.CREATE or

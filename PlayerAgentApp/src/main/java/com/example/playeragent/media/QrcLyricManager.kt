@@ -33,6 +33,16 @@ class QrcLyricManager(
     private val parsedQrcCache = mutableMapOf<String, ParsedQrc?>()
     private val uncertainMissCooldown = mutableMapOf<String, QrcCooldownEntry>()
 
+    fun close() {
+        persistentIndexManager.shutdown()
+        synchronized(this) {
+            songGroupCache.clear()
+            songLinesCache.clear()
+            parsedQrcCache.clear()
+            uncertainMissCooldown.clear()
+        }
+    }
+
     @Synchronized
     fun load(title: String, artist: String, album: String): Boolean {
         return loadWithResult(title, artist, album).success
@@ -210,7 +220,11 @@ class QrcLyricManager(
         )
 
         val indexStartedAt = System.currentTimeMillis()
-        val entries = getIndexEntries(forceRefresh = false)
+        val entries = if (allowIndexRefresh) {
+            getIndexEntries(forceRefresh = false)
+        } else {
+            getIndexEntriesForForeground()
+        }
         trace(
             traceId,
             "qrcIndex",
@@ -318,14 +332,22 @@ class QrcLyricManager(
                 "[QrcLyric] best group=${best?.entry?.groupId ?: "none"} " +
                     "score=${best?.score ?: 0}"
             )
-            logger("[QrcLyric] skip negative cache reason=uncertain qrc match")
-            saveUncertainCooldown(songKey)
-            val retryable = searchResult.producerCandidateCount == 0 ||
-                cacheManager.isFuzzyIndexWarming()
-            val reason = if (retryable && searchResult.producerCandidateCount == 0) {
-                "waiting qqmusic lyric cache"
+            val cacheIndexWarming = cacheManager.isFuzzyIndexWarming()
+            if (cacheIndexWarming) {
+                // The cache index completion listener immediately retries this song.
+                // Do not poison that retry with a cooldown created from an incomplete
+                // candidate set.
+                logger("[QrcLyric] skip uncertain cooldown reason=cache index warming")
             } else {
-                "no safe qrc candidate"
+                logger("[QrcLyric] skip negative cache reason=uncertain qrc match")
+                saveUncertainCooldown(songKey)
+            }
+            val retryable = searchResult.producerCandidateCount == 0 || cacheIndexWarming
+            val reason = when {
+                cacheIndexWarming -> "cache index warming"
+                retryable && searchResult.producerCandidateCount == 0 ->
+                "waiting qqmusic lyric cache"
+                else -> "no safe qrc candidate"
             }
             trace(
                 traceId,
@@ -610,6 +632,10 @@ class QrcLyricManager(
 
     private fun getIndexEntries(forceRefresh: Boolean): List<QrcGroupIndexEntry> {
         return persistentIndexManager.getIndex(forceRefresh = forceRefresh)
+    }
+
+    private fun getIndexEntriesForForeground(): List<QrcGroupIndexEntry> {
+        return persistentIndexManager.getIndexForForeground()
     }
 
     private fun refreshIndexIfChanged(reason: String): List<QrcGroupIndexEntry>? {
@@ -1166,6 +1192,14 @@ class QrcLyricManager(
     fun removeUncertainCooldown(songKey: String, reason: String) {
         if (uncertainMissCooldown.remove(songKey) != null) {
             logger("[QrcCooldown] removed songKey=$songKey reason=$reason")
+        }
+    }
+
+    @Synchronized
+    fun clearUncertainCooldowns(reason: String) {
+        if (uncertainMissCooldown.isNotEmpty()) {
+            uncertainMissCooldown.clear()
+            logger("[QrcCooldown] cleared all reason=$reason")
         }
     }
 

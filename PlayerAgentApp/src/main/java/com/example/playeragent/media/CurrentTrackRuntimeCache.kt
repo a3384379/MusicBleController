@@ -457,16 +457,22 @@ object CurrentTrackRuntimeCache {
         lines: List<RuntimeLyricLine>,
         positionMs: Long
     ): IndexedRuntimeWord? {
+        val currentLineIndex = findLatestLineIndex(lines, positionMs)
+        if (currentLineIndex < 0) {
+            return null
+        }
         var fallback: IndexedRuntimeWord? = null
-        lines.forEachIndexed { lineIndex, line ->
-            line.words.forEachIndexed { wordIndex, word ->
-                if (positionMs >= word.startMs) {
-                    val indexed = IndexedRuntimeWord(lineIndex, wordIndex, word)
-                    fallback = indexed
-                    if (word.durationMs <= 0L || positionMs < word.startMs + word.durationMs) {
-                        return indexed
-                    }
-                }
+        for (lineIndex in currentLineIndex downTo maxOf(0, currentLineIndex - 1)) {
+            val words = lines[lineIndex].words
+            val wordIndex = findLatestWordIndex(words, positionMs)
+            if (wordIndex < 0) {
+                continue
+            }
+            val word = words[wordIndex]
+            val indexed = IndexedRuntimeWord(lineIndex, wordIndex, word)
+            fallback = fallback ?: indexed
+            if (word.durationMs <= 0L || positionMs < word.startMs + word.durationMs) {
+                return indexed
             }
         }
         return fallback
@@ -476,34 +482,67 @@ object CurrentTrackRuntimeCache {
         lines: List<RuntimeLyricLine>,
         positionMs: Long
     ): IndexedRuntimeWord? {
-        var fallback: IndexedRuntimeWord? = null
-        lines.forEachIndexed { lineIndex, line ->
-            if (line.text.isBlank()) {
-                return@forEachIndexed
-            }
-            if (positionMs >= line.timeMs) {
-                val lineEndMs = when {
-                    line.durationMs > 0L -> line.timeMs + line.durationMs
-                    lineIndex + 1 < lines.size -> lines[lineIndex + 1].timeMs
-                    else -> line.timeMs
-                }
-                val indexed = IndexedRuntimeWord(
-                    lineIndex = lineIndex,
-                    wordIndex = -1,
-                    word = RuntimeLyricWord(
-                        startMs = line.timeMs,
-                        durationMs = (lineEndMs - line.timeMs).coerceAtLeast(0L),
-                        text = line.text
-                    ),
-                    hasWordTiming = false
-                )
-                fallback = indexed
-                if (positionMs < lineEndMs) {
-                    return indexed
-                }
+        var lineIndex = findLatestLineIndex(lines, positionMs)
+        while (lineIndex >= 0 && lines[lineIndex].text.isBlank()) {
+            lineIndex -= 1
+        }
+        if (lineIndex < 0) {
+            return null
+        }
+        val line = lines[lineIndex]
+        val lineEndMs = when {
+            line.durationMs > 0L -> line.timeMs + line.durationMs
+            lineIndex + 1 < lines.size -> lines[lineIndex + 1].timeMs
+            else -> line.timeMs
+        }
+        return IndexedRuntimeWord(
+            lineIndex = lineIndex,
+            wordIndex = -1,
+            word = RuntimeLyricWord(
+                startMs = line.timeMs,
+                durationMs = (lineEndMs - line.timeMs).coerceAtLeast(0L),
+                text = line.text
+            ),
+            hasWordTiming = false
+        )
+    }
+
+    private fun findLatestLineIndex(
+        lines: List<RuntimeLyricLine>,
+        positionMs: Long
+    ): Int {
+        var low = 0
+        var high = lines.lastIndex
+        var result = -1
+        while (low <= high) {
+            val mid = (low + high) ushr 1
+            if (lines[mid].timeMs <= positionMs) {
+                result = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
             }
         }
-        return fallback
+        return result
+    }
+
+    private fun findLatestWordIndex(
+        words: List<RuntimeLyricWord>,
+        positionMs: Long
+    ): Int {
+        var low = 0
+        var high = words.lastIndex
+        var result = -1
+        while (low <= high) {
+            val mid = (low + high) ushr 1
+            if (words[mid].startMs <= positionMs) {
+                result = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        return result
     }
 
     private data class IndexedRuntimeWord(
