@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/a3384379/MusicBleController/security/advisories/new
+    about: Report security-sensitive problems privately.
+  - name: Architecture and setup documentation
+    url: https://github.com/a3384379/MusicBleController/tree/master/docs
+    about: Review protocol, architecture, and smoke-test documentation before filing an issue.
