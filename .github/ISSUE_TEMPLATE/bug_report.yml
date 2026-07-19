@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a reproducible connection, lyric, artwork, control, cache, or UI problem.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: checkboxes
+    attributes:
+      label: Scope check
+      options:
+        - label: I reproduced this with QQ Music for Android.
+          required: true
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: I removed account details and device identifiers from logs.
+          required: true
+  - type: input
+    attributes:
+      label: Sony device
+      description: Model and Android version, for example NW-WM1AM2 / Android 11.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: iPhone and iOS
+      description: Model and iOS version.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: QQ Music version
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Start PlayerAgent...
+        2. Connect the iPhone...
+        3. Play or switch to...
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Redacted diagnostics
+      description: Add relevant iOS and Sony log excerpts. Do not upload complete private media caches.
+      render: shell

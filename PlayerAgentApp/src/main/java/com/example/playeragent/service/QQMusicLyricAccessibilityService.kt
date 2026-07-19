@@ -9,6 +9,7 @@ import android.media.MediaMetadata
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.Process
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
@@ -77,23 +78,14 @@ class QQMusicLyricAccessibilityService : AccessibilityService() {
                 return
             }
 
-            val eventType =
-                AccessibilityEvent.eventTypeToString(event.eventType)
-            val sourceState = try {
-                if (event.source == null) "null" else "present"
-            } catch (throwable: Throwable) {
-                "error=${throwable.javaClass.simpleName}"
+            val now = SystemClock.elapsedRealtime()
+            val shouldDumpTree = treeDumpRequested
+            if (!shouldDumpTree &&
+                now - lastTraversalAtElapsedMs < MIN_TRAVERSAL_INTERVAL_MS
+            ) {
+                return
             }
-            val eventText = try {
-                event.text?.joinToString(" | ").orEmpty()
-            } catch (throwable: Throwable) {
-                "error=${throwable.javaClass.simpleName}"
-            }
-            logDiagnostic(
-                "[AccessibilityLyric] event type=$eventType " +
-                    "packageName=${event.packageName} " +
-                    "source=$sourceState text=${field(eventText)}"
-            )
+            lastTraversalAtElapsedMs = now
 
             val root = try {
                 rootInActiveWindow
@@ -109,31 +101,28 @@ class QQMusicLyricAccessibilityService : AccessibilityService() {
                 return
             }
 
-            if (treeDumpRequested) {
+            if (shouldDumpTree) {
                 treeDumpRequested = false
                 dumpAccessibilityTree(root)
             }
             val currentMedia = readCurrentMedia()
             val traversal = collectTextViewTexts(root)
             latestTexts = traversal.texts
-            logDiagnostic(
-                "[AccessibilityLyric] node count=${traversal.nodeCount} " +
-                    "text count=${traversal.texts.size}"
-            )
-            traversal.texts.forEach { text ->
-                logLocalOnly("[AccessibilityLyric] text=$text")
-            }
-
-            traversal.texts.asSequence()
+            val candidate = traversal.texts.asSequence()
                 .filter { isLyricCandidate(it, currentMedia) }
-                .distinct()
-                .forEach { candidate ->
-                    latestCandidateLyric = candidate
-                    if (candidate != lastLoggedCandidate) {
-                        lastLoggedCandidate = candidate
-                        logImportant("[AccessibilityLyric] candidate=$candidate")
-                    }
+                .maxByOrNull { it.length }
+            if (candidate != null) {
+                latestCandidateLyric = candidate
+                if (candidate != lastLoggedCandidate) {
+                    lastLoggedCandidate = candidate
+                    logImportant("[AccessibilityLyric] candidate=$candidate")
                 }
+            } else if (shouldDumpTree) {
+                logImportant(
+                    "[AccessibilityLyric] no usable candidate " +
+                        "nodes=${traversal.nodeCount} texts=${traversal.texts.size}"
+                )
+            }
         } catch (throwable: Throwable) {
             recordThrowable(
                 "[AccessibilityCrash] onAccessibilityEvent",
@@ -284,7 +273,12 @@ class QQMusicLyricAccessibilityService : AccessibilityService() {
         currentMedia: CurrentMedia
     ): Boolean {
         val normalized = text.trim()
-        if (normalized.length !in MIN_CANDIDATE_LENGTH..MAX_CANDIDATE_LENGTH) {
+        if (normalized.length !in MIN_LYRIC_CANDIDATE_LENGTH..MAX_CANDIDATE_LENGTH ||
+            normalized in UI_LABELS ||
+            TIME_PATTERN.matches(normalized) ||
+            normalized.all { it.isDigit() || it in "+.-:/" } ||
+            normalized.none { it in '\u4e00'..'\u9fff' }
+        ) {
             return false
         }
 
@@ -434,6 +428,9 @@ class QQMusicLyricAccessibilityService : AccessibilityService() {
         @Volatile
         private var latestTexts: List<String> = emptyList()
 
+        @Volatile
+        private var lastTraversalAtElapsedMs = 0L
+
         fun isConnected(): Boolean = serviceConnected
 
         fun latestTextsSnapshot(): List<String> = latestTexts.toList()
@@ -463,11 +460,16 @@ class QQMusicLyricAccessibilityService : AccessibilityService() {
         private const val TAG = "AccessibilityLyric"
         private const val QQ_MUSIC_PACKAGE = "com.tencent.qqmusic"
         private const val MAX_TEXT_COUNT = 30
-        private const val MIN_CANDIDATE_LENGTH = 2
+        private const val MIN_LYRIC_CANDIDATE_LENGTH = 6
         private const val MAX_CANDIDATE_LENGTH = 80
         private const val MAX_TREE_NODE_COUNT = 300
         private const val MAX_TREE_FIELD_LENGTH = 100
+        private const val MIN_TRAVERSAL_INTERVAL_MS = 800L
         private const val TRUNCATED_SUFFIX = "...<truncated>"
         private const val CRASH_LOG_CHUNK_LENGTH = 220
+        private val TIME_PATTERN = Regex("^\\d{1,2}:\\d{2}$")
+        private val UI_LABELS = setOf(
+            "推荐", "歌曲", "歌词", "LIVE", "直播中", "制作团队", "off"
+        )
     }
 }

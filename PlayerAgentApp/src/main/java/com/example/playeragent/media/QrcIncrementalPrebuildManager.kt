@@ -49,31 +49,48 @@ class QrcIncrementalPrebuildManager(
             if (stopped.get()) {
                 return@execute
             }
+            // A QRC group that QQ Music has just written for the song currently
+            // playing is part of the foreground lyric path, not background cache
+            // maintenance.  Do not let a pending full-lyrics/album-art request
+            // postpone it: doing so leaves QQ Music showing lyrics while the
+            // receiver waits for the cache warm-up to finish.
+            val foregroundGroups = cleanGroupIds.filter(::isForegroundCurrentTrackGroup).toSet()
             val token = QrcMaintenanceCoordinator.tryStart(
                 MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD,
                 "groups=${cleanGroupIds.size}",
                 logger
             )
-            if (token == null) {
+            if (token == null && foregroundGroups.isEmpty()) {
                 logger("[QrcIncremental] skipped reason=maintenance busy groups=${cleanGroupIds.size}")
                 cleanGroupIds.forEach { incrementSkipped() }
                 return@execute
             }
             setRunning(true)
+            val handledGroups = linkedSetOf<String>()
             try {
                 cleanGroupIds.forEachIndexed { index, groupId ->
-                    if (stopped.get() || token.cancelled) {
+                    if (stopped.get() || token?.cancelled == true) {
                         return@forEachIndexed
                     }
-                    if (!MaintenanceGuard.yieldIfRealtimeWindow(
+                    val isForegroundGroup = groupId in foregroundGroups
+                    if (token == null && !isForegroundGroup) {
+                        logger("[QrcIncremental] skipped background groupId=$groupId reason=maintenance busy")
+                        incrementSkipped()
+                        return@forEachIndexed
+                    }
+                    if (!isForegroundGroup && !MaintenanceGuard.yieldIfRealtimeWindow(
                             MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD,
-                            token,
+                            token!!,
                             logger
                         )
                     ) {
                         return@forEachIndexed
                     }
+                    if (isForegroundGroup) {
+                        logger("[QrcIncremental] foreground bypass maintenance groupId=$groupId")
+                    }
                     processGroup(groupId, cleanGroupIds.size)
+                    handledGroups += groupId
                     if ((index + 1) % THROTTLE_INTERVAL == 0) {
                         Thread.sleep(THROTTLE_SLEEP_MS)
                     }
@@ -81,13 +98,13 @@ class QrcIncrementalPrebuildManager(
             } catch (exception: Exception) {
                 logger("[QrcIncremental] failed reason=${exception.message}")
                 incrementFailed()
-                QrcMaintenanceCoordinator.fail(token, exception, logger)
+                token?.let { QrcMaintenanceCoordinator.fail(it, exception, logger) }
                 return@execute
             } finally {
-                QrcMaintenanceCoordinator.finish(token, logger)
+                token?.let { QrcMaintenanceCoordinator.finish(it, logger) }
                 setRunning(false)
-                if (cleanGroupIds.isNotEmpty()) {
-                    onBatchProcessed(cleanGroupIds.toSet())
+                if (handledGroups.isNotEmpty()) {
+                    onBatchProcessed(handledGroups)
                 }
             }
         }
@@ -130,10 +147,10 @@ class QrcIncrementalPrebuildManager(
             incrementSkipped()
             return
         }
-        val currentTrack = currentTrackProvider()
-        val shouldTryCurrentTrack = currentTrack != null &&
-            !currentTrack.hasLyrics &&
-            isRecentForCurrentTrack(group, currentTrack)
+        val currentTrackAtStart = currentTrackProvider()
+        val shouldTryCurrentTrack = currentTrackAtStart != null &&
+            !currentTrackAtStart.hasLyrics &&
+            isRecentForCurrentTrack(group, currentTrackAtStart)
         if (!shouldTryCurrentTrack) {
             val validation = cacheManager.validateGroupCache(group, requireComplete = true)
             if (validation.valid) {
@@ -149,17 +166,24 @@ class QrcIncrementalPrebuildManager(
                 )
             }
         }
-        val parsed = try {
-            QrcLyricUtils.decryptAndParseGroup(group, logger)
-        } catch (exception: Exception) {
-            logger("[QrcIncremental] failed groupId=$groupId reason=${exception.message}")
-            null
-        }
+        val parsed = parseGroupWithRetry(group, foreground = shouldTryCurrentTrack)
         if (parsed == null || parsed.lines.isEmpty()) {
             logger("[QrcIncremental] failed groupId=$groupId reason=parse empty")
             persistentIndexManager.markDirty(groupId)
             incrementFailed()
             return
+        }
+
+        // QQ Music writes the sidecar before its MediaSession metadata changes.
+        // Parsing can overlap that transition, so refresh the snapshot here
+        // instead of matching the new group against the previous song.
+        val currentTrack = currentTrackProvider() ?: currentTrackAtStart
+        if (currentTrackAtStart?.trackId != currentTrack?.trackId) {
+            logger(
+                "[QrcIncremental] current track refreshed after parse " +
+                    "from=${currentTrackAtStart?.trackId.orEmpty()} " +
+                    "to=${currentTrack?.trackId.orEmpty()}"
+            )
         }
 
         var savedAny = false
@@ -223,13 +247,70 @@ class QrcIncrementalPrebuildManager(
         incrementSuccess()
     }
 
+    private fun parseGroupWithRetry(
+        group: QrcFileGroup,
+        foreground: Boolean
+    ): ParsedLyric? {
+        val delays = if (foreground) CURRENT_TRACK_PARSE_RETRY_DELAYS_MS else longArrayOf(0L)
+        delays.forEachIndexed { attempt, delayMs ->
+            if (delayMs > 0L) {
+                Thread.sleep(delayMs)
+            }
+            if (foreground && !isGroupStable(group)) {
+                logger(
+                    "[QrcIncremental] current file not stable " +
+                        "groupId=${group.groupId} attempt=${attempt + 1}"
+                )
+                return@forEachIndexed
+            }
+            val parsed = try {
+                QrcLyricUtils.decryptAndParseGroup(group, logger)
+            } catch (exception: Exception) {
+                logger(
+                    "[QrcIncremental] parse attempt failed groupId=${group.groupId} " +
+                        "attempt=${attempt + 1} reason=${exception.message}"
+                )
+                null
+            }
+            if (parsed != null && parsed.lines.isNotEmpty()) {
+                return parsed
+            }
+        }
+        return null
+    }
+
+    private fun isGroupStable(group: QrcFileGroup): Boolean {
+        val files = listOfNotNull(
+            group.qrcFile,
+            group.producerFile,
+            group.exFile,
+            group.translrcFile,
+            group.romaqrcFile
+        )
+        val first = files.associate { it.absolutePath to (it.length() to it.lastModified()) }
+        Thread.sleep(CURRENT_TRACK_STABILITY_SAMPLE_MS)
+        return files.all { file ->
+            first[file.absolutePath] == (file.length() to file.lastModified())
+        }
+    }
+
     private fun isRecentForCurrentTrack(
         group: QrcFileGroup,
         currentTrack: CurrentTrackSnapshot
     ): Boolean {
-        val qrcModifiedAt = group.qrcFile?.lastModified() ?: group.lastModified
-        return qrcModifiedAt >= currentTrack.trackChangedAtMs ||
-            kotlin.math.abs(qrcModifiedAt - currentTrack.trackChangedAtMs) <= CURRENT_TRACK_MATCH_WINDOW_MS
+        return isQrcGroupRecentForCurrentTrack(
+            group = group,
+            trackChangedAtMs = currentTrack.trackChangedAtMs,
+            matchWindowMs = CURRENT_TRACK_MATCH_WINDOW_MS
+        )
+    }
+
+    private fun isForegroundCurrentTrackGroup(groupId: String): Boolean {
+        val currentTrack = currentTrackProvider() ?: return false
+        if (currentTrack.hasLyrics) {
+            return false
+        }
+        return isRecentForCurrentTrack(findGroup(groupId), currentTrack)
     }
 
     private fun evaluateCurrentTrackMatch(
@@ -372,6 +453,8 @@ class QrcIncrementalPrebuildManager(
         private const val THROTTLE_INTERVAL = 10
         private const val THROTTLE_SLEEP_MS = 200L
         private const val CURRENT_TRACK_MATCH_WINDOW_MS = 90_000L
+        private const val CURRENT_TRACK_STABILITY_SAMPLE_MS = 80L
+        private val CURRENT_TRACK_PARSE_RETRY_DELAYS_MS = longArrayOf(0L, 200L, 500L, 1_000L)
         private val SUPPORTED_SUFFIXES = listOf(
             "qrc",
             "producer",
@@ -380,6 +463,30 @@ class QrcIncrementalPrebuildManager(
             "romaqrc"
         )
     }
+}
+
+/**
+ * QQ Music may reuse an existing encrypted .qrc and only rewrite its .ex sidecar
+ * when that lyric becomes active for the current song. Use the newest timestamp
+ * from the whole group so that this foreground signal is not hidden by an older
+ * .qrc timestamp.
+ */
+internal fun isQrcGroupRecentForCurrentTrack(
+    group: QrcFileGroup,
+    trackChangedAtMs: Long,
+    matchWindowMs: Long
+): Boolean {
+    val newestModifiedAt = listOfNotNull(
+        group.qrcFile,
+        group.producerFile,
+        group.exFile,
+        group.translrcFile,
+        group.romaqrcFile
+    ).maxOfOrNull(File::lastModified)
+        ?.coerceAtLeast(group.lastModified)
+        ?: group.lastModified
+    return newestModifiedAt >= trackChangedAtMs ||
+        kotlin.math.abs(newestModifiedAt - trackChangedAtMs) <= matchWindowMs
 }
 
 data class QrcWatcherStatus(

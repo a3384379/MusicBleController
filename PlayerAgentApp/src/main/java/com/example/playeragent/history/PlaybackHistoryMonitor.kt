@@ -66,6 +66,7 @@ class PlaybackHistoryMonitor(
             }
         }
         executor.shutdown()
+        reader.close()
         logger("[History] monitor stopped")
     }
 

@@ -186,6 +186,10 @@ object MaintenanceGuard {
         finishListeners += listener
     }
 
+    fun removeWindowEndListener(listener: () -> Unit) {
+        finishListeners -= listener
+    }
+
     private fun startRealtimeWindow(
         reason: String,
         trackId: String,

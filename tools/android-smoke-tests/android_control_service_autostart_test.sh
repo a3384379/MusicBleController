@@ -7,8 +7,27 @@ if [[ -z "$LOG_PATH" || ! -f "$LOG_PATH" ]]; then
   exit 0
 fi
 
-OUT_DIR="${OUT_DIR:-$(dirname "$LOG_PATH")}"
+if [[ -z "${OUT_DIR:-}" ]]; then
+  OUT_DIR="$(dirname "$LOG_PATH")"
+fi
 JSON_PATH="$OUT_DIR/control_service_autostart.json"
+
+# Service startup is intentionally asynchronous on the low-power Sony player.
+# When the launch snapshot already contains the auto-start request, give the
+# GATT/MediaSession chain a short bounded window to finish before evaluating it.
+if [[ -n "${ADB_BIN:-}" && -n "${DEVICE_ID:-}" ]] && \
+  grep -q "\[ControlServiceAutoStart\] start requested" "$LOG_PATH" && \
+  ! grep -Eq "\[BleGattServer\] (started|already started)" "$LOG_PATH"; then
+  for _ in 1 2 3 4 5 6; do
+    sleep 1
+    "$ADB_BIN" -s "$DEVICE_ID" logcat -d > "$LOG_PATH" || true
+    if grep -Eq "\[BleGattServer\] (started|already started)" "$LOG_PATH"; then
+      break
+    fi
+  done
+  grep -E "PlayerAgent|ControlServiceAutoStart|MediaSessionReader|BleGattServer|BLE-A|BLE-ADV|BLE-GATT|BLE-RECOVERY|BLE-DIAG|Qrc|Lyric|AlbumArt|FullLyrics|FATAL EXCEPTION|ANR|AndroidRuntime" \
+    "$LOG_PATH" > "$OUT_DIR/sony_filtered.log" || true
+fi
 
 python3 - "$LOG_PATH" "$JSON_PATH" <<'PY'
 import json

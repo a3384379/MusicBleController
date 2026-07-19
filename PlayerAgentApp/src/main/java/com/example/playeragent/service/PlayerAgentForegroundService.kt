@@ -37,6 +37,11 @@ import com.example.playeragent.media.MaintenanceTaskType
 class PlayerAgentForegroundService : Service() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val logBroadcastLock = Any()
+    private val pendingLogBroadcasts = ArrayDeque<String>()
+    private var logBroadcastScheduled = false
+    private var droppedLogBroadcastCount = 0
+    private val flushLogBroadcastRunnable = Runnable { flushLogBroadcasts() }
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var advertiserManager: BleAdvertiserManager? = null
     private var gattServerManager: BleGattServerManager? = null
@@ -117,6 +122,7 @@ class PlayerAgentForegroundService : Service() {
         gattServerManager = null
         publishBleHealthSnapshot("service destroyed")
         log("Foreground service stopped")
+        flushLogBroadcasts()
         super.onDestroy()
     }
 
@@ -151,7 +157,8 @@ class PlayerAgentForegroundService : Service() {
                 return@post
             }
             ensureBleStackStarted("service start")
-            log("[QrcWatcher] startup auto watcher disabled; use Debug Tools manual start")
+            startQrcWatcher()
+            log("[QrcWatcher] startup auto watcher enabled")
             log("[LyricWarmup] startup auto warmup disabled; use Debug Tools manual warmup")
         }
     }
@@ -663,7 +670,7 @@ class PlayerAgentForegroundService : Service() {
     private fun log(message: String) {
         val fullMessage = "[PlayerAgent] $message"
         LogBuffer.append(fullMessage)
-        publishLog(fullMessage)
+        publishLog(fullMessage, emitLogcat = false)
     }
 
     private fun logVerbose(message: String) {
@@ -676,12 +683,47 @@ class PlayerAgentForegroundService : Service() {
         publishLog("[PlayerAgent] $message")
     }
 
-    private fun publishLog(fullMessage: String) {
-        Log.i(TAG, fullMessage)
+    private fun publishLog(fullMessage: String, emitLogcat: Boolean = true) {
+        if (emitLogcat) {
+            Log.i(TAG, fullMessage)
+        }
+        var shouldSchedule = false
+        synchronized(logBroadcastLock) {
+            if (pendingLogBroadcasts.size >= MAX_PENDING_LOG_BROADCASTS) {
+                pendingLogBroadcasts.removeFirst()
+                droppedLogBroadcastCount += 1
+            }
+            pendingLogBroadcasts.addLast(fullMessage)
+            if (!logBroadcastScheduled) {
+                logBroadcastScheduled = true
+                shouldSchedule = true
+            }
+        }
+        if (shouldSchedule) {
+            mainHandler.postDelayed(flushLogBroadcastRunnable, LOG_BROADCAST_BATCH_MS)
+        }
+    }
+
+    private fun flushLogBroadcasts() {
+        val batch = synchronized(logBroadcastLock) {
+            logBroadcastScheduled = false
+            if (pendingLogBroadcasts.isEmpty() && droppedLogBroadcastCount == 0) {
+                return
+            }
+            buildList {
+                if (droppedLogBroadcastCount > 0) {
+                    add("[PlayerAgent] [LogBroadcast] coalesced=$droppedLogBroadcastCount")
+                }
+                addAll(pendingLogBroadcasts)
+            }.also {
+                pendingLogBroadcasts.clear()
+                droppedLogBroadcastCount = 0
+            }
+        }
         sendBroadcast(
             Intent(ACTION_LOG)
                 .setPackage(packageName)
-                .putExtra(EXTRA_LOG_MESSAGE, fullMessage)
+                .putExtra(EXTRA_LOG_MESSAGE, batch.joinToString("\n"))
         )
     }
 
@@ -731,6 +773,8 @@ class PlayerAgentForegroundService : Service() {
         const val ACTION_REFRESH_CURRENT_LYRIC =
             "com.example.playeragent.ACTION_REFRESH_CURRENT_LYRIC"
         const val EXTRA_LOG_MESSAGE = "extra_log_message"
+        private const val LOG_BROADCAST_BATCH_MS = 300L
+        private const val MAX_PENDING_LOG_BROADCASTS = 80
         const val EXTRA_QRC_WATCHER_RUNNING = "extra_qrc_watcher_running"
         const val EXTRA_QRC_WATCHER_PENDING = "extra_qrc_watcher_pending"
         const val EXTRA_QRC_INCREMENTAL_RUNNING = "extra_qrc_incremental_running"

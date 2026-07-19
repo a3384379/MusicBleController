@@ -31,7 +31,17 @@ class QrcLyricManager(
     private val songGroupCache = mutableMapOf<String, String>()
     private val songLinesCache = mutableMapOf<String, List<LyricLine>>()
     private val parsedQrcCache = mutableMapOf<String, ParsedQrc?>()
-    private val uncertainMissCooldown = mutableMapOf<String, QrcCooldownEntry>()
+    private val uncertainMissCooldown = QrcCooldownStore()
+
+    fun close() {
+        persistentIndexManager.shutdown()
+        synchronized(this) {
+            songGroupCache.clear()
+            songLinesCache.clear()
+            parsedQrcCache.clear()
+            uncertainMissCooldown.clear()
+        }
+    }
 
     @Synchronized
     fun load(title: String, artist: String, album: String): Boolean {
@@ -45,7 +55,8 @@ class QrcLyricManager(
         album: String,
         traceId: String = "",
         shouldCancel: () -> Boolean = { false },
-        allowIndexRefresh: Boolean = true
+        allowIndexRefresh: Boolean = true,
+        skipParsedCache: Boolean = false
     ): QrcLoadResult {
         val normalizedTitle = normalizeForMatch(title)
         val normalizedArtist = normalizeForMatch(artist)
@@ -85,7 +96,12 @@ class QrcLyricManager(
         logger("[QrcLyric] load title=$title artist=$artist album=$album")
         logger("[QrcLyric] findBestGroup start title=$title")
 
-        cacheManager.get(title, artist, album, traceId, shouldCancel)?.let { cached ->
+        val parsedCacheHit = if (skipParsedCache) {
+            null
+        } else {
+            cacheManager.get(title, artist, album, traceId, shouldCancel)
+        }
+        parsedCacheHit?.let { cached ->
             trace(
                 traceId,
                 "parseOptimizationCacheHit",
@@ -210,7 +226,11 @@ class QrcLyricManager(
         )
 
         val indexStartedAt = System.currentTimeMillis()
-        val entries = getIndexEntries(forceRefresh = false)
+        val entries = if (allowIndexRefresh) {
+            getIndexEntries(forceRefresh = false)
+        } else {
+            getIndexEntriesForForeground()
+        }
         trace(
             traceId,
             "qrcIndex",
@@ -281,6 +301,7 @@ class QrcLyricManager(
             normalizedTitle = normalizedTitle,
             normalizedArtist = normalizedArtist,
             normalizedAlbum = normalizedAlbum,
+            allowRecentFallback = allowIndexRefresh,
             shouldCancel = shouldCancel,
             traceId = traceId
         )
@@ -303,6 +324,7 @@ class QrcLyricManager(
                     normalizedTitle = normalizedTitle,
                     normalizedArtist = normalizedArtist,
                     normalizedAlbum = normalizedAlbum,
+                    allowRecentFallback = true,
                     shouldCancel = shouldCancel,
                     traceId = traceId
                 )
@@ -318,14 +340,22 @@ class QrcLyricManager(
                 "[QrcLyric] best group=${best?.entry?.groupId ?: "none"} " +
                     "score=${best?.score ?: 0}"
             )
-            logger("[QrcLyric] skip negative cache reason=uncertain qrc match")
-            saveUncertainCooldown(songKey)
-            val retryable = searchResult.producerCandidateCount == 0 ||
-                cacheManager.isFuzzyIndexWarming()
-            val reason = if (retryable && searchResult.producerCandidateCount == 0) {
-                "waiting qqmusic lyric cache"
+            val cacheIndexWarming = cacheManager.isFuzzyIndexWarming()
+            if (cacheIndexWarming) {
+                // The cache index completion listener immediately retries this song.
+                // Do not poison that retry with a cooldown created from an incomplete
+                // candidate set.
+                logger("[QrcLyric] skip uncertain cooldown reason=cache index warming")
             } else {
-                "no safe qrc candidate"
+                logger("[QrcLyric] skip negative cache reason=uncertain qrc match")
+                saveUncertainCooldown(songKey)
+            }
+            val retryable = searchResult.producerCandidateCount == 0 || cacheIndexWarming
+            val reason = when {
+                cacheIndexWarming -> "cache index warming"
+                retryable && searchResult.producerCandidateCount == 0 ->
+                "waiting qqmusic lyric cache"
+                else -> "no safe qrc candidate"
             }
             trace(
                 traceId,
@@ -406,6 +436,51 @@ class QrcLyricManager(
             lines = cachedLines,
             retryable = false,
             reason = "qrc parsed"
+        )
+    }
+
+    /**
+     * Reads the already-parsed cache without taking QrcLyricManager's coarse
+     * monitor. This lets a new foreground song bypass a stale raw-QRC/recovery
+     * lookup while still using QrcLyricCacheManager's own thread-safe index.
+     * No manager-level current-song state is mutated here.
+     */
+    fun loadParsedCacheWithResult(
+        title: String,
+        artist: String,
+        album: String,
+        traceId: String = "",
+        shouldCancel: () -> Boolean = { false }
+    ): QrcLoadResult {
+        if (shouldCancel()) {
+            trace(traceId, "qrcLookup", "result=cancelled stage=parsed_cache_fast_start")
+            return cancelledResult()
+        }
+        val cached = cacheManager.get(title, artist, album, traceId, shouldCancel)
+            ?: return QrcLoadResult(
+                success = false,
+                lines = emptyList(),
+                retryable = cacheManager.isFuzzyIndexWarming(),
+                reason = if (cacheManager.isFuzzyIndexWarming()) {
+                    "parsed cache index warming"
+                } else {
+                    "parsed cache miss"
+                }
+            )
+        return QrcLoadResult(
+            success = cached.lines.isNotEmpty(),
+            lines = cached.lines.map {
+                LyricLine(
+                    timeMs = it.timeMs,
+                    text = it.text,
+                    durationMs = it.durationMs,
+                    words = it.words,
+                    translation = it.translation,
+                    romanization = it.romanization
+                )
+            },
+            retryable = false,
+            reason = "parsed cache fast hit"
         )
     }
 
@@ -612,6 +687,10 @@ class QrcLyricManager(
         return persistentIndexManager.getIndex(forceRefresh = forceRefresh)
     }
 
+    private fun getIndexEntriesForForeground(): List<QrcGroupIndexEntry> {
+        return persistentIndexManager.getIndexForForeground()
+    }
+
     private fun refreshIndexIfChanged(reason: String): List<QrcGroupIndexEntry>? {
         logger("[QrcIndex] refresh check reason=$reason")
         val before = persistentIndexManager.status()
@@ -633,6 +712,7 @@ class QrcLyricManager(
         normalizedTitle: String,
         normalizedArtist: String,
         normalizedAlbum: String,
+        allowRecentFallback: Boolean = true,
         shouldCancel: () -> Boolean = { false },
         traceId: String = ""
     ): SearchResult {
@@ -690,7 +770,7 @@ class QrcLyricManager(
                 "costMs=${System.currentTimeMillis() - confirmStartedAt}"
         )
 
-        if (confirmed == null && !shouldCancel()) {
+        if (confirmed == null && !shouldCancel() && allowRecentFallback) {
             val fallbackStartedAt = System.currentTimeMillis()
             val attemptedGroupIds = producerConfirmCandidates
                 .map { it.entry.groupId }
@@ -724,7 +804,18 @@ class QrcLyricManager(
             )
             logger(
                 "[QrcLyric] fallback decrypt candidates=${fallbackCandidates.size} " +
-                    "costMs=${System.currentTimeMillis() - fallbackStartedAt}"
+                "costMs=${System.currentTimeMillis() - fallbackStartedAt}"
+            )
+        } else if (confirmed == null && !allowRecentFallback) {
+            // The foreground player path must not decrypt unrelated recent
+            // groups when the current title has no indexed producer match.
+            // QrcDirectoryWatcher parses the newly written current group after
+            // its size/mtime stabilise and then retries the exact song.
+            logger("[QrcLyric] foreground recent fallback skipped")
+            trace(
+                traceId,
+                "fuzzy",
+                "result=skipped reason=foreground_no_recent_fallback"
             )
         }
         return SearchResult(
@@ -1151,10 +1242,13 @@ class QrcLyricManager(
             )
         }
         val generation = QrcDirectoryGeneration.current()
-        uncertainMissCooldown[songKey] = QrcCooldownEntry(
-            retryAfterMs = retryAfterMs,
-            generation = generation,
-            reason = "uncertain qrc match"
+        uncertainMissCooldown.put(
+            songKey,
+            QrcCooldownStore.Entry(
+                retryAfterMs = retryAfterMs,
+                generation = generation,
+                reason = "uncertain qrc match"
+            )
         )
         logger(
             "[QrcCooldown] saved songKey=$songKey generation=$generation " +
@@ -1162,10 +1256,15 @@ class QrcLyricManager(
         )
     }
 
-    @Synchronized
     fun removeUncertainCooldown(songKey: String, reason: String) {
         if (uncertainMissCooldown.remove(songKey) != null) {
             logger("[QrcCooldown] removed songKey=$songKey reason=$reason")
+        }
+    }
+
+    fun clearUncertainCooldowns(reason: String) {
+        if (uncertainMissCooldown.clear()) {
+            logger("[QrcCooldown] cleared all reason=$reason")
         }
     }
 
@@ -1251,12 +1350,6 @@ class QrcLyricManager(
         val album: String,
         val lines: List<LyricLine>,
         val rawText: String
-    )
-
-    private data class QrcCooldownEntry(
-        val retryAfterMs: Long,
-        val generation: Long,
-        val reason: String
     )
 
     data class QrcLoadResult(

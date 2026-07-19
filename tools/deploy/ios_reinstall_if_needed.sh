@@ -7,12 +7,19 @@ PROJECT_PATH="${PROJECT_PATH:-$ROOT_DIR/IOSBleFeasibility/IOSBleFeasibility.xcod
 SCHEME="${SCHEME:-sonyMusic}"
 CONFIGURATION="${CONFIGURATION:-Debug}"
 BUNDLE_ID="${BUNDLE_ID:-com.sqz.IOSBleFeasibility}"
+APP_NAME="${APP_NAME:-sonyMusic.app}"
+DERIVED_DATA_PATH="${DERIVED_DATA_PATH:-$HOME/Library/Developer/Xcode/DerivedData/MusicBleControllerAutoDeploy}"
 STATE_FILE="${STATE_FILE:-$SCRIPT_DIR/last_deploy.json}"
+LAST_SUCCESS_FILE="${LAST_SUCCESS_FILE:-$(dirname "$STATE_FILE")/last_successful_deploy.json}"
 OUT_ROOT="${OUT_ROOT:-/tmp/music_ble_deploy}"
 IOS_DEVICE_ID="${IOS_DEVICE_ID:-}"
 THRESHOLD_HOURS=24
 FORCE=false
 FORCE_REINSTALL=false
+REFRESH_ONLY=false
+ONCE_PER_DAY=false
+RENEW_PROFILES=false
+REQUIRE_RENEWED_PROFILE=false
 
 usage() {
   cat <<'EOF'
@@ -26,10 +33,15 @@ Options:
   --device <IOS_DEVICE_ID>
                           Use a specific iPhone device id.
   --force-reinstall       Pass through to ios_deploy.sh; uninstall only after install fails.
+  --refresh-only          Build and install only; skip launch and smoke.
+  --once-per-day          Skip if a deploy already succeeded today.
+  --renew-profiles        Back up and remove local matching provisioning profiles before build.
+  --require-renewed-profile
+                          Treat deploy as failed unless the embedded profile UUID or expiry changes.
   -h, --help              Show this help.
 
 Environment overrides:
-  ROOT_DIR PROJECT_PATH SCHEME CONFIGURATION BUNDLE_ID STATE_FILE OUT_ROOT IOS_DEVICE_ID
+  ROOT_DIR PROJECT_PATH SCHEME CONFIGURATION BUNDLE_ID APP_NAME DERIVED_DATA_PATH STATE_FILE LAST_SUCCESS_FILE OUT_ROOT IOS_DEVICE_ID
 EOF
 }
 
@@ -49,6 +61,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --force-reinstall)
       FORCE_REINSTALL=true
+      shift
+      ;;
+    --refresh-only)
+      REFRESH_ONLY=true
+      shift
+      ;;
+    --once-per-day)
+      ONCE_PER_DAY=true
+      shift
+      ;;
+    --renew-profiles)
+      RENEW_PROFILES=true
+      shift
+      ;;
+    --require-renewed-profile)
+      REQUIRE_RENEWED_PROFILE=true
       shift
       ;;
     -h|--help)
@@ -76,11 +104,12 @@ if value < 0:
 PY
 
 RUN_DIR="$OUT_ROOT/$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$RUN_DIR" "$(dirname "$STATE_FILE")"
+mkdir -p "$RUN_DIR" "$(dirname "$STATE_FILE")" "$(dirname "$LAST_SUCCESS_FILE")"
 
 LAST_RUN_TIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 PROFILE_EXPIRE_TIME=""
 DAYS_REMAINING=""
+PROFILE_UUID=""
 DEPLOY_EXECUTED=false
 RESULT="UNKNOWN"
 REASON=""
@@ -89,12 +118,12 @@ write_state() {
   local result="$1"
   local reason="$2"
   DEPLOY_EXECUTED="${3:-$DEPLOY_EXECUTED}"
-  python3 - "$STATE_FILE" "$LAST_RUN_TIME" "$PROFILE_EXPIRE_TIME" "$DAYS_REMAINING" "$DEPLOY_EXECUTED" "$result" "$reason" "$RUN_DIR" "$IOS_DEVICE_ID" <<'PY'
+  python3 - "$STATE_FILE" "$LAST_SUCCESS_FILE" "$LAST_RUN_TIME" "$PROFILE_EXPIRE_TIME" "$DAYS_REMAINING" "$PROFILE_UUID" "$DEPLOY_EXECUTED" "$result" "$reason" "$RUN_DIR" "$IOS_DEVICE_ID" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-state_file, last_run, expire_time, days_remaining, deploy_executed, result, reason, run_dir, device_id = sys.argv[1:]
+state_file, last_success_file, last_run, expire_time, days_remaining, profile_uuid, deploy_executed, result, reason, run_dir, device_id = sys.argv[1:]
 
 def nullable(value):
     return None if value == "" else value
@@ -108,6 +137,7 @@ data = {
     "lastRunTime": last_run,
     "profileExpireTime": nullable(expire_time),
     "daysRemaining": nullable_float(days_remaining),
+    "profileUUID": nullable(profile_uuid),
     "deployExecuted": deploy_executed == "true",
     "result": result,
     "reason": reason,
@@ -115,7 +145,33 @@ data = {
     "deviceId": nullable(device_id),
 }
 Path(state_file).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+if result == "PASS" and data["deployExecuted"]:
+    Path(last_success_file).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 print(json.dumps(data, indent=2, ensure_ascii=False))
+PY
+}
+
+already_deployed_today() {
+  if [[ ! -r "$LAST_SUCCESS_FILE" ]]; then
+    return 1
+  fi
+  python3 - "$LAST_SUCCESS_FILE" <<'PY'
+import datetime as dt
+import json
+import sys
+from pathlib import Path
+
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    last_run = data.get("lastRunTime")
+    if not last_run:
+        sys.exit(1)
+    last = dt.datetime.fromisoformat(last_run.replace("Z", "+00:00")).astimezone()
+except Exception:
+    sys.exit(1)
+
+today = dt.datetime.now().astimezone().date()
+sys.exit(0 if last.date() == today else 1)
 PY
 }
 
@@ -151,7 +207,7 @@ for raw in Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").split
         continue
     right = raw[match.end():].strip()
     state = right.split("  ")[0].strip() if right else ""
-    if "available" not in state:
+    if "available" not in state and "connected" not in state:
         continue
     name = raw[:match.start()].strip().split("  ")[0].strip() or "iPhone"
     rows.append((name, match.group(0), state))
@@ -171,24 +227,7 @@ PY
 }
 
 resolve_app_path() {
-  local build_settings="$RUN_DIR/xcode_build_settings.txt"
-  if ! xcodebuild \
-    -project "$PROJECT_PATH" \
-    -scheme "$SCHEME" \
-    -configuration "$CONFIGURATION" \
-    -destination 'generic/platform=iOS' \
-    -showBuildSettings >"$build_settings" 2>"$RUN_DIR/xcode_build_settings.err"; then
-    return 1
-  fi
-
-  local target_build_dir
-  local wrapper_name
-  target_build_dir="$(awk -F'= ' '/TARGET_BUILD_DIR =/ {print $2; exit}' "$build_settings")"
-  wrapper_name="$(awk -F'= ' '/WRAPPER_NAME =/ {print $2; exit}' "$build_settings")"
-  if [[ -z "$target_build_dir" || -z "$wrapper_name" ]]; then
-    return 1
-  fi
-  printf '%s/%s\n' "$target_build_dir" "$wrapper_name"
+  printf '%s/Build/Products/%s-iphoneos/%s\n' "$DERIVED_DATA_PATH" "$CONFIGURATION" "$APP_NAME"
 }
 
 read_profile_expiry() {
@@ -220,6 +259,28 @@ now = dt.datetime.now(dt.timezone.utc)
 days = (expire - now).total_seconds() / 86400
 print(expire.isoformat().replace("+00:00", "Z"))
 print(f"{days:.6f}")
+print(data.get("UUID", ""))
+PY
+}
+
+last_successful_profile_expire_time() {
+  if [[ ! -r "$LAST_SUCCESS_FILE" ]]; then
+    return 1
+  fi
+  python3 - "$LAST_SUCCESS_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+
+if data.get("result") == "PASS" and data.get("deployExecuted") is True and data.get("profileExpireTime"):
+    print(data["profileExpireTime"])
+    sys.exit(0)
+sys.exit(1)
 PY
 }
 
@@ -280,7 +341,18 @@ if APP_PATH="$(resolve_app_path)"; then
   if profile_output="$(read_profile_expiry "$PROFILE_PATH")"; then
     PROFILE_EXPIRE_TIME="$(sed -n '1p' <<<"$profile_output")"
     DAYS_REMAINING="$(sed -n '2p' <<<"$profile_output")"
+    PROFILE_UUID="$(sed -n '3p' <<<"$profile_output")"
   fi
+fi
+
+PRE_DEPLOY_PROFILE_EXPIRE_TIME="$PROFILE_EXPIRE_TIME"
+PRE_DEPLOY_PROFILE_UUID="$PROFILE_UUID"
+
+if [[ "$ONCE_PER_DAY" == true ]] && already_deployed_today; then
+  RESULT="SKIPPED"
+  REASON="already successfully deployed today"
+  write_state "$RESULT" "$REASON" false
+  exit 0
 fi
 
 if ! SELECTED_DEVICE="$(find_device)"; then
@@ -325,6 +397,9 @@ PY
   then
     SHOULD_DEPLOY=true
     REASON="profile expires within ${THRESHOLD_HOURS} hours"
+  elif [[ "$(last_successful_profile_expire_time || true)" != "$PROFILE_EXPIRE_TIME" ]]; then
+    SHOULD_DEPLOY=true
+    REASON="current profile has not been successfully installed by this deploy tool"
   else
     REASON="profile is still valid"
   fi
@@ -341,12 +416,29 @@ deploy_args=(--device "$IOS_DEVICE_ID" --output "$RUN_DIR/deploy")
 if [[ "$FORCE_REINSTALL" == true ]]; then
   deploy_args+=(--force-reinstall)
 fi
+if [[ "$REFRESH_ONLY" == true ]]; then
+  deploy_args+=(--refresh-only)
+fi
+if [[ "$RENEW_PROFILES" == true ]]; then
+  deploy_args+=(--renew-profiles)
+fi
+if [[ "$REQUIRE_RENEWED_PROFILE" == true ]]; then
+  deploy_args+=(--require-renewed-profile)
+fi
 
 if "$SCRIPT_DIR/ios_deploy.sh" "${deploy_args[@]}"; then
   if [[ -n "$APP_PATH" && -r "$PROFILE_PATH" ]]; then
     if profile_output="$(read_profile_expiry "$PROFILE_PATH")"; then
       PROFILE_EXPIRE_TIME="$(sed -n '1p' <<<"$profile_output")"
       DAYS_REMAINING="$(sed -n '2p' <<<"$profile_output")"
+      PROFILE_UUID="$(sed -n '3p' <<<"$profile_output")"
+    fi
+  fi
+  if [[ "$REQUIRE_RENEWED_PROFILE" == true ]]; then
+    if [[ -n "$PRE_DEPLOY_PROFILE_UUID" && "$PROFILE_UUID" == "$PRE_DEPLOY_PROFILE_UUID" && "$PROFILE_EXPIRE_TIME" == "$PRE_DEPLOY_PROFILE_EXPIRE_TIME" ]]; then
+      RESULT="FAIL"
+      write_state "$RESULT" "deploy completed but provisioning profile did not change" true
+      exit 1
     fi
   fi
   RESULT="PASS"
@@ -355,5 +447,11 @@ if "$SCRIPT_DIR/ios_deploy.sh" "${deploy_args[@]}"; then
 fi
 
 RESULT="FAIL"
-write_state "$RESULT" "$REASON" true
+failure_reason="deploy failed; see $RUN_DIR/deploy"
+if grep -R "No Accounts" "$RUN_DIR/deploy" >/dev/null 2>&1; then
+  failure_reason="xcodebuild cannot access an Apple ID account; see $RUN_DIR/deploy"
+elif grep -R "No profiles for" "$RUN_DIR/deploy" >/dev/null 2>&1; then
+  failure_reason="xcodebuild could not create or find renewed provisioning profiles; see $RUN_DIR/deploy"
+fi
+write_state "$RESULT" "$failure_reason" true
 exit 1

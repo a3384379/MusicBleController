@@ -64,8 +64,13 @@ object LyricTraceLogger {
                 }
             }
         }
-        Log.i(TAG, message)
-        sink?.invoke(message)
+        if (sink != null) {
+            // The service sink already writes this line to logcat and its in-memory
+            // buffer. Avoid a second logcat copy for every QRC pipeline stage.
+            sink(message)
+        } else {
+            Log.i(TAG, message)
+        }
     }
 
     fun legacy(

@@ -1,6 +1,6 @@
 # BLE 协议架构
 
-本文记录当前 Sony PlayerAgent 与 iPhone 之间的 BLE 协议边界。协议字段没有版本协商，修改必须非常谨慎。
+本文记录当前 Sony PlayerAgent 与 iPhone 之间的 BLE 协议边界。V2 增加能力协商，但 UUID、旧命令和旧响应保持兼容，修改仍必须非常谨慎。
 
 ## 模块职责
 
@@ -41,7 +41,8 @@
 - Seek：`SEEK_TO`
 - 状态：`GET_PLAYBACK_STATE`、`GET_VOLUME`
 - 封面：`ALBUM_ART_REQUEST`、`ALBUM_ART_SKIP`
-- 歌词：`GET_FULL_LYRICS`、`GET_LYRIC_SECONDARY`、`GET_LYRIC_DIAGNOSTIC`
+- 歌词：`GET_FULL_LYRICS`、`GET_LYRIC_WINDOW`、`GET_LYRIC_SECONDARY`、`GET_LYRIC_DIAGNOSTIC`
+- V2：`CLIENT_CAPABILITIES`、`PING`、`RETRY_TRANSFER`
 - 日志/诊断：`GET_LOGS`、`DUMP_MEDIA_FIELDS`
 - 历史：`GET_PLAY_HISTORY_PAGE`、`GET_PLAY_HISTORY_SINCE`、`GET_PLAY_STATS`
 
@@ -54,16 +55,34 @@
 - `albumArtBinaryStart` / binary chunk / `albumArtBinaryEnd`
 - `albumArtUnavailable`
 - `fullLyricsStart` / `fullLyricsChunk` / `fullLyricsEnd` / `fullLyricsUnavailable`
+- `fullLyricsBinaryStart` / `0xA2` binary chunk / `fullLyricsBinaryEnd`
+- `lyricWindowStart` / `lyricWindowChunk` / `lyricWindowEnd`
+- `clientCapabilitiesAck`、`pong`
 - `lyricSecondaryStart` / `lyricSecondaryPart` / `lyricSecondaryEnd`
 - `lyricDiagnostic`
 - `historyPayloadStart` / `historyPayloadChunk` / `historyPayloadEnd`
 
 ## 关键状态
 
-- Sony `BleNotifyQueue` 有 long job 概念，`albumArt`、`fullLyrics`、`lyricSecondary`、`playHistory` 都属于长任务。
-- 长任务期间会 interleave 最新短状态，避免控制和播放状态长期饥饿。
+- Sony `BleNotifyQueue` 使用四级优先级：P0 控制/状态/逐字，P1 lyricWindow/preview，P2 完整歌词/secondary，P3 HQ/历史/日志。
+- P0 每包可抢占；P2 每 4 包为 P1 让路；P3 每包让路。同优先级 FIFO，切歌按任务 generation 取消旧歌词/封面。
 - iOS 控制命令在连接不健康时会丢弃，不缓存，不重连后补发。
 - AlbumArt binary 使用 Sony 端 `ALBUM_ART_BINARY_MAGIC` 和 6 字节 header；iOS 在 `didUpdateValueFor` 中把非 JSON 二进制 chunk 转交给 `AlbumArtReceiver`。
+
+## V2 能力协商与回退
+
+1. iOS 完成 status notify 订阅后立即发送 `CLIENT_CAPABILITIES`，包含 `protocolVersion=2`、`fullLyricsZlib`、`lyricWindow`、`ping`、`transferRetry`。
+2. Sony 返回 `clientCapabilitiesAck`。Sony 在 ACK 或 250ms 超时前暂缓首次封面 Offer；iOS 300ms 未收到 ACK 时保持旧协议。
+3. V2 `GET_FULL_LYRICS` 附带 `format=zlib-json-v1`。旧 Sony 忽略新字段并返回 legacy 逐行响应，新 iOS 同时解析两种格式。
+4. 压缩歌词正文为 zlib JSON，最大 24KB；分包头为 `0xA2 + version + index + total` 共 6 字节。start/end 在小 MTU 下可使用 `id/tid/g/s/u/c/n/crc` 别名。
+5. A1/A2 都使用 `trackId + generation + transferId + CRC32` 栅栏。缺包不超过 32 个时 `RETRY_TRANSFER` 局部重传，否则完整重试一次。
+6. 协商失败、正文超限、metadata 超 MTU 或旧端连接时自动回退 legacy，不改变 QRC 解密和 secondary 协议。
+
+## 自适应发送
+
+- JSON 歌词初始间隔 5ms，A2 binary 初始 2ms。
+- notify 失败后增加 5ms，连续 20 包成功后逐步降低，最大 30ms。
+- `GET_LYRIC_WINDOW` 与完整歌词走独立歌词命令执行器，不被较慢的播放状态读取 FIFO 阻塞。
 
 ## 不允许随便修改的点
 

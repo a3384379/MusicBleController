@@ -26,19 +26,23 @@ class PlaybackStateReader(
     private val appContext = context.applicationContext
     private val mediaSessionManager =
         appContext.getSystemService(MediaSessionManager::class.java)
-    private val lyricManager = LyricManager(
-        context = appContext,
-        logger = logger,
-        onLyricsReady = { snapshot ->
-            reactiveMediaController.markLyricsTaskFinished(
-                trackId = snapshot.trackId,
-                generation = snapshot.generation,
-                ready = snapshot.lyricsReady,
-                reason = snapshot.reason
-            )
-            onLyricsReady(snapshot)
-        }
-    )
+    private val lyricManagerHolder = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        LyricManager(
+            context = appContext,
+            logger = logger,
+            onLyricsReady = { snapshot ->
+                reactiveMediaController.markLyricsTaskFinished(
+                    trackId = snapshot.trackId,
+                    generation = snapshot.generation,
+                    ready = snapshot.lyricsReady,
+                    reason = snapshot.reason
+                )
+                onLyricsReady(snapshot)
+            }
+        )
+    }
+    private val lyricManager: LyricManager
+        get() = lyricManagerHolder.value
     private var metadataMissingLogged = false
     private var durationMissingLogged = false
     private var lastLoggedLyric: String? = null
@@ -48,6 +52,13 @@ class PlaybackStateReader(
     private var lastCandidateDiagnosticAtMs: Long = 0L
     private var lastReactiveTraceKey: String = ""
     private val transitionStats = mutableMapOf<String, TransitionStat>()
+
+    fun close() {
+        if (lyricManagerHolder.isInitialized()) {
+            lyricManagerHolder.value.close()
+        }
+        transitionStats.clear()
+    }
 
     fun readPlaybackState(): JSONObject {
         val startedAtMs = SystemClock.elapsedRealtime()
@@ -91,9 +102,8 @@ class PlaybackStateReader(
             }
         }
 
-        val selected = controllers.firstOrNull {
-            it.playbackState?.state == PlaybackState.STATE_PLAYING
-        } ?: controllers.first()
+        val selected = selectQqMusicController(controllers)
+            ?: return emptyResponse("QQ Music is not active")
 
         val metadata = selected.metadata
         if (metadata == null && !metadataMissingLogged) {
@@ -398,9 +408,7 @@ class PlaybackStateReader(
         if (controllers.isEmpty()) {
             return null
         }
-        val selected = controllers.firstOrNull {
-            it.playbackState?.state == PlaybackState.STATE_PLAYING
-        } ?: controllers.first()
+        val selected = selectQqMusicController(controllers) ?: return null
         val metadata = selected.metadata ?: return FastPlaybackSnapshot(
             packageName = selected.packageName.orEmpty(),
             title = "",
@@ -714,9 +722,16 @@ class PlaybackStateReader(
             logger("[PredictiveLyricsCandidate] source=manual_next_with_queue unavailable reason=getActiveSessions_failed")
             return null
         }
-        return controllers.firstOrNull {
+        return selectQqMusicController(controllers)
+    }
+
+    private fun selectQqMusicController(
+        controllers: List<MediaController>
+    ): MediaController? {
+        val qqControllers = controllers.filter { it.packageName == QQ_MUSIC_PACKAGE }
+        return qqControllers.firstOrNull {
             it.playbackState?.state == PlaybackState.STATE_PLAYING
-        } ?: controllers.firstOrNull()
+        } ?: qqControllers.firstOrNull()
     }
 
     private fun trackFromDescription(description: MediaDescription): PredictiveLyricsTrack {
@@ -824,6 +839,7 @@ class PlaybackStateReader(
         private const val SLOW_PLAYBACK_READ_MS = 200L
         private const val TRACK_ID_HASH_BYTES = 12
         private const val HISTORY_TRANSITION_MIN_COUNT = 2
+        private const val QQ_MUSIC_PACKAGE = "com.tencent.qqmusic"
     }
 
     private enum class PredictiveCandidateMode(val source: String) {

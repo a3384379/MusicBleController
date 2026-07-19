@@ -7,10 +7,10 @@
 - Sony `PlaybackStateReader`：读取 MediaSession，调用 `LyricManager` 获取当前行，返回 `playbackState.lyric` 和轻量诊断字段。
 - Sony `LyricManager`：当前歌曲歌词状态机、单线程异步加载、retryable failure、lazy wait、Recovery Engine。
 - Sony `QrcLyricManager`：扫描 QQMusic/qrc group、解密 QRC、解析逐字、翻译 translrc、罗马音 romaqrc，对齐时间轴。
-- Sony `QrcLyricCacheManager`：L1/L2 cache、fuzzy、alias、negative、group cache fingerprint、V3 有效性。
+- Sony `QrcLyricCacheManager`：L1/L2 cache、版本化 parsed index、title+artist 安全直达、fuzzy、alias、negative、group cache fingerprint。
 - Sony `QrcDirectoryWatcher` / `QrcIncrementalPrebuildManager`：监听 QQMusic 文件后到并增量解析。
 - Sony `LyricRecoveryEngine`：当前歌曲无歌词后短期恢复窗口，处理 QQ音乐懒加载歌词缓存。
-- iOS `BLETestManager`：接收 `playbackState.lyric`、`fullLyrics*`、`lyricSecondary*`、歌词诊断。
+- iOS `BLETestManager`：接收 `lyricWindow*`、legacy `fullLyrics*`、A2 zlib full lyrics、`lyricSecondary*` 和歌词诊断。
 - iOS `FullLyricsView`：显示原文、翻译、罗马音，逐字高亮只作用于原文。
 
 ## 核心文件
@@ -20,6 +20,7 @@
 - Sony QRC：[QrcLyricManager.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/QrcLyricManager.kt)
 - Sony 模型：[QrcLyricModels.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/QrcLyricModels.kt)
 - Sony cache：[QrcLyricCacheManager.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/QrcLyricCacheManager.kt)
+- Sony parsed index：[QrcParsedCacheIndexStore.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/QrcParsedCacheIndexStore.kt)
 - Sony watcher：[QrcDirectoryWatcher.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/QrcDirectoryWatcher.kt)
 - Sony recovery：[LyricRecoveryEngine.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/LyricRecoveryEngine.kt)
 - iOS full lyrics：[FullLyricsView.swift](/Volumes/雷电/project/MusicBleController/IOSBleFeasibility/IOSBleFeasibility/FullLyricsView.swift)
@@ -31,16 +32,18 @@
 2. Sony `PlaybackStateReader.readPlaybackState()` 选中当前 MediaController。
 3. `LyricManager.requestLyricLoadAsync()` 根据 title/artist/album 调度异步加载。
 4. `LyricManager.getCurrentLine(position)` 快速返回当前缓存行；不在快速路径同步解密/重建。
-5. QRC 加载顺序大致为 L1/L2 exact、alias、fuzzy、negative/cooldown、QRC fallback。
-6. 成功后 `playbackState.lyric` 立即可用；iOS 再按需 `GET_FULL_LYRICS`。
-7. `GET_FULL_LYRICS` 只发原文、时间、可选 words。
-8. 翻译/罗马音通过 `GET_LYRIC_SECONDARY mode=translation|romanization` 独立分片发送。
+5. QRC 前台顺序为 L1、alias、exact L2、title+artist 唯一安全直达、内存索引 fuzzy；不再为当前歌曲 `listFiles` 或解析所有缓存 JSON。
+6. TrackInfo 后 iOS 优先请求最多 5 行的 `GET_LYRIC_WINDOW`，先构建可见 UI；完整歌词后台请求。
+7. V2 完整歌词为 zlib JSON + A2 binary + CRC32；协商/大小失败自动回退 legacy 逐行协议。
+8. 翻译/罗马音继续通过 `GET_LYRIC_SECONDARY mode=translation|romanization` 独立分片发送。
+9. QRC 就绪回调会立即恢复 currentWord 边界调度；暂停时无周期任务，seek/恢复/切歌重新计算，最长 500ms 漂移校正。
 
 ## 关键状态
 
 - `QrcLyricLine`：`timeMs`、`durationMs`、`text`、`words`、`translation`、`romanization`。
 - `ParsedLyric`：包含 `schemaVersion`、`wordTimingStatus`、`groupFingerprint`、`cacheBuildVersion=3`、translation/romanization parse failed 标记。
 - `QrcGroupFingerprint`：记录 qrc/producer/ex/translrc/romaqrc 的 lastModified、size 和存在性。
+- `QrcParsedCacheIndex.json`：只保存 songKey、标准化 metadata、groupId、文件名、行数、时间和 fingerprint；500ms 防抖、临时文件原子替换。
 - `LyricRecoveryState`：`WAITING_QQMUSIC_CACHE`、`WATCHING_RECENT_QRC`、`RETRY_SCHEDULED`、`RETRYING`、`RESOLVED`、`EXPIRED` 等。
 - iOS `LyricLine`：解析 fullLyrics 和 secondary 后合并，secondary 会清洗 `//`、`/`、`暂无翻译` 等占位。
 
@@ -49,6 +52,7 @@
 - 不要改 QRC Triple DES 解密核心算法。
 - 不要在 `GET_PLAYBACK_STATE` / AutoPush 快速路径同步 rebuild QRC index 或全量扫描。
 - 不要只凭 artist 匹配新 QRC 到当前歌曲。
+- title+artist 直达仅在两者都匹配且候选唯一时使用；多候选必须再由专辑唯一化，否则回到完整 fuzzy 评分。
 - 不要把 translation/romanization 塞回基础 `fullLyricsChunk` 导致 MTU 裁剪。
 - 不要让 Live Activity 显示翻译/罗马音或携带完整歌词。
 - 不要删除 negative/cooldown/alias 策略，除非有日志证明它们错误。

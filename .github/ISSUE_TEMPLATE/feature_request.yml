@@ -1,0 +1,21 @@
+name: Feature request
+description: Propose an improvement within the Sony Walkman and QQ Music scope.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    attributes:
+      label: Problem
+      description: What user problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Compatibility considerations
+      description: Note any BLE protocol, old-client, Sony model, iOS, or QQ Music implications.

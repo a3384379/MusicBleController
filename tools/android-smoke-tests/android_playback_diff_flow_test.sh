@@ -45,10 +45,20 @@ metrics_re = re.compile(
     r"positionJump=(?P<jump>\d+)",
     re.I,
 )
-push_re = re.compile(r"\[PlaybackDiff\]\s+push playback type=([A-Za-z]+)", re.I)
-skip_re = re.compile(r"\[PlaybackDiff\]\s+skip identical", re.I)
+candidate_re = re.compile(
+    r"\[PlaybackDiff\]\s+candidate\s+.*?type=([A-Za-z]+)\s+shouldPush=(true|false)",
+    re.I,
+)
+push_re = re.compile(
+    r"\[PlaybackDiff\]\s+push(?:\s+playback)?\s+.*?type=([A-Za-z]+)",
+    re.I,
+)
+skip_re = re.compile(r"\[PlaybackDiff\]\s+skip(?:\s+identical|\s+reason=)", re.I)
 
 last_metrics = None
+candidate_push_events = 0
+candidate_skip_events = 0
+candidate_push_types: dict[str, int] = {}
 push_events = 0
 skip_events = 0
 push_types: dict[str, int] = {}
@@ -64,6 +74,14 @@ for line in lines:
             "wordChangedCount": int(metrics_match.group("word")),
             "positionJumpCount": int(metrics_match.group("jump")),
         }
+    candidate_match = candidate_re.search(line)
+    if candidate_match:
+        kind = candidate_match.group(1)
+        if candidate_match.group(2).lower() == "true":
+            candidate_push_events += 1
+            candidate_push_types[kind] = candidate_push_types.get(kind, 0) + 1
+        else:
+            candidate_skip_events += 1
     push_match = push_re.search(line)
     if push_match:
         push_events += 1
@@ -72,15 +90,34 @@ for line in lines:
     if skip_re.search(line):
         skip_events += 1
 
-metrics = last_metrics or {
-    "snapshotBuildCount": push_events + skip_events,
-    "diffCount": push_events + skip_events,
-    "pushCount": push_events,
-    "skipCount": skip_events,
-    "trackChangedCount": push_types.get("TrackChanged", 0),
-    "wordChangedCount": push_types.get("CurrentWordChanged", 0),
-    "positionJumpCount": push_types.get("PositionJump", 0),
-}
+if last_metrics is not None:
+    metrics = last_metrics
+elif candidate_push_events + candidate_skip_events > 0:
+    metrics = {
+        "snapshotBuildCount": candidate_push_events + candidate_skip_events,
+        "diffCount": candidate_push_events + candidate_skip_events,
+        "pushCount": candidate_push_events,
+        "skipCount": candidate_skip_events,
+        "trackChangedCount": candidate_push_types.get("TrackChanged", 0),
+        "wordChangedCount": (
+            candidate_push_types.get("CurrentWordChanged", 0)
+            + candidate_push_types.get("LyricChanged", 0)
+        ),
+        "positionJumpCount": candidate_push_types.get("PositionJump", 0),
+    }
+else:
+    metrics = {
+        "snapshotBuildCount": push_events + skip_events,
+        "diffCount": push_events + skip_events,
+        "pushCount": push_events,
+        "skipCount": skip_events,
+        "trackChangedCount": push_types.get("TrackChanged", 0),
+        "wordChangedCount": (
+            push_types.get("CurrentWordChanged", 0)
+            + push_types.get("LyricChanged", 0)
+        ),
+        "positionJumpCount": push_types.get("PositionJump", 0),
+    }
 
 push_count = metrics["pushCount"]
 skip_count = metrics["skipCount"]
@@ -115,6 +152,8 @@ payload = {
     "pushEventsInLog": push_events,
     "skipEventsInLog": skip_events,
     "pushTypes": push_types,
+    "candidateEventsInLog": candidate_push_events + candidate_skip_events,
+    "candidatePushTypes": candidate_push_types,
     "metricsLineFound": last_metrics is not None,
 }
 json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

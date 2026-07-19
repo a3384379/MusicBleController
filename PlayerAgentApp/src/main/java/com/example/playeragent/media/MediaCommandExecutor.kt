@@ -4,7 +4,6 @@ import android.content.Context
 import android.media.AudioManager
 import android.media.session.MediaSessionManager
 import android.os.SystemClock
-import android.view.KeyEvent
 import com.example.playeragent.service.PlayerNotificationListenerService
 import android.content.ComponentName
 import android.media.session.PlaybackState
@@ -37,8 +36,16 @@ class MediaCommandExecutor(
     fun playPause(seq: String? = null) {
         val start = SystemClock.elapsedRealtime()
         logger("[CTRL-Sony] media key begin seq=${seq.orUnknown()} key=PLAY_PAUSE")
-        logger("Media key: PLAY_PAUSE")
-        dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+        val controller = findActiveMediaController()
+        if (controller == null) {
+            logQqSessionUnavailable("PLAY_PAUSE", seq, start)
+            return
+        }
+        if (controller.playbackState?.state == PlaybackState.STATE_PLAYING) {
+            controller.transportControls.pause()
+        } else {
+            controller.transportControls.play()
+        }
         logger(
             "[CTRL-Sony] media key end seq=${seq.orUnknown()} " +
                 "key=PLAY_PAUSE costMs=${SystemClock.elapsedRealtime() - start}"
@@ -48,8 +55,12 @@ class MediaCommandExecutor(
     fun next(seq: String? = null) {
         val start = SystemClock.elapsedRealtime()
         logger("[CTRL-Sony] media key begin seq=${seq.orUnknown()} key=NEXT")
-        logger("Media key: NEXT")
-        dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
+        val controller = findActiveMediaController()
+        if (controller == null) {
+            logQqSessionUnavailable("NEXT", seq, start)
+            return
+        }
+        controller.transportControls.skipToNext()
         logger(
             "[CTRL-Sony] media key end seq=${seq.orUnknown()} " +
                 "key=NEXT costMs=${SystemClock.elapsedRealtime() - start}"
@@ -59,8 +70,12 @@ class MediaCommandExecutor(
     fun previous(seq: String? = null) {
         val start = SystemClock.elapsedRealtime()
         logger("[CTRL-Sony] media key begin seq=${seq.orUnknown()} key=PREVIOUS")
-        logger("Media key: PREVIOUS")
-        dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
+        val controller = findActiveMediaController()
+        if (controller == null) {
+            logQqSessionUnavailable("PREVIOUS", seq, start)
+            return
+        }
+        controller.transportControls.skipToPrevious()
         logger(
             "[CTRL-Sony] media key end seq=${seq.orUnknown()} " +
                 "key=PREVIOUS costMs=${SystemClock.elapsedRealtime() - start}"
@@ -119,11 +134,12 @@ class MediaCommandExecutor(
         )
     }
 
-    private fun dispatchMediaKey(keyCode: Int) {
-        val downEvent = KeyEvent(KeyEvent.ACTION_DOWN, keyCode)
-        val upEvent = KeyEvent(KeyEvent.ACTION_UP, keyCode)
-        audioManager.dispatchMediaKeyEvent(downEvent)
-        audioManager.dispatchMediaKeyEvent(upEvent)
+    private fun logQqSessionUnavailable(command: String, seq: String?, start: Long) {
+        logger("[CTRL-Sony] $command ignored: QQ Music session unavailable")
+        logger(
+            "[CTRL-Sony] media key end seq=${seq.orUnknown()} " +
+                "key=$command costMs=${SystemClock.elapsedRealtime() - start}"
+        )
     }
 
     private fun executeVolumeCommand(
@@ -183,10 +199,15 @@ class MediaCommandExecutor(
             return null
         }
 
-        return controllers.firstOrNull {
+        val qqControllers = controllers.filter { it.packageName == QQ_MUSIC_PACKAGE }
+        return qqControllers.firstOrNull {
             it.playbackState?.state == PlaybackState.STATE_PLAYING
-        } ?: controllers.firstOrNull()
+        } ?: qqControllers.firstOrNull()
     }
 
     private fun String?.orUnknown(): String = this?.takeIf { it.isNotBlank() } ?: "unknown"
+
+    private companion object {
+        private const val QQ_MUSIC_PACKAGE = "com.tencent.qqmusic"
+    }
 }

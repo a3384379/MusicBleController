@@ -1,0 +1,43 @@
+name: Device compatibility report
+description: Share a successful or unsuccessful test on another Android-based Sony Walkman.
+title: "[Device]: "
+labels:
+  - compatibility
+body:
+  - type: input
+    attributes:
+      label: Sony model and region
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Android and firmware version
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: iPhone and iOS version
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Result
+      options:
+        - Fully working
+        - Partially working
+        - Unable to connect
+    validations:
+      required: true
+  - type: checkboxes
+    attributes:
+      label: Features tested
+      options:
+        - label: BLE connection and reconnect
+        - label: Playback controls and volume
+        - label: QRC lyrics and current-word timing
+        - label: Album art preview and HQ
+        - label: Live Activity / Dynamic Island
+  - type: textarea
+    attributes:
+      label: Notes and redacted logs
+      description: Describe any required workarounds or missing features.

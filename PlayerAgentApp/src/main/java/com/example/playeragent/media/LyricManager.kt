@@ -8,6 +8,7 @@ import java.nio.charset.Charset
 import java.util.LinkedHashMap
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 class LyricManager(
     context: Context,
@@ -51,6 +52,7 @@ class LyricManager(
     private var lazyWaitStartedAtMs: Long = 0L
     private var lyricsReadyState: LyricsReadyState = LyricsReadyState.NOT_STARTED
     private var activeLyricsTaskId: Long = 0L
+    private val requestCancellationGate = LyricRequestCancellationGate()
     private val lyricExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "QrcLyricLoaderThread")
     }
@@ -112,19 +114,54 @@ class LyricManager(
             retryActiveSongFromRecovery(reason, bypassRetryableCooldown)
         }
     )
-
-    init {
-        QrcLyricCacheManager.addFuzzyIndexReadyListener {
+    private val closed = AtomicBoolean(false)
+    private val fuzzyIndexReadyListener: (QrcFuzzyIndexStatus) -> Unit = {
+        if (!closed.get()) {
+            // A miss made while the on-disk cache index was cold is provisional.
+            // Let the just-built index participate in the next foreground lookup.
+            qrcLyricManager.clearUncertainCooldowns("cache index ready")
             recoveryEngine.onFuzzyIndexReady()
             retryActiveSong("fuzzy index ready")
         }
-        QrcMaintenanceCoordinator.addFinishListener { token ->
+    }
+    private val maintenanceFinishListener: (MaintenanceToken) -> Unit = { token ->
+        if (!closed.get()) {
+            // A QRC index refresh can make a previously uncertain match resolvable.
+            qrcLyricManager.clearUncertainCooldowns("maintenance done ${token.type}")
             logger("[LyricRetry] scheduled reason=maintenance done current active song type=${token.type}")
             retryActiveSong("maintenance done")
         }
-        MaintenanceGuard.addWindowEndListener {
+    }
+    private val maintenanceWindowEndListener: () -> Unit = {
+        if (!closed.get()) {
             retryActiveSong("maintenance guard window end")
         }
+    }
+
+    init {
+        QrcLyricCacheManager.addFuzzyIndexReadyListener(fuzzyIndexReadyListener)
+        QrcMaintenanceCoordinator.addFinishListener(maintenanceFinishListener)
+        MaintenanceGuard.addWindowEndListener(maintenanceWindowEndListener)
+    }
+
+    fun close() {
+        if (!closed.compareAndSet(false, true)) {
+            return
+        }
+        QrcLyricCacheManager.removeFuzzyIndexReadyListener(fuzzyIndexReadyListener)
+        QrcMaintenanceCoordinator.removeFinishListener(maintenanceFinishListener)
+        MaintenanceGuard.removeWindowEndListener(maintenanceWindowEndListener)
+        recoveryEngine.shutdown()
+        requestCancellationGate.cancelAll()
+        lyricExecutor.shutdownNow()
+        foregroundLyricExecutor.shutdownNow()
+        qrcLyricManager.close()
+        synchronized(this) {
+            pendingRequest = null
+            cachedLines = emptyList()
+            parsedCache.clear()
+        }
+        logger("[LyricManager] closed")
     }
 
     fun scanLrcFiles(title: String, artist: String, album: String) {
@@ -253,6 +290,7 @@ class LyricManager(
                     "artist=${artist.take(32)} t=$activeLyricTraceStartedAtMs"
             )
             activeSongKey = key
+            requestCancellationGate.activate(key, activeLyricsTaskId)
             activeTitle = title
             activeArtist = artist
             activeAlbum = album
@@ -413,7 +451,11 @@ class LyricManager(
             logger("[LyricRetry] skipped reason=has lyrics songKey=$key")
             return false
         }
-        if (retryableFailureSongKey != key) {
+        val retryableFailure = retryableFailureSongKey == key
+        val qrcMayHaveArrivedAfterFinalMiss =
+            finalEmptySongKey == key &&
+                finalEmptyReason == "no safe qrc candidate"
+        if (!retryableFailure && !qrcMayHaveArrivedAfterFinalMiss) {
             logger("[LyricRetry] skipped reason=no retryable failure songKey=$key")
             return false
         }
@@ -431,6 +473,12 @@ class LyricManager(
             return false
         }
         lastWatcherRetryAtMs = now
+        if (qrcMayHaveArrivedAfterFinalMiss) {
+            finalEmptySongKey = null
+            finalEmptyReason = ""
+            loadedSongKey = null
+            logger("[LyricRetry] retry final qrc miss reason=qrc generation changed")
+        }
         recoveryEngine.onQrcGenerationChanged(
             oldGeneration = recoveryEngine.snapshot().lastQrcGeneration,
             newGeneration = QrcDirectoryGeneration.current()
@@ -920,6 +968,11 @@ class LyricManager(
                     "lines=${cachedLines.size}"
             )
             onLyricsReady(lyricsReadyGateSnapshotLocked())
+            // Populate the reusable in-memory lookup only after the active
+            // track has been published. parsedCachePut takes the manager lock;
+            // doing it in loadLyricFastPath can otherwise make a ready QRC
+            // result wait behind playback readers before the UI is notified.
+            parsedCachePut(request, result)
         } else if (result.retryable) {
             lyricsReadyState = if (isCooldownBlockedReason(result.failureReason)) {
                 logger("[LyricsState] cooldown blocked retry only songKey=${request.key}")
@@ -1006,6 +1059,82 @@ class LyricManager(
         if (shouldCancelRequest(request, "lrcLookup")) {
             return staleLyricResult()
         }
+
+        // QQ Music's parsed QRC cache is the normal hot path. Read it before
+        // probing local LRC files and before entering QrcLyricManager's coarse
+        // raw-QRC lookup lock. This keeps a previous no-lyrics recovery task
+        // from delaying the newly selected song.
+        val parsedCacheStartedAt = System.currentTimeMillis()
+        val parsedCacheResult = qrcLyricManager.loadParsedCacheWithResult(
+            title = title,
+            artist = artist,
+            album = album,
+            traceId = request.traceId,
+            shouldCancel = { shouldCancelRequest(request, "qrcParsedCacheFast") }
+        )
+        if (parsedCacheResult.success) {
+            val qrcLines = parsedCacheResult.lines.map {
+                LyricLine(
+                    timeMs = it.timeMs,
+                    text = it.text,
+                    durationMs = it.durationMs,
+                    words = it.words,
+                    translation = it.translation,
+                    romanization = it.romanization
+                )
+            }
+            val costMs = System.currentTimeMillis() - parsedCacheStartedAt
+            trace(
+                request.traceId,
+                "parseOptimizationCacheHit",
+                "source=qrc_parsed_fast lines=${qrcLines.size} costMs=$costMs"
+            )
+            trace(
+                request.traceId,
+                "qrcFileFound",
+                "reason=parsed_cache_fast_hit costMs=$costMs retryable=false " +
+                    "lines=${qrcLines.size}"
+            )
+            trace(
+                request.traceId,
+                "qrcDecryptStart",
+                "reason=parsed_cache_fast_hit source=qrc_parsed_fast"
+            )
+            trace(
+                request.traceId,
+                "qrcDecryptEnd",
+                "reason=parsed_cache_fast_hit source=qrc_parsed_fast " +
+                    "result=skipped costMs=0"
+            )
+            trace(
+                request.traceId,
+                "qrcLookupEnd",
+                "result=hit source=qrc_parsed_fast lines=${qrcLines.size} costMs=$costMs"
+            )
+            TrackCapabilityTracker.onLyricLookupDone(
+                songKey = request.key,
+                trackId = request.trackId,
+                success = true,
+                reason = parsedCacheResult.reason,
+                costMs = costMs,
+                lineCount = qrcLines.size
+            )
+            return LyricLoadResult(
+                lines = qrcLines,
+                lineCount = qrcLines.size,
+                source = LyricSource.QRC,
+                retryable = false,
+                failureReason = ""
+            )
+        }
+        if (shouldCancelRequest(request, "qrcParsedCacheFastMiss")) {
+            return staleLyricResult()
+        }
+        trace(
+            request.traceId,
+            "parseOptimizationCacheMiss",
+            "source=qrc_parsed_fast costMs=${System.currentTimeMillis() - parsedCacheStartedAt}"
+        )
         val lrcStartedAt = System.currentTimeMillis()
         if (applyScannedCacheIfAvailable(title, artist)) {
             trace(
@@ -1105,7 +1234,8 @@ class LyricManager(
                 album,
                 request.traceId,
                 shouldCancel = { shouldCancelRequest(request, "qrcLookup") },
-                allowIndexRefresh = false
+                allowIndexRefresh = false,
+                skipParsedCache = true
             )
             val qrcLines = if (qrcResult.success) {
                 qrcResult.lines.map {
@@ -1306,7 +1436,6 @@ class LyricManager(
                 parseCostMs = parseCostMs,
                 reason = ""
             )
-            parsedCachePut(request, result)
         } else {
             lyricsReadyState = LyricsReadyState.FAILED
             trace(
@@ -1515,9 +1644,8 @@ class LyricManager(
         return true
     }
 
-    @Synchronized
     private fun isLatestRequest(request: LyricLoadRequest): Boolean {
-        return activeSongKey == request.key && request.taskId == activeLyricsTaskId
+        return !requestCancellationGate.isCancelled(request.key, request.taskId)
     }
 
     @Synchronized
@@ -1527,18 +1655,18 @@ class LyricManager(
             pendingRequest?.key == key
     }
 
-    @Synchronized
     private fun shouldCancelRequest(request: LyricLoadRequest, stage: String): Boolean {
-        val cancelled = !isLatestRequest(request)
+        val cancelled = requestCancellationGate.isCancelled(request.key, request.taskId)
         if (cancelled) {
+            val currentSongKey = requestCancellationGate.activeSongKey().orEmpty()
             logger(
                 "[LyricAsync] cancelled stale stage=$stage old=${request.key} " +
-                    "current=${activeSongKey.orEmpty()}"
+                    "current=$currentSongKey"
             )
             trace(
                 request.traceId,
                 "cancelled",
-                "stage=$stage old=${request.key} current=${activeSongKey.orEmpty()}"
+                "stage=$stage old=${request.key} current=$currentSongKey"
             )
         }
         return cancelled
@@ -1555,14 +1683,19 @@ class LyricManager(
             return ""
         }
 
-        var currentLine = ""
-        for (line in lines) {
-            if (line.timeMs <= safePosition) {
-                currentLine = line.text
+        var low = 0
+        var high = lines.lastIndex
+        var currentIndex = -1
+        while (low <= high) {
+            val mid = (low + high) ushr 1
+            if (lines[mid].timeMs <= safePosition) {
+                currentIndex = mid
+                low = mid + 1
             } else {
-                break
+                high = mid - 1
             }
         }
+        val currentLine = lines.getOrNull(currentIndex)?.text.orEmpty()
 
         if (currentLine != lastLoggedLine) {
             if (LogConfig.DEBUG_VERBOSE_LOG) {
@@ -1623,10 +1756,16 @@ class LyricManager(
             currentTrack.artist,
             currentTrack.album
         )
-        if (activeSongKey != activeKey) {
+        if (!isSameIncrementalLyricTrack(
+                activeSongKey = activeSongKey,
+                activeTrackId = activeTrackId,
+                snapshotSongKey = activeKey,
+                snapshotTrackId = currentTrack.trackId
+            )
+        ) {
             logger(
                 "[Lyric] incremental lyrics ignored reason=track changed " +
-                    "songKey=${currentTrack.songKey}"
+                    "songKey=${currentTrack.songKey} trackId=${currentTrack.trackId}"
             )
             return false
         }
@@ -1643,16 +1782,20 @@ class LyricManager(
         if (lines.isEmpty()) {
             return false
         }
-        cachedKey = activeKey
+        val lyricStateKey = activeSongKey ?: activeKey
+        cachedKey = lyricStateKey
         cachedLines = lines
-        loadedSongKey = activeKey
+        loadedSongKey = lyricStateKey
         lastSource = LyricSource.QRC
         lastLoggedLine = null
+        // This store is deliberately independent from QrcLyricManager's
+        // lookup monitor. Do not replace it with a manager-level synchronized
+        // call while LyricManager's state monitor is held.
         qrcLyricManager.removeUncertainCooldown(
             currentTrack.songKey,
             "incremental lyrics ready"
         )
-        recoveryEngine.onLyricLoaded(activeKey, lines.size)
+        recoveryEngine.onLyricLoaded(lyricStateKey, lines.size)
         retryableFailureSongKey = null
         retryableFailureReason = ""
         retryableFailureAtMs = 0L
@@ -1665,7 +1808,7 @@ class LyricManager(
         predictiveLyricsPipeline.putLoadedTrack(
             track = PredictiveLyricsTrack(
                 trackId = currentTrack.trackId,
-                songKey = activeKey,
+                songKey = lyricStateKey,
                 title = currentTrack.title,
                 artist = currentTrack.artist,
                 album = currentTrack.album
@@ -1675,7 +1818,7 @@ class LyricManager(
             buildTimeMs = 0L
         )
         CurrentTrackRuntimeCache.updateLyrics(
-            songKey = activeKey,
+            songKey = currentTrack.songKey,
             lines = lines,
             lyricSource = LyricSource.QRC.name,
             logger = logger
@@ -1683,13 +1826,13 @@ class LyricManager(
         lyricsReadyState = LyricsReadyState.READY
         logger(
             "[LyricsState] index ready trackId=${currentTrack.trackId} " +
-                "songKey=$activeKey lines=${lines.size} " +
+                "songKey=$lyricStateKey lines=${lines.size} " +
                 "generation=${CurrentTrackRuntimeCache.currentGeneration()}"
         )
         logger("[LyricsState] lyricsReady=true")
         trace(
             activeLyricTraceId.ifBlank {
-                buildLyricTraceId(currentTrack.trackId, activeKey, System.currentTimeMillis())
+                buildLyricTraceId(currentTrack.trackId, lyricStateKey, System.currentTimeMillis())
             },
             "lyricsReadyGateReady",
             "trackId=${currentTrack.trackId} " +
@@ -1749,6 +1892,7 @@ class LyricManager(
         val normalized = reason.lowercase(Locale.ROOT)
         return normalized.contains("lyric recovery active") ||
             normalized.contains("waiting qqmusic lyric cache") ||
+            normalized.contains("cache index warming") ||
             normalized.contains("qrc cooldown retry pending") ||
             normalized.contains("lyrics retry pending") ||
             normalized.contains("no safe qrc candidate")
@@ -2284,7 +2428,12 @@ class LyricManager(
         private const val RETRY_RATE_WINDOW_MS = 30_000L
         private const val RETRYABLE_RECHECK_INTERVAL_MS = 30_000L
         private const val WATCHER_RETRY_MIN_INTERVAL_MS = 30_000L
+        // Full-lyrics requests are also the recovery signal from the iOS client.
+        // Keep the established cadence: a longer throttle can leave a newly written
+        // QQ QRC file unseen for tens of seconds after the first provisional miss.
         private const val FULL_LYRICS_RECOVERY_NUDGE_MIN_INTERVAL_MS = 8_000L
+        // Do not convert a cold-index or delayed QQ write into a final miss early.
+        // Directory and index events still retry immediately, so this is not a poll.
         private const val LAZY_WAIT_WINDOW_MS = 3 * 60_000L
         private const val MAX_RETRIES_PER_WINDOW = 2
         private const val PARSED_CACHE_MAX_KEYS = 40
@@ -2306,4 +2455,18 @@ class LyricManager(
             )
         }
     }
+}
+
+internal fun isSameIncrementalLyricTrack(
+    activeSongKey: String?,
+    activeTrackId: String,
+    snapshotSongKey: String,
+    snapshotTrackId: String
+): Boolean {
+    if (activeSongKey == snapshotSongKey) {
+        return true
+    }
+    return activeTrackId.isNotBlank() &&
+        snapshotTrackId.isNotBlank() &&
+        activeTrackId == snapshotTrackId
 }

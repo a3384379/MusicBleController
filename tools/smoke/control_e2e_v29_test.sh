@@ -278,6 +278,15 @@ log "ios=$IOS_DEVICE_ID android=$ANDROID_DEVICE_ID duration=${DURATION_SEC}s"
 
 copy_ios_log "$IOS_BEFORE" || true
 "$ADB_BIN" -s "$ANDROID_DEVICE_ID" logcat -c || true
+"$ADB_BIN" -s "$ANDROID_DEVICE_ID" logcat -v threadtime > "$SONY_LOG" &
+LOGCAT_PID=$!
+cleanup_logcat() {
+  if kill -0 "$LOGCAT_PID" 2>/dev/null; then
+    kill "$LOGCAT_PID" 2>/dev/null || true
+  fi
+  wait "$LOGCAT_PID" 2>/dev/null || true
+}
+trap cleanup_logcat EXIT
 
 START_EPOCH_MS="$(python3 - <<'PY'
 import time
@@ -297,7 +306,8 @@ PY
 )"
 
 copy_ios_log "$IOS_AFTER" || true
-"$ADB_BIN" -s "$ANDROID_DEVICE_ID" logcat -v threadtime -d > "$SONY_LOG"
+cleanup_logcat
+trap - EXIT
 
 python3 - "$OUT_DIR" "$DURATION_SEC" "$START_EPOCH_MS" "$END_EPOCH_MS" "$IOS_BEFORE" "$IOS_AFTER" "$SONY_LOG" "$IOS_DEVICE_ID" "$ANDROID_DEVICE_ID" <<'PY'
 import json
@@ -419,12 +429,19 @@ for match in re.finditer(r"\[CTRL-iOS\] didWrite seq=(\d+) cmd=([A-Z_]+).*?costM
 
 playback_events = []
 for line in ios_window.splitlines():
-    if "[iOS][Status] playbackState" in line:
+    if '"type":"playbackState"' in line and "[BLE] status notify received" in line:
         ts = parse_ios_ms(line) or 0
-        pos_match = re.search(r"position=(\d+)", line)
+        pos_match = re.search(r'(?:position=|"position":)(\d+)', line)
+        playing_match = re.search(r'"playing":(true|false)', line, re.I)
+        if playing_match is None:
+            playing_match = re.search(r"playing=(true|false)", line, re.I)
         playback_events.append({
             "timeMs": ts,
             "position": int(pos_match.group(1)) if pos_match else 0,
+            "playing": (
+                playing_match.group(1).lower() == "true"
+                if playing_match else None
+            ),
             "line": line,
         })
 
@@ -482,6 +499,23 @@ def first_playback_after(ms):
         if event["timeMs"] >= ms:
             return event
     return None
+
+def playback_state_changed_after(ms):
+    prior = None
+    for event in playback_events:
+        if event["timeMs"] < ms and event["playing"] is not None:
+            prior = event["playing"]
+        elif event["timeMs"] >= ms and event["playing"] is not None:
+            if prior is None or event["playing"] != prior:
+                return event
+    return None
+
+def closest_playback_after(ms, target, window_ms=3_000):
+    candidates = [
+        event for event in playback_events
+        if ms <= event["timeMs"] <= ms + window_ms
+    ]
+    return min(candidates, key=lambda event: abs(event["position"] - target)) if candidates else None
 
 def first_track_after(ms):
     for event in track_events:
@@ -552,9 +586,14 @@ def mark_effective(name, evidence, evidence_reason, required=True):
 ops = {}
 ops["PLAY_PAUSE"] = operation("PLAY_PAUSE", required=True)
 play_send = first_send_time("PLAY_PAUSE")
-if ops["PLAY_PAUSE"]["result"] == "PASS" and first_playback_after(play_send):
+playback_change = playback_state_changed_after(play_send)
+if ops["PLAY_PAUSE"]["result"] == "PASS" and playback_change:
     ops["PLAY_PAUSE"]["playbackStateAfterCommand"] = True
-mark_effective("PLAY_PAUSE", sony_key_evidence["PLAY_PAUSE"], "MediaSession KEYCODE_MEDIA_PLAY_PAUSE")
+mark_effective(
+    "PLAY_PAUSE",
+    sony_key_evidence["PLAY_PAUSE"] or playback_change is not None,
+    "playbackState changed after PLAY_PAUSE",
+)
 if ops["PLAY_PAUSE"]["result"] == "PASS" and not ops["PLAY_PAUSE"].get("playbackStateAfterCommand"):
     ops["PLAY_PAUSE"]["result"] = "FAIL"
     ops["PLAY_PAUSE"]["issues"].append("no playbackState after PLAY_PAUSE")
@@ -566,7 +605,11 @@ next_track = first_track_after(next_send)
 if ops["NEXT"]["result"] == "PASS" and next_track:
     ops["NEXT"]["trackChanged"] = True
     ops["NEXT"]["trackChangedLatencyMs"] = max(next_track["timeMs"] - next_send, 0) if next_send else 0
-mark_effective("NEXT", sony_key_evidence["NEXT"], "MediaSession KEYCODE_MEDIA_NEXT")
+mark_effective(
+    "NEXT",
+    sony_key_evidence["NEXT"] or next_track is not None,
+    "trackInfo changed after NEXT",
+)
 if ops["NEXT"]["result"] == "PASS" and not ops["NEXT"].get("trackChanged"):
     ops["NEXT"]["result"] = "FAIL"
     ops["NEXT"]["issues"].append("no trackInfo update after NEXT")
@@ -599,8 +642,8 @@ for volume_cmd in ("VOLUME_UP", "VOLUME_DOWN"):
 ops["SEEK_TO"] = operation("SEEK_TO", required=True)
 seek_send = first_send_time("SEEK_TO")
 if ops["SEEK_TO"]["result"] == "PASS":
-    seek_event = first_playback_after(seek_send)
     target = seek_targets[-1]["target"] if seek_targets else 0
+    seek_event = closest_playback_after(seek_send, target) if target > 0 else None
     if seek_event and target > 0:
         delta = abs(seek_event["position"] - target)
         ops["SEEK_TO"]["targetPositionMs"] = target
@@ -618,12 +661,19 @@ if ops["SEEK_TO"]["result"] == "PASS":
         ops["SEEK_TO"]["reason"] = "; ".join(ops["SEEK_TO"]["issues"])
 
 ops["GET_FULL_LYRICS"] = operation("GET_FULL_LYRICS", required=True)
-full_lyrics_received = count(r"fullLyricsStart|fullLyricsEnd|\[LyricsPerf\] full publish lines=", ios_window)
+full_lyrics_received = count(
+    r"fullLyrics(?:Binary)?Start|fullLyrics(?:Binary)?End|"
+    r"\[FullLyricsV2-iOS\] complete|\[LyricsPerf\] (?:full|final) publish lines=",
+    ios_window,
+)
 full_lyrics_unavailable = count(r"fullLyricsUnavailable", ios_window + "\n" + sony_text)
 if ops["GET_FULL_LYRICS"]["result"] == "PASS":
     if full_lyrics_received > 0:
         ops["GET_FULL_LYRICS"]["received"] = True
-        line_counts = [int(m.group(1)) for m in re.finditer(r"full publish lines=(\d+)", ios_window)]
+        line_counts = [
+            int(m.group(1))
+            for m in re.finditer(r"(?:full|final) publish lines=(\d+)", ios_window)
+        ]
         ops["GET_FULL_LYRICS"]["lineCount"] = max(line_counts) if line_counts else 0
         mark_effective("GET_FULL_LYRICS", True, "fullLyrics response")
     elif full_lyrics_unavailable > 0:
@@ -664,6 +714,10 @@ playback_count = len(playback_events)
 current_word_raw = count(r'\{"type":"currentWord"', ios_window)
 current_word_accepted = count(r"\[Lyrics-iOS\] currentWord line=", ios_window)
 stale_discard = count(r"discarded stale|stale discard", ios_window)
+stale_overwrite = count(
+    r"stale (?:lyrics|albumArt).*accepted|old (?:lyrics|albumArt).*overwrite|stale overwrite",
+    ios_window + "\n" + sony_text,
+)
 payload_too_large = count(r"payload=\d+ max=\d+|Payload maximum size exceeded|payload too large", sony_text + "\n" + ios_window)
 main_stall = count(r"main stall detected", ios_window)
 track_changed_count = len(track_events)
@@ -691,8 +745,8 @@ for name in ("PREVIOUS", "ALBUM_ART"):
         warnings.append(f"{name}: {ops[name].get('reason', 'warn')}")
     elif ops[name]["result"] == "FAIL":
         warnings.append(f"{name}: {ops[name].get('reason', 'failed')}")
-if stale_discard:
-    issues.append(f"stale discard observed ({stale_discard})")
+if stale_overwrite:
+    issues.append(f"stale content overwrite observed ({stale_overwrite})")
 if payload_too_large:
     issues.append(f"payload too large observed ({payload_too_large})")
 if main_stall:
@@ -724,6 +778,7 @@ metrics = {
     "albumArtBinaryChunkCount": album_chunk_count,
     "albumArtBinaryEndCount": album_end_count,
     "staleDiscardCount": stale_discard,
+    "staleOverwriteCount": stale_overwrite,
     "payloadTooLargeCount": payload_too_large,
     "mainStallCount": main_stall,
     "commandLatencyAvgMs": int(statistics.mean(did_write_costs)) if did_write_costs else 0,

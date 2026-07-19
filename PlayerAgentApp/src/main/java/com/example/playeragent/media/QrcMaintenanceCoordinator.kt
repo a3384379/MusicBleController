@@ -135,6 +135,10 @@ object QrcMaintenanceCoordinator {
         finishListeners += listener
     }
 
+    fun removeFinishListener(listener: (MaintenanceToken) -> Unit) {
+        finishListeners -= listener
+    }
+
     fun snapshot(): MaintenanceSnapshot {
         val token = current.get()
         val now = System.currentTimeMillis()
