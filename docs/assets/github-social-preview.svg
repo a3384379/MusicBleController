@@ -27,7 +27,7 @@
   <circle cx="160" cy="640" r="230" fill="#0891b2" opacity="0.13" filter="url(#glow)"/>
   <path d="M0 510 C250 435 390 620 650 522 C880 435 1020 550 1280 430 L1280 640 L0 640 Z" fill="#fff" opacity="0.025"/>
 
-  <g font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif">
+  <g font-family="Inter, 'PingFang SC', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif">
     <g transform="translate(84 78)">
       <rect width="72" height="72" rx="20" fill="url(#accent)"/>
       <path d="M45 18 V48.5 C45 57 35 62 28 58 C20 53 23 43 31 41 C34 40 38 40 41 41 V25 L58 21 V44.5 C58 53 48 58 41 54 C34 50 35 42 41 39 C45 37 50 38 54 39 V16 Z" fill="#fff"/>
@@ -36,24 +36,24 @@
     </g>
 
     <text x="84" y="244" fill="#fff" font-size="62" font-weight="800" letter-spacing="-2">MusicBleController</text>
-    <text x="84" y="300" fill="#cbd5e1" font-size="27" font-weight="500">Real-time QQ Music bridge over Bluetooth Low Energy</text>
+    <text x="84" y="300" fill="#cbd5e1" font-size="26" font-weight="500">QQ 音乐实时歌词、封面与控制 · Bluetooth Low Energy</text>
 
     <g transform="translate(84 350)" fill="#e2e8f0" font-size="18" font-weight="600">
       <g>
         <rect width="186" height="46" rx="23" fill="#0f2633" stroke="#22d3ee" stroke-opacity="0.42"/>
-        <text x="93" y="29" text-anchor="middle">QRC Lyrics</text>
+        <text x="93" y="29" text-anchor="middle">QRC 逐字歌词</text>
       </g>
       <g transform="translate(200 0)">
         <rect width="182" height="46" rx="23" fill="#201a35" stroke="#a855f7" stroke-opacity="0.5"/>
-        <text x="91" y="29" text-anchor="middle">Album Art</text>
+        <text x="91" y="29" text-anchor="middle">歌曲封面</text>
       </g>
       <g transform="translate(0 60)">
         <rect width="186" height="46" rx="23" fill="#201a35" stroke="#a855f7" stroke-opacity="0.5"/>
-        <text x="93" y="29" text-anchor="middle">Playback Control</text>
+        <text x="93" y="29" text-anchor="middle">播放控制</text>
       </g>
       <g transform="translate(200 60)">
         <rect width="210" height="46" rx="23" fill="#0f2633" stroke="#22d3ee" stroke-opacity="0.42"/>
-        <text x="105" y="29" text-anchor="middle">Live Activities</text>
+        <text x="105" y="29" text-anchor="middle">实时活动 / 灵动岛</text>
       </g>
     </g>
 
