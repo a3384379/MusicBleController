@@ -143,6 +143,7 @@ final class AlbumArtReceiver {
     private(set) var artworkEnhancementTargetPixelSize = 780
     private(set) var artworkEnhancementSharpness = 0.30
     private(set) var currentAlbumArtID = ""
+    private var displayedAlbumArtID = ""
     private var authoritativeAlbumArtID = ""
     private var deferredAlbumArtOfferWorkItem: DispatchWorkItem?
 
@@ -359,6 +360,7 @@ final class AlbumArtReceiver {
 
         currentAlbumArtID = ""
         albumArtImage = nil
+        displayedAlbumArtID = ""
         currentCachedAlbumArtQuality = ""
         artworkDisplayQuality = .placeholder
         hqAlbumArtUnavailableReason = "-"
@@ -601,7 +603,9 @@ final class AlbumArtReceiver {
         if id == currentAlbumArtID,
            quality == "preview" {
             cancelAlbumArtFallback()
-            if albumArtImage == nil {
+            if displayedAlbumArtID != id {
+                albumArtImage = nil
+                displayedAlbumArtID = ""
                 currentCachedAlbumArtQuality = ""
                 artworkDisplayQuality = .placeholder
                 updateArtworkEnhancementStatus(message: "album art unavailable")
@@ -697,6 +701,7 @@ final class AlbumArtReceiver {
         if artworkDisplayQuality != .placeholder {
             artworkDisplayQuality = .placeholder
             albumArtImage = nil
+            displayedAlbumArtID = ""
             currentCachedAlbumArtQuality = ""
             updateArtworkEnhancementStatus(message: "force refresh")
             delegate?.albumArtClearLiveArtwork(reason: "forceRefresh", shouldUpdate: false)
@@ -986,7 +991,9 @@ final class AlbumArtReceiver {
             }
             if id == currentAlbumArtID, quality == "preview" {
                 cancelAlbumArtFallback()
-                if albumArtImage == nil {
+                if displayedAlbumArtID != id {
+                    albumArtImage = nil
+                    displayedAlbumArtID = ""
                     currentCachedAlbumArtQuality = ""
                     artworkDisplayQuality = .placeholder
                     updateArtworkEnhancementStatus(message: "placeholder")
@@ -1288,7 +1295,7 @@ final class AlbumArtReceiver {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             guard let self,
                   self.currentAlbumArtID == id,
-                  self.albumArtImage == nil else {
+                  self.displayedAlbumArtID != id else {
                 return
             }
             self.requestedAlbumArtKeys.remove("\(id)|preview")
@@ -1431,6 +1438,7 @@ final class AlbumArtReceiver {
                 return
             }
             self.albumArtImage = nil
+            self.displayedAlbumArtID = ""
             self.currentCachedAlbumArtQuality = ""
             self.updateArtworkEnhancementStatus(message: "fallback default")
             self.delegate?.albumArtClearLiveArtwork(reason: "fallback default", shouldUpdate: false)
@@ -1677,6 +1685,7 @@ final class AlbumArtReceiver {
 
         let previous = artworkDisplayQuality
         albumArtImage = image
+        displayedAlbumArtID = id
         artworkDisplayQuality = quality
         currentCachedAlbumArtQuality = quality.label
         updateArtworkEnhancementStatus(message: reason)

@@ -2633,56 +2633,14 @@ class BleGattServerManager(
             }
         }
         val attempts = when (quality) {
-            AlbumArtQuality.PREVIEW -> listOf(
-                CompressionAttempt(112, 112, 48, PREVIEW_MAX_JPEG_BYTES),
-                CompressionAttempt(104, 104, 45, PREVIEW_MAX_JPEG_BYTES),
-                CompressionAttempt(96, 96, 42, PREVIEW_MAX_JPEG_BYTES),
-                CompressionAttempt(88, 88, 40, PREVIEW_MAX_JPEG_BYTES),
-                CompressionAttempt(80, 80, 38, PREVIEW_MAX_JPEG_BYTES),
-                CompressionAttempt(72, 72, 35, PREVIEW_MAX_JPEG_BYTES),
-                CompressionAttempt(64, 64, 32, PREVIEW_MAX_JPEG_BYTES)
-            )
-            AlbumArtQuality.HQ -> listOfNotNull(
-                CompressionAttempt(bitmap.width, bitmap.height, 80, HQ_MAX_JPEG_BYTES),
-                CompressionAttempt(bitmap.width, bitmap.height, 76, HQ_MAX_JPEG_BYTES),
-                CompressionAttempt(
-                    minOf(bitmap.width, 280),
-                    minOf(bitmap.height, 280),
-                    76,
-                    HQ_MAX_JPEG_BYTES
-                ),
-                CompressionAttempt(
-                    minOf(bitmap.width, 256),
-                    minOf(bitmap.height, 256),
-                    74,
-                    HQ_MAX_JPEG_BYTES
-                ),
-                CompressionAttempt(
-                    minOf(bitmap.width, 240),
-                    minOf(bitmap.height, 240),
-                    72,
-                    HQ_MAX_JPEG_BYTES
-                ),
-                CompressionAttempt(
-                    minOf(bitmap.width, 224),
-                    minOf(bitmap.height, 224),
-                    70,
-                    HQ_MAX_JPEG_BYTES
-                ),
-                CompressionAttempt(
-                    minOf(bitmap.width, 208),
-                    minOf(bitmap.height, 208),
-                    68,
-                    HQ_MAX_JPEG_BYTES
-                ),
-                CompressionAttempt(
-                    minOf(bitmap.width, 192),
-                    minOf(bitmap.height, 192),
-                    66,
-                    HQ_MAX_JPEG_BYTES
-                )
-            ).distinctBy {
-                "${it.width}x${it.height}@${it.quality}"
+            AlbumArtQuality.PREVIEW -> AlbumArtCompressionPolicy.previewProfiles().map {
+                CompressionAttempt(it.width, it.height, it.quality, PREVIEW_MAX_JPEG_BYTES)
+            }
+            AlbumArtQuality.HQ -> AlbumArtCompressionPolicy.hqProfiles(
+                sourceWidth = bitmap.width,
+                sourceHeight = bitmap.height
+            ).map {
+                CompressionAttempt(it.width, it.height, it.quality, HQ_MAX_JPEG_BYTES)
             }.also {
                 if (bitmap.width < 240 || bitmap.height < 240) {
                     logger(
