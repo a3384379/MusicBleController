@@ -1,5 +1,6 @@
 package com.example.playeragent.ble
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -46,5 +47,12 @@ class BleNotifyQueuePolicyTest {
                 packetsSinceYield = 10
             )
         )
+    }
+
+    @Test
+    fun commandResponseQuietWindowNeverReturnsNegativeDelay() {
+        assertEquals(25L, BleNotifyQueue.remainingQuietDelayMs(1_025L, 1_000L))
+        assertEquals(0L, BleNotifyQueue.remainingQuietDelayMs(1_000L, 1_000L))
+        assertEquals(0L, BleNotifyQueue.remainingQuietDelayMs(999L, 1_000L))
     }
 }

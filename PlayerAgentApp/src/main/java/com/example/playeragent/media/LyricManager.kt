@@ -52,6 +52,7 @@ class LyricManager(
     private var lazyWaitStartedAtMs: Long = 0L
     private var lyricsReadyState: LyricsReadyState = LyricsReadyState.NOT_STARTED
     private var activeLyricsTaskId: Long = 0L
+    private val requestCancellationGate = LyricRequestCancellationGate()
     private val lyricExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "QrcLyricLoaderThread")
     }
@@ -151,6 +152,7 @@ class LyricManager(
         QrcMaintenanceCoordinator.removeFinishListener(maintenanceFinishListener)
         MaintenanceGuard.removeWindowEndListener(maintenanceWindowEndListener)
         recoveryEngine.shutdown()
+        requestCancellationGate.cancelAll()
         lyricExecutor.shutdownNow()
         foregroundLyricExecutor.shutdownNow()
         qrcLyricManager.close()
@@ -288,6 +290,7 @@ class LyricManager(
                     "artist=${artist.take(32)} t=$activeLyricTraceStartedAtMs"
             )
             activeSongKey = key
+            requestCancellationGate.activate(key, activeLyricsTaskId)
             activeTitle = title
             activeArtist = artist
             activeAlbum = album
@@ -1641,9 +1644,8 @@ class LyricManager(
         return true
     }
 
-    @Synchronized
     private fun isLatestRequest(request: LyricLoadRequest): Boolean {
-        return activeSongKey == request.key && request.taskId == activeLyricsTaskId
+        return !requestCancellationGate.isCancelled(request.key, request.taskId)
     }
 
     @Synchronized
@@ -1653,18 +1655,18 @@ class LyricManager(
             pendingRequest?.key == key
     }
 
-    @Synchronized
     private fun shouldCancelRequest(request: LyricLoadRequest, stage: String): Boolean {
-        val cancelled = !isLatestRequest(request)
+        val cancelled = requestCancellationGate.isCancelled(request.key, request.taskId)
         if (cancelled) {
+            val currentSongKey = requestCancellationGate.activeSongKey().orEmpty()
             logger(
                 "[LyricAsync] cancelled stale stage=$stage old=${request.key} " +
-                    "current=${activeSongKey.orEmpty()}"
+                    "current=$currentSongKey"
             )
             trace(
                 request.traceId,
                 "cancelled",
-                "stage=$stage old=${request.key} current=${activeSongKey.orEmpty()}"
+                "stage=$stage old=${request.key} current=$currentSongKey"
             )
         }
         return cancelled
@@ -1786,6 +1788,9 @@ class LyricManager(
         loadedSongKey = lyricStateKey
         lastSource = LyricSource.QRC
         lastLoggedLine = null
+        // This store is deliberately independent from QrcLyricManager's
+        // lookup monitor. Do not replace it with a manager-level synchronized
+        // call while LyricManager's state monitor is held.
         qrcLyricManager.removeUncertainCooldown(
             currentTrack.songKey,
             "incremental lyrics ready"

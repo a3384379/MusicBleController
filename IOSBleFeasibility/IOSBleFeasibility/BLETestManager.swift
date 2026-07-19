@@ -27,6 +27,7 @@ private let CONNECTION_HEALTH_HARD_RECONNECT_MIN_INTERVAL_MS: Int64 = 5_000
 private let CONNECTION_SUBSCRIBE_NOTIFY_TIMEOUT_MS: Int64 = 5_000
 private let CONNECTION_DISPLAY_CONNECTED_MIN_HOLD_MS: Int64 = 5_000
 private let CONNECTION_DISPLAY_DISCONNECTED_CONFIRM_MS: Int64 = 1_000
+private let COMMAND_WRITE_CALLBACK_TIMEOUT_MS: Int64 = 2_500
 private let FULL_LYRICS_REQUEST_DEDUP_WINDOW_MS: Int64 = 1_500
 private let FULL_LYRICS_REQUEST_START_TIMEOUT_MS: Int64 = 3_000
 private let FULL_LYRICS_REQUEST_START_MAX_RETRIES = 2
@@ -199,9 +200,10 @@ final class BLETestManager: NSObject, ObservableObject {
     private var sonyPeripheral: CBPeripheral?
     private var sonyCommandCharacteristic: CBCharacteristic?
     private var sonyStatusCharacteristic: CBCharacteristic?
-    private var pendingWriteCommand = ""
     private var commandSeq: UInt64 = 0
     private var commandWriteInflight: [CommandWriteInfo] = []
+    private var pendingCommandWrites: [PendingCommandWrite] = []
+    private var commandWriteTimeoutWorkItem: DispatchWorkItem?
     private var volumeWriteInFlightSeq: UInt64?
     private var lastVolumeSendAtMs: Int64 = 0
     private var lastVolumeRequestedValue: Int?
@@ -338,6 +340,17 @@ final class BLETestManager: NSObject, ObservableObject {
         let seq: UInt64
         let cmd: String
         let writeCalledAtMs: Int64
+    }
+
+    private struct PendingCommandWrite {
+        let seq: UInt64
+        let cmd: String
+        let data: Data
+        let payloadText: String
+        let enqueuedAtMs: Int64
+        let isControl: Bool
+        let volumeValue: Int?
+        let volumeReason: String?
     }
 
     private enum HistoryRequestKind {
@@ -1551,25 +1564,105 @@ final class BLETestManager: NSObject, ObservableObject {
             return
         }
 
-        pendingWriteCommand = cmd
-        let writeBeginMs = currentTimeMs()
-        ctrlLog("[CTRL-iOS] write begin seq=\(seq) cmd=\(cmd) timeMs=\(writeBeginMs)")
-        commandWriteInflight.append(
-            CommandWriteInfo(
+        enqueueCommandWrite(
+            PendingCommandWrite(
                 seq: seq,
                 cmd: cmd,
+                data: data,
+                payloadText: text,
+                enqueuedAtMs: startMs,
+                isControl: isControlCommand(cmd),
+                volumeValue: nil,
+                volumeReason: nil
+            )
+        )
+    }
+
+    private func enqueueCommandWrite(_ request: PendingCommandWrite) {
+        if request.isControl,
+           let firstBackgroundIndex = pendingCommandWrites.firstIndex(where: { !$0.isControl }) {
+            pendingCommandWrites.insert(request, at: firstBackgroundIndex)
+        } else {
+            pendingCommandWrites.append(request)
+        }
+        if !commandWriteInflight.isEmpty {
+            ctrlLog(
+                "[CTRL-iOS] write queued seq=\(request.seq) cmd=\(request.cmd) " +
+                    "pending=\(pendingCommandWrites.count)"
+            )
+        }
+        flushCommandWriteQueue()
+    }
+
+    private func flushCommandWriteQueue() {
+        guard commandWriteInflight.isEmpty,
+              !pendingCommandWrites.isEmpty,
+              let sonyPeripheral,
+              sonyPeripheral.state == .connected,
+              let sonyCommandCharacteristic else {
+            return
+        }
+
+        let request = pendingCommandWrites.removeFirst()
+        let writeBeginMs = currentTimeMs()
+        commandWriteInflight.append(
+            CommandWriteInfo(
+                seq: request.seq,
+                cmd: request.cmd,
                 writeCalledAtMs: writeBeginMs
             )
         )
-        sonyPeripheral.writeValue(data, for: sonyCommandCharacteristic, type: .withResponse)
-        lastSuccessfulWriteAt = Date()
-        ctrlLog("[CTRL-iOS] write called seq=\(seq) cmd=\(cmd) timeMs=\(currentTimeMs())")
-        if cmd == "SET_VOLUME" {
-            log("[iOS][BLE] write SET_VOLUME requested")
-        } else {
-            log("[Command] send \(cmd)")
+        if request.cmd == "SET_VOLUME" {
+            volumeWriteInFlightSeq = request.seq
+            lastVolumeSendAtMs = writeBeginMs
         }
-        log("[BLE] write requested \(text)")
+        ctrlLog(
+            "[CTRL-iOS] write begin seq=\(request.seq) cmd=\(request.cmd) " +
+                "timeMs=\(writeBeginMs) queuedMs=\(writeBeginMs - request.enqueuedAtMs)"
+        )
+        sonyPeripheral.writeValue(
+            request.data,
+            for: sonyCommandCharacteristic,
+            type: .withResponse
+        )
+        ctrlLog(
+            "[CTRL-iOS] write called seq=\(request.seq) cmd=\(request.cmd) " +
+                "timeMs=\(currentTimeMs())"
+        )
+        if request.cmd == "SET_VOLUME" {
+            log(
+                "[VOL-iOS] send SET_VOLUME value=\(request.volumeValue ?? -1) " +
+                    "reason=\(request.volumeReason ?? "unknown")"
+            )
+        } else {
+            log("[Command] send \(request.cmd)")
+        }
+        log("[BLE] write requested \(request.payloadText)")
+        scheduleCommandWriteTimeout(seq: request.seq, cmd: request.cmd)
+    }
+
+    private func scheduleCommandWriteTimeout(seq: UInt64, cmd: String) {
+        commandWriteTimeoutWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.commandWriteInflight.first?.seq == seq else {
+                return
+            }
+            self.ctrlLog(
+                "[CTRL-iOS] write timeout seq=\(seq) cmd=\(cmd) " +
+                    "timeoutMs=\(COMMAND_WRITE_CALLBACK_TIMEOUT_MS) " +
+                    "pending=\(self.pendingCommandWrites.count)"
+            )
+            self.performHardReconnect(
+                reason: "command write callback timeout cmd=\(cmd) seq=\(seq)",
+                manual: false
+            )
+        }
+        commandWriteTimeoutWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Double(COMMAND_WRITE_CALLBACK_TIMEOUT_MS) / 1_000.0,
+            execute: item
+        )
     }
 
     func seek(to position: Int64) {
@@ -1739,7 +1832,9 @@ final class BLETestManager: NSObject, ObservableObject {
             return
         }
 
-        if volumeWriteInFlightSeq != nil || !commandWriteInflight.isEmpty {
+        if volumeWriteInFlightSeq != nil ||
+            !commandWriteInflight.isEmpty ||
+            !pendingCommandWrites.isEmpty {
             setPendingVolume(targetVolume, reason: reason, isFinal: forceFinal, nowMs: nowMs)
             log(
                 "[VOL-iOS] send throttled value=\(targetVolume) " +
@@ -1781,22 +1876,18 @@ final class BLETestManager: NSObject, ObservableObject {
             return
         }
 
-        pendingWriteCommand = "SET_VOLUME"
-        volumeWriteInFlightSeq = seq
-        lastVolumeSendAtMs = startMs
-        commandWriteInflight.append(
-            CommandWriteInfo(
+        enqueueCommandWrite(
+            PendingCommandWrite(
                 seq: seq,
                 cmd: "SET_VOLUME",
-                writeCalledAtMs: startMs
+                data: data,
+                payloadText: text,
+                enqueuedAtMs: startMs,
+                isControl: true,
+                volumeValue: value,
+                volumeReason: forceFinal ? "final" : reason
             )
         )
-        ctrlLog("[CTRL-iOS] write begin seq=\(seq) cmd=SET_VOLUME timeMs=\(startMs)")
-        sonyPeripheral.writeValue(data, for: sonyCommandCharacteristic, type: .withResponse)
-        lastSuccessfulWriteAt = Date()
-        ctrlLog("[CTRL-iOS] write called seq=\(seq) cmd=SET_VOLUME timeMs=\(currentTimeMs())")
-        log("[VOL-iOS] send SET_VOLUME value=\(value) reason=\(forceFinal ? "final" : reason)")
-        log("[BLE] write requested \(text)")
     }
 
     private func setPendingVolume(_ value: Int, reason: String, isFinal: Bool, nowMs: Int64) {
@@ -1850,7 +1941,9 @@ final class BLETestManager: NSObject, ObservableObject {
             clearPendingVolume()
             return
         }
-        guard volumeWriteInFlightSeq == nil, commandWriteInflight.isEmpty else {
+        guard volumeWriteInFlightSeq == nil,
+              commandWriteInflight.isEmpty,
+              pendingCommandWrites.isEmpty else {
             return
         }
         if !latestPendingVolumeIsFinal {
@@ -2630,7 +2723,10 @@ final class BLETestManager: NSObject, ObservableObject {
         sonyCommandCharacteristic = nil
         sonyStatusCharacteristic = nil
         firstConnectionReadyAtMs = 0
+        commandWriteTimeoutWorkItem?.cancel()
+        commandWriteTimeoutWorkItem = nil
         commandWriteInflight.removeAll()
+        pendingCommandWrites.removeAll()
         liveActivityControlInFlightSeq = nil
         liveActivityControlWriteStartedAtMs = 0
         clearPendingVolume()
@@ -3318,6 +3414,8 @@ extension BLETestManager: CBPeripheralDelegate {
             log("[BLE-Reconnect] ignore stale didWrite id=\(peripheral.identifier.uuidString)")
             return
         }
+        commandWriteTimeoutWorkItem?.cancel()
+        commandWriteTimeoutWorkItem = nil
         let completed = commandWriteInflight.isEmpty ? nil : commandWriteInflight.removeFirst()
         let didWriteMs = currentTimeMs()
         if let completed {
@@ -3345,25 +3443,30 @@ extension BLETestManager: CBPeripheralDelegate {
         } else {
             let errorText = error?.localizedDescription ?? "nil"
             ctrlLog(
-                "[CTRL-iOS] didWrite seq=unknown cmd=\(pendingWriteCommand) " +
+                "[CTRL-iOS] didWrite seq=unknown cmd=unknown " +
                     "timeMs=\(didWriteMs) costMs=unknown error=\(errorText)"
             )
         }
 
         if let error {
-            if pendingWriteCommand == "SET_VOLUME" {
+            if completed?.cmd == "SET_VOLUME" {
                 log("[iOS][BLE] write SET_VOLUME failed: \(error.localizedDescription)")
             } else {
                 log(
-                    "[Command] \(pendingWriteCommand) failed " +
+                    "[Command] \(completed?.cmd ?? "unknown") failed " +
                         "error=\(error.localizedDescription)"
                 )
             }
             performHardReconnect(reason: "didWrite error \(error.localizedDescription)", manual: false)
-        } else if pendingWriteCommand == "SET_VOLUME" {
+        } else if completed?.cmd == "SET_VOLUME" {
+            lastSuccessfulWriteAt = Date()
             log("[iOS][BLE] write SET_VOLUME success")
         } else {
-            log("[Command] \(pendingWriteCommand) success")
+            lastSuccessfulWriteAt = Date()
+            log("[Command] \(completed?.cmd ?? "unknown") success")
+        }
+        if error == nil {
+            flushCommandWriteQueue()
         }
     }
 

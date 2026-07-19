@@ -41,6 +41,7 @@ class BleNotifyQueue(
     private var notifyTimeoutRunnable: Runnable? = null
     private var drainingCancelledCallback = false
     private var cancelledCallbackDrainRunnable: Runnable? = null
+    private var commandResponseQuietUntilMs = 0L
 
     fun enqueueShort(
         device: BluetoothDevice,
@@ -62,6 +63,22 @@ class BleNotifyQueue(
                 isLongJob = false
             )
         )
+    }
+
+    /**
+     * Gives the ATT write response a short radio window before the next notification packet.
+     * Older Sony Bluetooth stacks can otherwise acknowledge sendResponse() locally while the
+     * iOS client never receives its write callback during a dense album-art transfer.
+     */
+    @Synchronized
+    fun onCommandResponseSent() {
+        commandResponseQuietUntilMs = maxOf(
+            commandResponseQuietUntilMs,
+            SystemClock.elapsedRealtime() + COMMAND_RESPONSE_QUIET_MS
+        )
+        if (!notificationInFlight && !drainingCancelledCallback) {
+            handler.postDelayed({ sendNextPacket() }, COMMAND_RESPONSE_QUIET_MS)
+        }
     }
 
     fun enqueueLongJob(
@@ -237,6 +254,7 @@ class BleNotifyQueue(
         activePacketIndex = 0
         activeJobStartedAtMs = 0L
         notificationInFlight = false
+        commandResponseQuietUntilMs = 0L
         activeRequestType = null
         activeRequestId += 1
         cancelNotifyTimeout()
@@ -257,6 +275,7 @@ class BleNotifyQueue(
         activeJob = null
         activePacketIndex = 0
         notificationInFlight = false
+        commandResponseQuietUntilMs = 0L
         activeRequestType = null
         activeRequestId += 1
         cancelNotifyTimeout()
@@ -284,6 +303,14 @@ class BleNotifyQueue(
     @Synchronized
     private fun sendNextPacket() {
         if (notificationInFlight || drainingCancelledCallback) {
+            return
+        }
+        val quietDelayMs = remainingQuietDelayMs(
+            commandResponseQuietUntilMs,
+            SystemClock.elapsedRealtime()
+        )
+        if (quietDelayMs > 0L) {
+            handler.postDelayed({ sendNextPacket() }, quietDelayMs)
             return
         }
 
@@ -858,6 +885,7 @@ class BleNotifyQueue(
         private const val NOTIFY_CALLBACK_TIMEOUT_STATUS = -2
         private const val NOTIFY_CALLBACK_TIMEOUT_MS = 2_000L
         private const val CANCELLED_CALLBACK_DRAIN_MS = 750L
+        private const val COMMAND_RESPONSE_QUIET_MS = 25L
         private const val BULK_YIELD_INTERVAL = 4
         private const val BACKGROUND_YIELD_INTERVAL = 1
         private const val JSON_LYRIC_MIN_DELAY_MS = 2L
@@ -903,6 +931,10 @@ class BleNotifyQueue(
                 }
                 Priority.P3_BACKGROUND -> packetsSinceYield >= BACKGROUND_YIELD_INTERVAL
             }
+        }
+
+        internal fun remainingQuietDelayMs(quietUntilMs: Long, nowMs: Long): Long {
+            return (quietUntilMs - nowMs).coerceAtLeast(0L)
         }
     }
 

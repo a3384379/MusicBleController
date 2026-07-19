@@ -31,7 +31,7 @@ class QrcLyricManager(
     private val songGroupCache = mutableMapOf<String, String>()
     private val songLinesCache = mutableMapOf<String, List<LyricLine>>()
     private val parsedQrcCache = mutableMapOf<String, ParsedQrc?>()
-    private val uncertainMissCooldown = mutableMapOf<String, QrcCooldownEntry>()
+    private val uncertainMissCooldown = QrcCooldownStore()
 
     fun close() {
         persistentIndexManager.shutdown()
@@ -1242,10 +1242,13 @@ class QrcLyricManager(
             )
         }
         val generation = QrcDirectoryGeneration.current()
-        uncertainMissCooldown[songKey] = QrcCooldownEntry(
-            retryAfterMs = retryAfterMs,
-            generation = generation,
-            reason = "uncertain qrc match"
+        uncertainMissCooldown.put(
+            songKey,
+            QrcCooldownStore.Entry(
+                retryAfterMs = retryAfterMs,
+                generation = generation,
+                reason = "uncertain qrc match"
+            )
         )
         logger(
             "[QrcCooldown] saved songKey=$songKey generation=$generation " +
@@ -1253,17 +1256,14 @@ class QrcLyricManager(
         )
     }
 
-    @Synchronized
     fun removeUncertainCooldown(songKey: String, reason: String) {
         if (uncertainMissCooldown.remove(songKey) != null) {
             logger("[QrcCooldown] removed songKey=$songKey reason=$reason")
         }
     }
 
-    @Synchronized
     fun clearUncertainCooldowns(reason: String) {
-        if (uncertainMissCooldown.isNotEmpty()) {
-            uncertainMissCooldown.clear()
+        if (uncertainMissCooldown.clear()) {
             logger("[QrcCooldown] cleared all reason=$reason")
         }
     }
@@ -1350,12 +1350,6 @@ class QrcLyricManager(
         val album: String,
         val lines: List<LyricLine>,
         val rawText: String
-    )
-
-    private data class QrcCooldownEntry(
-        val retryAfterMs: Long,
-        val generation: Long,
-        val reason: String
     )
 
     data class QrcLoadResult(

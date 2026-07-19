@@ -401,6 +401,7 @@ class BleGattServerManager(
                         "costMs=${SystemClock.elapsedRealtime() - responseStartMs} ok=$ok"
                 )
                 if (ok) {
+                    notifyQueue.onCommandResponseSent()
                     recordCommandSuccess(command)
                 }
             }
