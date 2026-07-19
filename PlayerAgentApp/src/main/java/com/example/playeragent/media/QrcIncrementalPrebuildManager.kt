@@ -147,10 +147,10 @@ class QrcIncrementalPrebuildManager(
             incrementSkipped()
             return
         }
-        val currentTrack = currentTrackProvider()
-        val shouldTryCurrentTrack = currentTrack != null &&
-            !currentTrack.hasLyrics &&
-            isRecentForCurrentTrack(group, currentTrack)
+        val currentTrackAtStart = currentTrackProvider()
+        val shouldTryCurrentTrack = currentTrackAtStart != null &&
+            !currentTrackAtStart.hasLyrics &&
+            isRecentForCurrentTrack(group, currentTrackAtStart)
         if (!shouldTryCurrentTrack) {
             val validation = cacheManager.validateGroupCache(group, requireComplete = true)
             if (validation.valid) {
@@ -172,6 +172,18 @@ class QrcIncrementalPrebuildManager(
             persistentIndexManager.markDirty(groupId)
             incrementFailed()
             return
+        }
+
+        // QQ Music writes the sidecar before its MediaSession metadata changes.
+        // Parsing can overlap that transition, so refresh the snapshot here
+        // instead of matching the new group against the previous song.
+        val currentTrack = currentTrackProvider() ?: currentTrackAtStart
+        if (currentTrackAtStart?.trackId != currentTrack?.trackId) {
+            logger(
+                "[QrcIncremental] current track refreshed after parse " +
+                    "from=${currentTrackAtStart?.trackId.orEmpty()} " +
+                    "to=${currentTrack?.trackId.orEmpty()}"
+            )
         }
 
         var savedAny = false
@@ -286,9 +298,11 @@ class QrcIncrementalPrebuildManager(
         group: QrcFileGroup,
         currentTrack: CurrentTrackSnapshot
     ): Boolean {
-        val qrcModifiedAt = group.qrcFile?.lastModified() ?: group.lastModified
-        return qrcModifiedAt >= currentTrack.trackChangedAtMs ||
-            kotlin.math.abs(qrcModifiedAt - currentTrack.trackChangedAtMs) <= CURRENT_TRACK_MATCH_WINDOW_MS
+        return isQrcGroupRecentForCurrentTrack(
+            group = group,
+            trackChangedAtMs = currentTrack.trackChangedAtMs,
+            matchWindowMs = CURRENT_TRACK_MATCH_WINDOW_MS
+        )
     }
 
     private fun isForegroundCurrentTrackGroup(groupId: String): Boolean {
@@ -449,6 +463,30 @@ class QrcIncrementalPrebuildManager(
             "romaqrc"
         )
     }
+}
+
+/**
+ * QQ Music may reuse an existing encrypted .qrc and only rewrite its .ex sidecar
+ * when that lyric becomes active for the current song. Use the newest timestamp
+ * from the whole group so that this foreground signal is not hidden by an older
+ * .qrc timestamp.
+ */
+internal fun isQrcGroupRecentForCurrentTrack(
+    group: QrcFileGroup,
+    trackChangedAtMs: Long,
+    matchWindowMs: Long
+): Boolean {
+    val newestModifiedAt = listOfNotNull(
+        group.qrcFile,
+        group.producerFile,
+        group.exFile,
+        group.translrcFile,
+        group.romaqrcFile
+    ).maxOfOrNull(File::lastModified)
+        ?.coerceAtLeast(group.lastModified)
+        ?: group.lastModified
+    return newestModifiedAt >= trackChangedAtMs ||
+        kotlin.math.abs(newestModifiedAt - trackChangedAtMs) <= matchWindowMs
 }
 
 data class QrcWatcherStatus(

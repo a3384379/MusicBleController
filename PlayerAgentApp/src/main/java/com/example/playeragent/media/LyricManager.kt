@@ -1754,10 +1754,16 @@ class LyricManager(
             currentTrack.artist,
             currentTrack.album
         )
-        if (activeSongKey != activeKey) {
+        if (!isSameIncrementalLyricTrack(
+                activeSongKey = activeSongKey,
+                activeTrackId = activeTrackId,
+                snapshotSongKey = activeKey,
+                snapshotTrackId = currentTrack.trackId
+            )
+        ) {
             logger(
                 "[Lyric] incremental lyrics ignored reason=track changed " +
-                    "songKey=${currentTrack.songKey}"
+                    "songKey=${currentTrack.songKey} trackId=${currentTrack.trackId}"
             )
             return false
         }
@@ -1774,16 +1780,17 @@ class LyricManager(
         if (lines.isEmpty()) {
             return false
         }
-        cachedKey = activeKey
+        val lyricStateKey = activeSongKey ?: activeKey
+        cachedKey = lyricStateKey
         cachedLines = lines
-        loadedSongKey = activeKey
+        loadedSongKey = lyricStateKey
         lastSource = LyricSource.QRC
         lastLoggedLine = null
         qrcLyricManager.removeUncertainCooldown(
             currentTrack.songKey,
             "incremental lyrics ready"
         )
-        recoveryEngine.onLyricLoaded(activeKey, lines.size)
+        recoveryEngine.onLyricLoaded(lyricStateKey, lines.size)
         retryableFailureSongKey = null
         retryableFailureReason = ""
         retryableFailureAtMs = 0L
@@ -1796,7 +1803,7 @@ class LyricManager(
         predictiveLyricsPipeline.putLoadedTrack(
             track = PredictiveLyricsTrack(
                 trackId = currentTrack.trackId,
-                songKey = activeKey,
+                songKey = lyricStateKey,
                 title = currentTrack.title,
                 artist = currentTrack.artist,
                 album = currentTrack.album
@@ -1806,7 +1813,7 @@ class LyricManager(
             buildTimeMs = 0L
         )
         CurrentTrackRuntimeCache.updateLyrics(
-            songKey = activeKey,
+            songKey = currentTrack.songKey,
             lines = lines,
             lyricSource = LyricSource.QRC.name,
             logger = logger
@@ -1814,13 +1821,13 @@ class LyricManager(
         lyricsReadyState = LyricsReadyState.READY
         logger(
             "[LyricsState] index ready trackId=${currentTrack.trackId} " +
-                "songKey=$activeKey lines=${lines.size} " +
+                "songKey=$lyricStateKey lines=${lines.size} " +
                 "generation=${CurrentTrackRuntimeCache.currentGeneration()}"
         )
         logger("[LyricsState] lyricsReady=true")
         trace(
             activeLyricTraceId.ifBlank {
-                buildLyricTraceId(currentTrack.trackId, activeKey, System.currentTimeMillis())
+                buildLyricTraceId(currentTrack.trackId, lyricStateKey, System.currentTimeMillis())
             },
             "lyricsReadyGateReady",
             "trackId=${currentTrack.trackId} " +
@@ -2443,4 +2450,18 @@ class LyricManager(
             )
         }
     }
+}
+
+internal fun isSameIncrementalLyricTrack(
+    activeSongKey: String?,
+    activeTrackId: String,
+    snapshotSongKey: String,
+    snapshotTrackId: String
+): Boolean {
+    if (activeSongKey == snapshotSongKey) {
+        return true
+    }
+    return activeTrackId.isNotBlank() &&
+        snapshotTrackId.isNotBlank() &&
+        activeTrackId == snapshotTrackId
 }
