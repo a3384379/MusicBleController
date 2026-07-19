@@ -1,6 +1,11 @@
 # MusicBleController
 
 <p align="center">
+  <a href="README.md"><strong>English</strong></a> ·
+  <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <strong>Turn a Sony Android Walkman into a Bluetooth music bridge for iPhone.</strong><br>
   <strong>让 iPhone 实时获取 Sony Android 播放器上的 QQ 音乐歌词、封面和播放状态。</strong>
 </p>
@@ -22,6 +27,22 @@ lyrics, artwork caching, Dynamic Island and Live Activities.
 > The current implementation supports **QQ Music on Android only**. It is an
 > unofficial community project and is not affiliated with Sony, Apple, Tencent
 > or QQ Music.
+
+## 中文简介
+
+MusicBleController 是面向 **Sony Android Walkman 与 iPhone** 的 QQ 音乐
+BLE 伴侣项目。Sony 端读取 QQ 音乐的播放状态、本地 QRC 逐字歌词和通知封面，
+再通过低功耗蓝牙实时同步到 iPhone；iPhone 端负责播放器界面、歌词高亮、封面缓存、
+播放控制、锁屏实时活动和灵动岛展示，全程不依赖云端中转服务。
+
+- 支持 QQ 音乐 QRC 逐字歌词、翻译和罗马音数据；
+- 支持预览封面优先传输、高清封面后台升级和缓存复用；
+- 支持播放、暂停、切歌、进度和音量控制；
+- 针对 Sony 播放器性能和 BLE 带宽做了队列抢占、压缩传输、重试和断线恢复优化。
+
+当前仅支持 Android 版 QQ 音乐，需要自行安装 Sony 端应用，并使用自己的 Apple
+开发者签名构建 iOS App。安装、权限、兼容性、排障和开发说明请阅读
+[完整简体中文文档](README.zh-CN.md)。
 
 ## Preview
 
@@ -163,13 +184,3 @@ helps other Sony Walkman and iPhone users discover the project.
 
 The QRC decryption implementation includes work derived from open-source
 projects credited in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
-## 中文简介
-
-MusicBleController 用 BLE 将 Sony Android Walkman 上的 QQ 音乐与 iPhone
-连接起来，提供歌词同步、逐字高亮、封面传输、播放控制、灵动岛和
-实时活动。Sony 端负责读取 QQ 音乐 MediaSession、通知封面与本地 QRC
-缓存，iPhone 端负责展示、缓存和控制，全程不需要云服务。
-
-当前仅支持 Android 版 QQ 音乐，需要自行编译并签名 iOS App。欢迎通过
-Issues 反馈其他 Walkman 机型的兼容情况、歌词或封面样本以及 BLE 性能数据。
