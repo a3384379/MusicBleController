@@ -12,7 +12,7 @@
   <img alt="Kotlin" src="https://img.shields.io/badge/Kotlin-BLE-7F52FF?logo=kotlin&logoColor=white">
 </p>
 
-MusicBleController is an open-source iPhone companion for Sony Walkman devices
+MusicBleController is a source-available iPhone companion for Sony Walkman devices
 running Android. A lightweight Android agent reads QQ Music playback metadata,
 QRC lyrics and album art, then streams them to a native SwiftUI app over
 Bluetooth Low Energy (BLE). The iPhone app provides playback controls, synced
