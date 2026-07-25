@@ -11,6 +11,7 @@
 - Sony `QrcDirectoryWatcher` / `QrcIncrementalPrebuildManager`：监听 QQMusic 文件后到并增量解析。
 - Sony `LyricRecoveryEngine`：当前歌曲无歌词后短期恢复窗口，处理 QQ音乐懒加载歌词缓存。
 - iOS `BLETestManager`：接收 `lyricWindow*`、legacy `fullLyrics*`、A2 zlib full lyrics、`lyricSecondary*` 和歌词诊断。
+- Sony `LyricsTransferCoordinator` / `CompressedLyricsCache`：独立持有歌词重传与最多 16 项/512KB 的 zlib 正文和 CRC，不受封面生命周期影响。
 - iOS `FullLyricsView`：显示原文、翻译、罗马音，逐字高亮只作用于原文。
 
 ## 核心文件
@@ -25,6 +26,8 @@
 - Sony recovery：[LyricRecoveryEngine.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/LyricRecoveryEngine.kt)
 - iOS full lyrics：[FullLyricsView.swift](/Volumes/雷电/project/MusicBleController/IOSBleFeasibility/IOSBleFeasibility/FullLyricsView.swift)
 - iOS 诊断：[LyricDiagnostic.swift](/Volumes/雷电/project/MusicBleController/IOSBleFeasibility/IOSBleFeasibility/LyricDiagnostic.swift)
+- Sony 压缩热缓存：[CompressedLyricsCache.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/ble/CompressedLyricsCache.kt)
+- Sony 歌词传输协调器：[MediaTransferCoordinators.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/ble/MediaTransferCoordinators.kt)
 
 ## 数据流
 
@@ -35,8 +38,11 @@
 5. QRC 前台顺序为 L1、alias、exact L2、title+artist 唯一安全直达、内存索引 fuzzy；不再为当前歌曲 `listFiles` 或解析所有缓存 JSON。
 6. TrackInfo 后 iOS 优先请求最多 5 行的 `GET_LYRIC_WINDOW`，先构建可见 UI；完整歌词后台请求。
 7. V2 完整歌词为 zlib JSON + A2 binary + CRC32；协商/大小失败自动回退 legacy 逐行协议。
+   - `RETRY_TRANSFER` 使用歌词传输自己的 `trackId + generation + transferId`，与封面是否存在、是否完成无关。
+   - 重传结果仍受当前 generation 栅栏保护，旧歌曲不得覆盖新歌。
 8. 翻译/罗马音继续通过 `GET_LYRIC_SECONDARY mode=translation|romanization` 独立分片发送。
 9. QRC 就绪回调会立即恢复 currentWord 边界调度；暂停时无周期任务，seek/恢复/切歌重新计算，最长 500ms 漂移校正。
+10. iOS 主界面显示等待 QQ QRC、歌词窗口、完整歌词、完成或明确失败；“重试歌词”只清理当前歌曲 cooldown/失败状态，并用 `GET_FULL_LYRICS forceRefresh=true` 触发兼容刷新。
 
 ## 关键状态
 
@@ -46,6 +52,7 @@
 - `QrcParsedCacheIndex.json`：只保存 songKey、标准化 metadata、groupId、文件名、行数、时间和 fingerprint；500ms 防抖、临时文件原子替换。
 - `LyricRecoveryState`：`WAITING_QQMUSIC_CACHE`、`WATCHING_RECENT_QRC`、`RETRY_SCHEDULED`、`RETRYING`、`RESOLVED`、`EXPIRED` 等。
 - iOS `LyricLine`：解析 fullLyrics 和 secondary 后合并，secondary 会清洗 `//`、`/`、`暂无翻译` 等占位。
+- 压缩缓存 key 包含 songKey、fingerprint、generation、格式和逐字行集合；翻译/罗马音、fingerprint、generation 改变时不复用旧正文。
 
 ## 不允许随便修改的点
 
@@ -56,6 +63,7 @@
 - 不要把 translation/romanization 塞回基础 `fullLyricsChunk` 导致 MTU 裁剪。
 - 不要让 Live Activity 显示翻译/罗马音或携带完整歌词。
 - 不要删除 negative/cooldown/alias 策略，除非有日志证明它们错误。
+- 不要让歌词重传读取或比较 `currentAlbumArtId`。
 
 ## 常见问题排查入口
 

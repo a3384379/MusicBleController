@@ -68,6 +68,21 @@ struct PreferencesView: View {
                 .foregroundStyle(.white.opacity(0.58))
 
             VStack(alignment: .leading, spacing: 8) {
+                Text("性能模式")
+                    .font(.subheadline.weight(.semibold))
+                Picker("性能模式", selection: performanceModeBinding) {
+                    ForEach(PlaybackPerformanceMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+
+            Text(preferences.playbackPerformanceMode.detail)
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.58))
+
+            VStack(alignment: .leading, spacing: 8) {
                 Text("灵动岛样式")
                     .font(.subheadline.weight(.semibold))
                 Picker("灵动岛样式", selection: dynamicIslandStyleBinding) {
@@ -223,6 +238,13 @@ struct PreferencesView: View {
         Binding(
             get: { preferences.autoReconnectEnabled },
             set: { bleManager.setAutoReconnectEnabled($0) }
+        )
+    }
+
+    private var performanceModeBinding: Binding<PlaybackPerformanceMode> {
+        Binding(
+            get: { preferences.playbackPerformanceMode },
+            set: { preferences.playbackPerformanceMode = $0 }
         )
     }
 

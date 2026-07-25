@@ -1,6 +1,47 @@
 import Foundation
 import SwiftUI
 
+enum PlaybackPerformanceMode: String, CaseIterable, Identifiable {
+    case automatic
+    case smooth
+    case powerSaving
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .automatic: return "自动"
+        case .smooth: return "流畅"
+        case .powerSaving: return "省电"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .automatic:
+            return "根据低电量模式和播放状态自动平衡实时性与耗电。"
+        case .smooth:
+            return "优先频谱、封面和灵动岛的响应速度。"
+        case .powerSaving:
+            return "降低动画和后台刷新频率，HQ 封面仍会延后加载。"
+        }
+    }
+
+    var hqDelayMultiplier: Double {
+        switch self {
+        case .automatic:
+            return ProcessInfo.processInfo.isLowPowerModeEnabled ? 1.8 : 1.0
+        case .smooth:
+            return 0.75
+        case .powerSaving:
+            return 2.5
+        }
+    }
+
+    static let userDefaultsKey = "playbackPerformanceMode"
+    static let defaultMode: PlaybackPerformanceMode = .automatic
+}
+
 enum ArtworkDisplaySizeOption: Int, CaseIterable, Identifiable {
     case small = 200
     case medium = 220
@@ -61,6 +102,10 @@ final class PreferencesStore: ObservableObject {
         didSet { persistDynamicIslandStyle(oldValue: oldValue) }
     }
 
+    @Published var playbackPerformanceMode: PlaybackPerformanceMode {
+        didSet { persistPlaybackPerformanceMode(oldValue: oldValue) }
+    }
+
     private let defaults: UserDefaults
 
     private init(defaults: UserDefaults = .standard) {
@@ -84,6 +129,7 @@ final class PreferencesStore: ObservableObject {
         )
         artworkDisplaySize = Self.loadArtworkDisplaySize(defaults: defaults)
         dynamicIslandStyle = Self.loadDynamicIslandStyle(defaults: defaults)
+        playbackPerformanceMode = Self.loadPlaybackPerformanceMode(defaults: defaults)
         logLoaded()
     }
 
@@ -107,6 +153,7 @@ final class PreferencesStore: ObservableObject {
         )
         artworkDisplaySize = Self.loadArtworkDisplaySize(defaults: defaults)
         dynamicIslandStyle = Self.loadDynamicIslandStyle(defaults: defaults)
+        playbackPerformanceMode = Self.loadPlaybackPerformanceMode(defaults: defaults)
         logLoaded()
     }
 
@@ -118,6 +165,7 @@ final class PreferencesStore: ObservableObject {
         artworkEnhancementEnabled = true
         artworkDisplaySize = .defaultOption
         dynamicIslandStyle = .defaultStyle
+        playbackPerformanceMode = .defaultMode
     }
 
     private static func loadAppExperienceMode(defaults: UserDefaults) -> AppExperienceMode {
@@ -138,6 +186,11 @@ final class PreferencesStore: ObservableObject {
     private static func loadDynamicIslandStyle(defaults: UserDefaults) -> DynamicIslandStyle {
         let raw = defaults.string(forKey: DynamicIslandStyle.userDefaultsKey)
         return raw.flatMap(DynamicIslandStyle.init(rawValue:)) ?? .defaultStyle
+    }
+
+    private static func loadPlaybackPerformanceMode(defaults: UserDefaults) -> PlaybackPerformanceMode {
+        let raw = defaults.string(forKey: PlaybackPerformanceMode.userDefaultsKey)
+        return raw.flatMap(PlaybackPerformanceMode.init(rawValue:)) ?? .defaultMode
     }
 
     private static func loadBool(defaults: UserDefaults, key: String, defaultValue: Bool) -> Bool {
@@ -172,6 +225,18 @@ final class PreferencesStore: ObservableObject {
         logChanged(key: DynamicIslandStyle.userDefaultsKey, value: dynamicIslandStyle.rawValue)
     }
 
+    private func persistPlaybackPerformanceMode(oldValue: PlaybackPerformanceMode) {
+        guard playbackPerformanceMode != oldValue else { return }
+        defaults.set(
+            playbackPerformanceMode.rawValue,
+            forKey: PlaybackPerformanceMode.userDefaultsKey
+        )
+        logChanged(
+            key: PlaybackPerformanceMode.userDefaultsKey,
+            value: playbackPerformanceMode.rawValue
+        )
+    }
+
     private func persistBool(_ value: Bool, oldValue: Bool, key: String) {
         guard value != oldValue else { return }
         defaults.set(value, forKey: key)
@@ -191,7 +256,8 @@ final class PreferencesStore: ObservableObject {
                 "lyricDisplayMode=\(lyricDisplayMode.rawValue) " +
                 "artworkEnhancement=\(artworkEnhancementEnabled) " +
                 "artworkDisplaySize=\(artworkDisplaySize.rawValue) " +
-                "dynamicIslandStyle=\(dynamicIslandStyle.rawValue)"
+                "dynamicIslandStyle=\(dynamicIslandStyle.rawValue) " +
+                "performanceMode=\(playbackPerformanceMode.rawValue)"
         )
     }
 

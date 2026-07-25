@@ -7,12 +7,15 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattServer
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
 import com.example.playeragent.logging.LogConfig
 import org.json.JSONObject
 import java.util.ArrayDeque
 import java.util.LinkedHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class BleNotifyQueue(
     private val serverProvider: () -> BluetoothGattServer?,
@@ -24,8 +27,10 @@ class BleNotifyQueue(
     private val onNotifyFailure: (type: String, status: Int, reason: String) -> Unit = { _, _, _ -> }
 ) {
 
-    private val handler = Handler(Looper.getMainLooper())
+    private val handlerThread = HandlerThread("BleNotifyQueue").apply { start() }
+    private val handler = Handler(handlerThread.looper)
     private val jobs = ArrayDeque<SendJob>()
+    private val linkProfiles = LinkedHashMap<String, BleLinkProfile>()
     private var activeJob: SendJob? = null
     private var activePacketIndex = 0
     private var activeJobStartedAtMs = 0L
@@ -42,6 +47,31 @@ class BleNotifyQueue(
     private var drainingCancelledCallback = false
     private var cancelledCallbackDrainRunnable: Runnable? = null
     private var commandResponseQuietUntilMs = 0L
+    private var activeNotifyStartedAtMs = 0L
+    private var activeNotifyDeviceAddress: String? = null
+    private var activeNotifyPacketType: String? = null
+
+    fun resetLinkProfile(address: String, mtu: Int) {
+        runOnQueueThread { resetLinkProfileOnQueue(address, mtu) }
+    }
+
+    @Synchronized
+    private fun resetLinkProfileOnQueue(address: String, mtu: Int) {
+        if (address.isBlank()) return
+        linkProfiles[address] = BleLinkProfile(mtu)
+        localOnlyLogger("[BleLink] reset device=$address mtu=$mtu")
+    }
+
+    fun updateLinkMtu(address: String, mtu: Int) {
+        runOnQueueThread { updateLinkMtuOnQueue(address, mtu) }
+    }
+
+    @Synchronized
+    private fun updateLinkMtuOnQueue(address: String, mtu: Int) {
+        if (address.isBlank() || mtu <= 0) return
+        linkProfiles.getOrPut(address) { BleLinkProfile(mtu) }.updateMtu(mtu)
+        localOnlyLogger("[BleLink] mtu device=$address mtu=$mtu pacing reset")
+    }
 
     fun enqueueShort(
         device: BluetoothDevice,
@@ -70,8 +100,12 @@ class BleNotifyQueue(
      * Older Sony Bluetooth stacks can otherwise acknowledge sendResponse() locally while the
      * iOS client never receives its write callback during a dense album-art transfer.
      */
-    @Synchronized
     fun onCommandResponseSent() {
+        runOnQueueThread { onCommandResponseSentOnQueue() }
+    }
+
+    @Synchronized
+    private fun onCommandResponseSentOnQueue() {
         commandResponseQuietUntilMs = maxOf(
             commandResponseQuietUntilMs,
             SystemClock.elapsedRealtime() + COMMAND_RESPONSE_QUIET_MS
@@ -109,12 +143,23 @@ class BleNotifyQueue(
         )
     }
 
-    @Synchronized
     fun setLatestInterleavedShort(
         device: BluetoothDevice,
         type: String,
         value: ByteArray,
         delayAfterMs: Long = SHORT_MESSAGE_DELAY_MS
+    ) {
+        runOnQueueThread {
+            setLatestInterleavedShortOnQueue(device, type, value, delayAfterMs)
+        }
+    }
+
+    @Synchronized
+    private fun setLatestInterleavedShortOnQueue(
+        device: BluetoothDevice,
+        type: String,
+        value: ByteArray,
+        delayAfterMs: Long
     ) {
         latestInterleavedPackets[type] = InterleavedPacket(
             device = device,
@@ -140,8 +185,12 @@ class BleNotifyQueue(
         return activeJob?.type == type || jobs.any { it.type == type }
     }
 
-    @Synchronized
     fun cancelJobTypes(types: Set<String>, reason: String) {
+        runOnQueueThread { cancelJobTypesOnQueue(types, reason) }
+    }
+
+    @Synchronized
+    private fun cancelJobTypesOnQueue(types: Set<String>, reason: String) {
         val removedJobs = jobs.filter { it.type in types }
         jobs.removeAll { it.type in types }
         removedJobs.forEach { failJob(it, reason) }
@@ -165,8 +214,12 @@ class BleNotifyQueue(
         }
     }
 
+    fun onNotificationSent(deviceAddress: String?, status: Int) {
+        runOnQueueThread { onNotificationSentOnQueue(deviceAddress, status) }
+    }
+
     @Synchronized
-    fun onNotificationSent(status: Int) {
+    private fun onNotificationSentOnQueue(deviceAddress: String?, status: Int) {
         if (drainingCancelledCallback) {
             logger("[BleNotifyQueue] ignored callback status=$status while draining cancelled notify")
             finishCancelledCallbackDrain()
@@ -179,13 +232,26 @@ class BleNotifyQueue(
 
         cancelNotifyTimeout()
         notificationInFlight = false
+        val callbackAddress = deviceAddress
+            ?.takeIf { it.isNotBlank() }
+            ?: activeNotifyDeviceAddress
+            ?: job.device.address
+        val callbackType = activeNotifyPacketType
+        val callbackRttMs = if (activeNotifyStartedAtMs > 0L) {
+            SystemClock.elapsedRealtime() - activeNotifyStartedAtMs
+        } else {
+            0L
+        }
+        clearActiveNotifyMetrics()
         if (interleavedPacketInFlight) {
-            val type = interleavedPacketType ?: job.type
+            val type = interleavedPacketType ?: callbackType ?: job.type
             interleavedPacketInFlight = false
             interleavedPacketType = null
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 onNotifySuccess(type)
+                recordAdaptiveSuccess(type, callbackAddress, callbackRttMs)
             } else {
+                recordAdaptiveFailure(type, callbackAddress)
                 logger("[BleNotifyQueue] interleaved notify failed type=$type status=$status")
                 onNotifyFailure(type, status, "callback_failed")
             }
@@ -195,8 +261,8 @@ class BleNotifyQueue(
         }
         val packet = job.packets.getOrNull(activePacketIndex)
         if (status != BluetoothGatt.GATT_SUCCESS) {
-            val type = packet?.type ?: job.type
-            recordAdaptiveFailure(type)
+            val type = packet?.type ?: callbackType ?: job.type
+            recordAdaptiveFailure(type, callbackAddress)
             logger(
                 "[BleNotifyQueue] notify failed " +
                     "type=$type status=$status"
@@ -206,19 +272,28 @@ class BleNotifyQueue(
             return
         } else {
             onNotifySuccess(packet?.type ?: job.type)
-            packet?.let { recordAdaptiveSuccess(it.type) }
+            packet?.let {
+                recordAdaptiveSuccess(it.type, callbackAddress, callbackRttMs)
+            }
         }
         activePacketIndex += 1
         job.packetsSinceYield += 1
-        val delay = packet?.let { adaptiveDelayFor(it) } ?: SHORT_MESSAGE_DELAY_MS
+        val delay = packet?.let {
+            adaptiveDelayFor(it, callbackAddress)
+        } ?: SHORT_MESSAGE_DELAY_MS
         handler.postDelayed({ sendNextPacket() }, delay)
     }
 
-    @Synchronized
     fun removeDevice(address: String) {
+        runOnQueueThread { removeDeviceOnQueue(address) }
+    }
+
+    @Synchronized
+    private fun removeDeviceOnQueue(address: String) {
         val removedJobs = jobs.filter { it.device.address == address }
         jobs.removeAll { it.device.address == address }
         latestInterleavedPackets.entries.removeAll { it.value.device.address == address }
+        linkProfiles.remove(address)
         val activeDeviceRemoved = activeJob?.device?.address == address
         if (interleavedPacketInFlight) {
             interleavedPacketInFlight = false
@@ -239,14 +314,19 @@ class BleNotifyQueue(
         }
     }
 
-    @Synchronized
     fun clearAllForDisconnect(reason: String) {
+        runOnQueueThread { clearAllForDisconnectOnQueue(reason) }
+    }
+
+    @Synchronized
+    private fun clearAllForDisconnectOnQueue(reason: String) {
         logger("[BleNotifyQueue] clear all reason=$reason")
         handler.removeCallbacksAndMessages(null)
         activeJob?.let { failJob(it, reason) }
         jobs.forEach { failJob(it, reason) }
         jobs.clear()
         latestInterleavedPackets.clear()
+        linkProfiles.clear()
         interleavedPacketInFlight = false
         interleavedPacketType = null
         interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
@@ -257,18 +337,24 @@ class BleNotifyQueue(
         commandResponseQuietUntilMs = 0L
         activeRequestType = null
         activeRequestId += 1
+        clearActiveNotifyMetrics()
         cancelNotifyTimeout()
         drainingCancelledCallback = false
         cancelledCallbackDrainRunnable = null
     }
 
-    @Synchronized
     fun clear() {
+        runOnQueueThread { clearOnQueue() }
+    }
+
+    @Synchronized
+    private fun clearOnQueue() {
         handler.removeCallbacksAndMessages(null)
         activeJob?.let { failJob(it, "queue cleared") }
         jobs.forEach { failJob(it, "queue cleared") }
         jobs.clear()
         latestInterleavedPackets.clear()
+        linkProfiles.clear()
         interleavedPacketInFlight = false
         interleavedPacketType = null
         interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
@@ -278,6 +364,7 @@ class BleNotifyQueue(
         commandResponseQuietUntilMs = 0L
         activeRequestType = null
         activeRequestId += 1
+        clearActiveNotifyMetrics()
         cancelNotifyTimeout()
         drainingCancelledCallback = false
         cancelledCallbackDrainRunnable = null
@@ -294,8 +381,12 @@ class BleNotifyQueue(
         )
     }
 
-    @Synchronized
     private fun enqueueJob(job: SendJob) {
+        runOnQueueThread { enqueueJobOnQueue(job) }
+    }
+
+    @Synchronized
+    private fun enqueueJobOnQueue(job: SendJob) {
         jobs.addLast(job)
         sendNextPacket()
     }
@@ -389,6 +480,10 @@ class BleNotifyQueue(
                     interleavedPacketInFlight = true
                     interleavedPacketType = interleaved.packet.type
                     notificationInFlight = true
+                    markNotifyStarted(
+                        interleaved.device.address,
+                        interleaved.packet.type
+                    )
                     logInterleavedEventThrottled(
                         isSavedEvent = false,
                         message = "[BleNotifyQueue] latest ${interleaved.packet.type} flushed during long job"
@@ -408,6 +503,7 @@ class BleNotifyQueue(
                         interleavedPacketInFlight = false
                         interleavedPacketType = null
                         notificationInFlight = false
+                        clearActiveNotifyMetrics()
                         interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
                         handler.postDelayed(
                             { sendNextPacket() },
@@ -467,6 +563,7 @@ class BleNotifyQueue(
 
         notificationInFlight = true
         activeRequestType = packet.type
+        markNotifyStarted(job.device.address, packet.type)
         val requested = notify(server, characteristic, job.device, packet.value)
         if (job.type == "albumArt") {
             logAlbumArtPacketProgress(job, packet)
@@ -507,7 +604,8 @@ class BleNotifyQueue(
         if (!requested) {
             notificationInFlight = false
             activeRequestType = null
-            recordAdaptiveFailure(packet.type)
+            clearActiveNotifyMetrics()
+            recordAdaptiveFailure(packet.type, job.device.address)
             logger("[BleNotifyQueue] notify request rejected type=${packet.type}")
             onNotifyFailure(
                 packet.type,
@@ -527,6 +625,7 @@ class BleNotifyQueue(
         activePacketIndex = 0
         activeJobStartedAtMs = 0L
         activeRequestType = null
+        clearActiveNotifyMetrics()
         handler.postDelayed({ sendNextPacket() }, SHORT_MESSAGE_DELAY_MS)
     }
 
@@ -540,6 +639,8 @@ class BleNotifyQueue(
                 }
                 val job = activeJob
                 logger("[BleNotifyQueue] notify callback timeout type=$type job=${job?.type}")
+                val address = activeNotifyDeviceAddress ?: job?.device?.address.orEmpty()
+                recordAdaptiveFailure(type, address)
                 onNotifyFailure(type, NOTIFY_CALLBACK_TIMEOUT_STATUS, "callback_timeout")
                 if (job != null) {
                     markJobFailed(job, "notify callback timeout type=$type")
@@ -552,6 +653,7 @@ class BleNotifyQueue(
                 interleavedPacketInFlight = false
                 interleavedPacketType = null
                 activeRequestType = null
+                clearActiveNotifyMetrics()
                 beginCancelledCallbackDrain("notify callback timeout")
             }
         }
@@ -570,6 +672,7 @@ class BleNotifyQueue(
         drainingCancelledCallback = true
         notificationInFlight = false
         activeRequestType = null
+        clearActiveNotifyMetrics()
         cancelledCallbackDrainRunnable?.let(handler::removeCallbacks)
         val drain = Runnable {
             synchronized(this) {
@@ -695,62 +798,76 @@ class BleNotifyQueue(
         )
     }
 
-    private fun adaptiveDelayFor(packet: Packet): Long {
-        return when (packet.type) {
-            "fullLyricsBinaryChunk" -> binaryLyricDelayMs
-            "fullLyricsStart", "fullLyricsChunk", "fullLyricsEnd",
-            "fullLyricsBinaryStart", "fullLyricsBinaryEnd",
-            "lyricWindowStart", "lyricWindowChunk", "lyricWindowEnd" ->
-                jsonLyricDelayMs
-            else -> packet.delayAfterMs
+    private fun adaptiveDelayFor(packet: Packet, address: String): Long {
+        val profile = linkProfiles.getOrPut(address) {
+            BleLinkProfile(DEFAULT_LINK_MTU)
+        }
+        return profile.delayFor(payloadKind(packet.type), packet.delayAfterMs)
+    }
+
+    private fun recordAdaptiveSuccess(
+        type: String,
+        address: String,
+        callbackRttMs: Long
+    ) {
+        if (address.isBlank()) return
+        val profile = linkProfiles.getOrPut(address) {
+            BleLinkProfile(DEFAULT_LINK_MTU)
+        }
+        val beforeJson = profile.jsonDelayMs
+        val beforeBinary = profile.binaryDelayMs
+        profile.recordSuccess(payloadKind(type), callbackRttMs)
+        if (beforeJson != profile.jsonDelayMs ||
+            beforeBinary != profile.binaryDelayMs ||
+            callbackRttMs > CONGESTED_CALLBACK_LOG_RTT_MS
+        ) {
+            localOnlyLogger(
+                "[BleLink] success device=$address type=$type rttMs=$callbackRttMs " +
+                    "ewmaMs=${profile.ewmaCallbackRttMs.toInt()} " +
+                    "jsonDelayMs=${profile.jsonDelayMs} " +
+                    "binaryDelayMs=${profile.binaryDelayMs}"
+            )
         }
     }
 
-    private fun recordAdaptiveSuccess(type: String) {
-        when {
-            type == "fullLyricsBinaryChunk" -> {
-                binaryLyricSuccesses += 1
-                if (binaryLyricSuccesses >= ADAPTIVE_SUCCESS_WINDOW) {
-                    binaryLyricDelayMs = (binaryLyricDelayMs - 1L)
-                        .coerceAtLeast(BINARY_LYRIC_MIN_DELAY_MS)
-                    binaryLyricSuccesses = 0
-                }
-            }
-            type in JSON_LYRIC_PACKET_TYPES -> {
-                jsonLyricSuccesses += 1
-                if (jsonLyricSuccesses >= ADAPTIVE_SUCCESS_WINDOW) {
-                    jsonLyricDelayMs = (jsonLyricDelayMs - 1L)
-                        .coerceAtLeast(JSON_LYRIC_MIN_DELAY_MS)
-                    jsonLyricSuccesses = 0
-                }
-            }
+    private fun recordAdaptiveFailure(type: String, address: String) {
+        if (address.isBlank()) return
+        val profile = linkProfiles.getOrPut(address) {
+            BleLinkProfile(DEFAULT_LINK_MTU)
+        }
+        profile.recordFailure(payloadKind(type))
+        logger(
+            "[BleLink] backoff device=$address type=$type " +
+                "jsonDelayMs=${profile.jsonDelayMs} " +
+                "binaryDelayMs=${profile.binaryDelayMs} " +
+                "failures=${profile.failureCount}"
+        )
+    }
+
+    private fun payloadKind(type: String): BleLinkProfile.PayloadKind {
+        return when {
+            type == "fullLyricsBinaryChunk" ->
+                BleLinkProfile.PayloadKind.BINARY_LYRIC
+            type in JSON_LYRIC_PACKET_TYPES ->
+                BleLinkProfile.PayloadKind.JSON_LYRIC
+            else -> BleLinkProfile.PayloadKind.OTHER
         }
     }
 
-    private fun recordAdaptiveFailure(type: String) {
-        when {
-            type == "fullLyricsBinaryChunk" -> {
-                binaryLyricDelayMs = (binaryLyricDelayMs + ADAPTIVE_FAILURE_STEP_MS)
-                    .coerceAtMost(ADAPTIVE_MAX_DELAY_MS)
-                binaryLyricSuccesses = 0
-            }
-            type in JSON_LYRIC_PACKET_TYPES -> {
-                jsonLyricDelayMs = (jsonLyricDelayMs + ADAPTIVE_FAILURE_STEP_MS)
-                    .coerceAtMost(ADAPTIVE_MAX_DELAY_MS)
-                jsonLyricSuccesses = 0
-            }
-        }
+    private fun markNotifyStarted(address: String, type: String) {
+        activeNotifyStartedAtMs = SystemClock.elapsedRealtime()
+        activeNotifyDeviceAddress = address
+        activeNotifyPacketType = type
+    }
+
+    private fun clearActiveNotifyMetrics() {
+        activeNotifyStartedAtMs = 0L
+        activeNotifyDeviceAddress = null
+        activeNotifyPacketType = null
     }
 
     private fun interleaveIntervalFor(jobType: String): Int {
-        return when (jobType) {
-            "albumArt" -> ALBUM_ART_INTERLEAVE_INTERVAL
-            "fullLyrics" -> FULL_LYRICS_INTERLEAVE_INTERVAL
-            "lyricSecondary" -> LYRIC_SECONDARY_INTERLEAVE_INTERVAL
-            "remoteLog", "mediaFieldDump", "qrcDump", "playHistory", "playStats" ->
-                OTHER_LONG_JOB_INTERLEAVE_INTERVAL
-            else -> 0
-        }
+        return realtimeInterleaveIntervalFor(jobType)
     }
 
     private fun logInterleavedEventThrottled(
@@ -805,6 +922,29 @@ class BleNotifyQueue(
         }
     }
 
+    fun shutdown(reason: String) {
+        if (Looper.myLooper() == handlerThread.looper) {
+            clearAllForDisconnectOnQueue(reason)
+            handlerThread.quitSafely()
+            return
+        }
+        val completed = CountDownLatch(1)
+        handler.post {
+            clearAllForDisconnectOnQueue(reason)
+            completed.countDown()
+            handlerThread.quitSafely()
+        }
+        completed.await(2, TimeUnit.SECONDS)
+    }
+
+    private fun runOnQueueThread(action: () -> Unit) {
+        if (Looper.myLooper() == handlerThread.looper) {
+            action()
+        } else {
+            handler.post(action)
+        }
+    }
+
     data class Packet(
         val type: String,
         val value: ByteArray,
@@ -847,6 +987,7 @@ class BleNotifyQueue(
                     || it.type == "mediaFieldDumpChunk"
                     || it.type == "trackInfoChunk"
                     || it.type == "fullLyricsChunk"
+                    || it.type == "fullLyricsBinaryChunk"
                     || it.type == "historyPayloadChunk"
             }
 
@@ -870,16 +1011,10 @@ class BleNotifyQueue(
     }
 
     companion object {
-        private var jsonLyricDelayMs = 5L
-        private var binaryLyricDelayMs = 2L
-        private var jsonLyricSuccesses = 0
-        private var binaryLyricSuccesses = 0
+        private const val DEFAULT_LINK_MTU = 23
         private const val SHORT_MESSAGE_DELAY_MS = 20L
         private const val CHUNK_PROGRESS_INTERVAL = 20
-        private const val ALBUM_ART_INTERLEAVE_INTERVAL = 1
-        private const val FULL_LYRICS_INTERLEAVE_INTERVAL = 10
-        private const val LYRIC_SECONDARY_INTERLEAVE_INTERVAL = 3
-        private const val OTHER_LONG_JOB_INTERLEAVE_INTERVAL = 5
+        private const val REALTIME_INTERLEAVE_INTERVAL = 1
         private const val INTERLEAVED_LOG_THROTTLE_MS = 10_000L
         private const val NOTIFY_REQUEST_REJECTED_STATUS = -1
         private const val NOTIFY_CALLBACK_TIMEOUT_STATUS = -2
@@ -888,11 +1023,7 @@ class BleNotifyQueue(
         private const val COMMAND_RESPONSE_QUIET_MS = 25L
         private const val BULK_YIELD_INTERVAL = 4
         private const val BACKGROUND_YIELD_INTERVAL = 1
-        private const val JSON_LYRIC_MIN_DELAY_MS = 2L
-        private const val BINARY_LYRIC_MIN_DELAY_MS = 1L
-        private const val ADAPTIVE_FAILURE_STEP_MS = 5L
-        private const val ADAPTIVE_MAX_DELAY_MS = 30L
-        private const val ADAPTIVE_SUCCESS_WINDOW = 20
+        private const val CONGESTED_CALLBACK_LOG_RTT_MS = 120L
         private val JSON_LYRIC_PACKET_TYPES = setOf(
             "fullLyricsStart",
             "fullLyricsChunk",
@@ -935,6 +1066,15 @@ class BleNotifyQueue(
 
         internal fun remainingQuietDelayMs(quietUntilMs: Long, nowMs: Long): Long {
             return (quietUntilMs - nowMs).coerceAtLeast(0L)
+        }
+
+        internal fun realtimeInterleaveIntervalFor(jobType: String): Int {
+            return when (jobType) {
+                "albumArt", "fullLyrics", "lyricSecondary",
+                "remoteLog", "mediaFieldDump", "qrcDump", "playHistory", "playStats" ->
+                    REALTIME_INTERLEAVE_INTERVAL
+                else -> 0
+            }
         }
     }
 

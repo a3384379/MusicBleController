@@ -55,4 +55,21 @@ class BleNotifyQueuePolicyTest {
         assertEquals(0L, BleNotifyQueue.remainingQuietDelayMs(1_000L, 1_000L))
         assertEquals(0L, BleNotifyQueue.remainingQuietDelayMs(999L, 1_000L))
     }
+
+    @Test
+    fun everyLongTransferChecksRealtimePacketsAfterEachChunk() {
+        listOf(
+            "albumArt",
+            "fullLyrics",
+            "lyricSecondary",
+            "remoteLog",
+            "mediaFieldDump",
+            "qrcDump",
+            "playHistory",
+            "playStats"
+        ).forEach { type ->
+            assertEquals(1, BleNotifyQueue.realtimeInterleaveIntervalFor(type))
+        }
+        assertEquals(0, BleNotifyQueue.realtimeInterleaveIntervalFor("playbackState"))
+    }
 }

@@ -1,0 +1,52 @@
+name: Cross-platform build and tests
+
+on:
+  push:
+    branches:
+      - main
+      - "codex/**"
+  pull_request:
+
+concurrency:
+  group: cross-platform-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    name: Android unit tests and debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - name: Test and assemble PlayerAgent
+        run: bash ./gradlew :PlayerAgentApp:testDebugUnitTest :PlayerAgentApp:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PlayerAgent-debug-apk
+          path: PlayerAgentApp/build/outputs/apk/debug/*.apk
+
+  ios:
+    name: iOS simulator XCTest
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode 16.2 when available
+        run: |
+          if [ -d /Applications/Xcode_16.2.app ]; then
+            sudo xcode-select -s /Applications/Xcode_16.2.app
+          fi
+          xcodebuild -version
+      - name: Run unsigned simulator tests
+        run: |
+          xcodebuild \
+            -project IOSBleFeasibility/IOSBleFeasibility.xcodeproj \
+            -scheme sonyMusic \
+            -destination 'platform=iOS Simulator,name=iPhone 16 Pro' \
+            CODE_SIGNING_ALLOWED=NO \
+            test

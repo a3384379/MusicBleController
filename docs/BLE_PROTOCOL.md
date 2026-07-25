@@ -4,7 +4,8 @@
 
 ## 模块职责
 
-- Sony `BleGattServerManager`：GATT Server、command 写入解析、status notify、长任务分片。
+- Sony `BleGattServerManager`：GATT Server、command 写入解析和 status notify；歌词、封面与能力协商的连接态分别交给内部协调器持有。
+- Sony `LyricsTransferCoordinator` / `AlbumArtTransferCoordinator` / `ConnectionCommandCoordinator`：隔离歌词热缓存与重传、封面重传记录、连接代次与能力协商，避免跨媒体类型错误失效。
 - Sony `BleNotifyQueue`：短消息和长任务队列，保证控制命令、播放状态、歌词、封面互不长期阻塞。
 - iOS `BLETestManager`：GATT Client / Central，写 command，接收 status notify 和封面 binary chunk。
 - Live Activity command bridge：iOS AppIntent 通过主 App 已有 BLE 连接发送控制命令。
@@ -15,6 +16,9 @@
 - Sony UUID：[PlayerAgentUuids.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/ble/PlayerAgentUuids.kt)
 - Sony GATT：[BleGattServerManager.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/ble/BleGattServerManager.kt)
 - Sony notify 队列：[BleNotifyQueue.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/ble/BleNotifyQueue.kt)
+- Sony 链路档案：[BleLinkProfile.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/ble/BleLinkProfile.kt)
+- Sony 压缩歌词热缓存：[CompressedLyricsCache.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/ble/CompressedLyricsCache.kt)
+- Sony 传输协调器：[MediaTransferCoordinators.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/ble/MediaTransferCoordinators.kt)
 - iOS BLE：[BLETestManager.swift](/Volumes/雷电/project/MusicBleController/IOSBleFeasibility/IOSBleFeasibility/BLETestManager.swift)
 - Live Activity 控制：[LiveActivityControlModels.swift](/Volumes/雷电/project/MusicBleController/IOSBleFeasibility/IOSBleFeasibility/LiveActivityControlModels.swift)、[LiveActivityCommandBridge.swift](/Volumes/雷电/project/MusicBleController/IOSBleFeasibility/IOSBleFeasibility/LiveActivityCommandBridge.swift)
 
@@ -65,6 +69,7 @@
 ## 关键状态
 
 - Sony `BleNotifyQueue` 使用四级优先级：P0 控制/状态/逐字，P1 lyricWindow/preview，P2 完整歌词/secondary，P3 HQ/历史/日志。
+- 队列的 enqueue、notify callback、超时、取消和抢占全部收敛到专用 `HandlerThread`；不要从 Binder/媒体线程直接修改队列状态。
 - P0 每包可抢占；P2 每 4 包为 P1 让路；P3 每包让路。同优先级 FIFO，切歌按任务 generation 取消旧歌词/封面。
 - iOS 控制命令在连接不健康时会丢弃，不缓存，不重连后补发。
 - AlbumArt binary 使用 Sony 端 `ALBUM_ART_BINARY_MAGIC` 和 6 字节 header；iOS 在 `didUpdateValueFor` 中把非 JSON 二进制 chunk 转交给 `AlbumArtReceiver`。
@@ -76,13 +81,23 @@
 3. V2 `GET_FULL_LYRICS` 附带 `format=zlib-json-v1`。旧 Sony 忽略新字段并返回 legacy 逐行响应，新 iOS 同时解析两种格式。
 4. 压缩歌词正文为 zlib JSON，最大 24KB；分包头为 `0xA2 + version + index + total` 共 6 字节。start/end 在小 MTU 下可使用 `id/tid/g/s/u/c/n/crc` 别名。
 5. A1/A2 都使用 `trackId + generation + transferId + CRC32` 栅栏。缺包不超过 32 个时 `RETRY_TRANSFER` 局部重传，否则完整重试一次。
+   - FullLyrics 重传只校验歌词自身的 `trackId + generation + transferId`，不得依赖当前封面 ID/状态。
 6. 协商失败、正文超限、metadata 超 MTU 或旧端连接时自动回退 legacy，不改变 QRC 解密和 secondary 协议。
 
 ## 自适应发送
 
-- JSON 歌词初始间隔 5ms，A2 binary 初始 2ms。
-- notify 失败后增加 5ms，连续 20 包成功后逐步降低，最大 30ms。
+- 每次连接创建独立 `BleLinkProfile`，记录设备、连接代次、MTU、EWMA notify RTT、失败率和 JSON/二进制间隔；重连或 MTU 改变时重置。
+- JSON 初始 5ms、范围 2～30ms；binary 初始 2ms、范围 1～30ms。
+- notify 失败或 callback RTT 超过 120ms 时增加 5ms；连续 20 次成功且 EWMA RTT 小于 60ms 时减少 1ms。
 - `GET_LYRIC_WINDOW` 与完整歌词走独立歌词命令执行器，不被较慢的播放状态读取 FIFO 阻塞。
+- 压缩歌词缓存最多 16 项/512KB，保存 zlib 正文与 CRC，按当前 MTU 重新分包；fingerprint、generation、格式或逐字行集合变化时失效。
+- Sony 执行器只分实时、前台媒体 I/O、后台维护和 BLE 发送四类；历史、索引、日志与诊断不得占用实时线程。
+
+## iOS 写回调容错
+
+- CoreBluetooth 偶发漏掉单次 `didWrite`，但 Sony 已处理命令且 status notify 仍持续时，iOS 先进入 1 秒 late-callback fence，丢弃待处理的后台写并保留控制写。
+- 后续真实写成功会清零计数；连续两次写回调超时才 hard reconnect。没有活动 notify 的超时仍按断链处理。
+- 恢复连接的 smoke 参数通过一次性 App 容器标记传递，避免 CoreBluetooth 后台恢复抢先启动导致测试序列丢失。
 
 ## 不允许随便修改的点
 

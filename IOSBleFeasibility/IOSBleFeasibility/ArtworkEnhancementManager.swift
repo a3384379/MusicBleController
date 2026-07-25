@@ -45,7 +45,7 @@ struct ArtworkEnhancementResult {
     let shouldAutoDisplay: Bool
 }
 
-struct ArtworkEnhancementDebugStatus {
+struct ArtworkEnhancementDebugStatus: Equatable {
     var enabled: Bool = true
     var currentSource: String = "-"
     var target: String = "-"

@@ -388,12 +388,26 @@ sync_current_word_sent = count(r"\[ReconnectSync\] send currentWord", sony_text)
 sync_current_word_skip = count(r"\[ReconnectSync\] skip currentWord", sony_text)
 sync_album_offer_sent = count(r"\[ReconnectSync\] send albumArtOffer", sony_text)
 cooldown_skip = count(r"\[ReconnectSync\] skip reason=cooldown", sony_text)
+restored_connection = count(
+    r"\[BLE-Restore\]\s+restored\b.*\bstate=connected",
+    ios_window,
+)
+ios_restore_sync_start = count(r"\[BLE-Reconnect\] sync playback state", ios_window)
 ios_state_sync = count(r"\[Reconnect\] state sync received", ios_window)
 ios_reconnect_playback_accepted = count(r"\[Reconnect\] playbackState accepted", ios_window)
 ios_raw_playback_state = count(r'\{"type":"playbackState"', ios_window)
 ios_playback_accepted = max(ios_reconnect_playback_accepted, ios_raw_playback_state)
-ios_current_word_after = count(r"\[Reconnect\] currentWord accepted after reconnect", ios_window)
+ios_current_word_reconnect_log = count(
+    r"\[Reconnect\] currentWord accepted after reconnect",
+    ios_window,
+)
+ios_raw_current_word = count(r"\[Lyrics-iOS\]\s+currentWord", ios_window)
+ios_current_word_after = max(ios_current_word_reconnect_log, ios_raw_current_word)
 ios_album_offer = count(r"albumArtOffer", ios_window)
+ios_artwork_cache_reused = count(
+    r"\[AlbumArtCache\]\s+hit|\[ArtworkDisplay\].*\bcacheHit\b",
+    ios_window,
+)
 stale_after = count(r"\[Reconnect\] stale discard after reconnect", ios_window)
 main_stall = count(r"main stall detected", ios_window)
 payload_too_large = count(r"payload=\d+ max=\d+|Payload maximum size exceeded", sony_text + "\n" + ios_window)
@@ -422,13 +436,13 @@ if ios_playback_accepted == 0:
     issues.append("iOS did not receive reconnect playbackState")
 elif playback_latency and playback_latency > 5_000:
     issues.append(f"reconnect playbackState latency exceeded 5s ({playback_latency}ms)")
-if sync_start == 0:
+if sync_start == 0 and not (restored_connection and ios_restore_sync_start):
     warnings.append("Sony reconnect sync start was not observed")
-if sync_playback_sent == 0:
+if sync_playback_sent == 0 and ios_playback_accepted == 0:
     warnings.append("Sony reconnect playbackState send log was not observed")
-if sync_current_word_sent == 0:
+if sync_current_word_sent == 0 and ios_current_word_after == 0:
     warnings.append("currentWord was not sent after reconnect or was unavailable")
-if sync_album_offer_sent == 0:
+if sync_album_offer_sent == 0 and ios_album_offer == 0 and ios_artwork_cache_reused == 0:
     warnings.append("albumArtOffer was not resent after reconnect")
 if stale_after > 0:
     issues.append(f"stale discard after reconnect observed ({stale_after})")
@@ -466,13 +480,18 @@ payload = {
     },
     "ios": {
         "reconnectCount": reconnect_count,
+        "coreBluetoothRestoredConnection": restored_connection,
+        "restoreSyncStartCount": ios_restore_sync_start,
         "notifySubscribedCount": notify_subscribed,
         "reconnectPlaybackStateReceived": ios_playback_accepted,
         "reconnectPlaybackStateAcceptedLogCount": ios_reconnect_playback_accepted,
         "rawPlaybackStateReceived": ios_raw_playback_state,
         "reconnectStateSyncReceived": ios_state_sync,
         "reconnectCurrentWordReceived": ios_current_word_after,
+        "reconnectCurrentWordAcceptedLogCount": ios_current_word_reconnect_log,
+        "rawCurrentWordReceived": ios_raw_current_word,
         "albumArtOfferReceived": ios_album_offer,
+        "artworkCacheReused": ios_artwork_cache_reused,
         "staleDiscardAfterReconnect": stale_after,
         "mainStallCount": main_stall,
         "payloadTooLargeCount": payload_too_large,
@@ -506,6 +525,8 @@ md = [
     "## Metrics",
     "",
     f"- reconnect count: {reconnect_count}",
+    f"- CoreBluetooth restored connection: {restored_connection}",
+    f"- iOS restore sync start: {ios_restore_sync_start}",
     f"- notify subscribed: {notify_subscribed}",
     f"- Sony sync start: {sync_start}",
     f"- Sony playbackState sent: {sync_playback_sent}",
@@ -515,6 +536,7 @@ md = [
     f"- iOS playbackState received: {ios_playback_accepted}",
     f"- iOS currentWord received: {ios_current_word_after}",
     f"- iOS albumArtOffer received: {ios_album_offer}",
+    f"- iOS artwork cache reused: {ios_artwork_cache_reused}",
     f"- playback latency: {playback_latency}ms",
     f"- currentWord latency: {current_word_latency}ms",
     f"- albumArtOffer latency: {album_offer_latency}ms",

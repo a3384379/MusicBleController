@@ -219,6 +219,7 @@ struct PlaybackStatsView: View {
 
 private struct HistoryArtworkView: View {
     let artworkId: String?
+    @State private var cachedImage: UIImage?
 
     var body: some View {
         Group {
@@ -235,17 +236,24 @@ private struct HistoryArtworkView: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 9))
+        .task(id: artworkId) {
+            cachedImage = await loadCachedImage()
+        }
     }
 
-    private var cachedImage: UIImage? {
+    private func loadCachedImage() async -> UIImage? {
         guard let artworkId, !artworkId.isEmpty else { return nil }
         let base = sha256(artworkId)
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let directory = documents.appendingPathComponent("AlbumArtCache", isDirectory: true)
-        for suffix in ["_hq", "_preview", ""] {
+        for (suffix, quality) in [("_hq", "hq"), ("_preview", "preview"), ("", "legacy")] {
             let url = directory.appendingPathComponent("\(base)\(suffix)").appendingPathExtension("jpg")
-            if let data = try? Data(contentsOf: url),
-               let image = UIImage(data: data) {
+            if let image = await ArtworkImageCache.shared.load(
+                artworkId: artworkId,
+                quality: "history-\(quality)",
+                fileURL: url,
+                maximumPixelSize: ArtworkImageCache.historyArtworkMaximumPixelSize
+            ) {
                 return image
             }
         }

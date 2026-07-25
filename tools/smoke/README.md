@@ -87,11 +87,13 @@ Use this when lyrics or artwork are slow/missing and you need to know whether th
 All tests that perform real iOS BLE operations must pass `ios_ble_precheck.sh` before they send commands or request large payloads. The hard precheck requires:
 
 - iOS app launched.
-- BLE connected.
+- BLE connected through a fresh `didConnect` or CoreBluetooth restored-connected event.
 - status notify subscribed.
 - at least one `playbackState` received within 5 seconds.
 
 If any of these conditions fail, the test exits immediately with `reason=ios_ble_not_connected` and does not send `GET_FULL_LYRICS`, AlbumArt requests, `NEXT`, volume, or seek commands. Reports include `iosAppLaunched`, `iosBleConnected`, `notifySubscribed`, `firstPlaybackStateReceived`, `firstPlaybackStateLatencyMs`, `precheckResult`, and `precheckFailReason`.
+
+When a test supplies `--smoke-*` launch arguments, the precheck also stages a one-shot app-container marker. This keeps the test trigger deterministic when CoreBluetooth restoration wakes the app before the foreground launch process receives its arguments.
 
 ## Device Behavior
 

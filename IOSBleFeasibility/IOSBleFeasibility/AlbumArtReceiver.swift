@@ -160,6 +160,7 @@ final class AlbumArtReceiver {
     private var binaryAlbumArtTransferID = ""
     private var binaryAlbumArtExpectedCRC32: UInt32?
     private var binaryAlbumArtGeneration: Int64?
+    private var albumArtDecodeToken: UUID?
     private var binaryAlbumArtRetryCounts: [String: Int] = [:]
     private var binaryAlbumArtChunks: [Int: Data] = [:]
     private var binaryAlbumArtLastPublishedProgressBucket = -1
@@ -205,6 +206,7 @@ final class AlbumArtReceiver {
     private var predictiveOfferTimes: [String: Date] = [:]
     private var predictiveHqRequestTimes: [String: Date] = [:]
     private var sourceRefreshAttemptedAlbumArtIDs: Set<String> = []
+    private var albumArtCacheLookupToken: UUID?
     private let albumArtCacheWriteQueue = DispatchQueue(
         label: "com.sqz.IOSBleFeasibility.albumArtCacheWrite",
         qos: .utility
@@ -256,34 +258,38 @@ final class AlbumArtReceiver {
         log("[AlbumArtOffer] id=\(id) currentTitle=\(delegate?.albumArtCurrentTitle ?? "-")")
         recordPredictiveOffer(id: id)
         handleAlbumArtIdentity(id)
-        let hqValidation = validateAlbumArtCache(id: id, preferredQuality: "hq")
-        let previewValidation = validateAlbumArtCache(id: id, preferredQuality: "preview")
+        loadAlbumArtCacheValidations(id: id) { [weak self] hqValidation, previewValidation, _ in
+            guard let self else { return }
+            self.applyAlbumArtOffer(
+                id: id,
+                hqValidation: hqValidation,
+                previewValidation: previewValidation
+            )
+        }
+    }
+
+    private func applyAlbumArtOffer(
+        id: String,
+        hqValidation: AlbumArtCacheValidation,
+        previewValidation: AlbumArtCacheValidation
+    ) {
+        guard currentAlbumArtID == id, isExpectedAlbumArtPayload(id: id) else {
+            log("[AlbumArt-iOS] stale cache lookup discarded id=\(id)")
+            return
+        }
         let sourceRefreshAlreadyAttempted = sourceRefreshAttemptedAlbumArtIDs.contains(id)
         let hqNeedsRefresh = hqValidation.shouldRefreshOnOffer && !sourceRefreshAlreadyAttempted
         let previewNeedsRefresh = previewValidation.shouldRefreshOnOffer && !sourceRefreshAlreadyAttempted
 
-        if let cached = cachedEnhancedAlbumArt(id: id),
+        if let image = hqValidation.image,
            hqValidation.valid,
            !hqNeedsRefresh {
             cancelAlbumArtFallback()
             cancelHqAlbumArtRequest()
             recordPredictiveHqSkip(id: id, reason: "cache hit", category: .cacheHit)
-            setAlbumArtDisplay(image: cached.image, id: id, quality: .enhanced, reason: "offer cacheHit")
-            delegate?.albumArtPublishLiveArtwork(image: cached.image, key: id, reason: "enhancedCacheHit")
-            let message = "[AlbumArtCache] display quality=enhanced id=\(id), skip hq request"
-            log(message)
-            consoleLog(message)
-            log("[AlbumArtRefresh] skip reason=fresh_cache id=\(id) source=\(hqValidation.source)")
-            delegate?.albumArtSendCommand(cmd: "ALBUM_ART_SKIP", extra: ["id": id, "quality": "hq"])
-        } else if let image = hqValidation.image,
-                  hqValidation.valid,
-                  !hqNeedsRefresh {
-            cancelAlbumArtFallback()
-            cancelHqAlbumArtRequest()
-            recordPredictiveHqSkip(id: id, reason: "cache hit", category: .cacheHit)
             setAlbumArtDisplay(image: image, id: id, quality: .hq, reason: "offer cacheHit")
             delegate?.albumArtPublishLiveArtwork(image: image, key: id, reason: "cacheHit")
-            startArtworkEnhancementFromCachedHq(id: id, reason: "hq cacheHit")
+            loadEnhancedAlbumArtIfAvailable(id: id, reason: "offer cacheHit")
             let message = "[AlbumArtCache] display quality=hq id=\(id), enhance from cache"
             log(message)
             consoleLog(message)
@@ -475,16 +481,15 @@ final class AlbumArtReceiver {
     }
 
     func handleBinaryChunk(_ data: Data) {
-        guard data.count > 6 else {
+        guard let chunk = BLEBinaryChunkCodec.decode(data, expectedMagic: 0xA1) else {
             let message = "[AlbumArtBinary] invalid chunk"
             log(message)
             consoleLog(message)
             return
         }
-        let bytes = [UInt8](data.prefix(6))
-        let qualityCode = bytes[1]
-        let index = (Int(bytes[2]) << 8) | Int(bytes[3])
-        let totalChunks = (Int(bytes[4]) << 8) | Int(bytes[5])
+        let qualityCode = chunk.kindCode
+        let index = chunk.index
+        let totalChunks = chunk.total
         let quality: String
         switch qualityCode {
         case 2:
@@ -504,7 +509,7 @@ final class AlbumArtReceiver {
             consoleLog(message)
             return
         }
-        let payload = data.subdata(in: 6..<data.count)
+        let payload = chunk.payload
         binaryAlbumArtChunks[index] = payload
         if var session = binaryAlbumArtSession,
            session.quality == quality,
@@ -856,13 +861,34 @@ final class AlbumArtReceiver {
             return
         }
 
-        guard let image = UIImage(data: jpegData) else {
-            log("[AlbumArt] decode failed")
-            resetAlbumArtTransfer()
-            return
+        let decodeToken = UUID()
+        albumArtDecodeToken = decodeToken
+        ArtworkImageCache.shared.decode(
+            data: jpegData,
+            artworkId: id,
+            quality: quality,
+            maximumPixelSize: ArtworkImageCache.mainArtworkMaximumPixelSize
+        ) { [weak self] image in
+            guard let self,
+                  self.albumArtDecodeToken == decodeToken,
+                  self.currentAlbumArtID == id,
+                  self.isExpectedAlbumArtPayload(id: id) else {
+                return
+            }
+            guard let image else {
+                self.log("[AlbumArt] decode failed")
+                self.resetAlbumArtTransfer()
+                return
+            }
+            self.finishDecodedAlbumArt(
+                id: id,
+                quality: quality,
+                data: jpegData,
+                image: image,
+                source: "transfer"
+            )
+            self.resetAlbumArtTransfer()
         }
-        finishDecodedAlbumArt(id: id, quality: quality, data: jpegData, image: image, source: "transfer")
-        resetAlbumArtTransfer()
     }
 
     private func finishBinaryAlbumArtTransfer(id: String, quality: String) {
@@ -916,29 +942,57 @@ final class AlbumArtReceiver {
             cancelBinaryAlbumArtTransfer(reason: "decode failed", shouldRetryPreview: quality == "preview")
             return
         }
-        guard let image = UIImage(data: jpegData) else {
-            if requestBinaryAlbumArtRetry(
-                missing: [],
-                retryAll: true,
-                reason: "jpeg decode failed"
-            ) {
+        cancelAlbumArtTransferTimeouts()
+        albumArtTransferState = "decoding"
+        let decodeToken = UUID()
+        albumArtDecodeToken = decodeToken
+        ArtworkImageCache.shared.decode(
+            data: jpegData,
+            artworkId: id,
+            quality: quality,
+            maximumPixelSize: ArtworkImageCache.mainArtworkMaximumPixelSize
+        ) { [weak self] image in
+            guard let self,
+                  self.albumArtDecodeToken == decodeToken,
+                  self.currentAlbumArtID == id,
+                  self.isExpectedAlbumArtPayload(id: id) else {
                 return
             }
-            cancelBinaryAlbumArtTransfer(reason: "jpeg decode failed", shouldRetryPreview: quality == "preview")
-            return
+            guard let image else {
+                if self.requestBinaryAlbumArtRetry(
+                    missing: [],
+                    retryAll: true,
+                    reason: "jpeg decode failed"
+                ) {
+                    return
+                }
+                self.cancelBinaryAlbumArtTransfer(
+                    reason: "jpeg decode failed",
+                    shouldRetryPreview: quality == "preview"
+                )
+                return
+            }
+            self.binaryAlbumArtRetryCounts.removeValue(
+                forKey: self.binaryAlbumArtTransferID
+            )
+            self.finishDecodedAlbumArt(
+                id: id,
+                quality: quality,
+                data: jpegData,
+                image: image,
+                source: "binary"
+            )
+            let message = "[AlbumArtBinary] decode success bytes=\(jpegData.count)"
+            self.log(message)
+            self.consoleLog(message)
+            let completeMessage =
+                "[AlbumArt-iOS] transfer complete id=\(id) quality=\(quality) " +
+                "bytes=\(jpegData.count)"
+            self.log(completeMessage)
+            self.consoleLog(completeMessage)
+            self.albumArtLastFailureReason = "-"
+            self.resetBinaryAlbumArtTransfer(reason: "complete")
         }
-        binaryAlbumArtRetryCounts.removeValue(forKey: binaryAlbumArtTransferID)
-        finishDecodedAlbumArt(id: id, quality: quality, data: jpegData, image: image, source: "binary")
-        let message = "[AlbumArtBinary] decode success bytes=\(jpegData.count)"
-        log(message)
-        consoleLog(message)
-        let completeMessage =
-            "[AlbumArt-iOS] transfer complete id=\(id) quality=\(quality) " +
-            "bytes=\(jpegData.count)"
-        log(completeMessage)
-        consoleLog(completeMessage)
-        albumArtLastFailureReason = "-"
-        resetBinaryAlbumArtTransfer(reason: "complete")
     }
 
     @discardableResult
@@ -1051,6 +1105,8 @@ final class AlbumArtReceiver {
             cancelPredictiveHqPrefetch(reason: "track changed", oldId: currentAlbumArtID)
         }
         currentAlbumArtID = id
+        albumArtDecodeToken = nil
+        albumArtCacheLookupToken = nil
         currentCachedAlbumArtQuality = ""
         artworkDisplayQuality = .placeholder
         hqAlbumArtUnavailableReason = "-"
@@ -1071,34 +1127,39 @@ final class AlbumArtReceiver {
         resetBinaryAlbumArtTransfer(reason: "track changed")
         cancelHqAlbumArtRequest()
 
-        if let cached = loadCachedAlbumArt(id: id) {
-            cancelAlbumArtFallback()
-            setAlbumArtDisplay(image: cached.image, id: id, quality: artworkQuality(from: cached.quality), reason: "identity cacheHit")
-            delegate?.albumArtPublishLiveArtwork(image: cached.image, key: id, reason: "cacheHit")
-            if cached.quality == "hq" {
-                startArtworkEnhancementFromCachedHq(id: id, reason: "identity hq cacheHit")
-            }
-            let message = "[AlbumArtCache] hit id=\(id)"
-            log(message)
-            consoleLog(message)
-        } else {
-            let hqValidation = validateAlbumArtCache(id: id, preferredQuality: "hq")
-            let previewValidation = validateAlbumArtCache(id: id, preferredQuality: "preview")
-            if (hqValidation.valid || previewValidation.valid),
-               (hqValidation.shouldRefreshOnOffer || previewValidation.shouldRefreshOnOffer),
-               !sourceRefreshAttemptedAlbumArtIDs.contains(id),
-               isPredictiveHqConnectionReady() {
-                handleStaleAlbumArtCacheOffer(
+        loadAlbumArtCacheValidations(id: id) { [weak self] hq, preview, legacy in
+            guard let self, self.currentAlbumArtID == id else { return }
+            let selected: AlbumArtCacheValidation? = {
+                if hq.shouldDisplayWhileRefreshing { return hq }
+                if preview.shouldDisplayWhileRefreshing { return preview }
+                if legacy.shouldDisplayWhileRefreshing { return legacy }
+                return nil
+            }()
+            if let selected, let image = selected.image {
+                self.cancelAlbumArtFallback()
+                self.setAlbumArtDisplay(
+                    image: image,
                     id: id,
-                    hqValidation: hqValidation,
-                    previewValidation: previewValidation
+                    quality: self.artworkQuality(from: selected.quality),
+                    reason: "identity cacheHit"
                 )
-                return
+                self.delegate?.albumArtPublishLiveArtwork(
+                    image: image,
+                    key: id,
+                    reason: "cacheHit"
+                )
+                if selected.quality == "hq" {
+                    self.loadEnhancedAlbumArtIfAvailable(
+                        id: id,
+                        reason: "identity hq cacheHit"
+                    )
+                }
+                self.log("[AlbumArtCache] hit id=\(id)")
+            } else {
+                self.log("[AlbumArtCache] miss id=\(id)")
+                self.scheduleAlbumArtFallback(id: id)
             }
-            let message = "[AlbumArtCache] miss id=\(id)"
-            log(message)
-            consoleLog(message)
-            scheduleAlbumArtFallback(id: id)
+            self.notifyStateChanged()
         }
         notifyStateChanged()
     }
@@ -1108,6 +1169,7 @@ final class AlbumArtReceiver {
     }
 
     private func resetAlbumArtTransfer() {
+        albumArtDecodeToken = nil
         albumArtID = ""
         albumArtQuality = ""
         albumArtExpectedSize = 0
@@ -1116,6 +1178,7 @@ final class AlbumArtReceiver {
     }
 
     private func resetBinaryAlbumArtTransfer(reason: String = "reset") {
+        albumArtDecodeToken = nil
         cancelAlbumArtTransferTimeouts()
         if binaryAlbumArtExpectedChunks > 0, reason != "reset" {
             let message = "[AlbumArt-iOS] cancel in-flight reason=\(reason)"
@@ -1482,7 +1545,8 @@ final class AlbumArtReceiver {
         }
         cancelHqAlbumArtRequest()
         let timing = predictive ? nil : delegate?.albumArtEffectiveHqDelay(delay)
-        let effectiveDelay = timing?.delay ?? delay
+        let baseDelay = timing?.delay ?? delay
+        let effectiveDelay = baseDelay * PreferencesStore.shared.playbackPerformanceMode.hqDelayMultiplier
         let deferred = timing?.deferred ?? false
         let workItem = DispatchWorkItem { [weak self] in
             self?.requestHqAlbumArt(id: id, reason: reason, predictive: predictive)
@@ -1618,27 +1682,185 @@ final class AlbumArtReceiver {
         albumArtRequestStartTimeouts.removeValue(forKey: key)?.cancel()
     }
 
-    private func loadCachedAlbumArt(id: String) -> (image: UIImage, quality: String)? {
-        let hqValidation = validateAlbumArtCache(id: id, preferredQuality: "hq")
-        if let cached = cachedEnhancedAlbumArt(id: id),
-           hqValidation.shouldDisplayWhileRefreshing {
-            return (cached.image, "enhanced")
+    private func loadAlbumArtCacheValidations(
+        id: String,
+        completion: @escaping (
+            AlbumArtCacheValidation,
+            AlbumArtCacheValidation,
+            AlbumArtCacheValidation
+        ) -> Void
+    ) {
+        let token = UUID()
+        albumArtCacheLookupToken = token
+        ArtworkImageCache.shared.performIO { [weak self] in
+            guard let self else { return }
+            let hq = self.readAlbumArtCacheValidation(
+                id: id,
+                preferredQuality: "hq"
+            )
+            let preview = self.readAlbumArtCacheValidation(
+                id: id,
+                preferredQuality: "preview"
+            )
+            let legacy = self.readAlbumArtCacheValidation(
+                id: id,
+                preferredQuality: nil
+            )
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.albumArtCacheLookupToken == token,
+                      self.currentAlbumArtID == id else {
+                    return
+                }
+                self.logAlbumArtValidation(id: id, validation: hq)
+                self.logAlbumArtValidation(id: id, validation: preview)
+                completion(hq, preview, legacy)
+            }
         }
-        if let image = hqValidation.image,
-           hqValidation.shouldDisplayWhileRefreshing {
-            return (image, "hq")
+    }
+
+    private func readAlbumArtCacheValidation(
+        id: String,
+        preferredQuality: String?
+    ) -> AlbumArtCacheValidation {
+        let resolvedQuality = preferredQuality ?? "legacy"
+        let imageURL = albumArtCacheURL(id: id, quality: preferredQuality)
+        let metadataURL = albumArtMetadataURL(id: id, quality: preferredQuality)
+        let exists = FileManager.default.fileExists(atPath: imageURL.path)
+        let data = try? Data(contentsOf: imageURL, options: [.mappedIfSafe])
+        let size = data?.count ?? 0
+        let image = ArtworkImageCache.shared.memoryImage(
+            artworkId: id,
+            quality: resolvedQuality,
+            maximumPixelSize: ArtworkImageCache.mainArtworkMaximumPixelSize
+        ) ?? data.flatMap {
+            ArtworkImageCache.downsampledImage(
+                data: $0,
+                maximumPixelSize: ArtworkImageCache.mainArtworkMaximumPixelSize
+            )
         }
-        let previewValidation = validateAlbumArtCache(id: id, preferredQuality: "preview")
-        if let image = previewValidation.image,
-           previewValidation.shouldDisplayWhileRefreshing {
-            return (image, "preview")
+        if let image {
+            ArtworkImageCache.shared.store(
+                image,
+                artworkId: id,
+                quality: resolvedQuality,
+                maximumPixelSize: ArtworkImageCache.mainArtworkMaximumPixelSize
+            )
         }
-        let legacyValidation = validateAlbumArtCache(id: id, preferredQuality: nil)
-        if let image = legacyValidation.image,
-           legacyValidation.shouldDisplayWhileRefreshing {
-            return (image, legacyValidation.quality)
+        let metadata = readAlbumArtMetadata(from: metadataURL)
+        let pixelWidth = metadata?.pixelWidth ?? image?.pixelWidth ?? 0
+        let pixelHeight = metadata?.pixelHeight ?? image?.pixelHeight ?? 0
+        let source = normalizedAlbumArtSource(metadata?.source)
+        let ttlMs = albumArtCacheTtlMs(source: source)
+        let savedAt = metadata?.effectiveSavedAt ?? fileModifiedAt(imageURL) ?? 0
+        let ageMs: Int64 = savedAt > 0
+            ? max(0, Int64((Date().timeIntervalSince1970 - savedAt) * 1_000))
+            : Int64.max
+        let expired = ageMs > ttlMs
+        let hardExpired = ageMs > ALBUM_ART_HARD_CACHE_TTL_MS
+        let storedQuality = preferredQuality == nil
+            ? (try? String(
+                contentsOf: albumArtQualityURL(id: id, quality: nil),
+                encoding: .utf8
+            ))?.trimmingCharacters(in: .whitespacesAndNewlines)
+            : preferredQuality
+        let quality = preferredQuality ?? (storedQuality == "preview" ? "preview" : "hq")
+        let placeholder = image.map {
+            isLikelyPlaceholderAlbumArt($0, dataSize: size)
+        } ?? false
+
+        let reason: String
+        let valid: Bool
+        if !exists {
+            reason = "missing"
+            valid = false
+        } else if image == nil || size <= 0 {
+            reason = "decode_failed"
+            valid = false
+        } else if placeholder {
+            reason = "placeholder"
+            valid = false
+        } else if hardExpired {
+            reason = "hard_ttl_expired"
+            valid = false
+        } else if expired {
+            reason = "source_ttl_expired"
+            valid = true
+        } else if source == "notificationLargeIcon" || source == "unknown" {
+            reason = "source_requires_refresh"
+            valid = true
+        } else if pixelWidth <= ALBUM_ART_SMALL_CACHE_PIXEL_LIMIT ||
+                    pixelHeight <= ALBUM_ART_SMALL_CACHE_PIXEL_LIMIT {
+            reason = "small_cache_requires_refresh"
+            valid = true
+        } else {
+            reason = "ok"
+            valid = true
         }
-        return nil
+
+        return AlbumArtCacheValidation(
+            image: image,
+            quality: quality,
+            source: source,
+            ageMs: ageMs,
+            ttlMs: ttlMs,
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight,
+            bytes: size,
+            valid: valid,
+            expired: expired,
+            reason: reason
+        )
+    }
+
+    private func logAlbumArtValidation(
+        id: String,
+        validation: AlbumArtCacheValidation
+    ) {
+        let message =
+            "[AlbumArtCache] validate id=\(id) valid=\(validation.valid) " +
+            "quality=\(validation.quality) source=\(validation.source) " +
+            "ageMs=\(validation.ageMs == Int64.max ? -1 : validation.ageMs) " +
+            "ttlMs=\(validation.ttlMs) reason=\(validation.reason) " +
+            "size=\(validation.bytes) " +
+            "pixelSize=\(validation.pixelWidth)x\(validation.pixelHeight)"
+        log(message)
+        consoleLog(message)
+    }
+
+    private func loadEnhancedAlbumArtIfAvailable(id: String, reason: String) {
+        guard artworkEnhancementEnabled else { return }
+        let target = artworkEnhancementTargetPixelSize
+        let sharpness = artworkEnhancementSharpness
+        ArtworkImageCache.shared.performIO { [weak self] in
+            guard let self else { return }
+            let result = ArtworkEnhancementManager.shared.cachedEnhancedArtwork(
+                artworkId: id,
+                targetPixelSize: target,
+                sharpness: sharpness
+            )
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.currentAlbumArtID == id else { return }
+                if let result, result.shouldAutoDisplay {
+                    self.setAlbumArtDisplay(
+                        image: result.image,
+                        id: id,
+                        quality: .enhanced,
+                        reason: "\(reason) enhanced"
+                    )
+                    self.delegate?.albumArtPublishLiveArtwork(
+                        image: result.image,
+                        key: id,
+                        reason: "enhancedCacheHit"
+                    )
+                } else {
+                    self.startArtworkEnhancementFromCachedHq(
+                        id: id,
+                        reason: reason
+                    )
+                }
+            }
+        }
     }
 
     private func cachedEnhancedAlbumArt(id: String, allowLowGain: Bool = false) -> ArtworkEnhancementResult? {
@@ -1723,13 +1945,37 @@ final class AlbumArtReceiver {
     }
 
     private func startArtworkEnhancementFromCachedHq(id: String, reason: String) {
-        guard let data = try? Data(contentsOf: albumArtCacheURL(id: id, quality: "hq")),
-              let image = UIImage(data: data) else {
-            updateArtworkEnhancementStatus(message: "HQ cache missing")
-            notifyStateChanged()
-            return
+        let fileURL = albumArtCacheURL(id: id, quality: "hq")
+        ArtworkImageCache.shared.performIO { [weak self] in
+            guard let self else { return }
+            let data = try? Data(contentsOf: fileURL, options: [.mappedIfSafe])
+            let image = data.flatMap {
+                ArtworkImageCache.downsampledImage(
+                    data: $0,
+                    maximumPixelSize: ArtworkImageCache.mainArtworkMaximumPixelSize
+                )
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.currentAlbumArtID == id else { return }
+                guard let data, let image else {
+                    self.updateArtworkEnhancementStatus(message: "HQ cache missing")
+                    self.notifyStateChanged()
+                    return
+                }
+                ArtworkImageCache.shared.store(
+                    image,
+                    artworkId: id,
+                    quality: "hq",
+                    maximumPixelSize: ArtworkImageCache.mainArtworkMaximumPixelSize
+                )
+                self.startArtworkEnhancementIfNeeded(
+                    id: id,
+                    sourceData: data,
+                    sourceImage: image,
+                    reason: reason
+                )
+            }
         }
-        startArtworkEnhancementIfNeeded(id: id, sourceData: data, sourceImage: image, reason: reason)
     }
 
     private func startArtworkEnhancementIfNeeded(
@@ -1987,19 +2233,7 @@ final class AlbumArtReceiver {
         let firstRefreshAttempt = sourceRefreshAttemptedAlbumArtIDs.insert(id).inserted
         let selected = hqValidation.valid ? hqValidation : previewValidation
         let reason = selected.reason
-        if let cached = cachedEnhancedAlbumArt(id: id), hqValidation.valid {
-            setAlbumArtDisplay(
-                image: cached.image,
-                id: id,
-                quality: .enhanced,
-                reason: "stale-while-revalidate"
-            )
-            delegate?.albumArtPublishLiveArtwork(
-                image: cached.image,
-                key: id,
-                reason: "staleWhileRevalidate"
-            )
-        } else if let image = selected.image, selected.valid {
+        if let image = selected.image, selected.valid {
             let displayQuality = selected.quality == "preview"
                 ? ArtworkDisplayQuality.preview
                 : ArtworkDisplayQuality.hq
@@ -2014,6 +2248,12 @@ final class AlbumArtReceiver {
                 key: id,
                 reason: "staleWhileRevalidate"
             )
+            if displayQuality == .hq {
+                loadEnhancedAlbumArtIfAvailable(
+                    id: id,
+                    reason: "stale-while-revalidate"
+                )
+            }
         }
         updateArtworkEnhancementStatus(message: "refreshing cache")
         let staleReason = selected.expired ? "source_ttl_expired" : reason
@@ -2049,6 +2289,7 @@ final class AlbumArtReceiver {
     }
 
     private func removeCachedAlbumArt(id: String, quality: String? = nil, reason: String) {
+        ArtworkImageCache.shared.removeAllDecodedImages()
         let imageURL = albumArtCacheURL(id: id, quality: quality)
         let qualityURL = albumArtQualityURL(id: id, quality: quality)
         let metadataURL = albumArtMetadataURL(id: id, quality: quality)
@@ -2413,14 +2654,7 @@ final class AlbumArtReceiver {
     }
 
     private static func crc32(_ data: Data) -> UInt32 {
-        var crc: UInt32 = 0xffff_ffff
-        for byte in data {
-            crc ^= UInt32(byte)
-            for _ in 0..<8 {
-                crc = (crc >> 1) ^ ((crc & 1) == 1 ? 0xedb8_8320 : 0)
-            }
-        }
-        return crc ^ 0xffff_ffff
+        BLEBinaryChunkCodec.crc32(data)
     }
 
     private func log(_ message: String) {

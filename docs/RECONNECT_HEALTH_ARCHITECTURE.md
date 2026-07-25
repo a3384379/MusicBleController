@@ -25,6 +25,8 @@
 5. Health timer 检查静默时间：播放中 15 秒、暂停中 30 秒才探测。
 6. V2 发送轻量 `PING/PONG`；旧 Sony 回退 `GET_PLAYBACK_STATE`。连续两次探测失败才 hard reconnect，明确断开回调仍立即处理。
 7. `connectionDisplayState` 给 UI，`connectionHealthState` 给诊断和控制保护。
+8. CoreBluetooth 状态恢复优先复用已连接 Sony 和已恢复 characteristic。恢复未完成时标为 `suspect`，前台生命周期检查必须等待 notify 确认，不能以初始 `disconnected` 强制断开有效连接。
+9. 单次 `didWrite` 回调超时但 3 秒内仍收到 status notify 时只做软恢复；连续两次写回调超时才 hard reconnect。
 
 ## 关键状态
 
@@ -40,6 +42,7 @@
 - `connectionHealthState`：内部健康，如 `healthy`、`suspect`、`stale`、`disconnected`。
 - `autoReconnectState`：`idle`、`reconnectScheduled`、`scanning`、`connecting` 等。
 - `connectionAttemptId`：防止旧 scan/connect 回调污染当前状态。
+- `coreBluetoothRestoreInProgress`：隔离状态恢复和前台检查的竞态。
 
 ## 不允许随便修改的点
 
@@ -48,16 +51,19 @@
 - 不要让 retrieve connect 阻塞 scan 太久。
 - 不要在非 healthy/suspect 时发送播放控制命令。
 - 不要重连后补发旧控制命令。
+- 不要因为恢复连接尚未完成 health 初始化就主动取消已连接 peripheral。
 
 ## 常见问题排查入口
 
 - 打开 App 连接慢：看 `[BLE-Reconnect] foreground strategy=scanFirst`、`retrieve connect fast timeout`、`didDiscover`、`didConnect`。
 - 一直显示重连：看 `autoReconnectState`、`connectionAttemptId`、`ignore stale callback`、`scan timeout`。
 - 假连接：看 `[BLE-Health] suspect`、`probe sent`、`probe timeout`、`hard reconnect reason=...`。
+- 恢复竞态：看 `[BLE-Restore] restored`、`foreground restore skipped`、`reuse restored notifying characteristic`。
+- 写回调偶发丢失：看 `[CTRL-iOS] write soft recovery`；仍有 notify 时不应紧跟 hard reconnect。
 - 胶囊闪烁：区分 `connectionDisplayState` 和 `connectionHealthState`，日常模式不应展示技术细节。
 
 ## 修改后必须跑哪些 smoke test
 
 - 改连接、重连、Health、UI 胶囊：quick smoke。
 - 改 `autoReconnectEnabled` 默认值/UserDefaults/Preferences：full smoke。
-- 真机建议测试：Sony 服务停止、恢复、App 前后台、Force Reconnect。
+- 真机建议测试：`reconnect_sync_v28_test.sh`、Sony 服务停止/恢复、App 前后台、Force Reconnect。

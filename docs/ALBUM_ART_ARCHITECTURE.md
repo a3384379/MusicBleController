@@ -5,19 +5,22 @@
 ## 模块职责
 
 - Sony `AlbumArtTestManager`：从 MediaMetadata 和通知 largeIcon 中探测当前可用封面。当前真实链路常见来源是 QQMusic notification largeIcon。
-- Sony `BleGattServerManager`：处理 `ALBUM_ART_REQUEST`，压缩 preview/HQ/fallback，发送 `albumArtOffer` 和 binary chunk。
+- Sony `BleGattServerManager`：处理 `ALBUM_ART_REQUEST`，压缩 preview/HQ/fallback，发送 `albumArtOffer` 和 binary chunk；短期重传记录由独立 `AlbumArtTransferCoordinator` 持有。
 - Sony `BleNotifyQueue`：发送 `albumArt` 长任务，控制 chunk 进度、超时和短状态让路。
 - iOS `AlbumArtReceiver`：接收 offer、请求 preview/HQ、处理 binary start/chunk/end、超时恢复、缓存、displayQuality、enhanced、诊断 snapshot。
+- iOS `ArtworkImageCache`：缓存已经解码/降采样的 `UIImage`，40 项、32MB；内存警告只清理解码层，不删除磁盘原图。
 - iOS `ArtworkEnhancementManager`：本地离线视觉增强缓存，不覆盖 HQ 原图。
 - Live Activity：通过 `LiveActivityArtworkStore` 写 App Group 小缩略图，`ContentState` 只带 key/revision。
 
 ## 核心文件
 
 - iOS 接收：[AlbumArtReceiver.swift](/Volumes/雷电/project/MusicBleController/IOSBleFeasibility/IOSBleFeasibility/AlbumArtReceiver.swift)
+- iOS 解码缓存：[ArtworkImageCache.swift](/Volumes/雷电/project/MusicBleController/IOSBleFeasibility/IOSBleFeasibility/ArtworkImageCache.swift)
 - iOS 增强：[ArtworkEnhancementManager.swift](/Volumes/雷电/project/MusicBleController/IOSBleFeasibility/IOSBleFeasibility/ArtworkEnhancementManager.swift)
 - iOS 诊断模型：[NowPlayingDiagnosticSnapshot.swift](/Volumes/雷电/project/MusicBleController/IOSBleFeasibility/IOSBleFeasibility/NowPlayingDiagnosticSnapshot.swift)
 - iOS Live Activity 缩略图：[LiveActivityArtworkStore.swift](/Volumes/雷电/project/MusicBleController/IOSBleFeasibility/IOSBleFeasibility/LiveActivityArtworkStore.swift)
 - Sony GATT 封面发送：[BleGattServerManager.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/ble/BleGattServerManager.kt)
+- Sony 封面传输协调器：[MediaTransferCoordinators.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/ble/MediaTransferCoordinators.kt)
 - Sony 封面探测：[AlbumArtTestManager.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/AlbumArtTestManager.kt)
 - iOS smoke AlbumArt 验收：[ios_album_art_flow_test.sh](/Volumes/雷电/project/MusicBleController/tools/ios-smoke-tests/ios_album_art_flow_test.sh)
 
@@ -31,8 +34,10 @@
 6. 二进制传输：
    - JSON：`albumArtBinaryStart` / `albumArtBinaryEnd`
    - 二进制 chunk：6 字节 header + payload
-7. iOS 在 utility 串行队列原子保存 `Documents/AlbumArtCache/`，不阻塞 CoreBluetooth/UI 主线程；增强图保存到 Enhanced 子目录。
-8. 主 UI 使用最终 `albumArtImage`；Live Activity 使用 App Group 小图。
+7. 传输结束先复制不可变 `Data` 快照到 utility 串行队列，再做 JPEG 校验、磁盘读写和 ImageIO 降采样；主图约 780px、历史缩略图约 128px。
+8. 解码完成回主线程前再次校验 `transferId + artworkId`；切歌后的旧任务不能覆盖新封面。
+9. iOS 在 utility 串行队列原子保存 `Documents/AlbumArtCache/`；增强图保存到 Enhanced 子目录。
+10. 主 UI 使用最终 `albumArtImage`；Live Activity 使用 App Group 小图。加载层明确区分 preview、HQ 和失败，可只重试当前歌曲。
 
 ## 关键状态
 
@@ -46,6 +51,7 @@
 - 缓存最长可展示 30 天；通知来源 30 分钟后复验，稳定 metadata 来源 24 小时后复验。小于 300px 只触发后台刷新，不清空可用图。
 - Sony preview 目标约 112px、Q40～50、最多 1.8KB/12 包；HQ Q70～80、最多 8KB且保持最低优先级。
 - Sony 已编码 JPEG 使用 40 项、16MB、30 分钟内存 LRU，避免同歌曲重复压缩。
+- iOS 解码缓存 key 包含 `artworkId + quality + targetPixelSize`，避免同一 JPEG 在主界面和历史列表重复全尺寸解码。
 - A1 header 和 quality code 不变；start/end 可带 `transferId`、`generation`、`crc32`，新端支持局部重传，旧端直接忽略新字段。
 
 ## 不允许随便修改的点
@@ -55,6 +61,7 @@
 - 不要让 HQ 请求在 fullLyrics、lyricSecondary、remoteLog、mediaFieldDump 长任务期间抢占。
 - 不要覆盖 HQ 原图；enhanced 必须是独立缓存。
 - 不要把封面接收逻辑塞回 `BLETestManager`。
+- 不要在 SwiftUI `body` 或主线程同步 `Data(contentsOf:)`、校验 JPEG 或创建全尺寸图片。
 
 ## 常见问题排查入口
 
@@ -64,6 +71,7 @@
   - `[AlbumArt-iOS] transfer start/first chunk timeout/idle chunk timeout/total timeout/transfer cancelled`
   - `[AlbumArtCache] saved/display quality`
   - `[ArtworkDisplay] upgrade ...`
+  - `[ArtworkImageCache]` / `[ArtworkDecode]`
   - `[ArtworkEnhance] ...`
 - Sony：
   - `[AlbumArt-Sony]`

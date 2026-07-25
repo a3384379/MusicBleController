@@ -1,7 +1,12 @@
 import SwiftUI
 
 struct ContentView: View {
-    @StateObject private var bleManager = BLETestManager()
+    @State private var bleManager: BLETestManager
+    @ObservedObject private var connectionStateModel: ObservableStateSlice<BLEConnectionViewState>
+    @ObservedObject private var playbackStateModel: ObservableStateSlice<BLEPlaybackViewState>
+    @ObservedObject private var lyricsStateModel: ObservableStateSlice<BLELyricsViewState>
+    @ObservedObject private var artworkStateModel: ObservableStateSlice<BLEArtworkViewState>
+    @ObservedObject private var diagnosticsStateModel: ObservableStateSlice<BLEDiagnosticsViewState>
     @ObservedObject private var preferences = PreferencesStore.shared
     @State private var showFullLyrics = false
     @State private var showDebugPage = false
@@ -10,6 +15,16 @@ struct ContentView: View {
     @State private var showNowPlayingDiagnostic = false
     @State private var showSystemHealthOverview = false
     @State private var showPreferences = false
+
+    init() {
+        let manager = BLETestManager()
+        _bleManager = State(initialValue: manager)
+        _connectionStateModel = ObservedObject(wrappedValue: manager.connectionStateModel)
+        _playbackStateModel = ObservedObject(wrappedValue: manager.playbackStateModel)
+        _lyricsStateModel = ObservedObject(wrappedValue: manager.lyricsStateModel)
+        _artworkStateModel = ObservedObject(wrappedValue: manager.artworkStateModel)
+        _diagnosticsStateModel = ObservedObject(wrappedValue: manager.diagnosticsStateModel)
+    }
 
     var body: some View {
         NavigationStack {
@@ -131,6 +146,58 @@ struct ContentView: View {
             darkVolumeControl
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay(alignment: .top) {
+            if bleManager.title != "-" {
+                mediaLoadingOverlay
+                    .padding(.top, 48)
+            }
+        }
+    }
+
+    private var mediaLoadingOverlay: some View {
+        HStack(spacing: 8) {
+            Text(bleManager.mediaLoadingState.lyric.title)
+                .foregroundStyle(
+                    bleManager.mediaLoadingState.lyric.isFailure
+                        ? Color.orange
+                        : Color.white.opacity(0.68)
+                )
+                .lineLimit(1)
+
+            Button {
+                bleManager.retryCurrentLyricsFromMain()
+            } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .accessibilityLabel("重试当前歌词")
+
+            Rectangle()
+                .fill(.white.opacity(0.16))
+                .frame(width: 1, height: 13)
+
+            Text(bleManager.mediaLoadingState.artwork.title)
+                .foregroundStyle(
+                    bleManager.mediaLoadingState.artwork.isFailure
+                        ? Color.orange
+                        : Color.white.opacity(0.68)
+                )
+                .lineLimit(1)
+
+            Button {
+                bleManager.retryCurrentAlbumArtFromMain()
+            } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .accessibilityLabel("重试当前封面")
+        }
+        .font(.system(size: 10, weight: .semibold, design: .rounded))
+        .padding(.horizontal, 10)
+        .frame(height: 25)
+        .background(.black.opacity(0.42), in: Capsule())
+        .overlay {
+            Capsule().stroke(.white.opacity(0.08), lineWidth: 1)
+        }
+        .buttonStyle(.plain)
     }
 
     private var darkSystemHeader: some View {
@@ -267,6 +334,15 @@ struct ContentView: View {
 
                 DarkPlaybackStatusBadge(state: uiState.playback)
                     .padding(.top, 8)
+                    .overlay(alignment: .bottomLeading) {
+                        if bleManager.isShowingLastNowPlayingSnapshot {
+                            Text("上次播放 · 等待同步")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.orange.opacity(0.88))
+                                .fixedSize()
+                                .offset(y: 22)
+                        }
+                    }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -1497,6 +1573,8 @@ private struct DarkLyricRhythmLine: View {
     let positionMs: Int64
 
     @StateObject private var spectrumEngine = NaturalPseudoSpectrumEngine()
+    @ObservedObject private var preferences = PreferencesStore.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var opacity: Double {
         switch state {
@@ -1512,22 +1590,55 @@ private struct DarkLyricRhythmLine: View {
     }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
-            let time = timeline.date.timeIntervalSinceReferenceDate
-            GeometryReader { proxy in
-                let levels = spectrumEngine.levels(
-                    time: time,
-                    width: proxy.size.width,
-                    state: state,
-                    trackSeed: trackSeed,
-                    lyricProgress: lyricProgress,
-                    wordSignature: wordSignature,
-                    positionMs: positionMs
-                )
-                spectrumCanvas(levels: levels)
+        Group {
+            if let frameInterval {
+                TimelineView(.animation(minimumInterval: frameInterval)) { timeline in
+                    spectrumFrame(
+                        time: timeline.date.timeIntervalSinceReferenceDate
+                    )
+                }
+            } else {
+                spectrumFrame(time: 0)
             }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private var frameInterval: TimeInterval? {
+        guard !reduceMotion else {
+            return nil
+        }
+        let performanceMode = preferences.playbackPerformanceMode
+        if performanceMode == .powerSaving {
+            return nil
+        }
+        if performanceMode == .automatic,
+           ProcessInfo.processInfo.isLowPowerModeEnabled {
+            return nil
+        }
+        switch state {
+        case .playing:
+            return 1.0 / 20.0
+        case .loading, .reconnecting:
+            return 1.0 / 10.0
+        case .paused, .stopped:
+            return nil
+        }
+    }
+
+    private func spectrumFrame(time: TimeInterval) -> some View {
+        GeometryReader { proxy in
+            let levels = spectrumEngine.levels(
+                time: time,
+                width: proxy.size.width,
+                state: state,
+                trackSeed: trackSeed,
+                lyricProgress: lyricProgress,
+                wordSignature: wordSignature,
+                positionMs: positionMs
+            )
+            spectrumCanvas(levels: levels)
+        }
     }
 
     private func spectrumCanvas(levels: [Double]) -> some View {

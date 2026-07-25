@@ -30,6 +30,7 @@ import com.example.playeragent.media.CurrentTrackSnapshot
 import com.example.playeragent.media.IncrementalLyricsReady
 import com.example.playeragent.media.LyricTraceLogger
 import com.example.playeragent.media.LyricsReadyGateSnapshot
+import com.example.playeragent.media.MediaExecutionContext
 import com.example.playeragent.media.PlaybackStateReader
 import com.example.playeragent.media.PlaybackStateDiffType
 import com.example.playeragent.media.ReactiveMediaController
@@ -84,32 +85,15 @@ class BleGattServerManager(
         sendLine = { message -> sendStatusMessage(message) }
     )
     private val mediaFieldDumpManager = MediaFieldDumpManager(appContext)
-    private val mediaFieldDumpExecutor =
-        Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "MediaFieldDumpThread")
-        }
+    private val mediaExecutionContext = MediaExecutionContext("BleMedia")
+    private val mediaFieldDumpExecutor = mediaExecutionContext.maintenance
     private val mediaFieldDumpPreparing = AtomicBoolean(false)
-    private val historyExecutor =
-        Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "PlaybackHistoryBleThread")
-        }
+    private val historyExecutor = mediaExecutionContext.maintenance
     private val historyQueryPreparing = AtomicBoolean(false)
-    private val reconnectSyncExecutor =
-        Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "ReconnectStateSyncThread")
-        }
-    private val commandExecutor =
-        Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "BleCommandDispatchThread")
-        }
-    private val lyricCommandExecutor =
-        Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "BleLyricCommandThread")
-        }
-    private val albumArtFastPathExecutor =
-        Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "AlbumArtFastPathThread")
-        }
+    private val reconnectSyncExecutor = mediaExecutionContext.realtime
+    private val commandExecutor = mediaExecutionContext.realtime
+    private val lyricCommandExecutor = mediaExecutionContext.foregroundIO
+    private val albumArtFastPathExecutor = mediaExecutionContext.foregroundIO
     private val albumArtHandler = Handler(Looper.getMainLooper())
     private val gattLifecycleHandler = Handler(Looper.getMainLooper())
     private val qqMusicArtworkListener: (String) -> Unit = { event ->
@@ -187,30 +171,13 @@ class BleGattServerManager(
     private var pendingFullLyricsRequest: PendingFullLyricsRequest? = null
     @Volatile
     private var pendingLyricWindowRequest: PendingLyricWindowRequest? = null
-    @Volatile
-    private var recentFullLyricsBinaryTransfer: FullLyricsBinaryTransfer? = null
-    private val recentAlbumArtBinaryTransfers =
-        ConcurrentHashMap<String, AlbumArtBinaryTransfer>()
+    private val lyricsTransferCoordinator = LyricsTransferCoordinator()
+    private val albumArtTransferCoordinator = AlbumArtTransferCoordinator()
+    private val connectionCommandCoordinator = ConnectionCommandCoordinator()
     private var lastAutoPushSongKey: String? = null
     private var lastAutoPushPlaying: Boolean? = null
     private var lastPlaybackDiffSkipLogAtMs: Long = 0L
     private val reconnectSyncLastAtByAddress = ConcurrentHashMap<String, Long>()
-    @Volatile
-    private var clientSupportsBinaryAlbumArt = false
-    @Volatile
-    private var clientProtocolVersion = 1
-    @Volatile
-    private var clientSupportsFullLyricsZlib = false
-    @Volatile
-    private var clientSupportsLyricWindow = false
-    @Volatile
-    private var clientSupportsPing = false
-    @Volatile
-    private var clientSupportsTransferRetry = false
-    @Volatile
-    private var clientCapabilitiesNegotiated = false
-    @Volatile
-    private var capabilityNegotiationGeneration = 0L
     @Volatile
     private var started = false
     @Volatile
@@ -264,6 +231,7 @@ class BleGattServerManager(
                 connectedDeviceAddresses.add(address)
                 connectedDevices[address] = device
                 mtuByAddress[address] = DEFAULT_MTU
+                notifyQueue.resetLinkProfile(address, DEFAULT_MTU)
                 logger("[ReconnectSync] central connected device=$address")
                 scheduleGattRediscoveryIfUnsubscribed(
                     device = device,
@@ -308,6 +276,7 @@ class BleGattServerManager(
         override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
             val address = device?.address ?: return
             mtuByAddress[address] = mtu
+            notifyQueue.updateLinkMtu(address, mtu)
             val callbackKey = "$address|$mtu"
             if (shouldLogCallback(recentMtuCallbacks, callbackKey)) {
                 logger("[BLE-A] MTU changed: device=$address mtu=$mtu")
@@ -315,7 +284,7 @@ class BleGattServerManager(
         }
 
         override fun onNotificationSent(device: BluetoothDevice?, status: Int) {
-            notifyQueue.onNotificationSent(status)
+            notifyQueue.onNotificationSent(device?.address, status)
         }
 
         override fun onCharacteristicWriteRequest(
@@ -472,16 +441,17 @@ class BleGattServerManager(
                     subscribedDevices[device.address] = device
                     lastSubscribedAtMs = SystemClock.elapsedRealtime()
                     resetClientCapabilities()
-                    val capabilityGeneration = ++capabilityNegotiationGeneration
+                    val capabilityGeneration =
+                        connectionCommandCoordinator.negotiationGeneration
                     logger("[BLE-A] status notify subscribed: device=${device.address}")
                     logger("[ReconnectSync] notify subscribed device=${device.address}")
                     startAutoPush()
                     scheduleReconnectStateSync(device, "notify_subscribed")
                     albumArtHandler.postDelayed({
-                        if (capabilityGeneration == capabilityNegotiationGeneration &&
-                            !clientCapabilitiesNegotiated
+                        if (connectionCommandCoordinator.useLegacyIfCurrent(
+                                capabilityGeneration
+                            )
                         ) {
-                            clientCapabilitiesNegotiated = true
                             logger("[BLE-A] client capability timeout, legacy fallback")
                             sendPendingAlbumArtIfAny()
                         }
@@ -500,7 +470,6 @@ class BleGattServerManager(
                     pendingAlbumArt = null
                     albumArtScheduleGeneration += 1
                     resetClientCapabilities()
-                    capabilityNegotiationGeneration += 1
                     lastAutoPushSongKey = null
                     lastAutoPushPlaying = null
                     logger("[BLE-A] status notify unsubscribed: device=${device.address}")
@@ -660,12 +629,14 @@ class BleGattServerManager(
         }
         logger("[BLE-GATT] close reason=$reason")
         stopAutoPush()
-        notifyQueue.clearAllForDisconnect(reason)
+        notifyQueue.shutdown(reason)
         lastAlbumArtKey = null
         currentAlbumArtId = null
         albumArtRequestsInFlight.clear()
         albumArtRequestsCompleted.clear()
         pendingAlbumArt = null
+        lyricsTransferCoordinator.reset()
+        albumArtTransferCoordinator.reset()
         albumArtScheduleGeneration += 1
         albumArtTaskGeneration += 1
         albumArtFastPathTask?.cancel(true)
@@ -686,12 +657,7 @@ class BleGattServerManager(
         recentConnectionCallbacks.clear()
         recentMtuCallbacks.clear()
         statusCharacteristic = null
-        mediaFieldDumpExecutor.shutdownNow()
-        historyExecutor.shutdownNow()
-        reconnectSyncExecutor.shutdownNow()
-        commandExecutor.shutdownNow()
-        lyricCommandExecutor.shutdownNow()
-        albumArtFastPathExecutor.shutdownNow()
+        mediaExecutionContext.close()
         playbackStateBuffer.shutdown()
         playbackStateReader.close()
 
@@ -990,19 +956,22 @@ class BleGattServerManager(
     }
 
     private fun handleClientCapabilities(request: JSONObject) {
-        clientProtocolVersion = request.optInt("protocolVersion", 1).coerceAtLeast(1)
-        clientSupportsBinaryAlbumArt = request.optBoolean("albumArtBinary", false)
-        clientSupportsFullLyricsZlib = request.optBoolean("fullLyricsZlib", false)
-        clientSupportsLyricWindow = request.optBoolean("lyricWindow", false)
-        clientSupportsPing = request.optBoolean("ping", false)
-        clientSupportsTransferRetry = request.optBoolean("transferRetry", false)
-        clientCapabilitiesNegotiated = true
+        val capabilities = ConnectionCommandCoordinator.Capabilities(
+            protocolVersion = request.optInt("protocolVersion", 1).coerceAtLeast(1),
+            binaryAlbumArt = request.optBoolean("albumArtBinary", false),
+            fullLyricsZlib = request.optBoolean("fullLyricsZlib", false),
+            lyricWindow = request.optBoolean("lyricWindow", false),
+            ping = request.optBoolean("ping", false),
+            transferRetry = request.optBoolean("transferRetry", false),
+            negotiated = true
+        )
+        connectionCommandCoordinator.accept(capabilities)
         logger(
-            "[BLE-A] client capability protocolVersion=$clientProtocolVersion " +
-                "albumArtBinary=$clientSupportsBinaryAlbumArt " +
-                "fullLyricsZlib=$clientSupportsFullLyricsZlib " +
-                "lyricWindow=$clientSupportsLyricWindow ping=$clientSupportsPing " +
-                "transferRetry=$clientSupportsTransferRetry"
+            "[BLE-A] client capability protocolVersion=${capabilities.protocolVersion} " +
+                "albumArtBinary=${capabilities.binaryAlbumArt} " +
+                "fullLyricsZlib=${capabilities.fullLyricsZlib} " +
+                "lyricWindow=${capabilities.lyricWindow} ping=${capabilities.ping} " +
+                "transferRetry=${capabilities.transferRetry}"
         )
         subscribedDevices.values.firstOrNull()?.let { device ->
             sendShortJsonIfFits(
@@ -1022,15 +991,9 @@ class BleGattServerManager(
     }
 
     private fun resetClientCapabilities() {
-        clientProtocolVersion = 1
-        clientSupportsBinaryAlbumArt = false
-        clientSupportsFullLyricsZlib = false
-        clientSupportsLyricWindow = false
-        clientSupportsPing = false
-        clientSupportsTransferRetry = false
-        clientCapabilitiesNegotiated = false
-        recentFullLyricsBinaryTransfer = null
-        recentAlbumArtBinaryTransfers.clear()
+        connectionCommandCoordinator.invalidate()
+        lyricsTransferCoordinator.clearRetryState()
+        albumArtTransferCoordinator.reset()
     }
 
     private fun sendPong(request: JSONObject) {
@@ -1267,6 +1230,17 @@ class BleGattServerManager(
 
     fun manualRefreshCurrentLyric(): Boolean {
         return playbackStateReader.manualRefreshCurrentLyric()
+    }
+
+    /**
+     * Debug/UI refresh entry point that does not require an active BLE subscriber.
+     * Refresh the QQ Music MediaSession snapshot first so LyricManager has the
+     * current song identity before clearing only that song's retry state.
+     */
+    fun refreshCurrentPlaybackAndLyric(): Boolean {
+        val playbackState = playbackStateReader.readPlaybackState()
+        val manualRefreshStarted = playbackStateReader.manualRefreshCurrentLyric()
+        return manualRefreshStarted || playbackState.optString("title").isNotBlank()
     }
 
     private fun sendShortJsonIfFits(
@@ -1906,7 +1880,7 @@ class BleGattServerManager(
             logger("[AlbumArt] offer skipped reason=empty protocol id")
             return
         }
-        if (!clientCapabilitiesNegotiated &&
+        if (!connectionCommandCoordinator.capabilities.negotiated &&
             SystemClock.elapsedRealtime() - lastSubscribedAtMs < CLIENT_CAPABILITY_WAIT_MS
         ) {
             pendingAlbumArt = pending
@@ -2348,7 +2322,7 @@ class BleGattServerManager(
             return
         }
         if (quality == AlbumArtQuality.HQ) {
-            if (!clientSupportsBinaryAlbumArt) {
+            if (!connectionCommandCoordinator.capabilities.binaryAlbumArt) {
                 logger("[AlbumArtHQ] request skipped reason=binary unsupported")
                 return
             }
@@ -2427,7 +2401,7 @@ class BleGattServerManager(
         )
         val useBinaryAlbumArt =
             (quality == AlbumArtQuality.PREVIEW || quality == AlbumArtQuality.HQ) &&
-                clientSupportsBinaryAlbumArt
+                connectionCommandCoordinator.capabilities.binaryAlbumArt
         val maximumPayload = if (useBinaryAlbumArt) {
             albumArtMaximumPayloadFor(device)
         } else {
@@ -3913,6 +3887,10 @@ class BleGattServerManager(
     }
 
     private fun sendFullLyrics(request: JSONObject) {
+        if (request.optBoolean("forceRefresh", false)) {
+            val started = playbackStateReader.manualRefreshCurrentLyric()
+            logger("[LyricRetry] BLE force refresh requested started=$started")
+        }
         val device = subscribedDevices.values.firstOrNull() ?: run {
             val requestedTrackId = request.optString("trackId")
             if (requestedTrackId.isNotBlank()) {
@@ -4096,10 +4074,11 @@ class BleGattServerManager(
 
         val maximumPayload = maximumPayloadFor(device)
         val requestedFormat = request.optString("format")
+        val negotiatedCapabilities = connectionCommandCoordinator.capabilities
         if (requestedFormat == FULL_LYRICS_ZLIB_FORMAT &&
-            clientCapabilitiesNegotiated &&
-            clientProtocolVersion >= SERVER_PROTOCOL_VERSION &&
-            clientSupportsFullLyricsZlib &&
+            negotiatedCapabilities.negotiated &&
+            negotiatedCapabilities.protocolVersion >= SERVER_PROTOCOL_VERSION &&
+            negotiatedCapabilities.fullLyricsZlib &&
             sendCompressedFullLyrics(
                 device = device,
                 trackId = trackId,
@@ -4255,53 +4234,99 @@ class BleGattServerManager(
         songKey: String,
         buildStartedAtMs: Long
     ): Boolean {
-        val body = JSONObject()
-            .put("format", FULL_LYRICS_ZLIB_FORMAT)
-            .put("trackId", trackId)
-            .put("title", title)
-            .put("artist", artist)
-            .put("generation", generation)
-            .put("count", lines.size)
-            .put(
-                "lines",
-                JSONArray().also { array ->
-                    lines.forEachIndexed { index, line ->
-                        array.put(
-                            JSONObject()
-                                .put("index", index)
-                                .put("timeMs", line.timeMs)
-                                .put("durationMs", line.durationMs)
-                                .put("text", line.text.take(MAX_COMPRESSED_LYRIC_TEXT_LENGTH))
-                                .also { item ->
-                                    if (index in wordLineIndexes && line.words.isNotEmpty()) {
-                                        item.put(
-                                            "words",
-                                            JSONArray().also { words ->
-                                                line.words.forEach { word ->
-                                                    if (word.text.isNotBlank()) {
-                                                        words.put(
-                                                            JSONObject()
-                                                                .put("startMs", word.startMs)
-                                                                .put("durationMs", word.durationMs)
-                                                                .put("text", word.text)
-                                                        )
+        val cacheKey = CompressedLyricsCache.Key(
+            songKey = songKey,
+            trackId = trackId,
+            generation = generation,
+            format = FULL_LYRICS_ZLIB_FORMAT,
+            contentFingerprint = fullLyricsContentFingerprint(
+                title = title,
+                artist = artist,
+                lines = lines
+            ),
+            wordLineIndexes = wordLineIndexes.sorted().joinToString(",")
+        )
+        val compressedLyricsCache = lyricsTransferCoordinator.compressedCache
+        val cached = compressedLyricsCache.get(cacheKey)
+        val cacheEntry = cached ?: run {
+            val body = JSONObject()
+                .put("format", FULL_LYRICS_ZLIB_FORMAT)
+                .put("trackId", trackId)
+                .put("title", title)
+                .put("artist", artist)
+                .put("generation", generation)
+                .put("count", lines.size)
+                .put(
+                    "lines",
+                    JSONArray().also { array ->
+                        lines.forEachIndexed { index, line ->
+                            array.put(
+                                JSONObject()
+                                    .put("index", index)
+                                    .put("timeMs", line.timeMs)
+                                    .put("durationMs", line.durationMs)
+                                    .put(
+                                        "text",
+                                        line.text.take(MAX_COMPRESSED_LYRIC_TEXT_LENGTH)
+                                    )
+                                    .also { item ->
+                                        if (index in wordLineIndexes &&
+                                            line.words.isNotEmpty()
+                                        ) {
+                                            item.put(
+                                                "words",
+                                                JSONArray().also { words ->
+                                                    line.words.forEach { word ->
+                                                        if (word.text.isNotBlank()) {
+                                                            words.put(
+                                                                JSONObject()
+                                                                    .put("startMs", word.startMs)
+                                                                    .put(
+                                                                        "durationMs",
+                                                                        word.durationMs
+                                                                    )
+                                                                    .put("text", word.text)
+                                                            )
+                                                        }
                                                     }
                                                 }
-                                            }
-                                        )
+                                            )
+                                        }
                                     }
-                                }
-                        )
+                            )
+                        }
                     }
-                }
-            )
-            .toString()
-            .toByteArray(Charsets.UTF_8)
-        val compressed = BleTransferCodec.zlibCompress(body)
+                )
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            val compressedBody = BleTransferCodec.zlibCompress(body)
+            if (compressedBody.isEmpty() ||
+                compressedBody.size > MAX_FULL_LYRICS_ZLIB_BYTES
+            ) {
+                logger(
+                    "[FullLyricsV2] fallback legacy reason=compressed_size " +
+                        "raw=${body.size} compressed=${compressedBody.size}"
+                )
+                return false
+            }
+            CompressedLyricsCache.Entry(
+                compressed = compressedBody,
+                uncompressedSize = body.size,
+                crc32 = BleTransferCodec.crc32Hex(compressedBody)
+            ).also { compressedLyricsCache.put(cacheKey, it) }
+        }
+        val compressed = cacheEntry.compressed
+        val uncompressedSize = cacheEntry.uncompressedSize
+        val crc32 = cacheEntry.crc32
+        logger(
+            "[FullLyricsCache] ${if (cached == null) "miss" else "hit"} " +
+                "trackId=$trackId generation=$generation bytes=${compressed.size} " +
+                "entries=${compressedLyricsCache.size()} totalBytes=${compressedLyricsCache.bytes()}"
+        )
         if (compressed.isEmpty() || compressed.size > MAX_FULL_LYRICS_ZLIB_BYTES) {
             logger(
                 "[FullLyricsV2] fallback legacy reason=compressed_size " +
-                    "raw=${body.size} compressed=${compressed.size}"
+                    "raw=$uncompressedSize compressed=${compressed.size}"
             )
             return false
         }
@@ -4317,7 +4342,6 @@ class BleGattServerManager(
             return false
         }
         val transferId = UUID.randomUUID().toString().replace("-", "").take(10)
-        val crc32 = BleTransferCodec.crc32Hex(compressed)
         val verboseStart = JSONObject()
             .put("type", "fullLyricsBinaryStart")
             .put("trackId", trackId)
@@ -4325,7 +4349,7 @@ class BleGattServerManager(
             .put("generation", generation)
             .put("format", FULL_LYRICS_ZLIB_FORMAT)
             .put("size", compressed.size)
-            .put("uncompressedSize", body.size)
+            .put("uncompressedSize", uncompressedSize)
             .put("chunks", binaryChunks.size)
             .put("count", lines.size)
             .put("crc32", crc32)
@@ -4348,7 +4372,7 @@ class BleGattServerManager(
             .put("tid", transferId)
             .put("g", generation)
             .put("s", compressed.size)
-            .put("u", body.size)
+            .put("u", uncompressedSize)
             .put("c", binaryChunks.size)
             .put("n", lines.size)
             .put("crc", crc32)
@@ -4385,7 +4409,7 @@ class BleGattServerManager(
             value = end,
             delayAfterMs = FULL_LYRICS_JSON_NOTIFICATION_DELAY_MS
         )
-        recentFullLyricsBinaryTransfer = FullLyricsBinaryTransfer(
+        lyricsTransferCoordinator.retain(FullLyricsBinaryTransfer(
             trackId = trackId,
             transferId = transferId,
             generation = generation,
@@ -4393,7 +4417,7 @@ class BleGattServerManager(
             chunks = chunkPackets,
             end = endPacket,
             expiresAtMs = SystemClock.elapsedRealtime() + FULL_LYRICS_RETRY_TTL_MS
-        )
+        ))
         val packets = buildList {
             add(startPacket)
             addAll(chunkPackets)
@@ -4402,7 +4426,7 @@ class BleGattServerManager(
         val sendStartedAtMs = SystemClock.elapsedRealtime()
         logger(
             "[FullLyricsV2] send start trackId=$trackId lines=${lines.size} " +
-                "raw=${body.size} compressed=${compressed.size} chunks=${binaryChunks.size} " +
+                "raw=$uncompressedSize compressed=${compressed.size} chunks=${binaryChunks.size} " +
                 "metadata=${if (start === compactStart) "compact" else "verbose"}"
         )
         lyricTrace(
@@ -4453,8 +4477,35 @@ class BleGattServerManager(
         return true
     }
 
+    private fun fullLyricsContentFingerprint(
+        title: String,
+        artist: String,
+        lines: List<com.example.playeragent.media.LyricManager.LyricLine>
+    ): Long {
+        var hash = 1_469_598_103_934_665_603L
+        fun mix(value: Long) {
+            hash = (hash xor value) * 1_099_511_628_211L
+        }
+        mix(title.hashCode().toLong())
+        mix(artist.hashCode().toLong())
+        mix(lines.size.toLong())
+        lines.forEach { line ->
+            mix(line.timeMs)
+            mix(line.durationMs)
+            mix(line.text.hashCode().toLong())
+            mix(line.words.size.toLong())
+            line.words.forEach { word ->
+                mix(word.startMs)
+                mix(word.durationMs)
+                mix(word.text.hashCode().toLong())
+            }
+        }
+        return hash
+    }
+
     private fun sendLyricWindow(request: JSONObject) {
-        if (!clientCapabilitiesNegotiated || !clientSupportsLyricWindow) return
+        val capabilities = connectionCommandCoordinator.capabilities
+        if (!capabilities.negotiated || !capabilities.lyricWindow) return
         val device = subscribedDevices.values.firstOrNull() ?: return
         val source = playbackSourceForRequestedTrack(request.optString("trackId"))
         val trackId = buildAlbumArtProtocolId(source)
@@ -4604,19 +4655,19 @@ class BleGattServerManager(
     }
 
     private fun retryTransfer(request: JSONObject) {
-        if (!clientCapabilitiesNegotiated || !clientSupportsTransferRetry) return
+        val capabilities = connectionCommandCoordinator.capabilities
+        if (!capabilities.negotiated || !capabilities.transferRetry) return
         val device = subscribedDevices.values.firstOrNull() ?: return
         val transferId = request.optString("transferId")
-        recentAlbumArtBinaryTransfers[transferId]?.let { albumTransfer ->
+        albumArtTransferCoordinator.retained(transferId)?.let { albumTransfer ->
             retryAlbumArtTransfer(device, request, albumTransfer)
             return
         }
-        val transfer = recentFullLyricsBinaryTransfer
+        val transfer = lyricsTransferCoordinator.retained(transferId)
         if (transfer == null ||
-            transfer.transferId != transferId ||
             transfer.trackId != request.optString("trackId") ||
             transfer.expiresAtMs < SystemClock.elapsedRealtime() ||
-            currentAlbumArtId != transfer.trackId
+            !isLyricsTransferCurrent(transfer.trackId, transfer.generation)
         ) {
             sendFullLyricsBinaryError(device, transferId, "transfer expired")
             return
@@ -4671,17 +4722,15 @@ class BleGattServerManager(
             JSONObject(start.value.toString(Charsets.UTF_8)).optString("transferId")
         }.getOrDefault("")
         if (transferId.isBlank()) return
-        val now = SystemClock.elapsedRealtime()
-        recentAlbumArtBinaryTransfers.entries.removeAll { it.value.expiresAtMs < now }
-        recentAlbumArtBinaryTransfers[transferId] = AlbumArtBinaryTransfer(
+        albumArtTransferCoordinator.retain(AlbumArtBinaryTransfer(
             trackId = protocolId,
             quality = quality,
             transferId = transferId,
             start = start,
             chunks = packets.filter { it.type == "albumArtBinaryChunk" },
             end = end,
-            expiresAtMs = now + ALBUM_ART_RETRY_TTL_MS
-        )
+            expiresAtMs = SystemClock.elapsedRealtime() + ALBUM_ART_RETRY_TTL_MS
+        ))
     }
 
     private fun retryAlbumArtTransfer(
@@ -5301,11 +5350,13 @@ class BleGattServerManager(
 
     private fun isLyricsTransferCurrent(trackId: String, generation: Long): Boolean {
         val track = playbackStateReader.runtimeCacheSnapshot().track ?: return false
-        val trackMatches = isSameProtocolTrackId(track.trackId, trackId)
-        val generationMatches = generation <= 0L ||
-            track.currentTrackGeneration <= 0L ||
-            track.currentTrackGeneration == generation
-        return trackMatches && generationMatches
+        return BleTransferCodec.isCurrentTransfer(
+            transferTrackId = trackId,
+            transferGeneration = generation,
+            currentTrackId = track.trackId,
+            currentGeneration = track.currentTrackGeneration,
+            trackIdsMatch = ::isSameProtocolTrackId
+        )
     }
 
     private fun buildFittingFullLyricsChunk(
@@ -5692,26 +5743,6 @@ class BleGattServerManager(
         val createdAtMs: Long
     )
 
-    private data class FullLyricsBinaryTransfer(
-        val trackId: String,
-        val transferId: String,
-        val generation: Long,
-        val start: BleNotifyQueue.Packet,
-        val chunks: List<BleNotifyQueue.Packet>,
-        val end: BleNotifyQueue.Packet,
-        val expiresAtMs: Long
-    )
-
-    private data class AlbumArtBinaryTransfer(
-        val trackId: String,
-        val quality: AlbumArtQuality,
-        val transferId: String,
-        val start: BleNotifyQueue.Packet,
-        val chunks: List<BleNotifyQueue.Packet>,
-        val end: BleNotifyQueue.Packet,
-        val expiresAtMs: Long
-    )
-
     private data class AlbumArtCacheEntry(
         val protocolId: String,
         val cacheKey: String,
@@ -5722,20 +5753,6 @@ class BleGattServerManager(
         val byteSize: Int,
         val createdAtElapsedMs: Long
     )
-
-    private enum class AlbumArtQuality(val wireValue: String) {
-        PREVIEW("preview"),
-        HQ("hq"),
-        FULL("full");
-
-        companion object {
-            fun fromWireValue(value: String): AlbumArtQuality? {
-                return entries.firstOrNull {
-                    it.wireValue.equals(value, ignoreCase = true)
-                }
-            }
-        }
-    }
 
     enum class ServerState {
         STOPPED,

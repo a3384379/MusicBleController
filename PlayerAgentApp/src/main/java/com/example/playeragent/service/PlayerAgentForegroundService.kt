@@ -607,7 +607,7 @@ class PlayerAgentForegroundService : Service() {
     }
 
     private fun refreshCurrentLyric() {
-        val handled = gattServerManager?.manualRefreshCurrentLyric() == true
+        val handled = gattServerManager?.refreshCurrentPlaybackAndLyric() == true
         if (handled) {
             log("[LyricRetry] manual refresh requested from service")
         } else {
