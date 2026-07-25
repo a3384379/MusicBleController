@@ -36,17 +36,37 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
-      - name: Select Xcode 16.2 when available
+      - name: Inspect Xcode and available simulators
         run: |
-          if [ -d /Applications/Xcode_16.2.app ]; then
-            sudo xcode-select -s /Applications/Xcode_16.2.app
-          fi
           xcodebuild -version
+          xcrun simctl list devices available
       - name: Run unsigned simulator tests
         run: |
+          set -euo pipefail
+          simulator_udid="$(
+            xcrun simctl list devices available -j |
+              python3 -c '
+          import json
+          import sys
+
+          runtimes = json.load(sys.stdin).get("devices", {})
+          devices = (
+              device
+              for runtime_devices in runtimes.values()
+              for device in runtime_devices
+          )
+          print(next(
+              device["udid"]
+              for device in devices
+              if device.get("isAvailable") and device.get("name", "").startswith("iPhone")
+          ))
+          '
+          )"
+          echo "Using iOS simulator: ${simulator_udid}"
           xcodebuild \
             -project IOSBleFeasibility/IOSBleFeasibility.xcodeproj \
             -scheme sonyMusic \
-            -destination 'platform=iOS Simulator,name=iPhone 16 Pro' \
+            -destination "platform=iOS Simulator,id=${simulator_udid}" \
+            -derivedDataPath "${RUNNER_TEMP}/IOSBleFeasibilityDerivedData" \
             CODE_SIGNING_ALLOWED=NO \
             test
