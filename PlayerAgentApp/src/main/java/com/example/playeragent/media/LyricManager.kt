@@ -83,6 +83,8 @@ class LyricManager(
         context = appContext,
         logger = logger
     )
+    @Volatile
+    private var fuzzyIndexReady: Boolean = qrcLyricManager.fuzzyIndexStatus().ready
     private val predictiveLyricsPipeline = PredictiveLyricsPipeline(
         logger = logger,
         loader = { track ->
@@ -116,6 +118,7 @@ class LyricManager(
     )
     private val closed = AtomicBoolean(false)
     private val fuzzyIndexReadyListener: (QrcFuzzyIndexStatus) -> Unit = {
+        fuzzyIndexReady = it.ready
         if (!closed.get()) {
             // A miss made while the on-disk cache index was cold is provisional.
             // Let the just-built index participate in the next foreground lookup.
@@ -603,6 +606,10 @@ class LyricManager(
 
     @Synchronized
     fun currentUnavailableReason(): String {
+        return currentUnavailableReasonLocked()
+    }
+
+    private fun currentUnavailableReasonLocked(): String {
         val key = activeSongKey
         return when {
             key != null && isInFlightLocked(key) -> "lyrics loading"
@@ -634,10 +641,28 @@ class LyricManager(
 
     @Synchronized
     fun diagnosticSnapshot(trackId: String): LyricDiagnosticSnapshot {
+        return diagnosticSnapshotLocked(trackId)
+    }
+
+    @Synchronized
+    fun playbackLyricStatusSnapshot(trackId: String): PlaybackLyricStatusSnapshot {
+        val reason = currentUnavailableReasonLocked()
+        val statusText = currentStatusTextLocked()
+        return PlaybackLyricStatusSnapshot(
+            statusText = statusText,
+            reason = reason,
+            diagnostic = diagnosticSnapshotLocked(trackId, reason)
+        )
+    }
+
+    private fun diagnosticSnapshotLocked(
+        trackId: String,
+        unavailableReason: String = currentUnavailableReasonLocked()
+    ): LyricDiagnosticSnapshot {
         val key = activeSongKey.orEmpty()
         val now = System.currentTimeMillis()
         val lines = if (key.isNotBlank() && key == loadedSongKey) cachedLines.size else 0
-        val reason = currentUnavailableReason()
+        val reason = unavailableReason
         val status = when {
             key.isBlank() -> "no_lyrics_final"
             lines > 0 -> "loaded"
@@ -691,7 +716,7 @@ class LyricManager(
             nextRetryAt = nextRetryAt,
             retryCount = retryCountInWindow,
             cooldownUntil = cooldownUntil,
-            fuzzyIndexReady = QrcLyricCacheManager(appContext, logger).fuzzyIndexStatus().ready,
+            fuzzyIndexReady = fuzzyIndexReady,
             qrcIndexLoaded = true,
             maintenanceBusy = QrcMaintenanceCoordinator.isRunning(),
             waitingQqMusicCache = status == "waiting_qqmusic_cache",
@@ -1849,6 +1874,10 @@ class LyricManager(
 
     @Synchronized
     fun currentStatusText(): String {
+        return currentStatusTextLocked()
+    }
+
+    private fun currentStatusTextLocked(): String {
         val key = activeSongKey ?: return "unknown"
         return when {
             key == loadedSongKey && cachedLines.isNotEmpty() -> "loaded"
@@ -2359,6 +2388,12 @@ class LyricManager(
         val recoveryExpiresAt: Long = 0L,
         val lastRecoveryReason: String = "",
         val recentQrcCandidateCount: Int = 0
+    )
+
+    data class PlaybackLyricStatusSnapshot(
+        val statusText: String,
+        val reason: String,
+        val diagnostic: LyricDiagnosticSnapshot
     )
 
     private data class LyricCandidate(

@@ -17,7 +17,11 @@ class CurrentWordPushEngine(
     private val logger: (String) -> Unit,
     private val sendStatusMessage: (String) -> Boolean,
     private val normalizeTrackId: (String) -> String = { it },
-    private val expectedGeneration: () -> Long = { CurrentTrackRuntimeCache.currentGeneration() }
+    private val expectedGeneration: () -> Long = { CurrentTrackRuntimeCache.currentGeneration() },
+    private val currentWordState: () -> CurrentWordState? = {
+        CurrentTrackRuntimeCache.currentWordState()
+    },
+    private val elapsedRealtime: () -> Long = { SystemClock.elapsedRealtime() }
 ) {
     private val lock = Any()
     private var lastPushedKey: String = ""
@@ -30,13 +34,17 @@ class CurrentWordPushEngine(
     private var lastSkipLogAtMs: Long = 0L
     private var lastObservedGeneration: Long = -1L
     private var generationFirstSeenAtMs: Long = 0L
+    private var lastPushedPositionMs: Long = -1L
+    private var nextSequence: Long = 0L
+    private var lastLoggedLineIndex: Int = -1
 
+    @Synchronized
     fun pushCurrentWord(
         reason: String = "diff",
         force: Boolean = false
     ): CurrentWordState? {
-        val startedAt = SystemClock.elapsedRealtime()
-        val state = CurrentTrackRuntimeCache.currentWordState() ?: run {
+        val startedAt = elapsedRealtime()
+        val state = currentWordState() ?: run {
             recordSkip("missing")
             return null
         }
@@ -49,7 +57,7 @@ class CurrentWordPushEngine(
                 protocolId = outgoingTrackId
             )
             synchronized(lock) {
-                recordSkipLocked("stale_generation", SystemClock.elapsedRealtime(), state, key)
+                recordSkipLocked("stale_generation", elapsedRealtime(), state, key)
             }
             logger(
                 "[CurrentWordFence] skip reason=stale_generation " +
@@ -60,10 +68,14 @@ class CurrentWordPushEngine(
         }
 
         synchronized(lock) {
-            val now = SystemClock.elapsedRealtime()
+            val now = elapsedRealtime()
             if (state.trackGeneration != lastObservedGeneration) {
                 lastObservedGeneration = state.trackGeneration
                 generationFirstSeenAtMs = now
+                lastPushedKey = ""
+                lastPushedPositionMs = -1L
+                nextSequence = 0L
+                lastLoggedLineIndex = -1
             }
             val generationAgeMs = now - generationFirstSeenAtMs
             if (!force && generationAgeMs < TRACK_SWITCH_BASELINE_HOLDOFF_MS) {
@@ -86,6 +98,27 @@ class CurrentWordPushEngine(
                 recordSkipLocked("same word", now, state, key)
                 return null
             }
+            if (!force && lastPushedPositionMs >= 0L && state.positionMs < lastPushedPositionMs) {
+                val regressionMs = lastPushedPositionMs - state.positionMs
+                if (regressionMs <= MAX_JITTER_REGRESSION_MS) {
+                    recordSkipLocked(
+                        "position regression",
+                        now,
+                        state,
+                        key,
+                        extra = " regressionMs=$regressionMs"
+                    )
+                    return null
+                }
+                // A larger backwards jump is a real seek. Start a new local
+                // timeline while preserving the connection generation.
+                lastPushedKey = ""
+                lastPushedPositionMs = -1L
+                logger(
+                    "[CurrentWordFence] timeline discontinuity " +
+                        "trackId=$outgoingTrackId regressionMs=$regressionMs"
+                )
+            }
             if (!force &&
                 lastPushElapsedMs > 0L &&
                 now - lastPushElapsedMs < MIN_CURRENT_WORD_INTERVAL_MS
@@ -95,9 +128,15 @@ class CurrentWordPushEngine(
             }
         }
 
+        val sequence = synchronized(lock) {
+            nextSequence += 1L
+            nextSequence
+        }
         val payload = JSONObject()
             .put("type", "currentWord")
             .put("trackId", outgoingTrackId)
+            .put("generation", state.trackGeneration)
+            .put("seq", sequence)
             .put("line", state.lineIndex)
             .put("word", state.wordIndex)
             .put("position", state.positionMs)
@@ -107,16 +146,17 @@ class CurrentWordPushEngine(
         val sent = sendStatusMessage(payload.toString())
         synchronized(lock) {
             if (!sent) {
-                recordSkipLocked("send failed", SystemClock.elapsedRealtime(), state, key)
+                recordSkipLocked("send failed", elapsedRealtime(), state, key)
                 return null
             }
-            val now = SystemClock.elapsedRealtime()
+            val now = elapsedRealtime()
             if (lastPushElapsedMs > 0L) {
                 intervalTotalMs += (now - lastPushElapsedMs).coerceAtLeast(0L)
                 intervalCount += 1
             }
             lastPushElapsedMs = now
             lastPushedKey = key
+            lastPushedPositionMs = state.positionMs
             pushCount += 1
             lastPushCostMs = now - startedAt
             val normalizedSuffix = if (outgoingTrackId != state.trackId) {
@@ -124,15 +164,21 @@ class CurrentWordPushEngine(
             } else {
                 " idMode=canonical"
             }
-            logger(
-                "[CurrentWordPush] push trackId=$outgoingTrackId$normalizedSuffix " +
-                    "generation=${state.trackGeneration} " +
-                    "line=${state.lineIndex} word=${state.wordIndex} " +
-                    "wordText=${state.wordText.take(MAX_LOG_WORD_TEXT)} " +
-                    "wordStartMs=${state.wordStartMs} wordEndMs=${state.wordEndMs} " +
-                    "hasWordTiming=${state.hasWordTiming} positionMs=${state.positionMs} " +
-                    "currentWordKey=$key reason=$reason force=$force costMs=$lastPushCostMs"
-            )
+            if (force ||
+                state.lineIndex != lastLoggedLineIndex ||
+                pushCount % PUSH_LOG_SAMPLE_INTERVAL == 0L
+            ) {
+                lastLoggedLineIndex = state.lineIndex
+                logger(
+                    "[CurrentWordPush] push trackId=$outgoingTrackId$normalizedSuffix " +
+                        "generation=${state.trackGeneration} seq=$sequence " +
+                        "line=${state.lineIndex} word=${state.wordIndex} " +
+                        "wordText=${state.wordText.take(MAX_LOG_WORD_TEXT)} " +
+                        "wordStartMs=${state.wordStartMs} wordEndMs=${state.wordEndMs} " +
+                        "hasWordTiming=${state.hasWordTiming} positionMs=${state.positionMs} " +
+                        "currentWordKey=$key reason=$reason force=$force costMs=$lastPushCostMs"
+                )
+            }
             TrackCapabilityTracker.onCurrentWordPushed(
                 trackId = state.trackId,
                 protocolId = outgoingTrackId
@@ -147,6 +193,16 @@ class CurrentWordPushEngine(
             lastPushElapsedMs = 0L
             lastObservedGeneration = -1L
             generationFirstSeenAtMs = 0L
+            lastPushedPositionMs = -1L
+            nextSequence = 0L
+            lastLoggedLineIndex = -1
+        }
+    }
+
+    fun resetTimeline() {
+        synchronized(lock) {
+            lastPushedKey = ""
+            lastPushedPositionMs = -1L
         }
     }
 
@@ -176,7 +232,7 @@ class CurrentWordPushEngine(
 
     private fun recordSkip(reason: String) {
         synchronized(lock) {
-            recordSkipLocked(reason, SystemClock.elapsedRealtime())
+            recordSkipLocked(reason, elapsedRealtime())
         }
     }
 
@@ -214,5 +270,7 @@ class CurrentWordPushEngine(
         private const val TRACK_SWITCH_BASELINE_HOLDOFF_MS = 450L
         private const val SKIP_LOG_INTERVAL_MS = 5_000L
         private const val MAX_LOG_WORD_TEXT = 24
+        private const val MAX_JITTER_REGRESSION_MS = 1_500L
+        private const val PUSH_LOG_SAMPLE_INTERVAL = 10L
     }
 }

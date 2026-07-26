@@ -324,6 +324,9 @@ final class BLETestManager: NSObject, ObservableObject {
     private var lastCurrentWordReceivedAtMs: Int64 = 0
     private var currentWordIntervalTotalMs: Int64 = 0
     private var currentWordIntervalCount: Int64 = 0
+    private var currentWordFence = CurrentWordOrderingFence()
+    private var lastCurrentWordLoggedLineIndex = -1
+    private var lastCurrentWordDiagnosticLogAtMs: Int64 = 0
     private let selfHealingEngine = SelfHealingEngine.shared
     private lazy var albumArtReceiver: AlbumArtReceiver = {
         let receiver = AlbumArtReceiver(delegate: self)
@@ -368,6 +371,8 @@ final class BLETestManager: NSObject, ObservableObject {
     private var connectionReadyAt: Date?
     private var lastHealthProbeAt: Date?
     private var healthProbeStartedAt: Date?
+    private var healthPingClockProbeStartedAt: Date?
+    private var sonyClockOffsetMs: Int64?
     private var healthProbeFailureCount = 0
     private var serverProtocolVersion = 1
     private var serverSupportsFullLyricsZlib = false
@@ -566,8 +571,7 @@ final class BLETestManager: NSObject, ObservableObject {
         if artworkEnhancementSharpness != receiver.artworkEnhancementSharpness {
             artworkEnhancementSharpness = receiver.artworkEnhancementSharpness
         }
-        let snapshot = receiver.snapshot()
-        let transfer = snapshot.transfer
+        let transfer = receiver.transferSnapshot()
         let artworkStage: ArtworkLoadingStage
         if transfer.state == "failed" || transfer.state == "timeout" {
             artworkStage = .failed(reason: transfer.lastFailureReason)
@@ -2064,6 +2068,7 @@ final class BLETestManager: NSObject, ObservableObject {
         basePlaybackPositionMs = targetPosition
         playbackStateReceivedAt = Date()
         isSeeking = false
+        resetCurrentWordFence()
         log("[iOS][Seek] user set position=\(targetPosition)")
         updateLiveActivity(force: true, reason: "seek")
         seek(to: targetPosition)
@@ -2732,6 +2737,7 @@ final class BLETestManager: NSObject, ObservableObject {
         }
         lastHealthProbeAt = now
         healthProbeStartedAt = now
+        healthPingClockProbeStartedAt = serverSupportsPing ? now : nil
         updateConnectionHealthDebugFields()
         let seq = nextCommandSeq()
         log("[BLE-Health] probe sent seq=\(seq) reason=\(reason)")
@@ -2746,6 +2752,7 @@ final class BLETestManager: NSObject, ObservableObject {
             let costMs = Int64(Date().timeIntervalSince(startedAt) * 1_000)
             self.log("[BLE-Health] probe timeout costMs=\(costMs)")
             self.healthProbeStartedAt = nil
+            self.healthPingClockProbeStartedAt = nil
             self.healthProbeTimeoutWorkItem = nil
             self.healthProbeFailureCount += 1
             if self.healthProbeFailureCount >= 2 {
@@ -2803,7 +2810,8 @@ final class BLETestManager: NSObject, ObservableObject {
             type == "historyPayloadChunk" ||
             type == "lyricSecondaryPart" ||
             type == "mediaFieldDumpChunk" ||
-            type == "logChunk"
+            type == "logChunk" ||
+            type == "currentWord"
     }
 
     private func setAutoReconnectState(_ state: AutoReconnectState) {
@@ -3712,6 +3720,8 @@ extension BLETestManager: CBCentralManagerDelegate {
         lastStatusNotifyAt = nil
         lastPlaybackStateAt = nil
         healthProbeStartedAt = nil
+        healthPingClockProbeStartedAt = nil
+        resetCurrentWordFence()
         reconnectStateSyncWindowUntilMs = 0
         reconnectStateSyncPlaybackLogged = false
         log("[BLE] connected")
@@ -4104,7 +4114,26 @@ extension BLETestManager: CBPeripheralDelegate {
                 }
 
             case "pong":
-                self.log("[BLE-Health] pong seq=\(object["seq"] ?? "")")
+                if let startedAt = self.healthPingClockProbeStartedAt {
+                    let receivedAt = Date()
+                    let rttMs = Int64(receivedAt.timeIntervalSince(startedAt) * 1_000)
+                    let midpointMs = Int64(
+                        (startedAt.timeIntervalSince1970 +
+                            receivedAt.timeIntervalSince1970) * 500
+                    )
+                    let sonyTimeMs = Self.int64Value(object["time"])
+                    if sonyTimeMs > 0 {
+                        self.sonyClockOffsetMs = sonyTimeMs - midpointMs
+                    }
+                    self.healthPingClockProbeStartedAt = nil
+                    self.log(
+                        "[BLE-Health] pong seq=\(object["seq"] ?? "") " +
+                            "rttMs=\(rttMs) " +
+                            "clockOffsetMs=\(self.sonyClockOffsetMs ?? 0)"
+                    )
+                } else {
+                    self.log("[BLE-Health] pong seq=\(object["seq"] ?? "")")
+                }
 
             case "playbackState":
                 let oldLyric = self.lyric
@@ -4680,6 +4709,7 @@ extension BLETestManager: CBPeripheralDelegate {
             newAlbum != album ||
             (!trackID.isEmpty && trackID != currentTrackID)
         if trackChanged {
+            resetCurrentWordFence()
             lyric = ""
             fullLyricsTrackId = ""
             isFullLyricsCurrent = false
@@ -4783,6 +4813,7 @@ extension BLETestManager: CBPeripheralDelegate {
         basePlaybackPositionMs = 0
         currentWordLineIndex = -1
         currentWordIndex = -1
+        resetCurrentWordFence()
         isShowingLastNowPlayingSnapshot = false
         mediaLoadingState = MediaLoadingState()
         LastNowPlayingSnapshotStore.shared.clear()
@@ -6147,7 +6178,28 @@ extension BLETestManager: CBPeripheralDelegate {
         let wordIndex = Self.intValue(object["word"])
         let remotePositionMs = Self.int64Value(object["position"])
         let timestampMs = Self.int64Value(object["timestamp"])
+        let generation = Self.int64Value(object["generation"])
+        let sequence = Self.int64Value(object["seq"])
         let nowMs = currentTimeMs()
+
+        let previousGeneration = currentWordFence.generation
+        let previousSequence = currentWordFence.sequence
+        let previousPositionMs = currentWordFence.positionMs
+        guard currentWordFence.shouldAccept(
+            generation: generation,
+            sequence: sequence,
+            positionMs: remotePositionMs
+        ) else {
+            currentWordDropCount += 1
+            log(
+                "[CurrentWordFence] ordered discard trackId=\(trackID) " +
+                    "generation=\(generation) seq=\(sequence) " +
+                    "position=\(remotePositionMs) " +
+                    "lastGeneration=\(previousGeneration) " +
+                    "lastSeq=\(previousSequence) lastPosition=\(previousPositionMs)"
+            )
+            return
+        }
 
         currentWordLineIndex = lineIndex
         currentWordIndex = wordIndex
@@ -6163,12 +6215,26 @@ extension BLETestManager: CBPeripheralDelegate {
             }
         }
         lastCurrentWordReceivedAtMs = nowMs
-        currentWordLastLatencyMs = timestampMs > 0 ? max(nowMs - timestampMs, 0) : 0
-        log(
-            "[LyricTrace-iOS] id=\(trackID) stage=currentWordAccepted " +
-                "line=\(lineIndex) word=\(wordIndex) position=\(remotePositionMs) " +
-                "latencyMs=\(currentWordLastLatencyMs)"
-        )
+        if timestampMs > 0, let sonyClockOffsetMs {
+            currentWordLastLatencyMs = max(
+                nowMs - (timestampMs - sonyClockOffsetMs),
+                0
+            )
+        } else {
+            currentWordLastLatencyMs = 0
+        }
+        let shouldLogDiagnostic = lineIndex != lastCurrentWordLoggedLineIndex ||
+            nowMs - lastCurrentWordDiagnosticLogAtMs >= 5_000
+        if shouldLogDiagnostic {
+            lastCurrentWordLoggedLineIndex = lineIndex
+            lastCurrentWordDiagnosticLogAtMs = nowMs
+            log(
+                "[LyricTrace-iOS] id=\(trackID) stage=currentWordAccepted " +
+                    "generation=\(generation) seq=\(sequence) " +
+                    "line=\(lineIndex) word=\(wordIndex) position=\(remotePositionMs) " +
+                    "latencyMs=\(currentWordLastLatencyMs)"
+            )
+        }
 
         let lineByOffset = fullLyrics.indices.contains(lineIndex) ? fullLyrics[lineIndex] : nil
         if isSameTrackId(incoming: trackID, current: fullLyricsTrackId),
@@ -6184,11 +6250,14 @@ extension BLETestManager: CBPeripheralDelegate {
             playbackStateReceivedAt = Date()
         }
 
-        log(
-            "[Lyrics-iOS] currentWord line=\(lineIndex) word=\(wordIndex) " +
-                "position=\(remotePositionMs) latencyMs=\(currentWordLastLatencyMs) " +
-                "count=\(currentWordPushCount) avgIntervalMs=\(currentWordAverageUpdateIntervalMs)"
-        )
+        if shouldLogDiagnostic {
+            log(
+                "[Lyrics-iOS] currentWord line=\(lineIndex) word=\(wordIndex) " +
+                    "position=\(remotePositionMs) latencyMs=\(currentWordLastLatencyMs) " +
+                    "count=\(currentWordPushCount) " +
+                    "avgIntervalMs=\(currentWordAverageUpdateIntervalMs)"
+            )
+        }
         if isInReconnectStateSyncWindow() {
             log(
                 "[Reconnect] currentWord accepted after reconnect " +
@@ -6197,6 +6266,12 @@ extension BLETestManager: CBPeripheralDelegate {
         }
 
         _ = updateLiveActivityForCurrentLyricIfNeeded(reason: "currentWord")
+    }
+
+    private func resetCurrentWordFence() {
+        currentWordFence.reset()
+        lastCurrentWordLoggedLineIndex = -1
+        lastCurrentWordDiagnosticLogAtMs = 0
     }
 
     private func isInReconnectStateSyncWindow() -> Bool {
@@ -6231,11 +6306,22 @@ extension BLETestManager: CBPeripheralDelegate {
             return
         }
         guard progressTimer == nil else { return }
-        let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: progressRefreshInterval, repeats: true) { [weak self] _ in
             self?.updateInterpolatedProgress()
         }
         progressTimer = timer
         RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private var progressRefreshInterval: TimeInterval {
+        switch preferences.playbackPerformanceMode {
+        case .smooth:
+            return 0.1
+        case .automatic:
+            return ProcessInfo.processInfo.isLowPowerModeEnabled ? 0.5 : 0.25
+        case .powerSaving:
+            return 0.5
+        }
     }
 
     private func updateInterpolatedProgress() {

@@ -833,6 +833,12 @@ final class AlbumArtReceiver {
         )
     }
 
+    /// Hot-path state used by the main player UI. Unlike `snapshot()`, this
+    /// never inspects artwork files or metadata on disk.
+    func transferSnapshot() -> AlbumArtTransferDiagnosticSnapshot {
+        makeAlbumArtTransferDiagnosticSnapshot()
+    }
+
     private func finishAlbumArtTransfer(id: String, quality: String) {
         let missingIndexes = (0..<albumArtExpectedChunks).filter { albumArtChunks[$0] == nil }
         log("[AlbumArt] missing indexes=\(missingIndexes)")
@@ -1727,13 +1733,24 @@ final class AlbumArtReceiver {
         let imageURL = albumArtCacheURL(id: id, quality: preferredQuality)
         let metadataURL = albumArtMetadataURL(id: id, quality: preferredQuality)
         let exists = FileManager.default.fileExists(atPath: imageURL.path)
-        let data = try? Data(contentsOf: imageURL, options: [.mappedIfSafe])
-        let size = data?.count ?? 0
-        let image = ArtworkImageCache.shared.memoryImage(
+        let metadata = readAlbumArtMetadata(from: metadataURL)
+        let memoryImage = ArtworkImageCache.shared.memoryImage(
             artworkId: id,
             quality: resolvedQuality,
             maximumPixelSize: ArtworkImageCache.mainArtworkMaximumPixelSize
-        ) ?? data.flatMap {
+        )
+        // A decoded memory hit must not map and read the JPEG again. Metadata
+        // is written atomically with the image and carries the exact byte size.
+        let data: Data?
+        if memoryImage == nil, exists {
+            data = try? Data(contentsOf: imageURL, options: [.mappedIfSafe])
+        } else {
+            data = nil
+        }
+        let size = metadata?.bytes ?? data?.count ?? (
+            (try? imageURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        )
+        let image = memoryImage ?? data.flatMap {
             ArtworkImageCache.downsampledImage(
                 data: $0,
                 maximumPixelSize: ArtworkImageCache.mainArtworkMaximumPixelSize
@@ -1747,7 +1764,6 @@ final class AlbumArtReceiver {
                 maximumPixelSize: ArtworkImageCache.mainArtworkMaximumPixelSize
             )
         }
-        let metadata = readAlbumArtMetadata(from: metadataURL)
         let pixelWidth = metadata?.pixelWidth ?? image?.pixelWidth ?? 0
         let pixelHeight = metadata?.pixelHeight ?? image?.pixelHeight ?? 0
         let source = normalizedAlbumArtSource(metadata?.source)

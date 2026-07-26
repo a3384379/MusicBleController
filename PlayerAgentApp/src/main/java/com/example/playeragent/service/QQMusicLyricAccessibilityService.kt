@@ -18,9 +18,27 @@ import com.example.playeragent.logging.LogBuffer
 import java.util.ArrayDeque
 import java.util.LinkedHashSet
 
+internal object AccessibilityTraversalPolicy {
+    fun shouldTraverse(
+        nowElapsedMs: Long,
+        lastTraversalAtElapsedMs: Long,
+        treeDumpRequested: Boolean,
+        captureUntilElapsedMs: Long,
+        minimumIntervalMs: Long
+    ): Boolean {
+        if (!treeDumpRequested && nowElapsedMs >= captureUntilElapsedMs) {
+            return false
+        }
+        return treeDumpRequested ||
+            nowElapsedMs - lastTraversalAtElapsedMs >= minimumIntervalMs
+    }
+}
+
 class QQMusicLyricAccessibilityService : AccessibilityService() {
 
     private var previousExceptionHandler: Thread.UncaughtExceptionHandler? = null
+    private var cachedCurrentMedia = CurrentMedia()
+    private var cachedCurrentMediaAtElapsedMs = 0L
     private val accessibilityExceptionHandler:
         Thread.UncaughtExceptionHandler =
         object : Thread.UncaughtExceptionHandler {
@@ -80,8 +98,13 @@ class QQMusicLyricAccessibilityService : AccessibilityService() {
 
             val now = SystemClock.elapsedRealtime()
             val shouldDumpTree = treeDumpRequested
-            if (!shouldDumpTree &&
-                now - lastTraversalAtElapsedMs < MIN_TRAVERSAL_INTERVAL_MS
+            if (!AccessibilityTraversalPolicy.shouldTraverse(
+                    nowElapsedMs = now,
+                    lastTraversalAtElapsedMs = lastTraversalAtElapsedMs,
+                    treeDumpRequested = shouldDumpTree,
+                    captureUntilElapsedMs = diagnosticCaptureUntilElapsedMs,
+                    minimumIntervalMs = MIN_TRAVERSAL_INTERVAL_MS
+                )
             ) {
                 return
             }
@@ -292,8 +315,12 @@ class QQMusicLyricAccessibilityService : AccessibilityService() {
     }
 
     private fun readCurrentMedia(): CurrentMedia {
+        val now = SystemClock.elapsedRealtime()
+        if (now - cachedCurrentMediaAtElapsedMs < MEDIA_CACHE_TTL_MS) {
+            return cachedCurrentMedia
+        }
         val manager = getSystemService(MediaSessionManager::class.java)
-            ?: return CurrentMedia()
+            ?: return cachedCurrentMedia
         val listenerComponent = ComponentName(
             this,
             PlayerNotificationListenerService::class.java
@@ -305,7 +332,7 @@ class QQMusicLyricAccessibilityService : AccessibilityService() {
                 "[AccessibilityLyric] current media unavailable: " +
                     "${throwable.message}"
             )
-            return CurrentMedia()
+            return cachedCurrentMedia
         }
 
         val controller = controllers.firstOrNull {
@@ -313,7 +340,7 @@ class QQMusicLyricAccessibilityService : AccessibilityService() {
                 it.playbackState?.state == PlaybackState.STATE_PLAYING
         } ?: controllers.firstOrNull {
             it.packageName == QQ_MUSIC_PACKAGE
-        } ?: return CurrentMedia()
+        } ?: return cachedCurrentMedia
 
         val metadata = controller.metadata
         return CurrentMedia(
@@ -326,14 +353,13 @@ class QQMusicLyricAccessibilityService : AccessibilityService() {
             album = metadata
                 ?.getString(MediaMetadata.METADATA_KEY_ALBUM)
                 .orEmpty()
-        )
+        ).also {
+            cachedCurrentMedia = it
+            cachedCurrentMediaAtElapsedMs = now
+        }
     }
 
     private fun logImportant(message: String) {
-        try {
-            Log.i(TAG, message)
-        } catch (_: Throwable) {
-        }
         try {
             LogBuffer.append(message)
         } catch (_: Throwable) {
@@ -437,6 +463,8 @@ class QQMusicLyricAccessibilityService : AccessibilityService() {
 
         fun requestTreeDump(): Boolean {
             val service = activeInstance ?: return false
+            diagnosticCaptureUntilElapsedMs =
+                SystemClock.elapsedRealtime() + DIAGNOSTIC_CAPTURE_DURATION_MS
             service.requestAccessibilityTreeDump()
             return true
         }
@@ -464,7 +492,12 @@ class QQMusicLyricAccessibilityService : AccessibilityService() {
         private const val MAX_CANDIDATE_LENGTH = 80
         private const val MAX_TREE_NODE_COUNT = 300
         private const val MAX_TREE_FIELD_LENGTH = 100
-        private const val MIN_TRAVERSAL_INTERVAL_MS = 800L
+        @Volatile
+        private var diagnosticCaptureUntilElapsedMs = 0L
+
+        private const val MIN_TRAVERSAL_INTERVAL_MS = 1_500L
+        private const val DIAGNOSTIC_CAPTURE_DURATION_MS = 15_000L
+        private const val MEDIA_CACHE_TTL_MS = 2_000L
         private const val TRUNCATED_SUFFIX = "...<truncated>"
         private const val CRASH_LOG_CHUNK_LENGTH = 220
         private val TIME_PATTERN = Regex("^\\d{1,2}:\\d{2}$")

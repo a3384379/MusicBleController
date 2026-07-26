@@ -262,9 +262,10 @@ class PlaybackStateReader(
             lastLoggedLyric = lyric
             logger("[PlaybackState] lyric=$lyric")
         }
-        val lyricStatus = lyricManager.currentStatusText()
-        val lyricReason = lyricManager.currentUnavailableReason()
-        val diagnostic = lyricManager.diagnosticSnapshot(lastTrackId)
+        val lyricState = lyricManager.playbackLyricStatusSnapshot(lastTrackId)
+        val lyricStatus = lyricState.statusText
+        val lyricReason = lyricState.reason
+        val diagnostic = lyricState.diagnostic
         val totalCostMs = SystemClock.elapsedRealtime() - startedAtMs
         if (LogConfig.DEBUG_VERBOSE_LOG || totalCostMs > SLOW_PLAYBACK_READ_MS) {
             logger(

@@ -11,6 +11,25 @@ data class FastPlaybackSnapshot(
     val durationMs: Long
 )
 
+internal object PlaybackHistorySamplingPolicy {
+    const val PLAYING_INTERVAL_MS = 5_000L
+    const val PAUSED_INTERVAL_MS = 30_000L
+    const val IDLE_INTERVAL_MS = 10_000L
+
+    fun intervalMs(
+        snapshot: FastPlaybackSnapshot?,
+        hasActiveSession: Boolean
+    ): Long {
+        return when {
+            snapshot == null || snapshot.title.isBlank() ->
+                if (hasActiveSession) PLAYING_INTERVAL_MS else IDLE_INTERVAL_MS
+            snapshot.playing -> PLAYING_INTERVAL_MS
+            snapshot.stopped -> IDLE_INTERVAL_MS
+            else -> PAUSED_INTERVAL_MS
+        }
+    }
+}
+
 enum class StatsRange {
     TODAY,
     WEEK,

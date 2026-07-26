@@ -4,6 +4,20 @@ import XCTest
 @testable import sonyMusic
 
 final class PerformanceStabilityTests: XCTestCase {
+    func testCurrentWordOrderingFenceRejectsDuplicatesAndSmallRegression() {
+        var fence = CurrentWordOrderingFence()
+        XCTAssertTrue(fence.shouldAccept(generation: 7, sequence: 1, positionMs: 1_000))
+        XCTAssertFalse(fence.shouldAccept(generation: 7, sequence: 1, positionMs: 1_050))
+        XCTAssertFalse(fence.shouldAccept(generation: 7, sequence: 2, positionMs: 900))
+        XCTAssertTrue(fence.shouldAccept(generation: 7, sequence: 3, positionMs: 1_700))
+        XCTAssertTrue(fence.shouldAccept(generation: 7, sequence: 4, positionMs: 100))
+        XCTAssertEqual(fence.sequence, 4)
+        XCTAssertEqual(fence.positionMs, 100)
+
+        fence.reset()
+        XCTAssertTrue(fence.shouldAccept(generation: 1, sequence: 1, positionMs: 20))
+    }
+
     func testA1AndA2DispatchAndOutOfOrderAssembly() {
         let a1 = packet(magic: 0xA1, kind: 3, index: 0, total: 1, payload: Data([9]))
         let decodedA1 = BLEBinaryChunkCodec.decode(a1, expectedMagic: 0xA1)

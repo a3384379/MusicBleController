@@ -84,3 +84,39 @@ enum PlaybackClockPolicy {
         isPlaying && durationMs > 0 && appLifecycleState == "active"
     }
 }
+
+struct CurrentWordOrderingFence {
+    private(set) var generation: Int64 = -1
+    private(set) var sequence: Int64 = -1
+    private(set) var positionMs: Int64 = -1
+
+    mutating func shouldAccept(
+        generation incomingGeneration: Int64,
+        sequence incomingSequence: Int64,
+        positionMs incomingPositionMs: Int64
+    ) -> Bool {
+        if incomingGeneration > 0, incomingSequence > 0 {
+            if incomingGeneration < generation ||
+                (incomingGeneration == generation && incomingSequence <= sequence) {
+                return false
+            }
+        }
+        if positionMs >= 0,
+           incomingPositionMs < positionMs,
+           positionMs - incomingPositionMs <= 1_500 {
+            return false
+        }
+        if incomingGeneration > 0, incomingSequence > 0 {
+            generation = incomingGeneration
+            sequence = incomingSequence
+        }
+        positionMs = incomingPositionMs
+        return true
+    }
+
+    mutating func reset() {
+        generation = -1
+        sequence = -1
+        positionMs = -1
+    }
+}

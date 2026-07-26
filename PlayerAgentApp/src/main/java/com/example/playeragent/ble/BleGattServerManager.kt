@@ -876,6 +876,7 @@ class BleGattServerManager(
             "SEEK_TO" -> {
                 cancelHistoryTransfersForControl(command)
                 val position = request.optLong("position").coerceAtLeast(0L)
+                currentWordPushEngine.resetTimeline()
                 logger("[BLE-A][Seek] position=$position")
                 mediaCommandExecutor.seekTo(position, seq)
                 logger("[BLE-A][Seek] seekTo called")

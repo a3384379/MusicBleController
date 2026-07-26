@@ -43,6 +43,10 @@ class QrcLyricManager(
         }
     }
 
+    fun fuzzyIndexStatus(): QrcFuzzyIndexStatus {
+        return cacheManager.fuzzyIndexStatus()
+    }
+
     @Synchronized
     fun load(title: String, artist: String, album: String): Boolean {
         return loadWithResult(title, artist, album).success

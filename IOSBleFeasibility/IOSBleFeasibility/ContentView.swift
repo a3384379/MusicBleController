@@ -6,7 +6,6 @@ struct ContentView: View {
     @ObservedObject private var playbackStateModel: ObservableStateSlice<BLEPlaybackViewState>
     @ObservedObject private var lyricsStateModel: ObservableStateSlice<BLELyricsViewState>
     @ObservedObject private var artworkStateModel: ObservableStateSlice<BLEArtworkViewState>
-    @ObservedObject private var diagnosticsStateModel: ObservableStateSlice<BLEDiagnosticsViewState>
     @ObservedObject private var preferences = PreferencesStore.shared
     @State private var showFullLyrics = false
     @State private var showDebugPage = false
@@ -23,7 +22,6 @@ struct ContentView: View {
         _playbackStateModel = ObservedObject(wrappedValue: manager.playbackStateModel)
         _lyricsStateModel = ObservedObject(wrappedValue: manager.lyricsStateModel)
         _artworkStateModel = ObservedObject(wrappedValue: manager.artworkStateModel)
-        _diagnosticsStateModel = ObservedObject(wrappedValue: manager.diagnosticsStateModel)
     }
 
     var body: some View {
