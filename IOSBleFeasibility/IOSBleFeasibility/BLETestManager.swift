@@ -28,6 +28,7 @@ private let CONNECTION_HEALTH_PAUSED_SUSPECT_MS: Int64 = 30_000
 private let CONNECTION_HEALTH_PROBE_TIMEOUT_MS: Int64 = 3_000
 private let CONNECTION_HEALTH_HARD_RECONNECT_MIN_INTERVAL_MS: Int64 = 5_000
 private let CONNECTION_SUBSCRIBE_NOTIFY_TIMEOUT_MS: Int64 = 5_000
+private let CORE_BLUETOOTH_RESTORE_TIMEOUT_MS: Int64 = 5_000
 private let CONNECTION_DISPLAY_CONNECTED_MIN_HOLD_MS: Int64 = 5_000
 private let CONNECTION_DISPLAY_DISCONNECTED_CONFIRM_MS: Int64 = 1_000
 private let COMMAND_WRITE_CALLBACK_TIMEOUT_MS: Int64 = 2_500
@@ -208,6 +209,16 @@ final class BLETestManager: NSObject, ObservableObject {
     let diagnosticsStateModel = ObservableStateSlice(BLEDiagnosticsViewState())
 
     private let preferences = PreferencesStore.shared
+    private let protocolDecodeQueue = DispatchQueue(
+        label: "com.musicblecontroller.protocol-decode",
+        qos: .userInitiated
+    )
+    private let uiLogQueue = DispatchQueue(
+        label: "com.musicblecontroller.ui-log",
+        qos: .utility
+    )
+    private var pendingUILogLines: [String] = []
+    private var isUILogFlushScheduled = false
     private var stateModelCancellable: AnyCancellable?
     private var stateModelSyncScheduled = false
     private lazy var centralManager = CBCentralManager(
@@ -274,6 +285,7 @@ final class BLETestManager: NSObject, ObservableObject {
     private var fullLyricsExpectedCount = 0
     private var fullLyricsChunks: [Int: LyricLine] = [:]
     private var fullLyricsBinaryTransfer: FullLyricsBinaryTransfer?
+    private var fullLyricsBinaryDecodingTransferID: String?
     private var fullLyricsBinaryRetryCounts: [String: Int] = [:]
     private var fullLyricsBinaryFallbackTrackIDs: Set<String> = []
     private var lyricWindowTransfer: LyricWindowTransfer?
@@ -329,6 +341,7 @@ final class BLETestManager: NSObject, ObservableObject {
     private var scanTimeoutWorkItem: DispatchWorkItem?
     private var reconnectWorkItem: DispatchWorkItem?
     private var reconnectStuckCheckWorkItem: DispatchWorkItem?
+    private var coreBluetoothRestoreTimeoutWorkItem: DispatchWorkItem?
     private var reconnectScheduledAt: Date?
     private var reconnectScheduledDelayMs: Int64 = 0
     private var connectTimeoutWorkItem: DispatchWorkItem?
@@ -405,6 +418,11 @@ final class BLETestManager: NSObject, ObservableObject {
         let expectedLineCount: Int
         let expectedCRC32: UInt32
         var chunks: [Int: Data] = [:]
+    }
+
+    private enum FullLyricsBinaryDecodeResult {
+        case success(lines: [LyricLine], compressedSize: Int)
+        case failure(reason: String)
     }
 
     private struct LyricWindowTransfer {
@@ -2421,10 +2439,27 @@ final class BLETestManager: NSObject, ObservableObject {
             AppLogStore.shared.appendTimeline(message)
         }
         #endif
-        DispatchQueue.main.async {
-            self.logs.append("[\(Self.logTimestampFormatter.string(from: Date()))] \(message)")
-            if self.logs.count > 300 {
-                self.logs.removeFirst(self.logs.count - 300)
+        let timestamp = Date()
+        uiLogQueue.async { [weak self] in
+            guard let self else { return }
+            self.pendingUILogLines.append(
+                "[\(Self.logTimestampFormatter.string(from: timestamp))] \(message)"
+            )
+            guard !self.isUILogFlushScheduled else { return }
+            self.isUILogFlushScheduled = true
+            self.uiLogQueue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                guard let self else { return }
+                let batch = self.pendingUILogLines
+                self.pendingUILogLines.removeAll(keepingCapacity: true)
+                self.isUILogFlushScheduled = false
+                guard !batch.isEmpty else { return }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.logs.append(contentsOf: batch)
+                    if self.logs.count > 300 {
+                        self.logs.removeFirst(self.logs.count - 300)
+                    }
+                }
             }
         }
     }
@@ -3002,6 +3037,8 @@ final class BLETestManager: NSObject, ObservableObject {
 
     private func clearConnectionTransports(reason: String) {
         log("[BLE-Reconnect] clear characteristics reason=\(reason)")
+        coreBluetoothRestoreTimeoutWorkItem?.cancel()
+        coreBluetoothRestoreTimeoutWorkItem = nil
         sonyCommandCharacteristic = nil
         sonyStatusCharacteristic = nil
         firstConnectionReadyAtMs = 0
@@ -3028,6 +3065,36 @@ final class BLETestManager: NSObject, ObservableObject {
         isMediaFieldDumpReceiving = false
         mediaFieldDumpProgressText = ""
         log("[BLE-Reconnect] cancel in-flight albumArt/secondary")
+    }
+
+    private func scheduleCoreBluetoothRestoreTimeout(for peripheral: CBPeripheral) {
+        coreBluetoothRestoreTimeoutWorkItem?.cancel()
+        let timeout = DispatchWorkItem { [weak self, weak peripheral] in
+            guard let self,
+                  let peripheral,
+                  self.coreBluetoothRestoreInProgress,
+                  self.sonyPeripheral?.identifier == peripheral.identifier,
+                  self.sonyCommandCharacteristic == nil ||
+                    self.sonyStatusCharacteristic == nil ||
+                    self.lastNotifySubscribedAt == nil else {
+                return
+            }
+            self.log("[BLE-Restore] timeout fallback scan")
+            self.coreBluetoothRestoreInProgress = false
+            self.clearConnectionTransports(reason: "CoreBluetooth restore timeout")
+            self.setStatus("正在连接")
+            self.setAutoReconnectState(.failed)
+            self.beginSonyScan(
+                reason: "restore timeout fallback",
+                isAutoReconnect: true,
+                force: true
+            )
+        }
+        coreBluetoothRestoreTimeoutWorkItem = timeout
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Double(CORE_BLUETOOTH_RESTORE_TIMEOUT_MS) / 1_000,
+            execute: timeout
+        )
     }
 
     private func syncAfterReconnect(reason: String) {
@@ -3553,6 +3620,7 @@ extension BLETestManager: CBCentralManagerDelegate {
         setStatus("正在恢复服务")
         setConnectionHealth(.suspect, reason: "CoreBluetooth restoration pending")
         setAutoReconnectState(.serviceDiscovering)
+        scheduleCoreBluetoothRestoreTimeout(for: peripheral)
         if let service = peripheral.services?.first(where: { $0.uuid == BLEUUIDs.service }) {
             let characteristics = service.characteristics ?? []
             sonyCommandCharacteristic = characteristics.first {
@@ -3881,6 +3949,8 @@ extension BLETestManager: CBPeripheralDelegate {
         }
         guard characteristic.uuid == BLEUUIDs.status else { return }
         coreBluetoothRestoreInProgress = false
+        coreBluetoothRestoreTimeoutWorkItem?.cancel()
+        coreBluetoothRestoreTimeoutWorkItem = nil
 
         if let error {
             setStatus("未连接")
@@ -3947,7 +4017,9 @@ extension BLETestManager: CBPeripheralDelegate {
                 self?.log("[BLE-Reconnect] sync playback state")
                 self?.sendGetPlaybackState()
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            // Let the interactive lyric window finish before the non-critical
+            // initial volume snapshot uses the ATT command/notify path.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 self?.log("[BLE-Reconnect] sync volume")
                 self?.sendGetVolume()
             }
@@ -3992,31 +4064,25 @@ extension BLETestManager: CBPeripheralDelegate {
             return
         }
 
-        guard let text = String(data: data, encoding: .utf8) else {
-            log("[Status] invalid UTF-8")
-            return
-        }
-
-        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let type = object["type"] as? String {
-            if type == "albumArtChunk" || type == "trackInfoChunk" {
-                log("[BLE] status notify received type=\(type)")
-            } else if !isHighVolumeNotifyType(type) {
-                log("[BLE] status notify received: \(text)")
-            }
-        } else {
-            log("[BLE] status notify received: \(text)")
-        }
-        parseStatus(data)
-    }
-
-    private func parseStatus(_ data: Data) {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = object["type"] as? String else {
+            if let text = String(data: data, encoding: .utf8) {
+                log("[BLE] status notify received: \(text)")
+            } else {
+                log("[Status] invalid UTF-8")
+            }
             log("[Status] JSON parse failed")
             return
         }
+        if type == "albumArtChunk" || type == "trackInfoChunk" {
+            log("[BLE] status notify received type=\(type)")
+        } else if !isHighVolumeNotifyType(type) {
+            log("[BLE] status notify received: \(String(data: data, encoding: .utf8) ?? type)")
+        }
+        parseStatus(object, type: type)
+    }
 
+    private func parseStatus(_ object: [String: Any], type: String) {
         let apply: () -> Void = {
             self.markStatusNotifyReceived(type: type)
             switch type {
@@ -5226,7 +5292,8 @@ extension BLETestManager: CBPeripheralDelegate {
               transfer.trackId == currentTrackID,
               (object["trackId"] as? String ?? object["id"] as? String) == transfer.trackId,
               (object["transferId"] as? String ?? object["tid"] as? String) == transfer.transferId,
-              Self.int64Value(object["generation"] ?? object["g"]) == transfer.generation else {
+              Self.int64Value(object["generation"] ?? object["g"]) == transfer.generation,
+              fullLyricsBinaryDecodingTransferID != transfer.transferId else {
             return
         }
         fullLyricsTimeoutWorkItem?.cancel()
@@ -5243,64 +5310,73 @@ extension BLETestManager: CBPeripheralDelegate {
             )
             return
         }
+        fullLyricsBinaryDecodingTransferID = transfer.transferId
+        protocolDecodeQueue.async {
+            let result = Self.decodeFullLyricsBinaryTransfer(transfer)
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.currentTrackID == transfer.trackId,
+                      self.fullLyricsBinaryTransfer?.transferId == transfer.transferId,
+                      self.fullLyricsBinaryDecodingTransferID == transfer.transferId else {
+                    return
+                }
+                self.fullLyricsBinaryDecodingTransferID = nil
+                switch result {
+                case let .success(lines, compressedSize):
+                    self.fullLyricsBinaryRetryCounts.removeValue(forKey: transfer.transferId)
+                    self.publishFullLyrics(
+                        lines: lines,
+                        trackID: transfer.trackId,
+                        isFinal: true
+                    )
+                    self.fullLyricsUnavailableTrackIDs.remove(transfer.trackId)
+                    self.log(
+                        "[FullLyricsV2-iOS] complete transferId=\(transfer.transferId) " +
+                            "compressed=\(compressedSize) lines=\(lines.count)"
+                    )
+                    self.resetFullLyricsTransfer()
+                case let .failure(reason):
+                    self.requestFullLyricsBinaryRetry(
+                        transfer: transfer,
+                        missing: [],
+                        retryAll: true,
+                        reason: reason
+                    )
+                }
+            }
+        }
+    }
+
+    private static func decodeFullLyricsBinaryTransfer(
+        _ transfer: FullLyricsBinaryTransfer
+    ) -> FullLyricsBinaryDecodeResult {
         guard let compressed = BLEBinaryChunkCodec.reassemble(
             chunks: transfer.chunks,
             expectedCount: transfer.expectedChunks
         ) else {
-            return
+            return .failure(reason: "reassemble failed")
         }
         guard compressed.count == transfer.expectedSize else {
-            requestFullLyricsBinaryRetry(
-                transfer: transfer,
-                missing: [],
-                retryAll: true,
-                reason: "size mismatch"
-            )
-            return
+            return .failure(reason: "size mismatch")
         }
-        guard Self.crc32(compressed) == transfer.expectedCRC32 else {
-            requestFullLyricsBinaryRetry(
-                transfer: transfer,
-                missing: [],
-                retryAll: true,
-                reason: "crc mismatch"
-            )
-            return
+        guard crc32(compressed) == transfer.expectedCRC32 else {
+            return .failure(reason: "crc mismatch")
         }
-        guard let raw = Self.zlibDecompress(
+        guard let raw = zlibDecompress(
                 compressed,
                 expectedSize: transfer.uncompressedSize
               ),
               let payload = try? JSONSerialization.jsonObject(with: raw) as? [String: Any],
               payload["trackId"] as? String == transfer.trackId,
-              Self.int64Value(payload["generation"]) == transfer.generation,
+              int64Value(payload["generation"]) == transfer.generation,
               let lineObjects = payload["lines"] as? [[String: Any]] else {
-            requestFullLyricsBinaryRetry(
-                transfer: transfer,
-                missing: [],
-                retryAll: true,
-                reason: "decode failed"
-            )
-            return
+            return .failure(reason: "decode failed")
         }
-        let lines = lineObjects.compactMap(Self.decodeLyricLine)
+        let lines = lineObjects.compactMap(decodeLyricLine)
         guard lines.count == transfer.expectedLineCount else {
-            requestFullLyricsBinaryRetry(
-                transfer: transfer,
-                missing: [],
-                retryAll: true,
-                reason: "line count mismatch"
-            )
-            return
+            return .failure(reason: "line count mismatch")
         }
-        fullLyricsBinaryRetryCounts.removeValue(forKey: transfer.transferId)
-        publishFullLyrics(lines: lines, trackID: transfer.trackId, isFinal: true)
-        fullLyricsUnavailableTrackIDs.remove(transfer.trackId)
-        log(
-            "[FullLyricsV2-iOS] complete transferId=\(transfer.transferId) " +
-                "compressed=\(compressed.count) lines=\(lines.count)"
-        )
-        resetFullLyricsTransfer()
+        return .success(lines: lines, compressedSize: compressed.count)
     }
 
     private func requestFullLyricsBinaryRetry(
@@ -5840,6 +5916,7 @@ extension BLETestManager: CBPeripheralDelegate {
         fullLyricsExpectedCount = 0
         fullLyricsChunks.removeAll()
         fullLyricsBinaryTransfer = nil
+        fullLyricsBinaryDecodingTransferID = nil
         isFullLyricsReceiving = false
         lastFullLyricsPartialPublishAtMs = 0
     }

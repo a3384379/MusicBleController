@@ -72,4 +72,25 @@ class BleNotifyQueuePolicyTest {
         }
         assertEquals(0, BleNotifyQueue.realtimeInterleaveIntervalFor("playbackState"))
     }
+
+    @Test
+    fun onlyReplaceableStateMessagesAreCoalesced() {
+        listOf(
+            "playbackState",
+            "currentWord",
+            "volumeState",
+            "albumArtOffer"
+        ).forEach { type ->
+            assertTrue(BleNotifyQueue.shouldCoalesceShortType(type))
+        }
+        listOf(
+            "trackInfo",
+            "controlResponse",
+            "pong",
+            "fullLyricsBinaryStart",
+            "albumArtBinaryStart"
+        ).forEach { type ->
+            assertFalse(BleNotifyQueue.shouldCoalesceShortType(type))
+        }
+    }
 }

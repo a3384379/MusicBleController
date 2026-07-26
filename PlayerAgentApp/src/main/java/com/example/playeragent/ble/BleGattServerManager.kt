@@ -41,6 +41,8 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.MessageDigest
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.LinkedHashMap
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -97,7 +99,10 @@ class BleGattServerManager(
     private val albumArtHandler = Handler(Looper.getMainLooper())
     private val gattLifecycleHandler = Handler(Looper.getMainLooper())
     private val qqMusicArtworkListener: (String) -> Unit = { event ->
-        albumArtHandler.post { retryCurrentAlbumArtAfterNotification(event) }
+        albumArtHandler.post {
+            retryCurrentAlbumArtAfterNotification(event)
+            wakeAutoPushFromQqNotification()
+        }
     }
 
     private var gattServer: BluetoothGattServer? = null
@@ -138,8 +143,6 @@ class BleGattServerManager(
     @Volatile
     private var pendingAlbumArt: PendingAlbumArt? = null
     @Volatile
-    private var albumArtScheduleGeneration = 0L
-    @Volatile
     private var albumArtTaskGeneration = 0L
     @Volatile
     private var albumArtFastPathTask: Future<*>? = null
@@ -150,18 +153,8 @@ class BleGattServerManager(
     private val albumArtPendingRequests =
         ConcurrentHashMap<String, PendingAlbumArtRequest>()
     private val albumArtSourceRetryCounts = ConcurrentHashMap<String, Int>()
-    private val albumArtCache = object :
-        LinkedHashMap<String, AlbumArtCacheEntry>(ALBUM_ART_CACHE_CAPACITY, 0.75f, true) {
-        override fun removeEldestEntry(
-            eldest: MutableMap.MutableEntry<String, AlbumArtCacheEntry>?
-        ): Boolean {
-            val shouldEvict = size > ALBUM_ART_CACHE_CAPACITY
-            if (shouldEvict && eldest != null) {
-                logger("[AlbumArtCache] evict key=${eldest.key} id=${eldest.value.protocolId}")
-            }
-            return shouldEvict
-        }
-    }
+    private val albumArtCache =
+        LinkedHashMap<String, AlbumArtCacheEntry>(ALBUM_ART_CACHE_CAPACITY * 2, 0.75f, true)
     private val encodedAlbumArtCache =
         LinkedHashMap<String, CompressedAlbumArt>(ENCODED_ART_CACHE_CAPACITY, 0.75f, true)
     private var encodedAlbumArtCacheBytes = 0
@@ -176,6 +169,8 @@ class BleGattServerManager(
     private val connectionCommandCoordinator = ConnectionCommandCoordinator()
     private var lastAutoPushSongKey: String? = null
     private var lastAutoPushPlaying: Boolean? = null
+    @Volatile
+    private var lastAutoPushReadAtMs: Long = 0L
     private var lastPlaybackDiffSkipLogAtMs: Long = 0L
     private val reconnectSyncLastAtByAddress = ConcurrentHashMap<String, Long>()
     @Volatile
@@ -261,7 +256,6 @@ class BleGattServerManager(
                 albumArtRequestsCompleted.clear()
                 albumArtPendingRequests.clear()
                 pendingAlbumArt = null
-                albumArtScheduleGeneration += 1
                 resetClientCapabilities()
                 lastAutoPushSongKey = null
                 lastAutoPushPlaying = null
@@ -468,7 +462,6 @@ class BleGattServerManager(
                     albumArtRequestsInFlight.clear()
                     albumArtRequestsCompleted.clear()
                     pendingAlbumArt = null
-                    albumArtScheduleGeneration += 1
                     resetClientCapabilities()
                     lastAutoPushSongKey = null
                     lastAutoPushPlaying = null
@@ -637,7 +630,6 @@ class BleGattServerManager(
         pendingAlbumArt = null
         lyricsTransferCoordinator.reset()
         albumArtTransferCoordinator.reset()
-        albumArtScheduleGeneration += 1
         albumArtTaskGeneration += 1
         albumArtFastPathTask?.cancel(true)
         albumArtFastPathTask = null
@@ -1326,7 +1318,11 @@ class BleGattServerManager(
         }.also { executor ->
             executor.scheduleAtFixedRate(
                 {
-                    pushPlaybackStateAutomatically()
+                    val now = SystemClock.elapsedRealtime()
+                    val interval = autoPushPollIntervalMs(lastAutoPushPlaying)
+                    if (now - lastAutoPushReadAtMs >= interval) {
+                        pushPlaybackStateAutomatically()
+                    }
                 },
                 0L,
                 AUTO_PUSH_INTERVAL_MS,
@@ -1351,7 +1347,20 @@ class BleGattServerManager(
         playbackStateBuffer.reset()
         CurrentTrackRuntimeCache.resetPlaybackDiffState()
         currentWordPushEngine.logMetrics()
+        lastAutoPushReadAtMs = 0L
         logger("[BLE-A][AutoPush] stopped")
+    }
+
+    @Synchronized
+    private fun wakeAutoPushFromQqNotification() {
+        val executor = autoPushExecutor ?: return
+        runCatching {
+            executor.execute {
+                pushPlaybackStateAutomatically()
+            }
+        }.onFailure {
+            transientLogger("[BLE-A][AutoPush] notification wake skipped")
+        }
     }
 
     private fun pushPlaybackStateAutomatically() {
@@ -1361,6 +1370,7 @@ class BleGattServerManager(
         }
 
         try {
+            lastAutoPushReadAtMs = SystemClock.elapsedRealtime()
             val source = playbackStateReader.readPlaybackState()
             onPlaybackUiState(source)
             val songChanged = logAutoPushStateChanges(source)
@@ -1371,7 +1381,7 @@ class BleGattServerManager(
                 CurrentTrackRuntimeCache.diffFromLastSent(it)
             }
             if (diff != null) {
-                logger(
+                verboseLogger(
                     "[PlaybackDiff] candidate reason=${diff.reason} " +
                         "type=${diff.type} shouldPush=${diff.shouldPush} " +
                         "positionMs=${diff.positionMs} lastPositionMs=${diff.lastPositionMs} " +
@@ -1822,18 +1832,11 @@ class BleGattServerManager(
             return
         }
         startAlbumArtFastPathLoad(pending, mediaGeneration)
-        val generation = ++albumArtScheduleGeneration
-        logger("[AlbumArt] scheduled after cooldown id=$protocolId")
-        albumArtHandler.postDelayed(
-            {
-                synchronized(this) {
-                    if (generation == albumArtScheduleGeneration) {
-                        enqueueAlbumArtOfferOrPending(pending)
-                    }
-                }
-            },
-            ALBUM_ART_COOLDOWN_AFTER_TRACK_CHANGE_MS
-        )
+        // The offer is intentionally sent before the bitmap is ready. iOS can
+        // request preview immediately; the pending-request path fulfills it as
+        // soon as the fast source read completes. Capability negotiation still
+        // provides the only required (maximum 250 ms) compatibility gate.
+        enqueueAlbumArtOfferOrPending(pending)
     }
 
     /**
@@ -1862,7 +1865,6 @@ class BleGattServerManager(
         albumArtRequestsCompleted.clear()
         albumArtPendingRequests.clear()
         albumArtSourceRetryCounts.clear()
-        albumArtScheduleGeneration += 1
         notifyQueue.cancelJobTypes(
             setOf(ALBUM_ART_JOB_TYPE),
             "no active QQ track"
@@ -2215,7 +2217,7 @@ class BleGattServerManager(
                     logger("[AlbumArtCache] hit key=$key id=${entry.protocolId}")
                     return entry
                 }
-                albumArtCache.remove(key)
+                removeAlbumArtCacheEntryLocked(entry)
                 logger("[AlbumArtCache] evict key=$key reason=ttl")
             }
         }
@@ -2242,11 +2244,42 @@ class BleGattServerManager(
         synchronized(albumArtCache) {
             albumArtCache[albumArtPrimaryCacheKey(protocolId)] = entry
             albumArtCache[albumArtFallbackCacheKey(cacheKey)] = entry
+            trimAlbumArtCacheLocked()
         }
         logger(
             "[AlbumArtCache] put id=$protocolId source=$source " +
                 "size=${bitmap.width}x${bitmap.height} bytes=${bitmap.allocationByteCount}"
         )
+    }
+
+    private fun trimAlbumArtCacheLocked() {
+        val uniqueEntries = Collections.newSetFromMap(
+            IdentityHashMap<AlbumArtCacheEntry, Boolean>()
+        )
+        uniqueEntries.addAll(albumArtCache.values)
+        var totalBytes = uniqueEntries.sumOf { it.byteSize.toLong() }
+        while (
+            uniqueEntries.size > ALBUM_ART_CACHE_CAPACITY ||
+            (totalBytes > ALBUM_ART_CACHE_MAX_BYTES && uniqueEntries.size > 1)
+        ) {
+            val eldest = albumArtCache.entries.firstOrNull()?.value ?: break
+            removeAlbumArtCacheEntryLocked(eldest)
+            uniqueEntries.remove(eldest)
+            totalBytes -= eldest.byteSize.toLong()
+            logger(
+                "[AlbumArtCache] evict id=${eldest.protocolId} " +
+                    "reason=memory entries=${uniqueEntries.size} bytes=$totalBytes"
+            )
+        }
+    }
+
+    private fun removeAlbumArtCacheEntryLocked(entry: AlbumArtCacheEntry) {
+        val iterator = albumArtCache.entries.iterator()
+        while (iterator.hasNext()) {
+            if (iterator.next().value === entry) {
+                iterator.remove()
+            }
+        }
     }
 
     private fun fulfillPendingAlbumArtRequests(protocolId: String) {
@@ -5604,6 +5637,7 @@ class BleGattServerManager(
         private const val DEFAULT_MTU = 23
         private const val ATT_HEADER_SIZE = 3
         private const val AUTO_PUSH_INTERVAL_MS = 1000L
+        private const val AUTO_PUSH_PAUSED_INTERVAL_MS = 5000L
         private const val CURRENT_WORD_INITIAL_DELAY_MS = 100L
         private const val CURRENT_WORD_TRACK_SWITCH_DELAY_MS = 450L
         private const val CURRENT_WORD_DRIFT_CORRECTION_MS = 500L
@@ -5621,9 +5655,9 @@ class BleGattServerManager(
         private const val ALBUM_ART_HQ_MAX_SEND_MS = 8000L
         private const val ALBUM_ART_FULL_MAX_SEND_MS = 3500L
         private const val ALBUM_ART_RETRY_TTL_MS = 10_000L
-        private const val ALBUM_ART_COOLDOWN_AFTER_TRACK_CHANGE_MS = 1500L
         private val ALBUM_ART_SOURCE_RETRY_DELAYS_MS = longArrayOf(250L, 800L, 2_000L)
         private const val ALBUM_ART_CACHE_CAPACITY = 20
+        private const val ALBUM_ART_CACHE_MAX_BYTES = 24L * 1024L * 1024L
         private const val ALBUM_ART_CACHE_TTL_MS = 30 * 60 * 1_000L
         private const val ENCODED_ART_CACHE_CAPACITY = 40
         private const val ENCODED_ART_CACHE_MAX_BYTES = 16 * 1024 * 1024
@@ -5648,6 +5682,14 @@ class BleGattServerManager(
         private const val MAX_MEDIA_FIELD_DUMP_CHUNK_BYTES = 300
         private const val MAX_MEDIA_FIELD_DUMP_ERROR_CHARS = 80
         private const val MEDIA_FIELD_DUMP_DELAY_MS = 25L
+
+        internal fun autoPushPollIntervalMs(isPlaying: Boolean?): Long {
+            return if (isPlaying == false) {
+                AUTO_PUSH_PAUSED_INTERVAL_MS
+            } else {
+                AUTO_PUSH_INTERVAL_MS
+            }
+        }
         private const val FULL_LYRICS_NOTIFICATION_DELAY_MS = 20L
         private const val FULL_LYRICS_JSON_NOTIFICATION_DELAY_MS = 5L
         private const val FULL_LYRICS_BINARY_NOTIFICATION_DELAY_MS = 2L

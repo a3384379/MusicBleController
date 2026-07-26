@@ -37,53 +37,79 @@ class AlbumArtTestManager(
         expectedTitle: String = "",
         expectedArtist: String = ""
     ): NotificationAlbumArt? {
-        val candidates = mutableListOf<AlbumArtCandidate>()
-        candidates += readMediaMetadataCandidates()
-        candidates += readNotificationCandidates(expectedTitle, expectedArtist)
-        logger("[AlbumArtSource] candidates count=${candidates.size}")
-        if (candidates.isEmpty()) {
-            logger("[AlbumArtDebug] unavailable reason=no album art candidate")
-            logger("[AlbumArt][BLE] unavailable")
-            return null
+        val selectedNotification = currentNotification(expectedTitle, expectedArtist)
+        val notificationFingerprint = selectedNotification?.let {
+            notificationFingerprint(it, expectedTitle)
         }
-
-        val valid = candidates.filter { candidate ->
-            if (isLikelyPlaceholder(candidate.bitmap)) {
-                logger("[AlbumArtSource] rejected placeholder source=${candidate.source}")
-                false
-            } else {
-                true
+        synchronized(sharedArtworkReadLock) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            val cached = sharedArtworkReadCache
+            if (notificationFingerprint != null &&
+                cached != null &&
+                cached.notificationFingerprint == notificationFingerprint &&
+                now - cached.createdAtElapsedMs <= SHARED_READ_CACHE_TTL_MS
+            ) {
+                logger("[AlbumArtSource] shared cache hit source=${cached.result.source}")
+                return cached.result
             }
-        }
-        if (valid.isEmpty()) {
-            logger("[AlbumArtDebug] unavailable reason=all candidates placeholder")
-            logger("[AlbumArt][BLE] unavailable")
-            return null
-        }
 
-        val selected = valid.maxWithOrNull(
-            compareBy<AlbumArtCandidate> { it.bitmap.width.toLong() * it.bitmap.height.toLong() }
-                .thenBy { it.priority }
-        ) ?: return null
-        valid.filter { it !== selected }.forEach { candidate ->
+            val candidates = mutableListOf<AlbumArtCandidate>()
+            candidates += readMediaMetadataCandidates()
+            candidates += readNotificationCandidates(selectedNotification)
+            logger("[AlbumArtSource] candidates count=${candidates.size}")
+            if (candidates.isEmpty()) {
+                logger("[AlbumArtDebug] unavailable reason=no album art candidate")
+                logger("[AlbumArt][BLE] unavailable")
+                return null
+            }
+
+            val valid = candidates.filter { candidate ->
+                if (isLikelyPlaceholder(candidate.bitmap)) {
+                    logger("[AlbumArtSource] rejected placeholder source=${candidate.source}")
+                    false
+                } else {
+                    true
+                }
+            }
+            if (valid.isEmpty()) {
+                logger("[AlbumArtDebug] unavailable reason=all candidates placeholder")
+                logger("[AlbumArt][BLE] unavailable")
+                return null
+            }
+
+            val selected = valid.maxWithOrNull(
+                compareBy<AlbumArtCandidate> {
+                    it.bitmap.width.toLong() * it.bitmap.height.toLong()
+                }.thenBy { it.priority }
+            ) ?: return null
+            valid.filter { it !== selected }.forEach { candidate ->
+                logger(
+                    "[AlbumArtSource] rejected smaller source=${candidate.source} " +
+                        "width=${candidate.bitmap.width} height=${candidate.bitmap.height}"
+                )
+            }
             logger(
-                "[AlbumArtSource] rejected smaller source=${candidate.source} " +
-                    "width=${candidate.bitmap.width} height=${candidate.bitmap.height}"
+                "[AlbumArtSource] selected source=${selected.source} " +
+                    "width=${selected.bitmap.width} height=${selected.bitmap.height}"
             )
+            logger("[AlbumArtDebug] source ${selected.source} exists=true")
+            logger(
+                "[AlbumArtDebug] bitmap width=${selected.bitmap.width} " +
+                    "height=${selected.bitmap.height}"
+            )
+            val result = NotificationAlbumArt(
+                bitmap = selected.bitmap,
+                source = selected.source
+            )
+            if (notificationFingerprint != null) {
+                sharedArtworkReadCache = SharedArtworkReadCache(
+                    notificationFingerprint = notificationFingerprint,
+                    result = result,
+                    createdAtElapsedMs = now
+                )
+            }
+            return result
         }
-        logger(
-            "[AlbumArtSource] selected source=${selected.source} " +
-                "width=${selected.bitmap.width} height=${selected.bitmap.height}"
-        )
-        logger("[AlbumArtDebug] source ${selected.source} exists=true")
-        logger(
-            "[AlbumArtDebug] bitmap width=${selected.bitmap.width} " +
-                "height=${selected.bitmap.height}"
-        )
-        return NotificationAlbumArt(
-            bitmap = selected.bitmap,
-            source = selected.source
-        )
     }
 
     fun readCurrentNotificationLargeIcon(): Bitmap? {
@@ -186,21 +212,26 @@ class AlbumArtTestManager(
         )
     }
 
-    private fun readNotificationCandidates(
+    private fun currentNotification(
         expectedTitle: String,
         expectedArtist: String
-    ): List<AlbumArtCandidate> {
+    ): StatusBarNotification? {
         if (!isNotificationAccessEnabled() ||
             !PlayerNotificationListenerService.isConnected()
         ) {
-            logger("[AlbumArtSource] notificationLargeIcon size=missing")
-            return emptyList()
+            return null
         }
-        val selected = selectMusicNotification(
+        return selectMusicNotification(
             PlayerNotificationListenerService.activeNotificationsSnapshot(),
             expectedTitle,
             expectedArtist
-        ) ?: run {
+        )
+    }
+
+    private fun readNotificationCandidates(
+        selected: StatusBarNotification?
+    ): List<AlbumArtCandidate> {
+        if (selected == null) {
             logger("[AlbumArtSource] notificationLargeIcon size=missing")
             return emptyList()
         }
@@ -222,6 +253,19 @@ class AlbumArtTestManager(
                 priority = SOURCE_PRIORITY_NOTIFICATION
             )
         )
+    }
+
+    private fun notificationFingerprint(
+        notification: StatusBarNotification,
+        expectedTitle: String
+    ): String {
+        val extras = notification.notification.extras
+        val title = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
+        val artist = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
+        // A title-less notification is accepted by the legacy matcher, but it
+        // must not share artwork across two different expected tracks.
+        val expectedScope = if (title.isBlank()) expectedTitle.trim().lowercase() else ""
+        return "${notification.key}|${notification.postTime}|$title|$artist|$expectedScope"
     }
 
     private fun albumArtCandidate(
@@ -444,9 +488,18 @@ class AlbumArtTestManager(
     )
 
     companion object {
+        private val sharedArtworkReadLock = Any()
+        private var sharedArtworkReadCache: SharedArtworkReadCache? = null
+        private const val SHARED_READ_CACHE_TTL_MS = 750L
         private const val QQ_MUSIC_PACKAGE = "com.tencent.qqmusic"
         private const val SOURCE_PRIORITY_METADATA = 2
         private const val SOURCE_PRIORITY_NOTIFICATION = 1
         private const val DEBUG_ART_DIAGNOSTICS = false
     }
+
+    private data class SharedArtworkReadCache(
+        val notificationFingerprint: String,
+        val result: NotificationAlbumArt,
+        val createdAtElapsedMs: Long
+    )
 }

@@ -387,6 +387,13 @@ class BleNotifyQueue(
 
     @Synchronized
     private fun enqueueJobOnQueue(job: SendJob) {
+        if (!job.isLongJob && shouldCoalesceShortType(job.type)) {
+            jobs.removeAll {
+                !it.isLongJob &&
+                    it.type == job.type &&
+                    it.device.address == job.device.address
+            }
+        }
         jobs.addLast(job)
         sendNextPacket()
     }
@@ -816,16 +823,19 @@ class BleNotifyQueue(
         }
         val beforeJson = profile.jsonDelayMs
         val beforeBinary = profile.binaryDelayMs
+        val beforeArtwork = profile.artworkDelayMs
         profile.recordSuccess(payloadKind(type), callbackRttMs)
         if (beforeJson != profile.jsonDelayMs ||
             beforeBinary != profile.binaryDelayMs ||
+            beforeArtwork != profile.artworkDelayMs ||
             callbackRttMs > CONGESTED_CALLBACK_LOG_RTT_MS
         ) {
             localOnlyLogger(
                 "[BleLink] success device=$address type=$type rttMs=$callbackRttMs " +
                     "ewmaMs=${profile.ewmaCallbackRttMs.toInt()} " +
                     "jsonDelayMs=${profile.jsonDelayMs} " +
-                    "binaryDelayMs=${profile.binaryDelayMs}"
+                    "binaryDelayMs=${profile.binaryDelayMs} " +
+                    "artworkDelayMs=${profile.artworkDelayMs}"
             )
         }
     }
@@ -840,6 +850,7 @@ class BleNotifyQueue(
             "[BleLink] backoff device=$address type=$type " +
                 "jsonDelayMs=${profile.jsonDelayMs} " +
                 "binaryDelayMs=${profile.binaryDelayMs} " +
+                "artworkDelayMs=${profile.artworkDelayMs} " +
                 "failures=${profile.failureCount}"
         )
     }
@@ -848,6 +859,8 @@ class BleNotifyQueue(
         return when {
             type == "fullLyricsBinaryChunk" ->
                 BleLinkProfile.PayloadKind.BINARY_LYRIC
+            type == "albumArtBinaryChunk" ->
+                BleLinkProfile.PayloadKind.BINARY_ARTWORK
             type in JSON_LYRIC_PACKET_TYPES ->
                 BleLinkProfile.PayloadKind.JSON_LYRIC
             else -> BleLinkProfile.PayloadKind.OTHER
@@ -1034,6 +1047,12 @@ class BleNotifyQueue(
             "lyricWindowChunk",
             "lyricWindowEnd"
         )
+        private val COALESCIBLE_SHORT_TYPES = setOf(
+            "playbackState",
+            "currentWord",
+            "volumeState",
+            "albumArtOffer"
+        )
 
         fun priorityFor(type: String): Priority {
             return when (type) {
@@ -1075,6 +1094,10 @@ class BleNotifyQueue(
                     REALTIME_INTERLEAVE_INTERVAL
                 else -> 0
             }
+        }
+
+        internal fun shouldCoalesceShortType(type: String): Boolean {
+            return type in COALESCIBLE_SHORT_TYPES
         }
     }
 

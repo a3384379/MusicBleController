@@ -8,6 +8,7 @@ internal class BleLinkProfile(initialMtu: Int) {
     enum class PayloadKind {
         JSON_LYRIC,
         BINARY_LYRIC,
+        BINARY_ARTWORK,
         OTHER
     }
 
@@ -16,6 +17,8 @@ internal class BleLinkProfile(initialMtu: Int) {
     var jsonDelayMs: Long = JSON_INITIAL_DELAY_MS
         private set
     var binaryDelayMs: Long = BINARY_INITIAL_DELAY_MS
+        private set
+    var artworkDelayMs: Long = ARTWORK_INITIAL_DELAY_MS
         private set
     var ewmaCallbackRttMs: Double = 0.0
         private set
@@ -26,16 +29,19 @@ internal class BleLinkProfile(initialMtu: Int) {
 
     private var jsonSuccessWindow = 0
     private var binarySuccessWindow = 0
+    private var artworkSuccessWindow = 0
 
     fun reset(newMtu: Int = mtu) {
         mtu = newMtu
         jsonDelayMs = JSON_INITIAL_DELAY_MS
         binaryDelayMs = BINARY_INITIAL_DELAY_MS
+        artworkDelayMs = ARTWORK_INITIAL_DELAY_MS
         ewmaCallbackRttMs = 0.0
         successCount = 0
         failureCount = 0
         jsonSuccessWindow = 0
         binarySuccessWindow = 0
+        artworkSuccessWindow = 0
     }
 
     fun updateMtu(newMtu: Int) {
@@ -48,6 +54,7 @@ internal class BleLinkProfile(initialMtu: Int) {
         return when (kind) {
             PayloadKind.JSON_LYRIC -> jsonDelayMs
             PayloadKind.BINARY_LYRIC -> binaryDelayMs
+            PayloadKind.BINARY_ARTWORK -> artworkDelayMs
             PayloadKind.OTHER -> fallbackMs
         }
     }
@@ -87,6 +94,16 @@ internal class BleLinkProfile(initialMtu: Int) {
                     binarySuccessWindow = 0
                 }
             }
+            PayloadKind.BINARY_ARTWORK -> {
+                artworkSuccessWindow += 1
+                if (artworkSuccessWindow >= SUCCESS_WINDOW &&
+                    ewmaCallbackRttMs < FAST_CALLBACK_RTT_MS
+                ) {
+                    artworkDelayMs = (artworkDelayMs - 1L)
+                        .coerceAtLeast(ARTWORK_MIN_DELAY_MS)
+                    artworkSuccessWindow = 0
+                }
+            }
             PayloadKind.OTHER -> Unit
         }
     }
@@ -105,6 +122,9 @@ internal class BleLinkProfile(initialMtu: Int) {
             PayloadKind.BINARY_LYRIC -> {
                 binaryDelayMs = (binaryDelayMs + FAILURE_STEP_MS).coerceAtMost(MAX_DELAY_MS)
             }
+            PayloadKind.BINARY_ARTWORK -> {
+                artworkDelayMs = (artworkDelayMs + FAILURE_STEP_MS).coerceAtMost(MAX_DELAY_MS)
+            }
             PayloadKind.OTHER -> Unit
         }
     }
@@ -113,6 +133,7 @@ internal class BleLinkProfile(initialMtu: Int) {
         when (kind) {
             PayloadKind.JSON_LYRIC -> jsonSuccessWindow = 0
             PayloadKind.BINARY_LYRIC -> binarySuccessWindow = 0
+            PayloadKind.BINARY_ARTWORK -> artworkSuccessWindow = 0
             PayloadKind.OTHER -> Unit
         }
     }
@@ -120,8 +141,10 @@ internal class BleLinkProfile(initialMtu: Int) {
     companion object {
         private const val JSON_INITIAL_DELAY_MS = 5L
         private const val BINARY_INITIAL_DELAY_MS = 2L
+        private const val ARTWORK_INITIAL_DELAY_MS = 3L
         private const val JSON_MIN_DELAY_MS = 2L
         private const val BINARY_MIN_DELAY_MS = 1L
+        private const val ARTWORK_MIN_DELAY_MS = 1L
         private const val FAILURE_STEP_MS = 5L
         private const val MAX_DELAY_MS = 30L
         private const val SUCCESS_WINDOW = 20
