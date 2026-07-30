@@ -69,10 +69,19 @@ jobs:
           '
           )"
           echo "Using iOS simulator: ${simulator_udid}"
-          xcodebuild \
-            -project IOSBleFeasibility/IOSBleFeasibility.xcodeproj \
-            -scheme sonyMusic \
-            -destination "platform=iOS Simulator,id=${simulator_udid}" \
-            -derivedDataPath "${RUNNER_TEMP}/IOSBleFeasibilityDerivedData" \
-            CODE_SIGNING_ALLOWED=NO \
-            test
+          run_ios_tests() {
+            local attempt="$1"
+            xcodebuild \
+              -project IOSBleFeasibility/IOSBleFeasibility.xcodeproj \
+              -scheme sonyMusic \
+              -destination "platform=iOS Simulator,id=${simulator_udid}" \
+              -derivedDataPath "${RUNNER_TEMP}/IOSBleFeasibilityDerivedData-${attempt}" \
+              -parallel-testing-enabled NO \
+              CODE_SIGNING_ALLOWED=NO \
+              test
+          }
+          if ! run_ios_tests 1; then
+            echo "::warning::iOS simulator test attempt 1 failed; restarting the simulator and retrying once"
+            xcrun simctl shutdown "${simulator_udid}" || true
+            run_ios_tests 2
+          fi
