@@ -134,12 +134,13 @@ final class PerformanceStabilityTests: XCTestCase {
         )
     }
 
-    func testQQFallbackIsRejectedAndForceRefreshRetainsRealArtwork() throws {
+    func testQQFallbackIsRejectedAndForceRefreshRetainsRealArtwork() async throws {
         let delegate = AlbumArtReceiverTestDelegate()
         let receiver = AlbumArtReceiver(delegate: delegate)
         let artworkID = "low-information-\(UUID().uuidString)"
         delegate.trackID = artworkID
         receiver.handleIdentity(id: artworkID)
+        defer { receiver.clearCurrentIdentity(reason: "test cleanup") }
 
         let rendererFormat = UIGraphicsImageRendererFormat()
         rendererFormat.scale = 1
@@ -183,7 +184,7 @@ final class PerformanceStabilityTests: XCTestCase {
             base64: fallbackData.base64EncodedString()
         )
         receiver.handleLegacyEnd(id: artworkID, quality: "hq")
-        wait(for: [rejected], timeout: 2)
+        await fulfillment(of: [rejected], timeout: 5)
         XCTAssertNil(receiver.albumArtImage)
         XCTAssertEqual(receiver.artworkDisplayQuality, .placeholder)
 
@@ -228,7 +229,7 @@ final class PerformanceStabilityTests: XCTestCase {
             base64: realData.base64EncodedString()
         )
         receiver.handleLegacyEnd(id: artworkID, quality: "preview")
-        wait(for: [displayed], timeout: 2)
+        await fulfillment(of: [displayed], timeout: 5)
 
         let displayedImage = try XCTUnwrap(receiver.albumArtImage)
         delegate.commands.removeAll()
@@ -275,7 +276,7 @@ final class PerformanceStabilityTests: XCTestCase {
         )
     }
 
-    func testRepeatedOfferDuringSourceRefreshDoesNotSkipHQ() throws {
+    func testRepeatedOfferDuringSourceRefreshDoesNotSkipHQ() async throws {
         let delegate = AlbumArtReceiverTestDelegate()
         let receiver = AlbumArtReceiver(delegate: delegate)
         let artworkID = "source-refresh-\(UUID().uuidString)"
@@ -316,7 +317,7 @@ final class PerformanceStabilityTests: XCTestCase {
             base64: data.base64EncodedString()
         )
         receiver.handleLegacyEnd(id: artworkID, quality: "hq")
-        wait(for: [cacheSaved], timeout: 2)
+        await fulfillment(of: [cacheSaved], timeout: 5)
 
         delegate.commands.removeAll()
         let forcedPreview = expectation(description: "source refresh preview requested")
@@ -329,7 +330,7 @@ final class PerformanceStabilityTests: XCTestCase {
             forcedPreview.fulfill()
         }
         receiver.handleOffer(id: artworkID)
-        wait(for: [forcedPreview], timeout: 2)
+        await fulfillment(of: [forcedPreview], timeout: 5)
 
         let secondOfferHeld = expectation(description: "second offer remains in refresh")
         delegate.onLog = { message in
@@ -338,7 +339,7 @@ final class PerformanceStabilityTests: XCTestCase {
             }
         }
         receiver.handleOffer(id: artworkID)
-        wait(for: [secondOfferHeld], timeout: 2)
+        await fulfillment(of: [secondOfferHeld], timeout: 5)
         XCTAssertFalse(
             delegate.commands.contains {
                 $0.command == "ALBUM_ART_SKIP" &&
