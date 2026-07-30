@@ -12,6 +12,7 @@ private let ALBUM_ART_TRANSIENT_SOURCE_TTL_MS: Int64 = 30 * 60 * 1_000
 private let ALBUM_ART_STABLE_SOURCE_TTL_MS: Int64 = 24 * 60 * 60 * 1_000
 private let ALBUM_ART_HARD_CACHE_TTL_MS: Int64 = 30 * 24 * 60 * 60 * 1_000
 private let ALBUM_ART_SMALL_CACHE_PIXEL_LIMIT = 300
+private let ALBUM_ART_PROVISIONAL_REFRESH_DELAYS: [TimeInterval] = [0.05, 2, 5, 12]
 
 struct AlbumArtSnapshot {
     let id: String
@@ -84,12 +85,13 @@ private struct AlbumArtCacheValidation {
         return expired ||
             source == "notificationLargeIcon" ||
             source == "unknown" ||
+            reason == "low_information_requires_refresh" ||
             pixelWidth <= ALBUM_ART_SMALL_CACHE_PIXEL_LIMIT ||
             pixelHeight <= ALBUM_ART_SMALL_CACHE_PIXEL_LIMIT
     }
 
     var shouldDisplayWhileRefreshing: Bool {
-        valid
+        valid && reason != "low_information_requires_refresh"
     }
 }
 
@@ -112,6 +114,116 @@ extension UIImage {
 
     var pixelHeight: Int {
         cgImage?.height ?? Int(size.height * scale)
+    }
+}
+
+enum AlbumArtPlaceholderDisposition: Equatable {
+    case normal
+    case provisional
+}
+
+enum AlbumArtPlaceholderPolicy {
+    static func disposition(
+        image: UIImage,
+        dataSize: Int
+    ) -> AlbumArtPlaceholderDisposition {
+        isLowInformation(image, dataSize: dataSize) ||
+            isKnownQQMusicFallback(image)
+            ? .provisional
+            : .normal
+    }
+
+    static func isLowInformation(_ image: UIImage, dataSize: Int) -> Bool {
+        guard dataSize < 1_800, let stats = visualStats(image) else {
+            return false
+        }
+        return stats.visiblePixels > 0 &&
+            stats.colorBuckets <= 10 &&
+            stats.colorfulPixels * 20 <= stats.visiblePixels
+    }
+
+    private static func isKnownQQMusicFallback(_ image: UIImage) -> Bool {
+        let width = image.pixelWidth
+        let height = image.pixelHeight
+        guard (200...240).contains(width),
+              (200...240).contains(height),
+              abs(width - height) <= max(width, height) / 20,
+              let stats = visualStats(image),
+              stats.visiblePixels > 0 else {
+            return false
+        }
+        // JPEG color conversion differs slightly between simulator and device.
+        // Keep the dominant-tone guard strict while allowing anti-aliased gray
+        // edges to span a few neighboring quantized buckets.
+        return stats.colorBuckets <= 8 &&
+            stats.colorfulPixels * 100 <= stats.visiblePixels &&
+            stats.dominantBucketPixels * 100 >= stats.visiblePixels * 70
+    }
+
+    private static func visualStats(_ image: UIImage) -> VisualStats? {
+        guard let cgImage = image.cgImage else {
+            return nil
+        }
+        let width = 24
+        let height = 24
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return nil
+        }
+        context.interpolationQuality = .low
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        var buckets: [Int: Int] = [:]
+        var colorfulPixels = 0
+        var visiblePixels = 0
+        stride(from: 0, to: pixels.count, by: 4).forEach { index in
+            let red = Int(pixels[index])
+            let green = Int(pixels[index + 1])
+            let blue = Int(pixels[index + 2])
+            let alpha = Int(pixels[index + 3])
+            guard alpha >= 24 else { return }
+            let maximum = max(red, max(green, blue))
+            let minimum = min(red, min(green, blue))
+            if maximum > 0 && Double(maximum - minimum) / Double(maximum) > 0.12 {
+                colorfulPixels += 1
+            }
+            let bucket = ((red / 32) << 10) | ((green / 32) << 5) | (blue / 32)
+            buckets[bucket, default: 0] += 1
+            visiblePixels += 1
+        }
+
+        return VisualStats(
+            colorBuckets: buckets.count,
+            colorfulPixels: colorfulPixels,
+            visiblePixels: visiblePixels,
+            dominantBucketPixels: buckets.values.max() ?? 0
+        )
+    }
+
+    private struct VisualStats {
+        let colorBuckets: Int
+        let colorfulPixels: Int
+        let visiblePixels: Int
+        let dominantBucketPixels: Int
+    }
+}
+
+enum AlbumArtSourceRefreshPolicy {
+    static func needsRefresh(
+        cacheRequiresRefresh: Bool,
+        refreshAttempted: Bool,
+        refreshInFlight: Bool
+    ) -> Bool {
+        cacheRequiresRefresh && (!refreshAttempted || refreshInFlight)
     }
 }
 
@@ -179,6 +291,9 @@ final class AlbumArtReceiver {
     private var albumArtRequestStartTimeouts: [String: DispatchWorkItem] = [:]
     private var albumArtRequestStartRetryCounts: [String: Int] = [:]
     private var requestedHqAlbumArtIDs: Set<String> = []
+    private var forceRefreshAlbumArtIDs: Set<String> = []
+    private var provisionalRefreshAttempts: [String: Int] = [:]
+    private var provisionalRefreshWorkItem: DispatchWorkItem?
     private var hqAlbumArtWorkItem: DispatchWorkItem?
     private var hqAlbumArtUnavailableReason = "-"
     private var hqAlbumArtUnavailableBestBytes = 0
@@ -206,6 +321,7 @@ final class AlbumArtReceiver {
     private var predictiveOfferTimes: [String: Date] = [:]
     private var predictiveHqRequestTimes: [String: Date] = [:]
     private var sourceRefreshAttemptedAlbumArtIDs: Set<String> = []
+    private var sourceRefreshInFlightAlbumArtIDs: Set<String> = []
     private var albumArtCacheLookupToken: UUID?
     private let albumArtCacheWriteQueue = DispatchQueue(
         label: "com.sqz.IOSBleFeasibility.albumArtCacheWrite",
@@ -278,8 +394,17 @@ final class AlbumArtReceiver {
             return
         }
         let sourceRefreshAlreadyAttempted = sourceRefreshAttemptedAlbumArtIDs.contains(id)
-        let hqNeedsRefresh = hqValidation.shouldRefreshOnOffer && !sourceRefreshAlreadyAttempted
-        let previewNeedsRefresh = previewValidation.shouldRefreshOnOffer && !sourceRefreshAlreadyAttempted
+        let sourceRefreshInFlight = sourceRefreshInFlightAlbumArtIDs.contains(id)
+        let hqNeedsRefresh = AlbumArtSourceRefreshPolicy.needsRefresh(
+            cacheRequiresRefresh: hqValidation.shouldRefreshOnOffer,
+            refreshAttempted: sourceRefreshAlreadyAttempted,
+            refreshInFlight: sourceRefreshInFlight
+        )
+        let previewNeedsRefresh = AlbumArtSourceRefreshPolicy.needsRefresh(
+            cacheRequiresRefresh: previewValidation.shouldRefreshOnOffer,
+            refreshAttempted: sourceRefreshAlreadyAttempted,
+            refreshInFlight: sourceRefreshInFlight
+        )
 
         if let image = hqValidation.image,
            hqValidation.valid,
@@ -350,14 +475,17 @@ final class AlbumArtReceiver {
         }
         cancelAlbumArtFallback()
         cancelHqAlbumArtRequest()
+        cancelProvisionalAlbumArtRefresh()
         albumArtRequestStartTimeouts.values.forEach { $0.cancel() }
         albumArtRequestStartTimeouts.removeAll()
         albumArtRequestStartRetryCounts.removeAll()
         requestedAlbumArtKeys.removeAll()
         requestedHqAlbumArtIDs.removeAll()
+        forceRefreshAlbumArtIDs.removeAll()
         albumArtPreviewRetryCounts.removeAll()
         albumArtHqRetryCounts.removeAll()
         sourceRefreshAttemptedAlbumArtIDs.removeAll()
+        sourceRefreshInFlightAlbumArtIDs.removeAll()
         authoritativeAlbumArtID = ""
         deferredAlbumArtOfferWorkItem?.cancel()
         deferredAlbumArtOfferWorkItem = nil
@@ -594,6 +722,9 @@ final class AlbumArtReceiver {
         requestedAlbumArtKeys.remove("\(id)|\(quality)")
         if id == currentAlbumArtID,
            quality == "hq" {
+            forceRefreshAlbumArtIDs.remove(id)
+            sourceRefreshInFlightAlbumArtIDs.remove(id)
+            sourceRefreshAttemptedAlbumArtIDs.remove(id)
             hqAlbumArtUnavailableReason = reason
             hqAlbumArtUnavailableBestBytes = bestBytes
             hqAlbumArtUnavailableBestChunks = bestChunks
@@ -621,11 +752,15 @@ final class AlbumArtReceiver {
             }
         }
         log("[AlbumArt] unavailable id=\(id) quality=\(quality) reason=\(reason)")
+        if id == currentAlbumArtID,
+           provisionalRefreshAttempts[id] != nil {
+            scheduleProvisionalAlbumArtRefresh(id: id)
+        }
         notifyStateChanged()
     }
 
     @discardableResult
-    func requestCurrentPreviewAlbumArt() -> Bool {
+    func requestCurrentPreviewAlbumArt(forceRefresh: Bool = false) -> Bool {
         let id = currentAlbumArtID
         guard !id.isEmpty else {
             log("[AlbumArt] preview request skipped reason=no artwork id")
@@ -639,12 +774,12 @@ final class AlbumArtReceiver {
             )
             return false
         }
-        requestAlbumArt(id: id, quality: "preview")
+        requestAlbumArt(id: id, quality: "preview", forceRefresh: forceRefresh)
         return true
     }
 
     @discardableResult
-    func requestCurrentHqAlbumArt() -> Bool {
+    func requestCurrentHqAlbumArt(forceRefresh: Bool = false) -> Bool {
         let id = currentAlbumArtID
         guard !id.isEmpty else {
             log("[NowDiag] hq artwork request skipped reason=no artwork id")
@@ -680,7 +815,7 @@ final class AlbumArtReceiver {
         requestedHqAlbumArtIDs.remove(id)
         requestedAlbumArtKeys.remove("\(id)|hq")
         log("[NowDiag] request HQ artwork id=\(id)")
-        requestHqAlbumArt(id: id)
+        requestHqAlbumArt(id: id, forceRefresh: forceRefresh)
         return true
     }
 
@@ -692,8 +827,6 @@ final class AlbumArtReceiver {
             return false
         }
         log("[AlbumArtRefresh] force refresh id=\(id)")
-        removeCachedAlbumArt(id: id, quality: "preview", reason: "force refresh")
-        removeCachedAlbumArt(id: id, quality: "hq", reason: "force refresh")
         ArtworkEnhancementManager.shared.cancel(artworkId: id)
         ArtworkEnhancementManager.shared.clearCachedArtwork(artworkId: id) { [weak self] in
             self?.log("[ArtworkEnhance] cache removed id=\(id) reason=force refresh")
@@ -701,20 +834,26 @@ final class AlbumArtReceiver {
         requestedAlbumArtKeys.remove("\(id)|preview")
         requestedAlbumArtKeys.remove("\(id)|hq")
         requestedHqAlbumArtIDs.remove(id)
+        forceRefreshAlbumArtIDs.insert(id)
+        cancelProvisionalAlbumArtRefresh(clearAttemptsFor: id)
+        albumArtRequestStartRetryCounts.removeValue(forKey: "\(id)|preview")
+        albumArtRequestStartRetryCounts.removeValue(forKey: "\(id)|hq")
         cancelHqAlbumArtRequest()
         cancelAlbumArtFallback()
-        if artworkDisplayQuality != .placeholder {
-            artworkDisplayQuality = .placeholder
-            albumArtImage = nil
-            displayedAlbumArtID = ""
-            currentCachedAlbumArtQuality = ""
-            updateArtworkEnhancementStatus(message: "force refresh")
-            delegate?.albumArtClearLiveArtwork(reason: "forceRefresh", shouldUpdate: false)
-            notifyStateChanged()
-        }
-        let requested = requestCurrentPreviewAlbumArt()
+        updateArtworkEnhancementStatus(message: "force refresh pending")
+        log(
+            "[AlbumArtRefresh] retain current artwork while refreshing " +
+                "quality=\(artworkDisplayQuality.label)"
+        )
+        notifyStateChanged()
+        let requested = requestCurrentPreviewAlbumArt(forceRefresh: true)
         if requested {
-            schedulePredictiveHqPrefetch(id: id, delay: 2.2, reason: "force refresh")
+            schedulePredictiveHqPrefetch(
+                id: id,
+                delay: 2.2,
+                reason: "force refresh",
+                forceRefresh: true
+            )
         }
         return requested
     }
@@ -806,7 +945,11 @@ final class AlbumArtReceiver {
         binaryAlbumArtRetryCounts.removeAll()
         requestedAlbumArtKeys.removeAll()
         requestedHqAlbumArtIDs.removeAll()
+        forceRefreshAlbumArtIDs.removeAll()
+        sourceRefreshAttemptedAlbumArtIDs.removeAll()
+        sourceRefreshInFlightAlbumArtIDs.removeAll()
         cancelHqAlbumArtRequest()
+        cancelProvisionalAlbumArtRefresh()
         predictivePendingHqId = ""
         notifyStateChanged()
     }
@@ -1042,36 +1185,40 @@ final class AlbumArtReceiver {
         image: UIImage,
         source: String
     ) {
-        if isLikelyPlaceholderAlbumArt(image, dataSize: data.count) {
+        let disposition = AlbumArtPlaceholderPolicy.disposition(
+            image: image,
+            dataSize: data.count
+        )
+        if disposition == .provisional {
             let prefix = source == "binary" ? "[AlbumArtBinary]" : "[AlbumArt]"
-            let message = "\(prefix) placeholder ignored id=\(id)"
+            let message =
+                "\(prefix) QQ fallback artwork rejected as terminal " +
+                "id=\(id) quality=\(quality)"
             log(message)
             if source == "binary" {
                 consoleLog(message)
             }
-            if id == currentAlbumArtID, quality == "preview" {
-                cancelAlbumArtFallback()
-                if displayedAlbumArtID != id {
-                    albumArtImage = nil
-                    displayedAlbumArtID = ""
-                    currentCachedAlbumArtQuality = ""
-                    artworkDisplayQuality = .placeholder
-                    updateArtworkEnhancementStatus(message: "placeholder")
-                    delegate?.albumArtClearLiveArtwork(reason: "placeholder", shouldUpdate: false)
-                    delegate?.albumArtUpdateLiveActivity(force: true, reason: "albumArt")
-                    notifyStateChanged()
-                } else {
-                    log("[AlbumArtCache] retain stale image after placeholder refresh id=\(id)")
-                }
-            }
             requestedAlbumArtKeys.remove("\(id)|\(quality)")
-            if source == "binary" {
-                resetBinaryAlbumArtTransfer(reason: "complete placeholder")
+            if quality == "hq" || quality == "full" {
+                requestedHqAlbumArtIDs.remove(id)
             }
+            removeCachedAlbumArt(
+                id: id,
+                quality: quality == "full" ? nil : quality,
+                reason: "qq fallback placeholder"
+            )
+            if id == currentAlbumArtID {
+                updateArtworkEnhancementStatus(message: "waiting for real artwork")
+                scheduleProvisionalAlbumArtRefresh(id: id)
+            }
+            notifyStateChanged()
             return
         }
 
+        cancelProvisionalAlbumArtRefresh(clearAttemptsFor: id)
         if quality == "hq", !shouldAcceptHqAlbumArt(image: image, data: data, id: id) {
+            forceRefreshAlbumArtIDs.remove(id)
+            sourceRefreshInFlightAlbumArtIDs.remove(id)
             requestedAlbumArtKeys.remove("\(id)|\(quality)")
             if source == "binary" {
                 resetBinaryAlbumArtTransfer(reason: "complete hq no visual upgrade")
@@ -1096,8 +1243,15 @@ final class AlbumArtReceiver {
         log("[AlbumArt] decode success imageSize=\(image.pixelWidth)x\(image.pixelHeight)")
         albumArtPreviewRetryCount = 0
         if quality == "preview" {
-            schedulePredictiveHqPrefetch(id: id, delay: 0.05, reason: "preview complete")
+            schedulePredictiveHqPrefetch(
+                id: id,
+                delay: 0.05,
+                reason: "preview complete",
+                forceRefresh: forceRefreshAlbumArtIDs.contains(id)
+            )
         } else if quality == "hq" || quality == "full" {
+            forceRefreshAlbumArtIDs.remove(id)
+            sourceRefreshInFlightAlbumArtIDs.remove(id)
             recordPredictiveHqReady(id: id)
         }
         notifyStateChanged()
@@ -1111,6 +1265,8 @@ final class AlbumArtReceiver {
             cancelPredictiveHqPrefetch(reason: "track changed", oldId: currentAlbumArtID)
         }
         currentAlbumArtID = id
+        forceRefreshAlbumArtIDs.removeAll()
+        cancelProvisionalAlbumArtRefresh()
         albumArtDecodeToken = nil
         albumArtCacheLookupToken = nil
         currentCachedAlbumArtQuality = ""
@@ -1129,6 +1285,7 @@ final class AlbumArtReceiver {
         albumArtHqRetryCounts.removeAll()
         binaryAlbumArtRetryCounts.removeAll()
         sourceRefreshAttemptedAlbumArtIDs.removeAll()
+        sourceRefreshInFlightAlbumArtIDs.removeAll()
         resetAlbumArtTransfer()
         resetBinaryAlbumArtTransfer(reason: "track changed")
         cancelHqAlbumArtRequest()
@@ -1415,8 +1572,19 @@ final class AlbumArtReceiver {
         count > 0 ? total / count : 0
     }
 
-    private func schedulePredictiveHqPrefetch(id: String, delay: TimeInterval, reason: String) {
-        scheduleHqAlbumArtRequest(id: id, delay: delay, reason: reason, predictive: true)
+    private func schedulePredictiveHqPrefetch(
+        id: String,
+        delay: TimeInterval,
+        reason: String,
+        forceRefresh: Bool = false
+    ) {
+        scheduleHqAlbumArtRequest(
+            id: id,
+            delay: delay,
+            reason: reason,
+            predictive: true,
+            forceRefresh: forceRefresh
+        )
     }
 
     private enum PredictiveHqSkipCategory {
@@ -1528,10 +1696,11 @@ final class AlbumArtReceiver {
         id: String,
         delay: TimeInterval = 1.8,
         reason: String = "standard",
-        predictive: Bool = false
+        predictive: Bool = false,
+        forceRefresh: Bool = false
     ) {
         guard id == currentAlbumArtID else { return }
-        guard artworkDisplayQuality < .hq else {
+        guard forceRefresh || artworkDisplayQuality < .hq else {
             if predictive {
                 recordPredictiveHqSkip(id: id, reason: "cache hit", category: .cacheHit)
             }
@@ -1555,7 +1724,12 @@ final class AlbumArtReceiver {
         let effectiveDelay = baseDelay * PreferencesStore.shared.playbackPerformanceMode.hqDelayMultiplier
         let deferred = timing?.deferred ?? false
         let workItem = DispatchWorkItem { [weak self] in
-            self?.requestHqAlbumArt(id: id, reason: reason, predictive: predictive)
+            self?.requestHqAlbumArt(
+                id: id,
+                reason: reason,
+                predictive: predictive,
+                forceRefresh: forceRefresh
+            )
         }
         hqAlbumArtWorkItem = workItem
         log("[AlbumArtHQ] scheduled id=\(id) delayMs=\(Int(effectiveDelay * 1_000))")
@@ -1579,9 +1753,56 @@ final class AlbumArtReceiver {
         hqAlbumArtWorkItem = nil
     }
 
-    private func requestHqAlbumArt(id: String, reason: String = "standard", predictive: Bool = false) {
+    private func scheduleProvisionalAlbumArtRefresh(id: String) {
         guard id == currentAlbumArtID else { return }
-        guard artworkDisplayQuality < .hq else {
+        let attempt = provisionalRefreshAttempts[id] ?? 0
+        guard attempt < ALBUM_ART_PROVISIONAL_REFRESH_DELAYS.count else {
+            log("[AlbumArtRefresh] provisional retries exhausted id=\(id)")
+            return
+        }
+        provisionalRefreshAttempts[id] = attempt + 1
+        provisionalRefreshWorkItem?.cancel()
+        let delay = ALBUM_ART_PROVISIONAL_REFRESH_DELAYS[attempt]
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.currentAlbumArtID == id else { return }
+            self.requestedAlbumArtKeys.remove("\(id)|hq")
+            self.requestedHqAlbumArtIDs.remove(id)
+            self.forceRefreshAlbumArtIDs.insert(id)
+            let requested = self.requestCurrentHqAlbumArt(forceRefresh: true)
+            self.log(
+                "[AlbumArtRefresh] provisional retry id=\(id) " +
+                    "attempt=\(attempt + 1) requested=\(requested)"
+            )
+            if !requested {
+                self.scheduleProvisionalAlbumArtRefresh(id: id)
+            }
+        }
+        provisionalRefreshWorkItem = workItem
+        log(
+            "[AlbumArtRefresh] provisional retry scheduled id=\(id) " +
+                "attempt=\(attempt + 1) delayMs=\(Int(delay * 1_000))"
+        )
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func cancelProvisionalAlbumArtRefresh(clearAttemptsFor id: String? = nil) {
+        provisionalRefreshWorkItem?.cancel()
+        provisionalRefreshWorkItem = nil
+        if let id {
+            provisionalRefreshAttempts.removeValue(forKey: id)
+        } else {
+            provisionalRefreshAttempts.removeAll()
+        }
+    }
+
+    private func requestHqAlbumArt(
+        id: String,
+        reason: String = "standard",
+        predictive: Bool = false,
+        forceRefresh: Bool = false
+    ) {
+        guard id == currentAlbumArtID else { return }
+        guard forceRefresh || artworkDisplayQuality < .hq else {
             if predictive {
                 recordPredictiveHqSkip(id: id, reason: "cache hit", category: .cacheHit)
             }
@@ -1609,7 +1830,13 @@ final class AlbumArtReceiver {
             if predictive {
                 recordPredictiveHqSkip(id: id, reason: "in flight", category: .inFlight)
             }
-            scheduleHqAlbumArtRequest(id: id, delay: 1.0, reason: "busy retry", predictive: predictive)
+            scheduleHqAlbumArtRequest(
+                id: id,
+                delay: 1.0,
+                reason: "busy retry",
+                predictive: predictive,
+                forceRefresh: forceRefresh
+            )
             return
         }
         guard requestedHqAlbumArtIDs.insert(id).inserted else {
@@ -1624,10 +1851,14 @@ final class AlbumArtReceiver {
             recordPredictiveHqRequest(id: id)
             log("[PredictiveAlbumArt] request hq id=\(id) reason=\(reason)")
         }
-        requestAlbumArt(id: id, quality: "hq")
+        requestAlbumArt(id: id, quality: "hq", forceRefresh: forceRefresh)
     }
 
-    private func requestAlbumArt(id: String, quality: String) {
+    private func requestAlbumArt(
+        id: String,
+        quality: String,
+        forceRefresh: Bool = false
+    ) {
         guard id == currentAlbumArtID else { return }
         cancelStaleBinaryAlbumArtTransferIfNeeded(reason: "request found stale transfer")
         if let session = binaryAlbumArtSession {
@@ -1643,12 +1874,24 @@ final class AlbumArtReceiver {
         }
         let key = "\(id)|\(quality)"
         guard requestedAlbumArtKeys.insert(key).inserted else { return }
-        log("[AlbumArt] request \(quality)")
-        delegate?.albumArtSendCommand(cmd: "ALBUM_ART_REQUEST", extra: ["id": id, "quality": quality])
-        scheduleAlbumArtRequestStartTimeout(id: id, quality: quality)
+        log("[AlbumArt] request \(quality) forceRefresh=\(forceRefresh)")
+        var extra: [String: Any] = ["id": id, "quality": quality]
+        if forceRefresh {
+            extra["forceRefresh"] = true
+        }
+        delegate?.albumArtSendCommand(cmd: "ALBUM_ART_REQUEST", extra: extra)
+        scheduleAlbumArtRequestStartTimeout(
+            id: id,
+            quality: quality,
+            forceRefresh: forceRefresh
+        )
     }
 
-    private func scheduleAlbumArtRequestStartTimeout(id: String, quality: String) {
+    private func scheduleAlbumArtRequestStartTimeout(
+        id: String,
+        quality: String,
+        forceRefresh: Bool = false
+    ) {
         let key = "\(id)|\(quality)"
         albumArtRequestStartTimeouts[key]?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
@@ -1667,13 +1910,22 @@ final class AlbumArtReceiver {
             let attempts = (self.albumArtRequestStartRetryCounts[key] ?? 0) + 1
             self.albumArtRequestStartRetryCounts[key] = attempts
             guard attempts <= ALBUM_ART_REQUEST_START_MAX_RETRIES else {
+                if quality == "hq" {
+                    self.forceRefreshAlbumArtIDs.remove(id)
+                    self.sourceRefreshInFlightAlbumArtIDs.remove(id)
+                    self.sourceRefreshAttemptedAlbumArtIDs.remove(id)
+                }
                 self.log("[AlbumArt] request start timeout id=\(id) quality=\(quality), giving up")
                 return
             }
             self.log("[AlbumArt] request start timeout id=\(id) quality=\(quality), retry=\(attempts)")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 guard let self, self.currentAlbumArtID == id else { return }
-                self.requestAlbumArt(id: id, quality: quality)
+                self.requestAlbumArt(
+                    id: id,
+                    quality: quality,
+                    forceRefresh: forceRefresh
+                )
             }
         }
         albumArtRequestStartTimeouts[key] = workItem
@@ -2158,12 +2410,15 @@ final class AlbumArtReceiver {
         } else if !decoded || size <= 0 {
             reason = "decode_failed"
             valid = false
-        } else if let image, isLikelyPlaceholderAlbumArt(image, dataSize: size) {
-            reason = "placeholder"
-            valid = false
         } else if hardExpired {
             reason = "hard_ttl_expired"
             valid = false
+        } else if let image,
+                  AlbumArtPlaceholderPolicy.disposition(
+                    image: image,
+                    dataSize: size
+                  ) == .provisional {
+            reason = "low_information_requires_refresh"
         } else if expired {
             reason = "source_ttl_expired"
         } else if source == "notificationLargeIcon" || source == "unknown" {
@@ -2200,23 +2455,6 @@ final class AlbumArtReceiver {
                 reason: reason
             )
         }
-        if isLikelyPlaceholderAlbumArt(image, dataSize: size) {
-            removePlaceholderAlbumArt(id: id, quality: preferredQuality)
-            return AlbumArtCacheValidation(
-                image: nil,
-                quality: quality,
-                source: source,
-                ageMs: ageMs,
-                ttlMs: ttlMs,
-                pixelWidth: pixelWidth,
-                pixelHeight: pixelHeight,
-                bytes: size,
-                valid: false,
-                expired: expired,
-                reason: reason
-            )
-        }
-
         if expired {
             let message =
                 "[AlbumArtCache] expired id=\(id) source=\(source) " +
@@ -2247,9 +2485,17 @@ final class AlbumArtReceiver {
         cancelAlbumArtFallback()
         cancelHqAlbumArtRequest()
         let firstRefreshAttempt = sourceRefreshAttemptedAlbumArtIDs.insert(id).inserted
+        sourceRefreshInFlightAlbumArtIDs.insert(id)
+        forceRefreshAlbumArtIDs.insert(id)
         let selected = hqValidation.valid ? hqValidation : previewValidation
         let reason = selected.reason
-        if let image = selected.image, selected.valid {
+        let rejectedFallback = reason == "low_information_requires_refresh"
+        if rejectedFallback {
+            removeCachedAlbumArt(id: id, quality: "preview", reason: "qq fallback placeholder")
+            removeCachedAlbumArt(id: id, quality: "hq", reason: "qq fallback placeholder")
+            updateArtworkEnhancementStatus(message: "waiting for real artwork")
+            log("[AlbumArtCache] fallback placeholder not displayed id=\(id)")
+        } else if let image = selected.image, selected.valid {
             let displayQuality = selected.quality == "preview"
                 ? ArtworkDisplayQuality.preview
                 : ArtworkDisplayQuality.hq
@@ -2271,7 +2517,9 @@ final class AlbumArtReceiver {
                 )
             }
         }
-        updateArtworkEnhancementStatus(message: "refreshing cache")
+        if !rejectedFallback {
+            updateArtworkEnhancementStatus(message: "refreshing cache")
+        }
         let staleReason = selected.expired ? "source_ttl_expired" : reason
         let staleMessage = "[AlbumArtCache] stale id=\(id) reason=\(staleReason)"
         log(staleMessage)
@@ -2291,17 +2539,18 @@ final class AlbumArtReceiver {
             "id=\(id) source=\(selected.source) cacheReason=\(reason)"
         log(message)
         consoleLog(message)
-        requestAlbumArt(id: id, quality: "preview")
-        schedulePredictiveHqPrefetch(id: id, delay: 2.2, reason: "stale cache")
+        requestAlbumArt(id: id, quality: "preview", forceRefresh: true)
+        schedulePredictiveHqPrefetch(
+            id: id,
+            delay: 2.2,
+            reason: "stale cache",
+            forceRefresh: true
+        )
         notifyStateChanged()
     }
 
     private func removeCorruptedAlbumArt(id: String, quality: String? = nil) {
         removeCachedAlbumArt(id: id, quality: quality, reason: "corrupted")
-    }
-
-    private func removePlaceholderAlbumArt(id: String, quality: String? = nil) {
-        removeCachedAlbumArt(id: id, quality: quality, reason: "placeholder")
     }
 
     private func removeCachedAlbumArt(id: String, quality: String? = nil, reason: String) {
@@ -2318,46 +2567,7 @@ final class AlbumArtReceiver {
     }
 
     private func isLikelyPlaceholderAlbumArt(_ image: UIImage, dataSize: Int) -> Bool {
-        guard dataSize < 1_800, let cgImage = image.cgImage else {
-            return false
-        }
-        let width = 24
-        let height = 24
-        var pixels = [UInt8](repeating: 0, count: width * height * 4)
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        guard let context = CGContext(
-            data: &pixels,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: width * 4,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
-            return false
-        }
-        context.interpolationQuality = .low
-        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-        var buckets = Set<Int>()
-        var colorfulPixels = 0
-        var visiblePixels = 0
-        stride(from: 0, to: pixels.count, by: 4).forEach { index in
-            let red = Int(pixels[index])
-            let green = Int(pixels[index + 1])
-            let blue = Int(pixels[index + 2])
-            let alpha = Int(pixels[index + 3])
-            guard alpha >= 24 else { return }
-            let maximum = max(red, max(green, blue))
-            let minimum = min(red, min(green, blue))
-            if maximum > 0 && Double(maximum - minimum) / Double(maximum) > 0.12 {
-                colorfulPixels += 1
-            }
-            buckets.insert(((red / 32) << 10) | ((green / 32) << 5) | (blue / 32))
-            visiblePixels += 1
-        }
-
-        return visiblePixels > 0 && buckets.count <= 10 && colorfulPixels * 20 <= visiblePixels
+        AlbumArtPlaceholderPolicy.isLowInformation(image, dataSize: dataSize)
     }
 
     private func shouldAcceptHqAlbumArt(image: UIImage, data: Data, id: String) -> Bool {

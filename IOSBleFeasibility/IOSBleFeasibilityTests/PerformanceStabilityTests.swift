@@ -134,6 +134,219 @@ final class PerformanceStabilityTests: XCTestCase {
         )
     }
 
+    func testQQFallbackIsRejectedAndForceRefreshRetainsRealArtwork() throws {
+        let delegate = AlbumArtReceiverTestDelegate()
+        let receiver = AlbumArtReceiver(delegate: delegate)
+        let artworkID = "low-information-\(UUID().uuidString)"
+        delegate.trackID = artworkID
+        receiver.handleIdentity(id: artworkID)
+
+        let rendererFormat = UIGraphicsImageRendererFormat()
+        rendererFormat.scale = 1
+        let fallbackRenderer = UIGraphicsImageRenderer(
+            size: CGSize(width: 228, height: 228),
+            format: rendererFormat
+        )
+        let fallbackImage = fallbackRenderer.image { context in
+            UIColor(white: 0.42, alpha: 1).setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 228, height: 228))
+        }
+        let fallbackData = try XCTUnwrap(fallbackImage.jpegData(compressionQuality: 0.8))
+        XCTAssertEqual(
+            AlbumArtPlaceholderPolicy.disposition(
+                image: fallbackImage,
+                dataSize: fallbackData.count
+            ),
+            .provisional
+        )
+
+        let rejected = expectation(description: "QQ fallback rejected")
+        var didFulfillRejection = false
+        receiver.onStateChanged = { state in
+            guard !didFulfillRejection,
+                  state.artworkEnhancementStatus.lastMessage == "waiting for real artwork" else {
+                return
+            }
+            didFulfillRejection = true
+            rejected.fulfill()
+        }
+        receiver.handleLegacyStart(
+            id: artworkID,
+            quality: "hq",
+            size: fallbackData.count,
+            chunks: 1
+        )
+        receiver.handleLegacyChunk(
+            id: artworkID,
+            quality: "hq",
+            index: 0,
+            base64: fallbackData.base64EncodedString()
+        )
+        receiver.handleLegacyEnd(id: artworkID, quality: "hq")
+        wait(for: [rejected], timeout: 2)
+        XCTAssertNil(receiver.albumArtImage)
+        XCTAssertEqual(receiver.artworkDisplayQuality, .placeholder)
+
+        let realRenderer = UIGraphicsImageRenderer(
+            size: CGSize(width: 280, height: 280),
+            format: rendererFormat
+        )
+        let realImage = realRenderer.image { context in
+            UIColor.systemRed.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 140, height: 280))
+            UIColor.systemBlue.setFill()
+            context.fill(CGRect(x: 140, y: 0, width: 140, height: 280))
+            UIColor.systemGreen.setFill()
+            context.fill(CGRect(x: 70, y: 70, width: 140, height: 140))
+        }
+        let realData = try XCTUnwrap(realImage.jpegData(compressionQuality: 0.8))
+        XCTAssertEqual(
+            AlbumArtPlaceholderPolicy.disposition(
+                image: realImage,
+                dataSize: realData.count
+            ),
+            .normal
+        )
+
+        let displayed = expectation(description: "real artwork displayed")
+        var didFulfillDisplay = false
+        receiver.onStateChanged = { state in
+            guard !didFulfillDisplay, state.albumArtImage != nil else { return }
+            didFulfillDisplay = true
+            displayed.fulfill()
+        }
+        receiver.handleLegacyStart(
+            id: artworkID,
+            quality: "preview",
+            size: realData.count,
+            chunks: 1
+        )
+        receiver.handleLegacyChunk(
+            id: artworkID,
+            quality: "preview",
+            index: 0,
+            base64: realData.base64EncodedString()
+        )
+        receiver.handleLegacyEnd(id: artworkID, quality: "preview")
+        wait(for: [displayed], timeout: 2)
+
+        let displayedImage = try XCTUnwrap(receiver.albumArtImage)
+        delegate.commands.removeAll()
+        XCTAssertTrue(receiver.forceRefreshCurrentAlbumArt())
+        XCTAssertTrue(receiver.albumArtImage === displayedImage)
+
+        let previewRefresh = try XCTUnwrap(
+            delegate.commands.first {
+                $0.command == "ALBUM_ART_REQUEST" &&
+                    ($0.extra["quality"] as? String) == "preview"
+            }
+        )
+        XCTAssertEqual(previewRefresh.extra["forceRefresh"] as? Bool, true)
+    }
+
+    func testSourceRefreshSecondOfferDoesNotBecomeFalseCacheHit() {
+        XCTAssertTrue(
+            AlbumArtSourceRefreshPolicy.needsRefresh(
+                cacheRequiresRefresh: true,
+                refreshAttempted: false,
+                refreshInFlight: false
+            )
+        )
+        XCTAssertTrue(
+            AlbumArtSourceRefreshPolicy.needsRefresh(
+                cacheRequiresRefresh: true,
+                refreshAttempted: true,
+                refreshInFlight: true
+            )
+        )
+        XCTAssertFalse(
+            AlbumArtSourceRefreshPolicy.needsRefresh(
+                cacheRequiresRefresh: true,
+                refreshAttempted: true,
+                refreshInFlight: false
+            )
+        )
+        XCTAssertFalse(
+            AlbumArtSourceRefreshPolicy.needsRefresh(
+                cacheRequiresRefresh: false,
+                refreshAttempted: false,
+                refreshInFlight: false
+            )
+        )
+    }
+
+    func testRepeatedOfferDuringSourceRefreshDoesNotSkipHQ() throws {
+        let delegate = AlbumArtReceiverTestDelegate()
+        let receiver = AlbumArtReceiver(delegate: delegate)
+        let artworkID = "source-refresh-\(UUID().uuidString)"
+        delegate.trackID = artworkID
+        receiver.handleIdentity(id: artworkID)
+        defer { receiver.clearCurrentIdentity(reason: "test cleanup") }
+
+        let rendererFormat = UIGraphicsImageRendererFormat()
+        rendererFormat.scale = 1
+        let renderer = UIGraphicsImageRenderer(
+            size: CGSize(width: 228, height: 228),
+            format: rendererFormat
+        )
+        let image = renderer.image { context in
+            UIColor.systemPurple.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 114, height: 228))
+            UIColor.systemOrange.setFill()
+            context.fill(CGRect(x: 114, y: 0, width: 114, height: 228))
+        }
+        let data = try XCTUnwrap(image.jpegData(compressionQuality: 0.8))
+
+        let cacheSaved = expectation(description: "transient HQ cache saved")
+        delegate.onLog = { message in
+            if message.contains("[AlbumArtCache] saved id=\(artworkID) quality=hq") {
+                cacheSaved.fulfill()
+            }
+        }
+        receiver.handleLegacyStart(
+            id: artworkID,
+            quality: "hq",
+            size: data.count,
+            chunks: 1
+        )
+        receiver.handleLegacyChunk(
+            id: artworkID,
+            quality: "hq",
+            index: 0,
+            base64: data.base64EncodedString()
+        )
+        receiver.handleLegacyEnd(id: artworkID, quality: "hq")
+        wait(for: [cacheSaved], timeout: 2)
+
+        delegate.commands.removeAll()
+        let forcedPreview = expectation(description: "source refresh preview requested")
+        delegate.onCommand = { command, extra in
+            guard command == "ALBUM_ART_REQUEST",
+                  (extra["quality"] as? String) == "preview",
+                  (extra["forceRefresh"] as? Bool) == true else {
+                return
+            }
+            forcedPreview.fulfill()
+        }
+        receiver.handleOffer(id: artworkID)
+        wait(for: [forcedPreview], timeout: 2)
+
+        let secondOfferHeld = expectation(description: "second offer remains in refresh")
+        delegate.onLog = { message in
+            if message.contains("refresh_already_requested id=\(artworkID)") {
+                secondOfferHeld.fulfill()
+            }
+        }
+        receiver.handleOffer(id: artworkID)
+        wait(for: [secondOfferHeld], timeout: 2)
+        XCTAssertFalse(
+            delegate.commands.contains {
+                $0.command == "ALBUM_ART_SKIP" &&
+                    ($0.extra["quality"] as? String) == "hq"
+            }
+        )
+    }
+
     func testObservableSliceDeduplicatesAndPlaybackClockPauses() {
         let slice = ObservableStateSlice(BLEConnectionViewState())
         var emissions = 0
@@ -198,4 +411,40 @@ final class PerformanceStabilityTests: XCTestCase {
         }
         return result
     }
+}
+
+private final class AlbumArtReceiverTestDelegate: AlbumArtReceiverDelegate {
+    var trackID = ""
+    var commands: [(command: String, extra: [String: Any])] = []
+    var onCommand: ((String, [String: Any]) -> Void)?
+    var onLog: ((String) -> Void)?
+
+    var albumArtCurrentTrackID: String { trackID }
+    var albumArtCurrentTitle: String { "Test Track" }
+    var albumArtConnectionStatus: String { "已连接" }
+    var albumArtConnectionDisplayState: String { "connected" }
+    var albumArtConnectionHealthState: String { "healthy" }
+    var albumArtCharacteristicReady: Bool { true }
+    var albumArtIsBusyForHqRequest: Bool { false }
+
+    func albumArtLog(_ message: String) {
+        onLog?(message)
+    }
+
+    func albumArtConsoleLog(_ message: String) {}
+
+    func albumArtSendCommand(cmd: String, extra: [String: Any]) {
+        commands.append((cmd, extra))
+        onCommand?(cmd, extra)
+    }
+
+    func albumArtEffectiveHqDelay(
+        _ delay: TimeInterval
+    ) -> (delay: TimeInterval, deferred: Bool) {
+        (delay, false)
+    }
+
+    func albumArtPublishLiveArtwork(image: UIImage, key: String, reason: String) {}
+    func albumArtClearLiveArtwork(reason: String, shouldUpdate: Bool) {}
+    func albumArtUpdateLiveActivity(force: Bool, reason: String) {}
 }

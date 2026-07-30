@@ -64,7 +64,7 @@ class AlbumArtTestManager(
             }
 
             val valid = candidates.filter { candidate ->
-                if (isLikelyPlaceholder(candidate.bitmap)) {
+                if (AlbumArtPlaceholderPolicy.isLikelyPlaceholder(candidate.bitmap)) {
                     logger("[AlbumArtSource] rejected placeholder source=${candidate.source}")
                     false
                 } else {
@@ -423,57 +423,6 @@ class AlbumArtTestManager(
         drawable.setBounds(0, 0, width, height)
         drawable.draw(canvas)
         return bitmap
-    }
-
-    private fun isLikelyPlaceholder(bitmap: Bitmap): Boolean {
-        if (bitmap.width <= 0 || bitmap.height <= 0) return true
-        val sampleWidth = minOf(24, bitmap.width)
-        val sampleHeight = minOf(24, bitmap.height)
-        val sampled = if (sampleWidth == bitmap.width &&
-            sampleHeight == bitmap.height
-        ) {
-            bitmap
-        } else {
-            Bitmap.createScaledBitmap(bitmap, sampleWidth, sampleHeight, true)
-        }
-        return try {
-            val pixels = IntArray(sampleWidth * sampleHeight)
-            sampled.getPixels(
-                pixels,
-                0,
-                sampleWidth,
-                0,
-                0,
-                sampleWidth,
-                sampleHeight
-            )
-            val colorBuckets = HashSet<Int>()
-            var colorfulPixels = 0
-            var visiblePixels = 0
-            pixels.forEach { pixel ->
-                val alpha = pixel ushr 24
-                if (alpha < 24) return@forEach
-                val red = (pixel ushr 16) and 0xff
-                val green = (pixel ushr 8) and 0xff
-                val blue = pixel and 0xff
-                val maximum = maxOf(red, green, blue)
-                val minimum = minOf(red, green, blue)
-                if (maximum > 0 &&
-                    (maximum - minimum).toFloat() / maximum.toFloat() > 0.12f
-                ) {
-                    colorfulPixels += 1
-                }
-                colorBuckets.add(
-                    ((red / 32) shl 10) or
-                        ((green / 32) shl 5) or
-                        (blue / 32)
-                )
-                visiblePixels += 1
-            }
-            visiblePixels == 0 || (bitmap.width <= 16 && bitmap.height <= 16)
-        } finally {
-            if (sampled !== bitmap) sampled.recycle()
-        }
     }
 
     private data class AlbumArtCandidate(

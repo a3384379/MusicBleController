@@ -93,4 +93,29 @@ class BleNotifyQueuePolicyTest {
             assertFalse(BleNotifyQueue.shouldCoalesceShortType(type))
         }
     }
+
+    @Test
+    fun terminalCallbackIsDeferredAndDispatchedExactlyOnce() {
+        val gate = BleQueueTerminalCallbackGate()
+        val pending = mutableListOf<() -> Unit>()
+        var callbackCount = 0
+
+        assertTrue(
+            gate.dispatch(
+                post = { pending += it },
+                callback = { callbackCount += 1 }
+            )
+        )
+        assertEquals(0, callbackCount)
+        assertEquals(1, pending.size)
+        assertFalse(
+            gate.dispatch(
+                post = { pending += it },
+                callback = { callbackCount += 100 }
+            )
+        )
+
+        pending.single().invoke()
+        assertEquals(1, callbackCount)
+    }
 }

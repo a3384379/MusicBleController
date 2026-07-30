@@ -975,7 +975,10 @@ final class BLETestManager: NSObject, ObservableObject {
     private func runSourceCapabilitySequence() {
         log("[SourceCapabilitySmoke] start")
         for index in 0..<5 {
-            let delay = TimeInterval(index * 30)
+            // The observable display state intentionally settles after the raw
+            // CoreBluetooth state. Give it a short grace period so the smoke
+            // request exercises the wire instead of being locally rejected.
+            let delay = 0.8 + TimeInterval(index * 30)
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self else { return }
                 self.log(
@@ -984,8 +987,10 @@ final class BLETestManager: NSObject, ObservableObject {
                 )
                 self.sendGetPlaybackState()
                 self.sendGetFullLyrics(force: true)
-                let requested = self.requestCurrentHqAlbumArt()
-                self.log("[SourceCapabilitySmoke] albumArt request result=\(requested)")
+                let requested = self.requestCurrentHqAlbumArt(forceRefresh: true)
+                self.log(
+                    "[SourceCapabilitySmoke] albumArt force request result=\(requested)"
+                )
             }
         }
     }
@@ -1377,8 +1382,8 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     @discardableResult
-    func requestCurrentHqAlbumArt() -> Bool {
-        albumArtReceiver.requestCurrentHqAlbumArt()
+    func requestCurrentHqAlbumArt(forceRefresh: Bool = false) -> Bool {
+        albumArtReceiver.requestCurrentHqAlbumArt(forceRefresh: forceRefresh)
     }
 
     @discardableResult

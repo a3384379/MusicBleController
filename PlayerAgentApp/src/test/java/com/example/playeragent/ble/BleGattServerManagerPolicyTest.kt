@@ -1,6 +1,8 @@
 package com.example.playeragent.ble
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class BleGattServerManagerPolicyTest {
@@ -9,5 +11,99 @@ class BleGattServerManagerPolicyTest {
         assertEquals(1_000L, BleGattServerManager.autoPushPollIntervalMs(null))
         assertEquals(1_000L, BleGattServerManager.autoPushPollIntervalMs(true))
         assertEquals(5_000L, BleGattServerManager.autoPushPollIntervalMs(false))
+    }
+
+    @Test
+    fun completedAlbumArtCanBeRetransmittedAfterCooldownOrForced() {
+        assertTrue(
+            AlbumArtRequestPolicy.shouldAllowCompletedRequest(
+                lastCompletedAtMs = null,
+                nowMs = 100L,
+                forceRefresh = false
+            )
+        )
+        assertFalse(
+            AlbumArtRequestPolicy.shouldAllowCompletedRequest(
+                lastCompletedAtMs = 100L,
+                nowMs = 200L,
+                forceRefresh = false
+            )
+        )
+        assertTrue(
+            AlbumArtRequestPolicy.shouldAllowCompletedRequest(
+                lastCompletedAtMs = 100L,
+                nowMs = 200L,
+                forceRefresh = true
+            )
+        )
+        assertTrue(
+            AlbumArtRequestPolicy.shouldAllowCompletedRequest(
+                lastCompletedAtMs = 100L,
+                nowMs = 100L + AlbumArtRequestPolicy.COMPLETED_REQUEST_COOLDOWN_MS,
+                forceRefresh = false
+            )
+        )
+        assertTrue(
+            AlbumArtRequestPolicy.shouldResendOfferAfterRecovery(
+                recoveredFromUnavailable = true,
+                hadWaitingClientRequest = false
+            )
+        )
+        assertFalse(
+            AlbumArtRequestPolicy.shouldResendOfferAfterRecovery(
+                recoveredFromUnavailable = true,
+                hadWaitingClientRequest = true
+            )
+        )
+        assertFalse(
+            AlbumArtRequestPolicy.shouldResendOfferAfterRecovery(
+                recoveredFromUnavailable = false,
+                hadWaitingClientRequest = false
+            )
+        )
+    }
+
+    @Test
+    fun subscribedLinkStalenessDoesNotDependOnQueuedOutboundWork() {
+        assertFalse(
+            BleSubscribedLinkPolicy.isActivityStale(
+                subscribed = true,
+                subscribedAtMs = 1_000L,
+                lastCommandSuccessAtMs = 1_100L,
+                lastNotifySuccessAtMs = 1_200L,
+                nowMs = 46_200L,
+                maxAgeMs = 45_000L
+            )
+        )
+        assertTrue(
+            BleSubscribedLinkPolicy.isActivityStale(
+                subscribed = true,
+                subscribedAtMs = 1_000L,
+                lastCommandSuccessAtMs = 1_100L,
+                lastNotifySuccessAtMs = 1_200L,
+                nowMs = 46_201L,
+                maxAgeMs = 45_000L
+            )
+        )
+        assertFalse(
+            BleSubscribedLinkPolicy.isActivityStale(
+                subscribed = false,
+                subscribedAtMs = 1_000L,
+                lastCommandSuccessAtMs = 1_100L,
+                lastNotifySuccessAtMs = 1_200L,
+                nowMs = 100_000L,
+                maxAgeMs = 45_000L
+            )
+        )
+        assertTrue(
+            BleSubscribedLinkPolicy.isWithoutSuccessStale(
+                subscribed = true,
+                subscribedAtMs = 1_000L,
+                lastCommandSuccessAtMs = 0L,
+                lastNotifySuccessAtMs = 0L,
+                nowMs = 46_001L,
+                maxAgeMs = 45_000L
+            )
+        )
     }
 }

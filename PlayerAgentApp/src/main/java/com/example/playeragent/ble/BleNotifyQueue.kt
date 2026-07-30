@@ -16,6 +16,22 @@ import java.util.ArrayDeque
 import java.util.LinkedHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+
+internal class BleQueueTerminalCallbackGate {
+    private val dispatched = AtomicBoolean(false)
+
+    fun dispatch(
+        post: ((() -> Unit) -> Unit),
+        callback: (() -> Unit)?
+    ): Boolean {
+        if (!dispatched.compareAndSet(false, true)) {
+            return false
+        }
+        callback?.let(post)
+        return true
+    }
+}
 
 class BleNotifyQueue(
     private val serverProvider: () -> BluetoothGattServer?,
@@ -193,9 +209,16 @@ class BleNotifyQueue(
     private fun cancelJobTypesOnQueue(types: Set<String>, reason: String) {
         val removedJobs = jobs.filter { it.type in types }
         jobs.removeAll { it.type in types }
-        removedJobs.forEach { failJob(it, reason) }
         val current = activeJob
-        if (current != null && current.type in types) {
+        val activeJobRemoved = current != null && current.type in types
+        if (removedJobs.isNotEmpty() || activeJobRemoved) {
+            // Cancel stale packet/timeout work before terminal callbacks are
+            // posted. Removing callbacks afterwards would silently discard
+            // the deferred cleanup which releases manager transfer state.
+            handler.removeCallbacksAndMessages(null)
+        }
+        removedJobs.forEach { failJob(it, reason) }
+        if (activeJobRemoved && current != null) {
             failJob(current, reason)
             activeJob = null
             activePacketIndex = 0
@@ -204,12 +227,11 @@ class BleNotifyQueue(
             interleavedPacketType = null
             interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
         }
-        if (removedJobs.isNotEmpty() || current?.type in types) {
-            handler.removeCallbacksAndMessages(null)
+        if (removedJobs.isNotEmpty() || activeJobRemoved) {
             if (notificationInFlight) {
                 beginCancelledCallbackDrain("cancelled active notify")
             } else {
-                sendNextPacket()
+                handler.post { sendNextPacket() }
             }
         }
     }
@@ -248,12 +270,12 @@ class BleNotifyQueue(
             interleavedPacketInFlight = false
             interleavedPacketType = null
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                onNotifySuccess(type)
+                dispatchNotifySuccess(type)
                 recordAdaptiveSuccess(type, callbackAddress, callbackRttMs)
             } else {
                 recordAdaptiveFailure(type, callbackAddress)
                 logger("[BleNotifyQueue] interleaved notify failed type=$type status=$status")
-                onNotifyFailure(type, status, "callback_failed")
+                dispatchNotifyFailure(type, status, "callback_failed")
             }
             handler.postDelayed({ sendNextPacket() }, interleavedDelayAfterMs)
             interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
@@ -267,11 +289,11 @@ class BleNotifyQueue(
                 "[BleNotifyQueue] notify failed " +
                     "type=$type status=$status"
             )
-            onNotifyFailure(type, status, "callback_failed")
+            dispatchNotifyFailure(type, status, "callback_failed")
             abortActiveJob(job, "notify callback failed type=$type status=$status")
             return
         } else {
-            onNotifySuccess(packet?.type ?: job.type)
+            dispatchNotifySuccess(packet?.type ?: job.type)
             packet?.let {
                 recordAdaptiveSuccess(it.type, callbackAddress, callbackRttMs)
             }
@@ -300,17 +322,19 @@ class BleNotifyQueue(
             interleavedPacketType = null
             interleavedDelayAfterMs = SHORT_MESSAGE_DELAY_MS
         }
+        if (removedJobs.isNotEmpty() || activeDeviceRemoved) {
+            handler.removeCallbacksAndMessages(null)
+        }
         removedJobs.forEach { failJob(it, "device disconnected") }
         if (activeDeviceRemoved) {
             activeJob?.let { failJob(it, "device disconnected") }
             activeJob = null
             activePacketIndex = 0
         }
-        handler.removeCallbacksAndMessages(null)
         if (notificationInFlight && activeDeviceRemoved) {
             beginCancelledCallbackDrain("device disconnected")
         } else {
-            sendNextPacket()
+            handler.post { sendNextPacket() }
         }
     }
 
@@ -446,12 +470,11 @@ class BleNotifyQueue(
             job.startedAtMs = activeJobStartedAtMs
         }
         if (job.shouldCancel?.invoke() == true) {
-            markJobFailed(job, "cancelled")
-            job.onFailure?.invoke()
+            failJob(job, "cancelled")
             activeJob = null
             activePacketIndex = 0
             activeJobStartedAtMs = 0L
-            sendNextPacket()
+            handler.post { sendNextPacket() }
             return
         }
         val maxSendDurationMs = job.maxSendDurationMs
@@ -463,12 +486,11 @@ class BleNotifyQueue(
             if (job.type == "albumArt") {
                 logger("[AlbumArt] timeout stop id=${job.albumArtId}")
             }
-            markJobFailed(job, "timeout")
-            job.onFailure?.invoke()
+            failJob(job, "timeout")
             activeJob = null
             activePacketIndex = 0
             activeJobStartedAtMs = 0L
-            sendNextPacket()
+            handler.post { sendNextPacket() }
             return
         }
         val interleaveInterval = interleaveIntervalFor(job.type)
@@ -502,7 +524,7 @@ class BleNotifyQueue(
                         interleaved.packet.value
                     )
                     if (!requested) {
-                        onNotifyFailure(
+                        dispatchNotifyFailure(
                             interleaved.packet.type,
                             NOTIFY_REQUEST_REJECTED_STATUS,
                             "request_rejected"
@@ -529,7 +551,7 @@ class BleNotifyQueue(
         if (activePacketIndex >= job.packets.size) {
             if (job.isLongJob) {
                 if (job.failed) {
-                    job.onFailure?.invoke()
+                    dispatchJobFailure(job)
                 } else {
                     when (job.type) {
                         "albumArt" -> logger(
@@ -545,13 +567,18 @@ class BleNotifyQueue(
                             logger("[TrackInfo] send end")
                         else -> logger("[BleNotifyQueue] job end type=${job.type}")
                     }
-                    job.onComplete?.invoke()
                 }
             }
             activeJob = null
             activePacketIndex = 0
             activeJobStartedAtMs = 0L
-            sendNextPacket()
+            if (job.isLongJob && !job.failed) {
+                dispatchJobComplete(job)
+            }
+            // Terminal callbacks can enter BleGattServerManager. Queue the
+            // next drain behind them so no callback runs while this monitor
+            // is held and callback ordering remains deterministic.
+            handler.post { sendNextPacket() }
             return
         }
 
@@ -564,7 +591,7 @@ class BleNotifyQueue(
             activeJob = null
             activePacketIndex = 0
             activeJobStartedAtMs = 0L
-            sendNextPacket()
+            handler.post { sendNextPacket() }
             return
         }
 
@@ -614,7 +641,7 @@ class BleNotifyQueue(
             clearActiveNotifyMetrics()
             recordAdaptiveFailure(packet.type, job.device.address)
             logger("[BleNotifyQueue] notify request rejected type=${packet.type}")
-            onNotifyFailure(
+            dispatchNotifyFailure(
                 packet.type,
                 NOTIFY_REQUEST_REJECTED_STATUS,
                 "request_rejected"
@@ -626,8 +653,7 @@ class BleNotifyQueue(
     }
 
     private fun abortActiveJob(job: SendJob, reason: String) {
-        markJobFailed(job, reason)
-        job.onFailure?.invoke()
+        failJob(job, reason)
         activeJob = null
         activePacketIndex = 0
         activeJobStartedAtMs = 0L
@@ -648,10 +674,13 @@ class BleNotifyQueue(
                 logger("[BleNotifyQueue] notify callback timeout type=$type job=${job?.type}")
                 val address = activeNotifyDeviceAddress ?: job?.device?.address.orEmpty()
                 recordAdaptiveFailure(type, address)
-                onNotifyFailure(type, NOTIFY_CALLBACK_TIMEOUT_STATUS, "callback_timeout")
+                dispatchNotifyFailure(
+                    type,
+                    NOTIFY_CALLBACK_TIMEOUT_STATUS,
+                    "callback_timeout"
+                )
                 if (job != null) {
-                    markJobFailed(job, "notify callback timeout type=$type")
-                    job.onFailure?.invoke()
+                    failJob(job, "notify callback timeout type=$type")
                     activeJob = null
                     activePacketIndex = 0
                     activeJobStartedAtMs = 0L
@@ -780,7 +809,35 @@ class BleNotifyQueue(
 
     private fun failJob(job: SendJob, reason: String) {
         markJobFailed(job, reason)
-        job.onFailure?.invoke()
+        dispatchJobFailure(job)
+    }
+
+    /**
+     * Queue methods use the BleNotifyQueue monitor to serialize state reads
+     * from diagnostic and media threads. Never call a manager callback inline
+     * while that monitor is held: BleGattServerManager may hold its own monitor
+     * while querying this queue, which otherwise creates an AB/BA deadlock.
+     */
+    private fun dispatchJobComplete(job: SendJob) {
+        job.terminalCallbackGate.dispatch(
+            post = { callback -> handler.post(callback) },
+            callback = job.onComplete
+        )
+    }
+
+    private fun dispatchJobFailure(job: SendJob) {
+        job.terminalCallbackGate.dispatch(
+            post = { callback -> handler.post(callback) },
+            callback = job.onFailure
+        )
+    }
+
+    private fun dispatchNotifySuccess(type: String) {
+        handler.post { onNotifySuccess(type) }
+    }
+
+    private fun dispatchNotifyFailure(type: String, status: Int, reason: String) {
+        handler.post { onNotifyFailure(type, status, reason) }
     }
 
     private fun pollNextJob(): SendJob? {
@@ -991,7 +1048,9 @@ class BleNotifyQueue(
         var failureLogged: Boolean = false,
         var nextPacketIndex: Int = 0,
         var startedAtMs: Long = 0L,
-        var packetsSinceYield: Int = 0
+        var packetsSinceYield: Int = 0,
+        val terminalCallbackGate: BleQueueTerminalCallbackGate =
+            BleQueueTerminalCallbackGate()
     ) {
         val chunkCount: Int
             get() = packets.count {

@@ -145,7 +145,7 @@ struct ContentView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .overlay(alignment: .top) {
-            if bleManager.title != "-" {
+            if isDebugMode, bleManager.title != "-" {
                 mediaLoadingOverlay
                     .padding(.top, 48)
             }
