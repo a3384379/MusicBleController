@@ -6,8 +6,8 @@
 </p>
 
 <p align="center">
-  <strong>Turn a Sony Android Walkman into a Bluetooth music bridge for iPhone.</strong><br>
-  <strong>让 iPhone 实时获取 Sony Android 播放器上的 QQ 音乐歌词、封面和播放状态。</strong>
+  <strong>Turn a Sony Android Walkman into a Bluetooth music source for iPhone and Android.</strong><br>
+  <strong>让 iPhone 与 Android 控制端实时获取 Sony 播放器上的 QQ 音乐歌词、封面和播放状态。</strong>
 </p>
 
 <p align="center">
@@ -17,11 +17,12 @@
   <img alt="Kotlin" src="https://img.shields.io/badge/Kotlin-BLE-7F52FF?logo=kotlin&logoColor=white">
 </p>
 
-MusicBleController is a source-available iPhone companion for Sony Walkman devices
-running Android. A lightweight Android agent reads QQ Music playback metadata,
-QRC lyrics and album art, then streams them to a native SwiftUI app over
-Bluetooth Low Energy (BLE). The iPhone app provides playback controls, synced
-lyrics, artwork caching, Dynamic Island and Live Activities.
+MusicBleController is a source-available, cross-platform companion for Sony
+Walkman devices running Android. A lightweight agent reads QQ Music playback
+metadata, QRC lyrics and album art, then streams them over Bluetooth Low Energy
+(BLE) to either a native SwiftUI iPhone app or a Jetpack Compose Android
+controller. Both clients provide playback controls, synced lyrics and artwork
+caching; iPhone additionally supports Dynamic Island and Live Activities.
 
 > [!IMPORTANT]
 > The current implementation supports **QQ Music on Android only**. It is an
@@ -30,10 +31,11 @@ lyrics, artwork caching, Dynamic Island and Live Activities.
 
 ## 中文简介
 
-MusicBleController 是面向 **Sony Android Walkman 与 iPhone** 的 QQ 音乐
-BLE 伴侣项目。Sony 端读取 QQ 音乐的播放状态、本地 QRC 逐字歌词和通知封面，
-再通过低功耗蓝牙实时同步到 iPhone；iPhone 端负责播放器界面、歌词高亮、封面缓存、
-播放控制、锁屏实时活动和灵动岛展示，全程不依赖云端中转服务。
+MusicBleController 是面向 **Sony Android Walkman、iPhone 与 Android 控制端**
+的 QQ 音乐 BLE 伴侣项目。Sony 端读取 QQ 音乐的播放状态、本地 QRC 逐字歌词和
+通知封面，再通过低功耗蓝牙实时同步到 SwiftUI iPhone App 或 Jetpack Compose
+Android App；两种控制端都支持歌词高亮、封面缓存和播放控制，iPhone 还支持锁屏
+实时活动与灵动岛，全程不依赖云端中转服务。
 
 - 支持 QQ 音乐 QRC 逐字歌词、翻译和罗马音数据；
 - 支持预览封面优先传输、高清封面后台升级和缓存复用；
@@ -69,8 +71,10 @@ devices without a cloud service:
 - **Fast album art** — preview-first BLE delivery, HQ background upgrades,
   CRC validation and stale-while-revalidate caching.
 - **Remote playback controls** — play/pause, next, previous, seek and volume.
-- **Native iPhone experience** — SwiftUI player, full-screen lyrics, lock-screen
-  Live Activity and Dynamic Island support.
+- **Two native controllers** — SwiftUI on iPhone and Jetpack Compose on Android,
+  with full-screen lyrics, history, settings and diagnostics.
+- **Native iPhone extras** — lock-screen Live Activity and Dynamic Island
+  support.
 - **Connection recovery** — capability negotiation, health checks, reconnect
   protection and old-client protocol fallback.
 - **Built for slow hardware** — priority-based BLE scheduling, compressed lyric
@@ -84,13 +88,16 @@ devices without a cloud service:
 flowchart LR
     QQ["QQ Music on Sony Walkman"] --> Agent["PlayerAgent · Kotlin"]
     Agent -->|"BLE · lyrics / artwork / state"| iOS["iPhone app · SwiftUI"]
+    Agent -->|"BLE · lyrics / artwork / state"| Android["Android controller · Compose"]
     iOS -->|"BLE · controls / seek / volume"| Agent
+    Android -->|"BLE · controls / seek / volume"| Agent
     iOS --> Live["Live Activity / Dynamic Island"]
 ```
 
 The Sony device is the authoritative media source. `PlayerAgentApp` reads
-MediaSession, notifications and QQ Music's local QRC cache, while the iOS app
-acts as the BLE controller, cache and presentation layer. No external server is
+MediaSession, notifications and QQ Music's local QRC cache. The iOS and Android
+apps are interchangeable BLE controllers, caches and presentation layers; only
+one controller should connect to a Sony device at a time. No external server is
 required.
 
 ## Compatibility
@@ -100,6 +107,7 @@ required.
 | Music source | QQ Music for Android |
 | Sony side | Android 6.0+; tested on Sony NW-WM1AM2 (Android 11) |
 | iPhone side | iOS 18.0+ with Bluetooth enabled |
+| Android controller | Android 6.0+ with BLE; Android 12+ requires Nearby Devices permission |
 | Development | Android Studio/JDK and Xcode with an Apple Development team |
 
 Other Android-based Sony Walkman models may work, but hardware and firmware
@@ -120,7 +128,19 @@ Install `PlayerAgentApp/build/outputs/apk/debug/PlayerAgentApp-debug.apk` on the
 Sony player. Grant notification access, enable the required accessibility
 service, then start the PlayerAgent foreground service.
 
-### 2. Build the iPhone app
+### 2. Build an Android controller
+
+```bash
+bash gradlew :ControllerApp:assembleDebug
+```
+
+Install `ControllerApp/build/outputs/apk/debug/ControllerApp-debug.apk` on an
+Android phone. Grant Bluetooth and notification permissions, open the app, and
+connect to `SonyPlayerAgent`. The controller includes a Compose player,
+word-synced and full-screen lyrics, Preview/HQ artwork, playback history,
+statistics, settings, MediaStyle background controls and diagnostics.
+
+### 3. Build the iPhone app
 
 1. Open `IOSBleFeasibility/IOSBleFeasibility.xcodeproj` in Xcode.
 2. Select your Apple Development team for the app and Live Activity extension.
@@ -144,15 +164,17 @@ For deeper implementation and troubleshooting details, see:
 |---|---|
 | `PlayerAgentApp/` | Sony/Android media agent and BLE GATT server |
 | `IOSBleFeasibility/` | Native iPhone app and Live Activity extension |
-| `ControllerApp/` | Legacy Android controller, retained for compatibility |
+| `ControllerApp/` | Jetpack Compose Android BLE V2 controller and foreground connection service |
 | `docs/` | Protocol and architecture documentation |
 | `tools/` | iOS, Android and cross-device smoke tests |
 
 ## Validation
 
 ```bash
-# Android unit tests and debug build
-bash gradlew :PlayerAgentApp:testDebugUnitTest :PlayerAgentApp:assembleDebug
+# Android unit tests and debug builds
+bash gradlew \
+  :PlayerAgentApp:testDebugUnitTest :PlayerAgentApp:assembleDebug \
+  :ControllerApp:testDebugUnitTest :ControllerApp:assembleDebug
 
 # Installed-device quick smoke tests
 ./tools/smoke/run_all_smoke_tests.sh --quick --json

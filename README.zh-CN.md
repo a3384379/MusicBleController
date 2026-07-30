@@ -6,8 +6,8 @@
 </p>
 
 <p align="center">
-  <strong>让 iPhone 实时获取 Sony Android Walkman 上的 QQ 音乐歌词、封面和播放状态。</strong><br>
-  <strong>一个不依赖云端中转的 Sony 播放器 × iPhone 蓝牙音乐伴侣。</strong>
+  <strong>让 iPhone 与 Android 控制端实时获取 Sony Walkman 上的 QQ 音乐歌词、封面和播放状态。</strong><br>
+  <strong>一个不依赖云端中转的 Sony 播放器跨平台蓝牙音乐伴侣。</strong>
 </p>
 
 <p align="center">
@@ -17,11 +17,12 @@
   <img alt="Kotlin" src="https://img.shields.io/badge/Kotlin-BLE-7F52FF?logo=kotlin&logoColor=white">
 </p>
 
-MusicBleController 是一个面向 Sony Android Walkman 和 iPhone 的 QQ 音乐
-状态同步与远程控制项目。运行在 Sony 播放器上的轻量 Android 服务负责读取
-QQ 音乐的 MediaSession、通知封面和本地 QRC 歌词，再通过低功耗蓝牙（BLE）
-传输到原生 SwiftUI iPhone App。iPhone 可以显示逐字歌词、歌曲封面和播放进度，
-也可以控制播放、切歌、进度和音量，并在锁屏实时活动与灵动岛中展示当前歌曲。
+MusicBleController 是一个面向 Sony Android Walkman、iPhone 和 Android 手机的
+QQ 音乐状态同步与远程控制项目。运行在 Sony 播放器上的轻量 Android 服务负责读取
+QQ 音乐的 MediaSession、通知封面和本地 QRC 歌词，再通过低功耗蓝牙（BLE）传输到
+原生 SwiftUI iPhone App 或 Jetpack Compose Android App。两种控制端都可以显示
+逐字歌词、歌曲封面和播放进度，也可以控制播放、切歌、进度和音量；iPhone 还支持
+锁屏实时活动与灵动岛。
 
 > [!IMPORTANT]
 > 当前版本只支持 **Android 版 QQ 音乐**，不支持 Apple Music、Spotify、网易云音乐
@@ -58,7 +59,9 @@ Sony 的 Android Walkman 可以安装 QQ 音乐，但它的播放状态、QRC �
 - **QQ 音乐逐字歌词**：解析本地加密 QRC 歌词，支持逐字时间、翻译和罗马音数据；
 - **快速封面显示**：优先发送小型预览图，再在后台升级高清封面；
 - **完整播放控制**：支持播放、暂停、上一首、下一首、进度和音量；
-- **原生 iPhone 体验**：使用 SwiftUI、ActivityKit、锁屏实时活动和灵动岛；
+- **双原生控制端**：iPhone 使用 SwiftUI，Android 使用 Jetpack Compose，均支持
+  主播放器、完整歌词、历史、设置与诊断；
+- **iPhone 专属能力**：使用 ActivityKit 提供锁屏实时活动和灵动岛；
 - **弱性能设备优化**：使用可抢占 BLE 队列、压缩歌词、索引缓存和分级封面；
 - **兼容与恢复**：支持新旧协议协商、健康探测、有限重试和自动重连；
 - **可诊断与可测试**：两端均提供诊断日志，并包含 Android、iOS 和跨端冒烟测试。
@@ -69,17 +72,21 @@ Sony 的 Android Walkman 可以安装 QQ 音乐，但它的播放状态、QRC �
 flowchart LR
     QQ["Sony Walkman 上的 QQ 音乐"] --> Agent["PlayerAgent · Kotlin"]
     Agent -->|"BLE · 歌词 / 封面 / 播放状态"| iOS["iPhone App · SwiftUI"]
+    Agent -->|"BLE · 歌词 / 封面 / 播放状态"| Android["Android App · Compose"]
     iOS -->|"BLE · 播放 / 进度 / 音量控制"| Agent
+    Android -->|"BLE · 播放 / 进度 / 音量控制"| Agent
     iOS --> Live["锁屏实时活动 / 灵动岛"]
 ```
 
-Sony 端是播放状态、歌词和封面的权威数据源，iPhone 端是控制、缓存和展示端：
+Sony 端是播放状态、歌词和封面的权威数据源，iPhone 与 Android App 是可替换的
+控制、缓存和展示端（同一时刻只建议连接一个控制端）：
 
 1. Sony `PlayerAgentApp` 启动 BLE GATT Server，并监听 QQ 音乐状态与本地 QRC 文件；
-2. iPhone `BLETestManager` 扫描并连接 `SonyPlayerAgent`；
-3. iPhone 通过命令特征发送 JSON 控制命令；
+2. iPhone `BLETestManager` 或 Android `ControllerConnectionService` 扫描并连接
+   `SonyPlayerAgent`；
+3. 控制端通过命令特征发送 JSON 控制命令；
 4. Sony 通过状态特征返回播放状态、歌词窗口、完整歌词和二进制封面分包；
-5. iPhone 合并传输结果，更新播放器、歌词、缓存和 Live Activity。
+5. 控制端合并传输结果并更新播放器、歌词和缓存；iPhone 同时更新 Live Activity。
 
 固定 BLE UUID、已有控制命令和旧协议兼容路径会被保留，新功能只在双方确认能力后启用。
 
@@ -114,6 +121,7 @@ Sony 端是播放状态、歌词和封面的权威数据源，iPhone 端是控�
 | 音乐来源 | Android 版 QQ 音乐 |
 | Sony 端 | Android 6.0+；已在 Sony NW-WM1AM2（Android 11）验证 |
 | iPhone 端 | iOS 18.0+，需要开启蓝牙 |
+| Android 控制端 | Android 6.0+，需要 BLE；Android 12+ 需要“附近的设备”权限 |
 | Android 开发 | Android Studio、JDK 和 Android SDK |
 | iOS 开发 | Xcode、Apple Development Team 和实体 iPhone |
 
@@ -150,7 +158,24 @@ PlayerAgentApp/build/outputs/apk/debug/PlayerAgentApp-debug.apk
 4. 按系统版本授予歌词缓存所需的存储访问权限；
 5. 打开 Player Agent，并确认前台服务和 BLE 广播已经运行。
 
-### 2. 构建 iPhone App
+### 2. 构建 Android 控制端
+
+```bash
+bash gradlew :ControllerApp:assembleDebug
+```
+
+生成的 APK 位于：
+
+```text
+ControllerApp/build/outputs/apk/debug/ControllerApp-debug.apk
+```
+
+安装到 Android 手机后允许蓝牙和通知权限，再连接 `SonyPlayerAgent`。Android
+控制端采用 BLE V2、Compose、ViewModel、StateFlow 和前台连接服务，提供逐字/完整
+歌词、翻译与罗马音、Preview/HQ 封面、播放历史与统计、设置、系统健康、歌曲/歌词
+诊断，以及 MediaStyle 后台通知控制。RFCOMM 只保留为调试模式下的手动兼容入口。
+
+### 3. 构建 iPhone App
 
 由于 Apple 签名与设备、团队绑定，Release 页面不提供通用 IPA。请自行构建：
 
@@ -162,11 +187,11 @@ PlayerAgentApp/build/outputs/apk/debug/PlayerAgentApp-debug.apk
 
 iOS 模拟器无法验证真实的 BLE 媒体传输链路。
 
-### 3. 连接与播放
+### 4. 连接与播放
 
 1. 在 Sony 播放器上启动 Player Agent；
 2. 打开 QQ 音乐并播放一首歌曲；
-3. 在 iPhone App 中搜索并连接 `SonyPlayerAgent`；
+3. 在 iPhone 或 Android 控制端中搜索并连接 `SonyPlayerAgent`；
 4. 连接成功后等待当前歌曲、歌词窗口和预览封面同步；
 5. 如果 QQ 音乐尚未生成本地歌词，可先在 QQ 音乐中打开一次歌词页面。
 
@@ -190,7 +215,7 @@ iOS 模拟器无法验证真实的 BLE 媒体传输链路。
 |---|---|
 | `PlayerAgentApp/` | Sony/Android 媒体代理与 BLE GATT Server |
 | `IOSBleFeasibility/` | 原生 iPhone App 与 Live Activity Extension |
-| `ControllerApp/` | 为兼容保留的旧 Android Controller，不属于当前主链路 |
+| `ControllerApp/` | Jetpack Compose Android BLE V2 控制端与前台连接服务 |
 | `docs/` | BLE、歌词、封面、重连和总体架构文档 |
 | `tools/` | iOS、Android、跨端和长时间播放冒烟测试 |
 
@@ -208,7 +233,9 @@ iOS 模拟器无法验证真实的 BLE 媒体传输链路。
 
 ```bash
 # Android 单元测试与 Debug 构建
-bash gradlew :PlayerAgentApp:testDebugUnitTest :PlayerAgentApp:assembleDebug
+bash gradlew \
+  :PlayerAgentApp:testDebugUnitTest :PlayerAgentApp:assembleDebug \
+  :ControllerApp:testDebugUnitTest :ControllerApp:assembleDebug
 
 # 已安装设备的快速跨端冒烟测试
 ./tools/smoke/run_all_smoke_tests.sh --quick --json

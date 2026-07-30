@@ -11,13 +11,16 @@ import java.io.InputStreamReader
 class RfcommServerManager(
     private val bluetoothAdapter: BluetoothAdapter,
     private val logger: (String) -> Unit,
-    private val onMessageReceived: (String) -> Unit = {}
+    private val onMessageReceived: (String) -> Unit = {},
+    private val onConnectionChanged: (Boolean) -> Unit = {}
 ) {
 
     private var serverSocket: BluetoothServerSocket? = null
     private var clientSocket: BluetoothSocket? = null
     private var acceptThread: Thread? = null
     private var readThread: Thread? = null
+    @Volatile
+    private var connected = false
 
     @SuppressLint("MissingPermission")
     fun startServer() {
@@ -37,6 +40,7 @@ class RfcommServerManager(
 
                 if (socket != null) {
                     logger("Client connected")
+                    updateConnection(true)
                     startReadLoop(socket)
                 }
             } catch (exception: IOException) {
@@ -75,11 +79,11 @@ class RfcommServerManager(
         sendRawMessage(message)
     }
 
-    private fun sendRawMessage(message: String) {
+    fun sendRawMessage(message: String): Boolean {
         val socket = clientSocket
         if (socket == null || !socket.isConnected) {
             logger("RFCOMM not connected")
-            return
+            return false
         }
 
         logger("Sending command: $message")
@@ -96,6 +100,7 @@ class RfcommServerManager(
             name = "RfcommServerCommandThread"
             start()
         }
+        return true
     }
 
     private fun startReadLoop(socket: BluetoothSocket) {
@@ -112,6 +117,8 @@ class RfcommServerManager(
                 }
             } catch (exception: IOException) {
                 logger("RFCOMM read stopped: ${exception.message}")
+            } finally {
+                updateConnection(false)
             }
         }.apply {
             name = "RfcommServerReadThread"
@@ -136,5 +143,12 @@ class RfcommServerManager(
 
         acceptThread = null
         readThread = null
+        updateConnection(false)
+    }
+
+    private fun updateConnection(value: Boolean) {
+        if (connected == value) return
+        connected = value
+        onConnectionChanged(value)
     }
 }

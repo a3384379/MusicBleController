@@ -1686,6 +1686,7 @@ class BleGattServerManager(
         val artist = source.optString("artist")
         val album = source.optString("album")
         val trackId = buildAlbumArtProtocolId(source)
+        val generation = reactiveMediaController.generation()
         val candidates = listOf(
             TrackInfoLimit(30, 30, 20, includeAlbum = true),
             TrackInfoLimit(30, 30, 0, includeAlbum = false),
@@ -1697,6 +1698,7 @@ class BleGattServerManager(
                 .put("title", title.take(limit.titleLength))
                 .put("artist", artist.take(limit.artistLength))
                 .put("trackId", trackId)
+                .put("generation", generation)
             if (limit.includeAlbum) {
                 objectValue.put("album", album.take(limit.albumLength))
             }
@@ -3369,7 +3371,7 @@ class BleGattServerManager(
 
     private fun maximumPayloadFor(device: BluetoothDevice): Int {
         val mtu = mtuByAddress[device.address] ?: DEFAULT_MTU
-        return (mtu - ATT_HEADER_SIZE).coerceAtLeast(0)
+        return BleGattPayloadPolicy.maximumNotificationPayload(mtu)
     }
 
     private fun albumArtMaximumPayloadFor(device: BluetoothDevice): Int {

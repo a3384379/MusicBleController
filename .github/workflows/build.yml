@@ -25,10 +25,16 @@ jobs:
           cache: gradle
       - name: Test and assemble PlayerAgent
         run: bash ./gradlew :PlayerAgentApp:testDebugUnitTest :PlayerAgentApp:assembleDebug
+      - name: Test and assemble Android Controller
+        run: bash ./gradlew :ControllerApp:testDebugUnitTest :ControllerApp:assembleDebug
       - uses: actions/upload-artifact@v4
         with:
           name: PlayerAgent-debug-apk
           path: PlayerAgentApp/build/outputs/apk/debug/*.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Controller-debug-apk
+          path: ControllerApp/build/outputs/apk/debug/*.apk
 
   ios:
     name: iOS simulator XCTest

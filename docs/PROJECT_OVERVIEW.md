@@ -7,7 +7,7 @@
 - `PlayerAgentApp/`：运行在 Sony Android 设备上的权威数据源。负责读取 MediaSession/通知、记录播放历史、解析 QQMusic QRC 歌词、监听 QRC 文件变化、提供 BLE GATT Server、执行播放/音量控制。
 - `IOSBleFeasibility/IOSBleFeasibility/`：iPhone 主 App。负责 CoreBluetooth Central 连接 Sony、发送命令、接收状态、缓存封面/歌词/历史、展示播放器、诊断页和设置页。
 - `IOSBleFeasibility/SonyMusicLiveActivityExtension/`：Live Activity / Dynamic Island / 锁屏 Widget Extension。只展示 `ActivityKit` 状态和 App Group 中的小封面缩略图，不直接连接 Sony。
-- `ControllerApp/`：旧 Android Controller 侧代码，当前主链路不依赖它。除非任务明确要求，不要修改。
+- `ControllerApp/`：Android BLE V2 控制端。使用 Jetpack Compose、ViewModel、StateFlow 和前台连接服务，负责连接 Sony、播放控制、逐字/完整歌词、封面、历史统计、设置与诊断；RFCOMM 仅作为调试兼容入口。
 - `tools/ios-smoke-tests/`：iOS-only smoke test 工具。只依赖 iPhone、`devicectl` 和 iOS App 日志，不使用 adb。
 
 ## 核心文件
@@ -21,6 +21,9 @@
 - Sony BLE 队列：[BleNotifyQueue.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/ble/BleNotifyQueue.kt)
 - Sony 播放状态：[PlaybackStateReader.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/PlaybackStateReader.kt)
 - Sony 歌词：[LyricManager.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/LyricManager.kt)、[QrcLyricManager.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/QrcLyricManager.kt)
+- Android Controller 服务：[ControllerConnectionService.kt](/Volumes/雷电/project/MusicBleController/ControllerApp/src/main/java/com/example/controllerapp/service/ControllerConnectionService.kt)
+- Android Controller 协议与状态：[ControllerRepository.kt](/Volumes/雷电/project/MusicBleController/ControllerApp/src/main/java/com/example/controllerapp/ControllerRepository.kt)、[ControllerModels.kt](/Volumes/雷电/project/MusicBleController/ControllerApp/src/main/java/com/example/controllerapp/model/ControllerModels.kt)
+- Android Controller 界面：[ControllerAppUi.kt](/Volumes/雷电/project/MusicBleController/ControllerApp/src/main/java/com/example/controllerapp/ui/ControllerAppUi.kt)
 
 ## 总体数据流
 
@@ -30,11 +33,14 @@
 4. Sony 从 MediaSession / Notification / QRC 缓存读取状态，通过 status characteristic notify JSON 或二进制封面 chunk。
 5. iPhone 更新主播放器、全屏歌词、诊断页、Live Activity。
 6. Live Activity Extension 只读取 `ContentState` 和 App Group 缩略图，不访问 BLE。
+7. Android `ControllerConnectionService` 可替代 iPhone 作为 Central，使用同一 BLE V2
+   协议更新 Compose 界面和 MediaStyle 通知；同一时刻只连接一个控制端。
 
 ## 关键状态
 
 - Sony 是播放、历史、歌词和封面来源的权威端。
 - iPhone 是同步、缓存和展示端。
+- Android Controller 是与 iPhone 对等的同步、缓存和展示端，不包含 Live Activity。
 - iOS `BLETestManager` 仍是连接/协议分发中心，但设置已拆到 `PreferencesStore`，封面接收已拆到 `AlbumArtReceiver`。
 - Live Activity 状态必须保持轻量，`ContentState` 不允许放图片、完整歌词、大数组或 Base64。
 - iOS 日志落盘在 App 容器 `Documents/Logs/ios_ble.log`。
@@ -63,4 +69,6 @@
   `./tools/ios-smoke-tests/run_ios_smoke_tests.sh --quick --json`
 - iOS 启动、安装、UserDefaults、日志、App 容器、`project.pbxproj` 改动：
   `./tools/ios-smoke-tests/run_ios_smoke_tests.sh --json`
+- Android Controller 改动：
+  `./gradlew :ControllerApp:testDebugUnitTest :ControllerApp:assembleDebug :ControllerApp:lintDebug`
 - docs-only 改动：只需 `git diff --check`。
