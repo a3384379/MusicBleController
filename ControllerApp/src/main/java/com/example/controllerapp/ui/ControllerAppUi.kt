@@ -193,6 +193,7 @@ private fun PlayerScreen(
     val artwork by viewModel.artwork.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val position by viewModel.displayedPositionMs.collectAsStateWithLifecycle()
+    val reduceAnimations by viewModel.reduceAnimations.collectAsStateWithLifecycle()
 
     Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         artwork.bitmap?.let { bitmap ->
@@ -231,6 +232,7 @@ private fun PlayerScreen(
                     lyrics = lyrics,
                     artwork = artwork,
                     settings = settings,
+                    reduceAnimations = reduceAnimations,
                     positionMs = position,
                     onOpenLyrics = { navController.navigate(Routes.LYRICS) },
                     onPrevious = viewModel::previous,
@@ -333,6 +335,7 @@ private fun PlayerBody(
     lyrics: LyricsState,
     artwork: ArtworkState,
     settings: ControllerSettings,
+    reduceAnimations: Boolean,
     positionMs: Long,
     onOpenLyrics: () -> Unit,
     onPrevious: () -> Unit,
@@ -363,6 +366,7 @@ private fun PlayerBody(
                     lyrics,
                     artwork,
                     settings,
+                    reduceAnimations,
                     positionMs,
                     onOpenLyrics,
                     onPrevious,
@@ -395,6 +399,7 @@ private fun PlayerBody(
                     lyrics,
                     artwork,
                     settings,
+                    reduceAnimations,
                     positionMs,
                     onOpenLyrics,
                     onPrevious,
@@ -476,6 +481,7 @@ private fun PlayerControlsPanel(
     lyrics: LyricsState,
     artwork: ArtworkState,
     settings: ControllerSettings,
+    reduceAnimations: Boolean,
     positionMs: Long,
     onOpenLyrics: () -> Unit,
     onPrevious: () -> Unit,
@@ -509,7 +515,7 @@ private fun PlayerControlsPanel(
         Spectrum(
             playing = playback.isPlaying,
             positionMs = positionMs,
-            animated = settings.performanceMode != PlaybackPerformanceMode.POWER_SAVING
+            animated = !reduceAnimations
         )
         CompactLyrics(
             lyrics = lyrics,
@@ -822,21 +828,43 @@ private fun FullLyricsScreen(
     val lyrics by viewModel.lyrics.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val position by viewModel.displayedPositionMs.collectAsStateWithLifecycle()
+    val displayLines = lyrics.lines
     val current = currentLineIndex(
-        lyrics.lines,
+        displayLines,
         position + settings.lyricOffsetMs,
         lyrics.currentLineIndex
     )
     val listState = rememberLazyListState()
     var following by remember { mutableStateOf(true) }
-    LaunchedEffect(current, following) {
-        if (following && current >= 0 && current < lyrics.lines.size) {
-            listState.animateScrollToItem(current, scrollOffset = -180)
+    var programmaticScroll by remember { mutableStateOf(false) }
+    var resumeFollowToken by remember { mutableStateOf(0) }
+    LaunchedEffect(lyrics.trackId, lyrics.isFinal) {
+        if (lyrics.trackId.isNotBlank() && !lyrics.isFinal) {
+            viewModel.ensureFullLyrics()
         }
     }
-    LaunchedEffect(listState.isScrollInProgress) {
-        if (listState.isScrollInProgress) {
+    LaunchedEffect(current, following, lyrics.isFinal) {
+        if (following && current >= 0 && current < displayLines.size) {
+            programmaticScroll = true
+            try {
+                val loadingHeaderOffset = if (lyrics.isFinal) 0 else 1
+                listState.animateScrollToItem(
+                    current + loadingHeaderOffset,
+                    scrollOffset = -180
+                )
+            } finally {
+                programmaticScroll = false
+            }
+        }
+    }
+    LaunchedEffect(listState.isScrollInProgress, programmaticScroll) {
+        if (listState.isScrollInProgress && !programmaticScroll) {
             following = false
+            resumeFollowToken += 1
+        }
+    }
+    LaunchedEffect(resumeFollowToken) {
+        if (resumeFollowToken > 0) {
             delay(4_000L)
             following = true
         }
@@ -854,7 +882,7 @@ private fun FullLyricsScreen(
             )
         }
     ) { padding ->
-        if (lyrics.lines.isEmpty()) {
+        if (displayLines.isEmpty()) {
             EmptyState(
                 title = lyricStageText(lyrics.loadingStage),
                 message = lyrics.failureReason.ifBlank { "正在等待 Sony 解析 QQ 音乐歌词" },
@@ -873,8 +901,46 @@ private fun FullLyricsScreen(
                 ),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                items(lyrics.lines, key = LyricLine::index) { line ->
-                    val selected = line.index == lyrics.lines.getOrNull(current)?.index
+                if (!lyrics.isFinal) {
+                    item(key = "full-lyrics-loading") {
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                Modifier.fillMaxWidth().padding(14.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        lyricStageText(lyrics.loadingStage),
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    Text(
+                                        if (settings.experienceMode != AppExperienceMode.DEBUG) {
+                                            "正在获取完整歌词，当前内容可先浏览"
+                                        } else {
+                                            when {
+                                                lyrics.partialFullLines.isNotEmpty() ->
+                                                    "已接收 ${lyrics.partialFullLines.size} 行，完成后自动替换"
+                                                lyrics.windowLines.isNotEmpty() ->
+                                                    "当前仅展示 ${lyrics.windowLines.size} 行歌词窗口"
+                                                else -> "正在等待 Sony 返回完整歌词"
+                                            }
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                TextButton(onClick = viewModel::retryLyrics) { Text("重试") }
+                            }
+                        }
+                    }
+                }
+                items(displayLines, key = LyricLine::index) { line ->
+                    val selected = line.index == displayLines.getOrNull(current)?.index
                     Column(
                         Modifier.fillMaxWidth()
                             .clip(RoundedCornerShape(14.dp))
@@ -1003,13 +1069,14 @@ private fun HistoryScreen(
                     }
                 }
             }
-            if (history.sessions.isNotEmpty()) {
+            if (history.sessions.isNotEmpty() && history.hasMore) {
                 item {
                     OutlinedButton(
                         onClick = viewModel::loadMoreHistory,
+                        enabled = !history.loading,
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("加载更多")
+                        Text(if (history.loading) "正在加载…" else "加载更多")
                     }
                 }
             }
@@ -1369,8 +1436,13 @@ private fun TrackDiagnosticScreen(
             DiagnosticValue("标题", playback.title)
             DiagnosticValue("歌手", playback.artist)
             DiagnosticValue("专辑", playback.album)
-            DiagnosticValue("歌词行数", lyrics.lines.size.toString())
+            DiagnosticValue("歌词窗口", "${lyrics.windowLines.size} 行")
+            DiagnosticValue("完整歌词", "${lyrics.fullLines.size} 行 · final=${lyrics.isFinal}")
             DiagnosticValue("歌词状态", lyrics.loadingStage.name)
+            DiagnosticValue("歌词协议", lyrics.protocolFormat)
+            DiagnosticValue("transferId", lyrics.transferId)
+            DiagnosticValue("传输进度", "${lyrics.receivedChunks}/${lyrics.expectedChunks}")
+            DiagnosticValue("重试次数", lyrics.retryCount.toString())
             DiagnosticValue("封面 ID", artwork.artworkId)
             DiagnosticValue("封面质量", artwork.quality.name)
             DiagnosticValue("封面状态", artwork.loadingStage.name)

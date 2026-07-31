@@ -50,5 +50,34 @@ class PlaybackClockPolicyTest {
                 PlaybackPerformanceMode.POWER_SAVING
             )
         )
+        assertEquals(
+            200L,
+            PlaybackClockPolicy.refreshIntervalMs(
+                true,
+                true,
+                PlaybackPerformanceMode.AUTOMATIC,
+                systemPowerSaveMode = true
+            )
+        )
+    }
+
+    @Test
+    fun `automatic mode respects battery saver and reduced motion`() {
+        assertEquals(
+            false,
+            PlaybackClockPolicy.animationsEnabled(
+                PlaybackPerformanceMode.AUTOMATIC,
+                systemPowerSaveMode = true,
+                systemAnimationsEnabled = true
+            )
+        )
+        assertEquals(
+            false,
+            PlaybackClockPolicy.animationsEnabled(
+                PlaybackPerformanceMode.SMOOTH,
+                systemPowerSaveMode = false,
+                systemAnimationsEnabled = false
+            )
+        )
     }
 }

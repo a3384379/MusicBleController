@@ -20,10 +20,8 @@ class ControllerCommandGateway internal constructor(
     fun requestVolume() = repository.requestVolume()
 
     fun requestFullLyrics() = repository.requestFullLyrics()
-    fun retryLyrics() {
-        repository.requestLyricWindow()
-        repository.requestFullLyrics()
-    }
+    fun ensureFullLyrics() = repository.ensureFullLyrics()
+    fun retryLyrics() = repository.retryLyrics()
 
     fun requestLyricDiagnostic() = repository.requestLyricDiagnostic()
     fun requestArtwork(quality: ArtworkQuality = ArtworkQuality.HQ) =

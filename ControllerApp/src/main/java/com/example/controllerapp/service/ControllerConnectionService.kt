@@ -174,13 +174,13 @@ class ControllerConnectionService :
         reconnectAttempt = 0
         repository.setReconnectAttempt(0, reason)
         repository.recordSelfHealing("重新连接：$reason")
-        if (forceScan) {
-            transport.reconnect(reason)
-        } else {
-            scope.launch {
-                val address = repository.preferences.savedDeviceAddress.first()
-                startConnection(address, forceScan = address.isBlank())
-            }
+        scope.launch {
+            val address = repository.preferences.savedDeviceAddress.first()
+            transport.restart(
+                savedAddress = address,
+                reason = reason,
+                forceScan = forceScan || address.isBlank()
+            )
         }
     }
 

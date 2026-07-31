@@ -259,10 +259,22 @@ class BleGattTransport(
     }
 
     fun reconnect(reason: String) {
+        restart(savedAddress = "", reason = reason, forceScan = true)
+    }
+
+    /** Always tears down the current GATT before attempting recovery. */
+    fun restart(savedAddress: String, reason: String, forceScan: Boolean) {
         handler.post {
-            logger("[BLE] reconnect reason=$reason")
+            logger("[BLE] restart reason=$reason forceScan=$forceScan")
             closing = false
             closeGattOnThread()
+            if (!forceScan && savedAddress.isNotBlank()) {
+                val device = runCatching { adapter?.getRemoteDevice(savedAddress) }.getOrNull()
+                if (device != null) {
+                    connectOnThread(device)
+                    return@post
+                }
+            }
             startScanOnThread(reconnecting = true)
         }
     }

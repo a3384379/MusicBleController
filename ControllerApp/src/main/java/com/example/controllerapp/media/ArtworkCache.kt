@@ -24,9 +24,9 @@ data class CachedArtwork(
 
 class ArtworkCache(context: Context) {
     private val directory = File(context.filesDir, "album_art_cache").apply { mkdirs() }
-    private val memory = object : LruCache<String, Bitmap>(32 * 1024) {
-        override fun sizeOf(key: String, value: Bitmap): Int =
-            (value.allocationByteCount / 1024).coerceAtLeast(1)
+    private val memory = object : LruCache<String, CachedArtwork>(32 * 1024) {
+        override fun sizeOf(key: String, value: CachedArtwork): Int =
+            (value.bitmap.allocationByteCount / 1024).coerceAtLeast(1)
     }
 
     suspend fun load(
@@ -34,38 +34,60 @@ class ArtworkCache(context: Context) {
         quality: ArtworkQuality,
         maximumPixelSize: Int
     ): CachedArtwork? = withContext(Dispatchers.IO) {
+        loadOnIo(artworkId, quality, maximumPixelSize)
+    }
+
+    /**
+     * The player always prefers HQ, then Preview.  Keeping this selection in
+     * the cache prevents the controller from doing two sequential disk reads
+     * every time a known song becomes active.
+     */
+    suspend fun loadBest(artworkId: String, maximumPixelSize: Int): CachedArtwork? =
+        withContext(Dispatchers.IO) {
+            peekBest(artworkId, maximumPixelSize)
+                ?: loadOnIo(artworkId, ArtworkQuality.HQ, maximumPixelSize)
+                ?: loadOnIo(artworkId, ArtworkQuality.PREVIEW, maximumPixelSize)
+        }
+
+    /** Fast path for the media reducer; no file I/O or bitmap decoding. */
+    fun peekBest(artworkId: String, maximumPixelSize: Int): CachedArtwork? =
+        ArtworkQuality.entries
+            .asSequence()
+            .filter { it == ArtworkQuality.HQ || it == ArtworkQuality.PREVIEW }
+            .sortedByDescending(ArtworkQuality::rank)
+            .mapNotNull { quality -> memory.get(key(artworkId, quality, maximumPixelSize)) }
+            .firstOrNull()
+
+    private fun loadOnIo(
+        artworkId: String,
+        quality: ArtworkQuality,
+        maximumPixelSize: Int
+    ): CachedArtwork? {
         val key = key(artworkId, quality, maximumPixelSize)
         memory.get(key)?.let {
-            return@withContext CachedArtwork(
-                bitmap = it,
-                quality = quality,
-                createdAtMs = System.currentTimeMillis(),
-                requiresRefresh = false
-            )
+            return it
         }
         val imageFile = imageFile(artworkId, quality)
         val metadataFile = metadataFile(artworkId, quality)
-        if (!imageFile.isFile || !metadataFile.isFile) return@withContext null
+        if (!imageFile.isFile || !metadataFile.isFile) return null
         val metadata = runCatching { JSONObject(metadataFile.readText()) }.getOrNull()
-            ?: return@withContext null
+            ?: return null
         val createdAt = metadata.optLong("createdAtMs")
         val ageMs = System.currentTimeMillis() - createdAt
         if (createdAt <= 0L || ageMs < 0L || ageMs > HARD_TTL_MS) {
             imageFile.delete()
             metadataFile.delete()
-            return@withContext null
+            return null
         }
         val bitmap = decodeDownsampled(imageFile.readBytes(), maximumPixelSize)
-            ?: return@withContext null
+            ?: return null
         if (ArtworkPlaceholderPolicy.isLikelyPlaceholder(bitmap)) {
             bitmap.recycle()
             imageFile.delete()
             metadataFile.delete()
-            return@withContext null
+            return null
         }
-        memory.put(key, bitmap)
-        trimDecodedEntries()
-        CachedArtwork(
+        val cached = CachedArtwork(
             bitmap = bitmap,
             quality = quality,
             createdAtMs = createdAt,
@@ -74,6 +96,9 @@ class ArtworkCache(context: Context) {
                 STABLE_REFRESH_MS
             )
         )
+        memory.put(key, cached)
+        trimDecodedEntries()
+        return cached
     }
 
     suspend fun store(
@@ -117,7 +142,15 @@ class ArtworkCache(context: Context) {
             metadata.delete()
             metadataTemp.renameTo(metadata)
         }
-        memory.put(key(artworkId, quality, maximumPixelSize), bitmap)
+        memory.put(
+            key(artworkId, quality, maximumPixelSize),
+            CachedArtwork(
+                bitmap = bitmap,
+                quality = quality,
+                createdAtMs = System.currentTimeMillis(),
+                requiresRefresh = false
+            )
+        )
         trimDecodedEntries()
         trimDisk()
     }

@@ -1,6 +1,9 @@
 package com.example.controllerapp
 
 import android.app.Application
+import android.animation.ValueAnimator
+import android.os.Build
+import android.os.PowerManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.controllerapp.model.AppExperienceMode
@@ -31,6 +34,8 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
     private val _displayedPositionMs = MutableStateFlow(0L)
     val displayedPositionMs: StateFlow<Long> = _displayedPositionMs.asStateFlow()
     private val uiVisible = MutableStateFlow(false)
+    private val _reduceAnimations = MutableStateFlow(false)
+    val reduceAnimations: StateFlow<Boolean> = _reduceAnimations.asStateFlow()
 
     init {
         viewModelScope.launch {
@@ -40,6 +45,7 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
                     continue
                 }
                 val state = playback.value
+                refreshPowerPolicy()
                 _displayedPositionMs.value = repository.displayedPositionMs()
                 if (!state.isPlaying) {
                     playback.first { next ->
@@ -52,7 +58,8 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
                 val interval = PlaybackClockPolicy.refreshIntervalMs(
                     uiVisible = true,
                     isPlaying = true,
-                    performanceMode = settings.value.performanceMode
+                    performanceMode = settings.value.performanceMode,
+                    systemPowerSaveMode = isPowerSaveMode()
                 ) ?: continue
                 delay(interval)
             }
@@ -61,7 +68,10 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
 
     fun setUiVisible(visible: Boolean) {
         uiVisible.value = visible
-        if (visible) _displayedPositionMs.value = repository.displayedPositionMs()
+        if (visible) {
+            refreshPowerPolicy()
+            _displayedPositionMs.value = repository.displayedPositionMs()
+        }
     }
 
     fun playPause() {
@@ -90,6 +100,10 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
 
     fun requestFullLyrics() {
         commands.requestFullLyrics()
+    }
+
+    fun ensureFullLyrics() {
+        commands.ensureFullLyrics()
     }
 
     fun retryLyrics() {
@@ -154,6 +168,7 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
 
     fun updatePerformanceMode(value: PlaybackPerformanceMode) {
         repository.updatePerformanceMode(value)
+        refreshPowerPolicy(value)
     }
 
     fun updateAutoReconnect(value: Boolean) {
@@ -181,4 +196,24 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
 
     suspend fun historyArtwork(artworkId: String) =
         repository.historyArtwork(artworkId)
+
+    private fun refreshPowerPolicy(
+        performanceMode: PlaybackPerformanceMode = settings.value.performanceMode
+    ) {
+        val animationsEnabled = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            ValueAnimator.areAnimatorsEnabled()
+        } else {
+            true
+        }
+        _reduceAnimations.value = !PlaybackClockPolicy.animationsEnabled(
+            performanceMode = performanceMode,
+            systemPowerSaveMode = isPowerSaveMode(),
+            systemAnimationsEnabled = animationsEnabled
+        )
+    }
+
+    private fun isPowerSaveMode(): Boolean =
+        getApplication<Application>()
+            .getSystemService(PowerManager::class.java)
+            ?.isPowerSaveMode == true
 }

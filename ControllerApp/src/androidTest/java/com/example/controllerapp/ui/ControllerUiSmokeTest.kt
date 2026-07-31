@@ -6,6 +6,7 @@ import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.test.core.app.ApplicationProvider
 import com.example.controllerapp.ControllerApplication
 import com.example.controllerapp.ControllerViewModel
@@ -38,14 +39,18 @@ class ControllerUiSmokeTest {
         compose.onNodeWithContentDescription("打开菜单").performClick()
         compose.onNodeWithText("设置").performClick()
         compose.onNodeWithText("性能模式").assertIsDisplayed()
-        compose.onNodeWithText("本地封面增强").assertIsDisplayed()
-        compose.onNodeWithText("调试").performClick()
+        compose.onNodeWithText("本地封面增强").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("调试").performScrollTo().performClick()
         compose.onNodeWithContentDescription("返回").performClick()
 
         compose.onNodeWithContentDescription("打开菜单").performClick()
         compose.onNodeWithText("调试工具").performClick()
-        compose.onNodeWithText("启动 RFCOMM 兼容模式").assertIsDisplayed()
-        compose.onNodeWithText("停止 RFCOMM 并恢复 BLE").assertIsDisplayed()
+        compose.onNodeWithText("启动 RFCOMM 兼容模式")
+            .performScrollTo()
+            .assertIsDisplayed()
+        compose.onNodeWithText("停止 RFCOMM 并恢复 BLE")
+            .performScrollTo()
+            .assertIsDisplayed()
         compose.onNodeWithContentDescription("返回").performClick()
 
         compose.onNodeWithContentDescription("打开菜单").performClick()

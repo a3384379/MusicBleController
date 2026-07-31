@@ -116,7 +116,9 @@ data class LyricsState(
     val trackId: String = "",
     val generation: Long = 0L,
     val currentText: String = "",
-    val lines: List<LyricLine> = emptyList(),
+    val windowLines: List<LyricLine> = emptyList(),
+    val partialFullLines: List<LyricLine> = emptyList(),
+    val fullLines: List<LyricLine> = emptyList(),
     val isFinal: Boolean = false,
     val currentLineIndex: Int = -1,
     val currentWordIndex: Int = -1,
@@ -125,8 +127,25 @@ data class LyricsState(
     val loadingStage: LyricLoadingStage = LyricLoadingStage.IDLE,
     val receivedChunks: Int = 0,
     val expectedChunks: Int = 0,
+    val transferId: String = "",
+    val protocolFormat: String = "",
+    val retryCount: Int = 0,
     val failureReason: String = ""
-)
+) {
+    /**
+     * The best lyrics currently available to the player UI.
+     *
+     * Keeping the three sources separate is important: a late five-line window must never
+     * replace a completed full-lyrics transfer. Callers that only need display data can keep
+     * using [lines], while the full-lyrics screen can inspect [isFinal] explicitly.
+     */
+    val lines: List<LyricLine>
+        get() = when {
+            fullLines.isNotEmpty() -> fullLines
+            partialFullLines.isNotEmpty() -> partialFullLines
+            else -> windowLines
+        }
+}
 
 enum class ArtworkQuality(val rank: Int) {
     PLACEHOLDER(0),
@@ -152,6 +171,7 @@ data class ArtworkState(
     val receivedChunks: Int = 0,
     val expectedChunks: Int = 0,
     val restoredSnapshot: Boolean = false,
+    val cacheRequiresRefresh: Boolean = false,
     val failureReason: String = "",
     val enhancementMessage: String = ""
 ) {
@@ -165,6 +185,7 @@ data class ArtworkState(
             receivedChunks == other.receivedChunks &&
             expectedChunks == other.expectedChunks &&
             restoredSnapshot == other.restoredSnapshot &&
+            cacheRequiresRefresh == other.cacheRequiresRefresh &&
             failureReason == other.failureReason &&
             enhancementMessage == other.enhancementMessage
     }
@@ -246,5 +267,6 @@ data class HistoryState(
     val sessions: List<PlaybackHistorySession> = emptyList(),
     val stats: Map<String, PlaybackStats> = emptyMap(),
     val loading: Boolean = false,
-    val status: String = ""
+    val status: String = "",
+    val hasMore: Boolean = true
 )
