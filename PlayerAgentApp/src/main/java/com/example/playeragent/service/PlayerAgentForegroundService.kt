@@ -24,6 +24,7 @@ import com.example.playeragent.StartupGuard
 import com.example.playeragent.ble.BleAdvertiserManager
 import com.example.playeragent.ble.BleGattServerManager
 import com.example.playeragent.ble.BleHealthSnapshot
+import com.example.playeragent.ble.MultiControllerPolicy
 import com.example.playeragent.ble.BleHealthState
 import com.example.playeragent.history.PlaybackHistoryMonitor
 import com.example.playeragent.logging.LogConfig
@@ -225,6 +226,7 @@ class PlayerAgentForegroundService : Service() {
                     advertiserManager?.getAdvertisingState()?.name ?: "none"
                 },
                 onAllClientsDisconnected = ::handleAllClientsDisconnected,
+                onControllerConnectionCountChanged = ::handleControllerConnectionCountChanged,
                 onPlaybackUiState = ::publishPlaybackUiState
             )
             if (manager.start()) {
@@ -398,6 +400,25 @@ class PlayerAgentForegroundService : Service() {
         if (snapshot.subscribedCount > 0 &&
             manager.notifyFailureCount() >= NOTIFY_FAILURE_RECOVERY_THRESHOLD
         ) {
+            val failingAddresses = manager.failingSubscriberAddresses(
+                NOTIFY_FAILURE_RECOVERY_THRESHOLD
+            )
+            if (MultiControllerPolicy.shouldIsolateOnlyFailingControllers(
+                    failingAddresses.size,
+                    snapshot.subscribedCount
+                )
+            ) {
+                val isolated = manager.disconnectSubscribers(
+                    failingAddresses,
+                    "notify_failures"
+                )
+                log(
+                    "[BleHealth] watchdog action=isolate_unhealthy_controllers " +
+                        "count=$isolated remaining=${snapshot.subscribedCount - isolated}"
+                )
+                publishBleHealthSnapshot("unhealthy controller isolated")
+                return
+            }
             manager.clearStaleSubscribers("notify_failures")
             restartAdvertisingFromWatchdog("notify_failures")
             recoverBleStack("notify_failures", respectCooldown = true)
@@ -545,6 +566,35 @@ class PlayerAgentForegroundService : Service() {
             },
             ADVERTISING_RESTORE_DIAG_DELAY_MS
         )
+    }
+
+    private fun handleControllerConnectionCountChanged(connectedCount: Int) {
+        mainHandler.post {
+            if (serviceStopping || !bluetoothAvailable || bluetoothAdapter?.isEnabled != true) {
+                return@post
+            }
+            val advertiser = advertiserManager ?: return@post
+            when {
+                !MultiControllerPolicy.hasConnectionCapacity(connectedCount) -> {
+                    log(
+                        "[BLE-ADV] stop reason=controller capacity full " +
+                            "connected=$connectedCount"
+                    )
+                    advertiser.stopAdvertising()
+                }
+                connectedCount > 0 -> {
+                    log(
+                        "[BLE-ADV] refresh reason=controller capacity available " +
+                            "connected=$connectedCount"
+                    )
+                    // Some vendor stacks silently stop legacy connectable
+                    // advertising after the first central connects. Refreshing
+                    // only at the 0 -> 1 / 2 -> 1 boundary keeps the remaining
+                    // slot discoverable without touching the GATT connection.
+                    advertiser.restartAdvertising("controller capacity available")
+                }
+            }
+        }
     }
 
     private fun startQrcWatcher() {

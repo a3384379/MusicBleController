@@ -39,6 +39,15 @@ private let FULL_LYRICS_REQUEST_DEDUP_WINDOW_MS: Int64 = 1_500
 private let FULL_LYRICS_REQUEST_START_TIMEOUT_MS: Int64 = 3_000
 private let FULL_LYRICS_REQUEST_START_MAX_RETRIES = 2
 
+enum CommandWriteSoftRecoveryPolicy {
+    static func shouldRetainPendingCommand(_ command: String) -> Bool {
+        // Pending commands have not reached CoreBluetooth yet. Dropping one here can
+        // strand higher-level deduplication state (for example lyric secondary modes),
+        // so the late-callback fence must retain every queued command.
+        true
+    }
+}
+
 struct LyricWord: Identifiable, Equatable {
     let id: Int
     let startMs: Int64
@@ -1940,8 +1949,11 @@ final class BLETestManager: NSObject, ObservableObject {
             volumeWriteInFlightSeq = nil
         }
         let pendingBefore = pendingCommandWrites.count
-        pendingCommandWrites.removeAll(where: { !$0.isControl })
-        let droppedBackground = pendingBefore - pendingCommandWrites.count
+        pendingCommandWrites.removeAll(where: {
+            !CommandWriteSoftRecoveryPolicy.shouldRetainPendingCommand($0.cmd)
+        })
+        let retainedBackground = pendingCommandWrites.filter { !$0.isControl }.count
+        let droppedPending = pendingBefore - pendingCommandWrites.count
         commandWriteRecoveryUntilMs = currentTimeMs() + COMMAND_WRITE_LATE_CALLBACK_FENCE_MS
         setConnectionHealth(
             .suspect,
@@ -1950,7 +1962,8 @@ final class BLETestManager: NSObject, ObservableObject {
         ctrlLog(
             "[CTRL-iOS] write soft recovery seq=\(seq) cmd=\(cmd) " +
                 "recentNotifyAgeMs=\(recentNotifyAgeMs) " +
-                "droppedBackground=\(droppedBackground)"
+                "retainedBackground=\(retainedBackground) " +
+                "droppedPending=\(droppedPending)"
         )
         scheduleCommandWriteRecoveryFlush()
     }

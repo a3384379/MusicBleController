@@ -3,6 +3,21 @@ package com.example.playeragent.ble
 import android.os.SystemClock
 import java.util.concurrent.ConcurrentHashMap
 
+internal object MultiControllerPolicy {
+    const val MAX_CONTROLLERS = 2
+
+    fun hasConnectionCapacity(connectedCount: Int): Boolean {
+        return connectedCount.coerceAtLeast(0) < MAX_CONTROLLERS
+    }
+
+    fun shouldIsolateOnlyFailingControllers(
+        failingCount: Int,
+        subscribedCount: Int
+    ): Boolean {
+        return failingCount > 0 && failingCount < subscribedCount
+    }
+}
+
 /**
  * Owns the retained full-lyrics transfer and its compressed payload cache.
  *
@@ -12,24 +27,31 @@ import java.util.concurrent.ConcurrentHashMap
 internal class LyricsTransferCoordinator(
     val compressedCache: CompressedLyricsCache = CompressedLyricsCache()
 ) {
-    @Volatile
-    private var retainedTransfer: FullLyricsBinaryTransfer? = null
+    private val retainedTransfers = ConcurrentHashMap<String, FullLyricsBinaryTransfer>()
 
     fun retain(transfer: FullLyricsBinaryTransfer) {
-        retainedTransfer = transfer
+        retainedTransfers[transferKey(transfer.ownerAddress, transfer.transferId)] = transfer
     }
 
-    fun retained(transferId: String): FullLyricsBinaryTransfer? {
-        return retainedTransfer?.takeIf { it.transferId == transferId }
+    fun retained(ownerAddress: String, transferId: String): FullLyricsBinaryTransfer? {
+        return retainedTransfers[transferKey(ownerAddress, transferId)]
     }
 
     fun reset() {
-        retainedTransfer = null
+        retainedTransfers.clear()
         compressedCache.clear()
     }
 
     fun clearRetryState() {
-        retainedTransfer = null
+        retainedTransfers.clear()
+    }
+
+    fun resetAddress(ownerAddress: String) {
+        retainedTransfers.entries.removeAll { it.value.ownerAddress == ownerAddress }
+    }
+
+    private fun transferKey(ownerAddress: String, transferId: String): String {
+        return "$ownerAddress|$transferId"
     }
 }
 
@@ -41,13 +63,23 @@ internal class AlbumArtTransferCoordinator {
 
     fun retain(transfer: AlbumArtBinaryTransfer, nowMs: Long = SystemClock.elapsedRealtime()) {
         retainedTransfers.entries.removeAll { it.value.expiresAtMs < nowMs }
-        retainedTransfers[transfer.transferId] = transfer
+        retainedTransfers[transferKey(transfer.ownerAddress, transfer.transferId)] = transfer
     }
 
-    fun retained(transferId: String): AlbumArtBinaryTransfer? = retainedTransfers[transferId]
+    fun retained(ownerAddress: String, transferId: String): AlbumArtBinaryTransfer? {
+        return retainedTransfers[transferKey(ownerAddress, transferId)]
+    }
+
+    fun resetAddress(ownerAddress: String) {
+        retainedTransfers.entries.removeAll { it.value.ownerAddress == ownerAddress }
+    }
 
     fun reset() {
         retainedTransfers.clear()
+    }
+
+    private fun transferKey(ownerAddress: String, transferId: String): String {
+        return "$ownerAddress|$transferId"
     }
 }
 
@@ -67,33 +99,97 @@ internal class ConnectionCommandCoordinator {
         val negotiated: Boolean = false
     )
 
-    @Volatile
-    var capabilities = Capabilities()
-        private set
+    private data class ClientSession(
+        val capabilities: Capabilities = Capabilities(),
+        val negotiationGeneration: Long = 0L,
+        val subscribedAtMs: Long = 0L
+    )
 
-    @Volatile
-    var negotiationGeneration: Long = 0L
-        private set
+    private val sessions = ConcurrentHashMap<String, ClientSession>()
 
-    fun beginNegotiation(): Long {
-        capabilities = Capabilities()
-        negotiationGeneration += 1
-        return negotiationGeneration
+    @Synchronized
+    fun beginNegotiation(address: String, nowMs: Long = SystemClock.elapsedRealtime()): Long {
+        val previous = sessions[address]
+        val session = ClientSession(
+            negotiationGeneration = (previous?.negotiationGeneration ?: 0L) + 1L,
+            subscribedAtMs = nowMs
+        )
+        sessions[address] = session
+        return session.negotiationGeneration
     }
 
-    fun accept(requested: Capabilities) {
-        capabilities = requested.copy(negotiated = true)
+    @Synchronized
+    fun accept(address: String, requested: Capabilities) {
+        val previous = sessions[address] ?: ClientSession()
+        sessions[address] = previous.copy(
+            capabilities = requested.copy(negotiated = true)
+        )
     }
 
-    fun useLegacyIfCurrent(generation: Long): Boolean {
-        if (generation != negotiationGeneration || capabilities.negotiated) return false
-        capabilities = capabilities.copy(negotiated = true)
+    @Synchronized
+    fun useLegacyIfCurrent(address: String, generation: Long): Boolean {
+        val session = sessions[address] ?: return false
+        if (generation != session.negotiationGeneration || session.capabilities.negotiated) {
+            return false
+        }
+        sessions[address] = session.copy(
+            capabilities = session.capabilities.copy(negotiated = true)
+        )
         return true
     }
 
-    fun invalidate() {
-        capabilities = Capabilities()
-        negotiationGeneration += 1
+    fun capabilities(address: String): Capabilities {
+        return sessions[address]?.capabilities ?: Capabilities()
+    }
+
+    fun subscribedAtMs(address: String): Long {
+        return sessions[address]?.subscribedAtMs ?: 0L
+    }
+
+    @Synchronized
+    fun invalidate(address: String) {
+        val session = sessions[address] ?: return
+        sessions[address] = session.copy(
+            capabilities = Capabilities(),
+            negotiationGeneration = session.negotiationGeneration + 1L
+        )
+    }
+
+    fun remove(address: String) {
+        sessions.remove(address)
+    }
+
+    fun clear() {
+        sessions.clear()
+    }
+}
+
+/**
+ * Prevents two controllers reacting to the same human action from toggling or
+ * skipping twice. Repeated commands from the same controller remain untouched.
+ */
+internal class MultiControllerCommandGate(
+    private val duplicateWindowMs: Long = 300L
+) {
+    private data class AcceptedCommand(val ownerAddress: String, val acceptedAtMs: Long)
+
+    private val acceptedByCommand = ConcurrentHashMap<String, AcceptedCommand>()
+
+    @Synchronized
+    fun shouldExecute(command: String, ownerAddress: String, nowMs: Long): Boolean {
+        val previous = acceptedByCommand[command]
+        val duplicateFromAnotherController = previous != null &&
+            previous.ownerAddress != ownerAddress &&
+            nowMs - previous.acceptedAtMs in 0..duplicateWindowMs
+        if (duplicateFromAnotherController) {
+            return false
+        }
+        acceptedByCommand[command] = AcceptedCommand(ownerAddress, nowMs)
+        return true
+    }
+
+    fun reset() {
+        acceptedByCommand.clear()
     }
 }
 
@@ -104,7 +200,8 @@ internal data class FullLyricsBinaryTransfer(
     val start: BleNotifyQueue.Packet,
     val chunks: List<BleNotifyQueue.Packet>,
     val end: BleNotifyQueue.Packet,
-    val expiresAtMs: Long
+    val expiresAtMs: Long,
+    val ownerAddress: String = ""
 )
 
 internal data class AlbumArtBinaryTransfer(
@@ -114,7 +211,8 @@ internal data class AlbumArtBinaryTransfer(
     val start: BleNotifyQueue.Packet,
     val chunks: List<BleNotifyQueue.Packet>,
     val end: BleNotifyQueue.Packet,
-    val expiresAtMs: Long
+    val expiresAtMs: Long,
+    val ownerAddress: String = ""
 )
 
 internal enum class AlbumArtQuality(val wireValue: String) {

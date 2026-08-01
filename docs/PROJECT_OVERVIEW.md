@@ -28,13 +28,13 @@
 ## 总体数据流
 
 1. Sony `PlayerAgentForegroundService` 启动 GATT Server、advertising、QRC watcher、播放历史监控。
-2. iPhone `BLETestManager` 作为 Central 扫描 `SonyPlayerAgent`，连接服务 `0000A001...`。
-3. iPhone 向 command characteristic 写 JSON 命令。
+2. iPhone `BLETestManager` 和 Android `ControllerConnectionService` 可同时作为 Central 扫描并连接 `SonyPlayerAgent`（最多两个控制端）。
+3. 控制端向 command characteristic 写 JSON 命令；直接响应按来源设备路由，权威播放状态广播给全部订阅端。
 4. Sony 从 MediaSession / Notification / QRC 缓存读取状态，通过 status characteristic notify JSON 或二进制封面 chunk。
 5. iPhone 更新主播放器、全屏歌词、诊断页、Live Activity。
 6. Live Activity Extension 只读取 `ContentState` 和 App Group 缩略图，不访问 BLE。
-7. Android `ControllerConnectionService` 可替代 iPhone 作为 Central，使用同一 BLE V2
-   协议更新 Compose 界面和 MediaStyle 通知；同一时刻只连接一个控制端。
+7. Android `ControllerConnectionService` 使用同一 BLE V2 协议更新 Compose 界面和
+   MediaStyle 通知，可与 iPhone 同时在线并保持控制与媒体状态同步。
 
 ## 关键状态
 

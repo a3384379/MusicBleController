@@ -787,7 +787,19 @@ class QrcLyricCacheManager(
             }
             val groupId = objectValue.optString("groupId")
             val qrcLastModified = objectValue.optLong("qrcLastModified")
-            val lines = readLines(objectValue.optJSONArray("lines") ?: JSONArray())
+            val cacheBuildVersion = objectValue.optInt("cacheBuildVersion", 0)
+            val cachedLines = readLines(objectValue.optJSONArray("lines") ?: JSONArray())
+            val lines = if (cacheBuildVersion < QRC_CACHE_BUILD_VERSION) {
+                if (cachedLines.any { it.words.isNotEmpty() }) {
+                    logger(
+                        "[QrcCache] discard legacy word timing build=$cacheBuildVersion " +
+                            "required=$QRC_CACHE_BUILD_VERSION groupId=$groupId"
+                    )
+                }
+                cachedLines.map { it.copy(words = emptyList()) }
+            } else {
+                cachedLines
+            }
             if (lines.isEmpty()) {
                 return CacheReadResult(rejectReason = "lines empty")
             }
@@ -821,14 +833,18 @@ class QrcLyricCacheManager(
                     lines = lines,
                     schemaVersion = schemaVersion,
                     qrcPath = objectValue.optString("qrcPath"),
-                    wordTimingStatus = QrcWordTimingStatus.fromValue(
-                        objectValue.optString(
-                            "wordTimingStatus",
-                            QrcWordTimingStatus.fromLines(lines).name
+                    wordTimingStatus = if (cacheBuildVersion < QRC_CACHE_BUILD_VERSION) {
+                        QrcWordTimingStatus.fromLines(lines)
+                    } else {
+                        QrcWordTimingStatus.fromValue(
+                            objectValue.optString(
+                                "wordTimingStatus",
+                                QrcWordTimingStatus.fromLines(lines).name
+                            )
                         )
-                    ),
+                    },
                     groupFingerprint = readFingerprint(objectValue),
-                    cacheBuildVersion = objectValue.optInt("cacheBuildVersion", 0),
+                    cacheBuildVersion = cacheBuildVersion,
                     translationParseFailed = objectValue.optBoolean(
                         "translationParseFailed",
                         false

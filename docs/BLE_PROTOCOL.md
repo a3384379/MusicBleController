@@ -33,7 +33,7 @@
 
 ## 命令数据流
 
-1. iOS 将 JSON 写到 command characteristic，字段通常包含 `cmd`、`time`、`seq`。
+1. iOS 或 Android Controller 将 JSON 写到 command characteristic，字段通常包含 `cmd`、`time`、`seq`。
 2. Sony `onCharacteristicWriteRequest` 解析 JSON。
 3. Sony `handleCommand` 执行控制、状态查询或长任务。
 4. Sony 通过 status characteristic notify JSON 状态，或用二进制 notify 发送 AlbumArt chunk。
@@ -66,11 +66,22 @@
 - `lyricDiagnostic`
 - `historyPayloadStart` / `historyPayloadChunk` / `historyPayloadEnd`
 
+## 双控制器会话
+
+- Sony 最多接受两个 status notify 订阅端；第三个订阅会返回失败并断开，不影响已有连接。
+- 每台控制器独立保存 capability、协商代次、MTU、发送节奏、歌词/封面等待请求和重传记录；任一设备退订或断开只清理自己的状态。
+- `PING`、能力 ACK、歌词、封面、历史、日志和诊断等请求响应只发送给命令来源设备。
+- `playbackState`、`trackInfo`、`currentWord`、`volumeState` 和 `albumArtOffer` 属于 Sony 权威状态，自动推送或控制完成后广播给全部订阅端。
+- 两台设备在 300ms 内发出相同 `PLAY_PAUSE`、`NEXT` 或 `PREVIOUS` 时只执行一次，避免双切换；seek 和音量仍按到达顺序执行并以最后状态为准。
+- 压缩歌词正文和已编码 JPEG 缓存全局共享，但分包、transferId、generation、CRC 和局部重传按设备隔离。
+- notify 成功、失败和退避按设备统计；仅一端连续失败时只断开该端，所有订阅端同时异常时才重建 Sony BLE 栈。
+- 第一个 Central 连接后会刷新 connectable advertising，第二个连接占满容量后停止 advertising；任一端断开后重新开放剩余连接位。
+
 ## 关键状态
 
 - Sony `BleNotifyQueue` 使用四级优先级：P0 控制/状态/逐字，P1 lyricWindow/preview，P2 完整歌词/secondary，P3 HQ/历史/日志。
 - 队列的 enqueue、notify callback、超时、取消和抢占全部收敛到专用 `HandlerThread`；不要从 Binder/媒体线程直接修改队列状态。
-- P0 每包可抢占；P2 每 4 包为 P1 让路；P3 每包让路。同优先级 FIFO，切歌按任务 generation 取消旧歌词/封面。
+- P0 每包可抢占；P2 每 4 包为 P1 让路；P3 每包让路。同优先级的大传输按设备轮转，单台设备内部保持 FIFO；切歌按任务 generation 取消旧歌词/封面。
 - iOS 控制命令在连接不健康时会丢弃，不缓存，不重连后补发。
 - AlbumArt binary 使用 Sony 端 `ALBUM_ART_BINARY_MAGIC` 和 6 字节 header；iOS 在 `didUpdateValueFor` 中把非 JSON 二进制 chunk 转交给 `AlbumArtReceiver`。
 

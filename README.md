@@ -97,8 +97,9 @@ flowchart LR
 The Sony device is the authoritative media source. `PlayerAgentApp` reads
 MediaSession, notifications and QQ Music's local QRC cache. The iOS and Android
 apps are interchangeable BLE controllers, caches and presentation layers; only
-one controller should connect to a Sony device at a time. No external server is
-required.
+up to two controllers can stay connected to one Sony device at the same time.
+Direct replies return to the requester while authoritative playback, lyric and
+artwork state is synchronized to both controllers. No external server is required.
 
 ## Compatibility
 

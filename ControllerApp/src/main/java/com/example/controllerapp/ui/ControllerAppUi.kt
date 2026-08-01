@@ -2,12 +2,14 @@ package com.example.controllerapp.ui
 
 import android.content.Intent
 import android.graphics.Bitmap
+import android.os.Build
 import android.text.format.DateUtils
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -26,6 +28,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -79,25 +82,35 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.BlurredEdgeTreatment
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -138,7 +151,6 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.max
-import kotlin.math.sin
 
 private object Routes {
     const val PLAYER = "player"
@@ -196,23 +208,12 @@ private fun PlayerScreen(
     val reduceAnimations by viewModel.reduceAnimations.collectAsStateWithLifecycle()
 
     Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        artwork.bitmap?.let { bitmap ->
-            Image(
-                bitmap = bitmap.asImageBitmap(),
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize()
-            )
-        }
-        Box(
-            Modifier.fillMaxSize().background(
-                Brush.verticalGradient(
-                    listOf(
-                        Color(0xe8090b10),
-                        Color(0xb5090b10),
-                        Color(0xff090b10)
-                    )
-                )
+        ArtworkAtmosphereBackground(
+            bitmap = artwork.bitmap,
+            overlayColors = listOf(
+                Color(0xd8090b10),
+                Color(0xaa090b10),
+                Color(0xff090b10)
             )
         )
         CompositionLocalProvider(
@@ -246,6 +247,35 @@ private fun PlayerScreen(
             }
         }
     }
+}
+
+@Composable
+private fun ArtworkAtmosphereBackground(
+    bitmap: Bitmap?,
+    overlayColors: List<Color>
+) {
+    bitmap?.takeIf { Build.VERSION.SDK_INT >= Build.VERSION_CODES.S }?.let {
+        Image(
+            bitmap = it.asImageBitmap(),
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize()
+                .graphicsLayer {
+                    scaleX = 1.14f
+                    scaleY = 1.14f
+                    alpha = 0.76f
+                }
+                .blur(
+                    radius = 34.dp,
+                    edgeTreatment = BlurredEdgeTreatment.Unbounded
+                )
+        )
+    }
+    Box(
+        Modifier.fillMaxSize().background(
+            Brush.verticalGradient(overlayColors)
+        )
+    )
 }
 
 @Composable
@@ -512,8 +542,10 @@ private fun PlayerControlsPanel(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
-        Spectrum(
-            playing = playback.isPlaying,
+        NaturalSpectrum(
+            playback = playback,
+            lyrics = lyrics,
+            settings = settings,
             positionMs = positionMs,
             animated = !reduceAnimations
         )
@@ -565,23 +597,88 @@ private fun PlayerControlsPanel(
 }
 
 @Composable
-private fun Spectrum(playing: Boolean, positionMs: Long, animated: Boolean) {
-    val phase = if (playing && animated) positionMs / 90f else 0f
-    Canvas(Modifier.fillMaxWidth().height(30.dp).padding(horizontal = 56.dp)) {
-        val bars = 20
-        val spacing = size.width / bars
-        repeat(bars) { index ->
-            val amplitude = if (playing) {
-                0.25f + (sin(phase + index * 0.8f) + 1f) * 0.28f
-            } else {
-                0.18f
-            }
-            val barHeight = size.height * amplitude
-            drawLine(
-                color = Color.White.copy(alpha = 0.48f),
-                start = Offset(index * spacing + spacing / 2, size.height / 2 - barHeight / 2),
-                end = Offset(index * spacing + spacing / 2, size.height / 2 + barHeight / 2),
-                strokeWidth = max(2f, spacing * 0.32f)
+private fun NaturalSpectrum(
+    playback: PlaybackState,
+    lyrics: LyricsState,
+    settings: ControllerSettings,
+    positionMs: Long,
+    animated: Boolean
+) {
+    val lyricPositionMs = positionMs + settings.lyricOffsetMs
+    val linePosition = currentLineIndex(
+        lyrics.lines,
+        lyricPositionMs,
+        lyrics.currentLineIndex
+    )
+    val line = lyrics.lines.getOrNull(linePosition)
+    val wordPosition = line?.let { LyricTimeline.currentWordPosition(it, lyricPositionMs) } ?: -1
+    val engine = remember(playback.trackId) { NaturalSpectrumEngine() }
+    val framePosition = if (animated) positionMs else 0L
+    val levels = remember(
+        playback.trackId,
+        framePosition,
+        playback.isPlaying,
+        line?.index,
+        wordPosition,
+        animated
+    ) {
+        engine.levels(
+            SpectrumFrame(
+                trackSeed = playback.trackId.ifBlank { "waiting" },
+                positionMs = framePosition,
+                playing = playback.isPlaying && animated,
+                lyricProgress = line?.let {
+                    LyricTimeline.lineProgress(it, lyricPositionMs)
+                } ?: 0f,
+                wordSignature = if (animated && line != null) {
+                    "${line.index}:$wordPosition"
+                } else {
+                    ""
+                }
+            )
+        )
+    }
+    val accent = MaterialTheme.colorScheme.primary
+    val opacity = when {
+        playback.isPlaying && animated -> 0.72f
+        playback.isPlaying -> 0.32f
+        else -> 0.22f
+    }
+    Canvas(
+        Modifier.fillMaxWidth(0.58f)
+            .height(32.dp)
+            .padding(vertical = 4.dp)
+            .testTag("natural_spectrum")
+    ) {
+        if (levels.isEmpty()) return@Canvas
+        val spacing = size.width / levels.size
+        val gap = (spacing * 0.30f).coerceIn(2f, 4f)
+        val barWidth = (spacing - gap).coerceAtLeast(2.4f)
+        val centerY = size.height / 2f
+        drawLine(
+            brush = Brush.horizontalGradient(
+                listOf(Color.Transparent, accent.copy(alpha = opacity * 0.28f), Color.Transparent)
+            ),
+            start = Offset(0f, centerY),
+            end = Offset(size.width, centerY),
+            strokeWidth = 1.2f
+        )
+        levels.forEachIndexed { index, level ->
+            val height = (size.height * (0.10f + level * 0.84f)).coerceAtMost(size.height)
+            val top = centerY - height / 2f
+            val left = index * spacing + (spacing - barWidth) / 2f
+            drawRoundRect(
+                brush = Brush.verticalGradient(
+                    colors = listOf(
+                        accent.copy(alpha = opacity),
+                        accent.copy(alpha = opacity * 0.42f)
+                    ),
+                    startY = top,
+                    endY = top + height
+                ),
+                topLeft = Offset(left, top),
+                size = Size(barWidth, height),
+                cornerRadius = CornerRadius(barWidth / 2f, barWidth / 2f)
             )
         }
     }
@@ -602,11 +699,11 @@ private fun CompactLyrics(
     val previous = lyrics.lines.getOrNull(currentIndex - 1)
     val current = lyrics.lines.getOrNull(currentIndex)
     val next = lyrics.lines.getOrNull(currentIndex + 1)
-    Card(
-        onClick = onClick,
-        colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.055f)),
-        shape = RoundedCornerShape(20.dp),
-        modifier = Modifier.fillMaxWidth().height(178.dp).testTag("compact_lyrics")
+    Box(
+        modifier = Modifier.fillMaxWidth()
+            .height(172.dp)
+            .clickable(onClick = onClick)
+            .testTag("compact_lyrics")
     ) {
         Column(
             Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 12.dp),
@@ -623,9 +720,9 @@ private fun CompactLyrics(
             )
             if (current != null) {
                 WordHighlightedText(current, positionMs + settings.lyricOffsetMs)
-                auxiliaryText(current, settings.lyricDisplayMode)?.let {
+                lyricAuxiliaryLines(current, settings.lyricDisplayMode).take(2).forEach { text ->
                     Text(
-                        it,
+                        text,
                         color = MaterialTheme.colorScheme.primary.copy(alpha = 0.72f),
                         fontSize = 12.sp,
                         maxLines = 1,
@@ -656,36 +753,41 @@ private fun CompactLyrics(
 }
 
 @Composable
-private fun WordHighlightedText(line: LyricLine, positionMs: Long) {
-    val completed = line.words.indexOfLast { positionMs >= it.startMs + it.durationMs }
-    val active = line.words.indexOfLast { positionMs >= it.startMs }.coerceAtLeast(0)
-    val value = if (line.words.isEmpty()) {
-        buildAnnotatedString { append(line.text) }
-    } else {
-        buildAnnotatedString {
-            line.words.forEachIndexed { index, word ->
-                withStyle(
-                    SpanStyle(
-                        color = when {
-                            index <= completed -> Color.White
-                            index == active -> Color(0xffb9c7ff)
-                            else -> Color.White.copy(alpha = 0.45f)
-                        },
-                        fontWeight = if (index == active) FontWeight.Bold else FontWeight.Medium
+private fun WordHighlightedText(
+    line: LyricLine,
+    positionMs: Long,
+    modifier: Modifier = Modifier,
+    fontSizeValue: Int = if (line.text.length > 42) 16 else 20,
+    lineHeightValue: Int = if (line.text.length > 42) 21 else 26,
+    textAlign: TextAlign = TextAlign.Center,
+    highlightColor: Color = Color.White,
+    pendingColor: Color = Color.White.copy(alpha = 0.45f)
+) {
+    val characterProgresses = LyricTimeline.characterProgresses(line, positionMs)
+    val value = buildAnnotatedString {
+        line.text.forEachIndexed { index, character ->
+            withStyle(
+                SpanStyle(
+                    color = lerp(
+                        pendingColor,
+                        highlightColor,
+                        characterProgresses.getOrElse(index) { 0f }
                     )
-                ) {
-                    append(word.text)
-                }
+                )
+            ) {
+                append(character)
             }
         }
     }
     Text(
         value,
-        fontSize = if (line.text.length > 42) 16.sp else 20.sp,
-        lineHeight = if (line.text.length > 42) 21.sp else 26.sp,
+        modifier = modifier,
+        fontSize = fontSizeValue.sp,
+        lineHeight = lineHeightValue.sp,
+        fontWeight = FontWeight.SemiBold,
         maxLines = 3,
         overflow = TextOverflow.Ellipsis,
-        textAlign = TextAlign.Center
+        textAlign = textAlign
     )
 }
 
@@ -825,7 +927,10 @@ private fun FullLyricsScreen(
     viewModel: ControllerViewModel,
     navController: NavHostController
 ) {
+    val connection by viewModel.connection.collectAsStateWithLifecycle()
+    val playback by viewModel.playback.collectAsStateWithLifecycle()
     val lyrics by viewModel.lyrics.collectAsStateWithLifecycle()
+    val artwork by viewModel.artwork.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val position by viewModel.displayedPositionMs.collectAsStateWithLifecycle()
     val displayLines = lyrics.lines
@@ -836,144 +941,446 @@ private fun FullLyricsScreen(
     )
     val listState = rememberLazyListState()
     var following by remember { mutableStateOf(true) }
+    var selectedLinePosition by remember { mutableStateOf<Int?>(null) }
     var programmaticScroll by remember { mutableStateOf(false) }
-    var resumeFollowToken by remember { mutableStateOf(0) }
+    var resumeFollowToken by remember { mutableIntStateOf(0) }
+    val isDragged by listState.interactionSource.collectIsDraggedAsState()
+    val nearestVisibleLine by remember(displayLines) {
+        derivedStateOf {
+            val layout = listState.layoutInfo
+            val viewportCenter = (layout.viewportStartOffset + layout.viewportEndOffset) / 2
+            LyricBrowsePolicy.nearestLine(
+                layout.visibleItemsInfo.map { item ->
+                    LyricViewportItem(
+                        linePosition = item.index,
+                        centerPx = item.offset + item.size / 2
+                    )
+                },
+                viewportCenterPx = viewportCenter
+            )
+        }
+    }
+    val lyricViewportHeight by remember {
+        derivedStateOf {
+            (listState.layoutInfo.viewportEndOffset -
+                listState.layoutInfo.viewportStartOffset).coerceAtLeast(0)
+        }
+    }
+    val lyricTopPaddingPx = with(LocalDensity.current) { 132.dp.roundToPx() }
     LaunchedEffect(lyrics.trackId, lyrics.isFinal) {
         if (lyrics.trackId.isNotBlank() && !lyrics.isFinal) {
             viewModel.ensureFullLyrics()
         }
     }
-    LaunchedEffect(current, following, lyrics.isFinal) {
-        if (following && current >= 0 && current < displayLines.size) {
+    LaunchedEffect(lyrics.trackId) {
+        following = true
+        selectedLinePosition = null
+        resumeFollowToken = 0
+    }
+    LaunchedEffect(current, following, lyrics.isFinal, lyricViewportHeight) {
+        if (following && lyricViewportHeight > 0 && current >= 0 && current < displayLines.size) {
             programmaticScroll = true
             try {
-                val loadingHeaderOffset = if (lyrics.isFinal) 0 else 1
                 listState.animateScrollToItem(
-                    current + loadingHeaderOffset,
-                    scrollOffset = -180
+                    current,
+                    scrollOffset = -(
+                        lyricViewportHeight / 2 - 56 - lyricTopPaddingPx
+                    ).coerceAtLeast(0)
                 )
             } finally {
                 programmaticScroll = false
             }
         }
     }
-    LaunchedEffect(listState.isScrollInProgress, programmaticScroll) {
-        if (listState.isScrollInProgress && !programmaticScroll) {
+    LaunchedEffect(isDragged) {
+        if (isDragged && !programmaticScroll) {
             following = false
             resumeFollowToken += 1
+        } else if (!following && !programmaticScroll) {
+            resumeFollowToken += 1
+        }
+    }
+    LaunchedEffect(nearestVisibleLine, following) {
+        if (!following && nearestVisibleLine != null) {
+            selectedLinePosition = nearestVisibleLine
         }
     }
     LaunchedEffect(resumeFollowToken) {
         if (resumeFollowToken > 0) {
             delay(4_000L)
             following = true
+            selectedLinePosition = null
         }
     }
-    Scaffold(
-        topBar = {
-            ControllerTopBar(
-                title = "完整歌词",
-                navController = navController,
-                action = {
-                    TextButton(onClick = { following = !following }) {
-                        Text(if (following) "跟随中" else "恢复跟随")
-                    }
-                }
+
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        ArtworkAtmosphereBackground(
+            bitmap = artwork.bitmap,
+            overlayColors = listOf(
+                Color(0xe8090b10),
+                Color(0xc8090b10),
+                Color(0xff090b10)
             )
-        }
-    ) { padding ->
-        if (displayLines.isEmpty()) {
-            EmptyState(
-                title = lyricStageText(lyrics.loadingStage),
-                message = lyrics.failureReason.ifBlank { "正在等待 Sony 解析 QQ 音乐歌词" },
-                action = "重新请求",
-                onAction = viewModel::retryLyrics,
-                modifier = Modifier.padding(padding)
-            )
-        } else {
-            LazyColumn(
-                state = listState,
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                    top = padding.calculateTopPadding() + 120.dp,
-                    bottom = padding.calculateBottomPadding() + 240.dp,
-                    start = 22.dp,
-                    end = 22.dp
-                ),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                if (!lyrics.isFinal) {
-                    item(key = "full-lyrics-loading") {
-                        Card(
-                            colors = CardDefaults.cardColors(
-                                containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)
-                            ),
-                            modifier = Modifier.fillMaxWidth()
+        )
+        Scaffold(
+            containerColor = Color.Transparent,
+            topBar = {
+                ControllerTopBar(
+                    title = "歌词",
+                    navController = navController,
+                    transparent = true,
+                    action = {
+                        TextButton(
+                            onClick = {
+                                following = true
+                                selectedLinePosition = null
+                            },
+                            enabled = !following
                         ) {
-                            Row(
-                                Modifier.fillMaxWidth().padding(14.dp),
-                                verticalAlignment = Alignment.CenterVertically
+                            Text(if (following) "跟随中" else "回到当前")
+                        }
+                    }
+                )
+            }
+        ) { padding ->
+            CompositionLocalProvider(LocalContentColor provides Color.White) {
+                Column(
+                    Modifier.fillMaxSize()
+                        .padding(padding)
+                        .padding(horizontal = 20.dp)
+                ) {
+                Text(
+                    playback.title.ifBlank { "等待 QQ 音乐" },
+                    fontSize = 19.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    playback.artist,
+                    fontSize = 13.sp,
+                    color = Color.White.copy(alpha = 0.58f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(12.dp))
+                LyricModeSelector(
+                    selected = settings.lyricDisplayMode,
+                    onSelected = viewModel::updateLyricMode
+                )
+                secondaryMissingMessage(
+                    lines = displayLines,
+                    mode = settings.lyricDisplayMode,
+                    isFinal = lyrics.isFinal
+                )?.let { message ->
+                    Text(
+                        message,
+                        fontSize = 12.sp,
+                        color = Color.White.copy(alpha = 0.56f),
+                        modifier = Modifier.padding(top = 7.dp)
+                    )
+                }
+                AnimatedVisibility(!lyrics.isFinal && displayLines.isNotEmpty()) {
+                    FullLyricsLoadingBanner(lyrics, settings, viewModel::retryLyrics)
+                }
+
+                if (displayLines.isEmpty()) {
+                    EmptyState(
+                        title = lyricStageText(lyrics.loadingStage),
+                        message = lyrics.failureReason.ifBlank {
+                            "正在等待 Sony 解析 QQ 音乐歌词"
+                        },
+                        action = "重新请求",
+                        onAction = viewModel::retryLyrics,
+                        modifier = Modifier.weight(1f)
+                    )
+                } else {
+                    Box(Modifier.weight(1f).fillMaxWidth()) {
+                        LazyColumn(
+                            state = listState,
+                            contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                                top = 132.dp,
+                                bottom = 178.dp,
+                                start = 2.dp,
+                                end = 2.dp
+                            ),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxSize().testTag("full_lyrics_list")
+                        ) {
+                            itemsIndexed(displayLines, key = { _, line -> line.index }) {
+                                    linePosition, line ->
+                                val isCurrent = linePosition == current
+                                val isBrowseSelected = !following &&
+                                    linePosition == selectedLinePosition
+                                FullLyricRow(
+                                    line = line,
+                                    positionMs = position + settings.lyricOffsetMs,
+                                    displayMode = settings.lyricDisplayMode,
+                                    isCurrent = isCurrent,
+                                    isBrowseSelected = isBrowseSelected,
+                                    connected = connection.connected,
+                                    onSelect = {
+                                        val result = LyricBrowsePolicy.onLineTapped(
+                                            browsing = !following,
+                                            selectedLinePosition = selectedLinePosition,
+                                            tappedLinePosition = linePosition,
+                                            lineTimeMs = line.timeMs,
+                                            connected = connection.connected
+                                        )
+                                        following = false
+                                        selectedLinePosition = result.selectedLinePosition
+                                        resumeFollowToken += 1
+                                        result.seekPositionMs?.let { seekPosition ->
+                                            viewModel.seekTo(seekPosition)
+                                            following = true
+                                            selectedLinePosition = null
+                                        }
+                                    },
+                                    onSeek = {
+                                        if (connection.connected) {
+                                            viewModel.seekTo(line.timeMs)
+                                            following = true
+                                            selectedLinePosition = null
+                                        }
+                                    }
+                                )
+                            }
+                        }
+                        if (!following) {
+                            Box(
+                                Modifier.align(Alignment.CenterStart)
+                                    .width(3.dp)
+                                    .height(48.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xff8ee6a3))
+                            )
+                            Surface(
+                                onClick = {
+                                    following = true
+                                    selectedLinePosition = null
+                                },
+                                shape = RoundedCornerShape(50),
+                                color = Color.Black.copy(alpha = 0.46f),
+                                modifier = Modifier.align(Alignment.TopEnd).padding(top = 8.dp)
                             ) {
-                                Column(Modifier.weight(1f)) {
-                                    Text(
-                                        lyricStageText(lyrics.loadingStage),
-                                        fontWeight = FontWeight.Medium
-                                    )
-                                    Text(
-                                        if (settings.experienceMode != AppExperienceMode.DEBUG) {
-                                            "正在获取完整歌词，当前内容可先浏览"
-                                        } else {
-                                            when {
-                                                lyrics.partialFullLines.isNotEmpty() ->
-                                                    "已接收 ${lyrics.partialFullLines.size} 行，完成后自动替换"
-                                                lyrics.windowLines.isNotEmpty() ->
-                                                    "当前仅展示 ${lyrics.windowLines.size} 行歌词窗口"
-                                                else -> "正在等待 Sony 返回完整歌词"
-                                            }
-                                        },
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                                TextButton(onClick = viewModel::retryLyrics) { Text("重试") }
+                                Text(
+                                    "回到当前歌词",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                                )
                             }
                         }
                     }
                 }
-                items(displayLines, key = LyricLine::index) { line ->
-                    val selected = line.index == displayLines.getOrNull(current)?.index
-                    Column(
-                        Modifier.fillMaxWidth()
-                            .clip(RoundedCornerShape(14.dp))
-                            .clickable { viewModel.seekTo(line.timeMs) }
-                            .background(
-                                if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
-                                else Color.Transparent
-                            )
-                            .padding(12.dp)
-                    ) {
-                        if (selected) {
-                            WordHighlightedText(line, position + settings.lyricOffsetMs)
-                        } else {
-                            Text(
-                                line.text,
-                                fontSize = if (line.text.length > 48) 16.sp else 19.sp,
-                                lineHeight = 25.sp,
-                                color = MaterialTheme.colorScheme.onSurface.copy(
-                                    alpha = if (line.timeMs < position) 0.48f else 0.76f
-                                )
-                            )
-                        }
-                        auxiliaryText(line, settings.lyricDisplayMode)?.let {
-                            Text(
-                                it,
-                                fontSize = 13.sp,
-                                lineHeight = 18.sp,
-                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
-                            )
-                        }
-                    }
+                    FullLyricsControls(
+                        isPlaying = playback.isPlaying,
+                        enabled = connection.connected,
+                        onPrevious = viewModel::previous,
+                        onPlayPause = viewModel::playPause,
+                        onNext = viewModel::next
+                    )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun LyricModeSelector(
+    selected: LyricDisplayMode,
+    onSelected: (LyricDisplayMode) -> Unit
+) {
+    val options = listOf(
+        LyricDisplayMode.ORIGINAL to "原文",
+        LyricDisplayMode.ORIGINAL_TRANSLATION to "翻译",
+        LyricDisplayMode.ORIGINAL_ROMANIZATION to "罗马音",
+        LyricDisplayMode.ALL to "全部"
+    )
+    Row(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color.White.copy(alpha = 0.07f))
+            .padding(3.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp)
+    ) {
+        options.forEach { (mode, label) ->
+            Surface(
+                onClick = { onSelected(mode) },
+                shape = RoundedCornerShape(11.dp),
+                color = if (selected == mode) {
+                    Color.White.copy(alpha = 0.17f)
+                } else {
+                    Color.Transparent
+                },
+                contentColor = Color.White,
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(
+                    label,
+                    fontSize = 12.sp,
+                    fontWeight = if (selected == mode) FontWeight.Bold else FontWeight.Medium,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(vertical = 8.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun FullLyricsLoadingBanner(
+    lyrics: LyricsState,
+    settings: ControllerSettings,
+    retry: () -> Unit
+) {
+    Row(
+        Modifier.fillMaxWidth().padding(top = 8.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.10f))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(lyricStageText(lyrics.loadingStage), fontSize = 12.sp, fontWeight = FontWeight.Medium)
+            if (settings.experienceMode == AppExperienceMode.DEBUG) {
+                Text(
+                    if (lyrics.expectedChunks > 0) {
+                        "${lyrics.receivedChunks}/${lyrics.expectedChunks} 分片 · ${lyrics.protocolFormat}"
+                    } else {
+                        "${lyrics.partialFullLines.size} 行 · ${lyrics.protocolFormat}"
+                    },
+                    fontSize = 10.sp,
+                    color = Color.White.copy(alpha = 0.50f)
+                )
+            }
+        }
+        TextButton(onClick = retry) { Text("重试", fontSize = 12.sp) }
+    }
+}
+
+@Composable
+private fun FullLyricRow(
+    line: LyricLine,
+    positionMs: Long,
+    displayMode: LyricDisplayMode,
+    isCurrent: Boolean,
+    isBrowseSelected: Boolean,
+    connected: Boolean,
+    onSelect: () -> Unit,
+    onSeek: () -> Unit
+) {
+    Row(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(15.dp))
+            .clickable(onClick = onSelect)
+            .background(
+                when {
+                    isBrowseSelected -> Color.White.copy(alpha = 0.105f)
+                    isCurrent -> Color(0xff8ee6a3).copy(alpha = 0.075f)
+                    else -> Color.Transparent
+                }
+            )
+            .padding(horizontal = 12.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (isCurrent) {
+                WordHighlightedText(
+                    line = line,
+                    positionMs = positionMs,
+                    modifier = Modifier.fillMaxWidth(),
+                    fontSizeValue = if (line.text.length > 48) 21 else 26,
+                    lineHeightValue = if (line.text.length > 48) 27 else 33,
+                    textAlign = TextAlign.Start,
+                    highlightColor = Color(0xff8ee6a3),
+                    pendingColor = Color.White.copy(alpha = if (isBrowseSelected) 0.60f else 0.34f)
+                )
+            } else {
+                Text(
+                    line.text,
+                    fontSize = if (line.text.length > 48) 17.sp else if (isBrowseSelected) 22.sp else 20.sp,
+                    lineHeight = if (line.text.length > 48) 23.sp else 28.sp,
+                    fontWeight = if (isBrowseSelected) FontWeight.SemiBold else FontWeight.Medium,
+                    color = Color.White.copy(alpha = if (isBrowseSelected) 0.92f else 0.43f),
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            lyricAuxiliaryLines(line, displayMode).forEach { auxiliary ->
+                Text(
+                    auxiliary,
+                    fontSize = if (isCurrent) 15.sp else 14.sp,
+                    lineHeight = if (isCurrent) 20.sp else 19.sp,
+                    fontWeight = if (isBrowseSelected) FontWeight.SemiBold else FontWeight.Medium,
+                    color = Color.White.copy(
+                        alpha = when {
+                            isCurrent -> 0.70f
+                            isBrowseSelected -> 0.62f
+                            else -> 0.32f
+                        }
+                    ),
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+        if (isBrowseSelected) {
+            Spacer(Modifier.width(10.dp))
+            Surface(
+                onClick = onSeek,
+                enabled = connected,
+                shape = RoundedCornerShape(50),
+                color = Color.White.copy(alpha = 0.14f),
+                modifier = Modifier.testTag("lyric_seek_time_${line.index}")
+                    .semantics { contentDescription = "跳转到 ${formatDuration(line.timeMs)}" }
+            ) {
+                Row(
+                    Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Icon(Icons.Default.PlayArrow, null, Modifier.size(13.dp))
+                    Text(
+                        formatDuration(line.timeMs),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FullLyricsControls(
+    isPlaying: Boolean,
+    enabled: Boolean,
+    onPrevious: () -> Unit,
+    onPlayPause: () -> Unit,
+    onNext: () -> Unit
+) {
+    Row(
+        Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 14.dp),
+        horizontalArrangement = Arrangement.spacedBy(30.dp, Alignment.CenterHorizontally),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        IconButton(enabled = enabled, onClick = onPrevious) {
+            Icon(Icons.Default.SkipPrevious, "上一首", Modifier.size(30.dp))
+        }
+        FilledIconButton(
+            enabled = enabled,
+            onClick = onPlayPause,
+            modifier = Modifier.size(58.dp)
+        ) {
+            Icon(
+                if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                if (isPlaying) "暂停" else "播放",
+                Modifier.size(32.dp)
+            )
+        }
+        IconButton(enabled = enabled, onClick = onNext) {
+            Icon(Icons.Default.SkipNext, "下一首", Modifier.size(30.dp))
         }
     }
 }
@@ -1638,10 +2045,22 @@ private fun DiagnosticText(title: String, text: String) {
 private fun ControllerTopBar(
     title: String,
     navController: NavHostController,
+    transparent: Boolean = false,
     action: @Composable (() -> Unit)? = null
 ) {
     CenterAlignedTopAppBar(
         title = { Text(title) },
+        colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
+            containerColor = if (transparent) Color.Transparent else MaterialTheme.colorScheme.surface,
+            scrolledContainerColor = if (transparent) {
+                Color.Black.copy(alpha = 0.72f)
+            } else {
+                MaterialTheme.colorScheme.surface
+            },
+            navigationIconContentColor = if (transparent) Color.White else MaterialTheme.colorScheme.onSurface,
+            titleContentColor = if (transparent) Color.White else MaterialTheme.colorScheme.onSurface,
+            actionIconContentColor = if (transparent) Color.White else MaterialTheme.colorScheme.onSurface
+        ),
         navigationIcon = {
             IconButton(onClick = { navController.popBackStack() }) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回")
@@ -1716,11 +2135,31 @@ private fun currentLineIndex(
     serverIndex: Int
 ): Int = LyricTimeline.currentLinePosition(lines, positionMs, serverIndex)
 
-private fun auxiliaryText(line: LyricLine, mode: LyricDisplayMode): String? =
+private fun lyricAuxiliaryLines(line: LyricLine, mode: LyricDisplayMode): List<String> =
     buildList {
         if (mode.showsTranslation) line.translation?.takeIf(String::isNotBlank)?.let(::add)
         if (mode.showsRomanization) line.romanization?.takeIf(String::isNotBlank)?.let(::add)
-    }.takeIf { it.isNotEmpty() }?.joinToString(" · ")
+    }
+
+private fun secondaryMissingMessage(
+    lines: List<LyricLine>,
+    mode: LyricDisplayMode,
+    isFinal: Boolean
+): String? {
+    if (!isFinal || lines.isEmpty() || mode == LyricDisplayMode.ORIGINAL) return null
+    val translationMissing = mode.showsTranslation && lines.none {
+        !it.translation.isNullOrBlank()
+    }
+    val romanizationMissing = mode.showsRomanization && lines.none {
+        !it.romanization.isNullOrBlank()
+    }
+    return when {
+        translationMissing && romanizationMissing -> "该歌曲暂无翻译和罗马音"
+        translationMissing -> "该歌曲暂无翻译"
+        romanizationMissing -> "该歌曲暂无罗马音"
+        else -> null
+    }
+}
 
 private fun formatDuration(milliseconds: Long): String =
     DateUtils.formatElapsedTime(milliseconds.coerceAtLeast(0L) / 1_000L)

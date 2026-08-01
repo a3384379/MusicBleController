@@ -6,6 +6,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CapabilityAndTimelineTest {
@@ -64,5 +65,66 @@ class CapabilityAndTimelineTest {
         )
         assertEquals(0, LyricTimeline.currentWordPosition(line, 399))
         assertEquals(1, LyricTimeline.currentWordPosition(line, 400))
+        assertEquals(0.5f, LyricTimeline.lineProgress(line, 500), 0.001f)
+        assertEquals(0f, LyricTimeline.lineProgress(line, -100), 0.001f)
+        assertEquals(1f, LyricTimeline.lineProgress(line, 2_000), 0.001f)
+    }
+
+    @Test
+    fun `karaoke character progress uses word duration and preserves separators`() {
+        val line = LyricLine(
+            index = 1,
+            timeMs = 1_000,
+            durationMs = 1_200,
+            text = "hello world",
+            words = listOf(
+                LyricWord(0, 1_000, 500, "hello"),
+                LyricWord(1, 1_600, 500, "world")
+            )
+        )
+
+        val midwayFirstWord = LyricTimeline.characterProgresses(line, 1_250)
+        assertEquals(1f, midwayFirstWord[0], 0.001f)
+        assertEquals(1f, midwayFirstWord[1], 0.001f)
+        assertEquals(0.5f, midwayFirstWord[2], 0.001f)
+        assertEquals(0f, midwayFirstWord[4], 0.001f)
+        assertEquals(0f, midwayFirstWord[6], 0.001f)
+
+        val betweenWords = LyricTimeline.characterProgresses(line, 1_550)
+        assertEquals(1f, betweenWords[4], 0.001f)
+        assertEquals(1f, betweenWords[5], 0.001f)
+        assertEquals(0f, betweenWords[6], 0.001f)
+    }
+
+    @Test
+    fun `karaoke progress falls back to line timing without words`() {
+        val line = LyricLine(
+            index = 2,
+            timeMs = 2_000,
+            durationMs = 1_000,
+            text = "歌词"
+        )
+
+        val midway = LyricTimeline.characterProgresses(line, 2_250)
+        assertEquals(0.5f, midway[0], 0.001f)
+        assertEquals(0f, midway[1], 0.001f)
+        assertTrue(LyricTimeline.characterProgresses(line, 3_000).all { it == 1f })
+    }
+
+    @Test
+    fun `karaoke ignores invalid doubled QRC word clock and uses line clock`() {
+        val line = LyricLine(
+            index = 3,
+            timeMs = 100_000,
+            durationMs = 4_000,
+            text = "abcd",
+            words = listOf(LyricWord(0, 200_000, 500, "abcd"))
+        )
+
+        val midway = LyricTimeline.characterProgresses(line, 102_000)
+        assertEquals(1f, midway[0], 0.001f)
+        assertEquals(1f, midway[1], 0.001f)
+        assertEquals(0f, midway[2], 0.001f)
+        assertEquals(0f, midway[3], 0.001f)
     }
 }

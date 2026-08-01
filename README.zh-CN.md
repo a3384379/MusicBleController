@@ -78,8 +78,9 @@ flowchart LR
     iOS --> Live["锁屏实时活动 / 灵动岛"]
 ```
 
-Sony 端是播放状态、歌词和封面的权威数据源，iPhone 与 Android App 是可替换的
-控制、缓存和展示端（同一时刻只建议连接一个控制端）：
+Sony 端是播放状态、歌词和封面的权威数据源，iPhone 与 Android App 是对等的
+控制、缓存和展示端；同一台 Sony 最多可同时连接两个控制端。查询和大文件传输只返回
+给发起设备，播放状态、歌曲信息、逐字进度、音量和封面 Offer 会同步给两个控制端：
 
 1. Sony `PlayerAgentApp` 启动 BLE GATT Server，并监听 QQ 音乐状态与本地 QRC 文件；
 2. iPhone `BLETestManager` 或 Android `ControllerConnectionService` 扫描并连接

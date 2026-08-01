@@ -103,7 +103,7 @@ enum class QrcWordTimingStatus {
 
 const val QRC_CACHE_SCHEMA_V1 = 1
 const val QRC_CACHE_SCHEMA_V2 = 2
-const val QRC_CACHE_BUILD_VERSION = 3
+const val QRC_CACHE_BUILD_VERSION = 4
 
 data class LyricCacheStats(
     val l1Hit: Long = 0,
@@ -748,19 +748,26 @@ object QrcLyricUtils {
         }
 
         val words = matches.mapIndexedNotNull { index, match ->
-            val relativeStartMs = match.groupValues.getOrNull(1)?.toLongOrNull()
+            val encodedStartMs = match.groupValues.getOrNull(1)?.toLongOrNull()
                 ?: return@mapIndexedNotNull null
             val durationMs = match.groupValues.getOrNull(2)?.toLongOrNull()
                 ?: return@mapIndexedNotNull null
-            val textStart = match.range.last + 1
-            val textEnd = matches.getOrNull(index + 1)?.range?.first ?: body.length
+            // QQ QRC places the timing marker after the word it describes. The encoded start
+            // is normally an absolute playback position, although a few older files use a
+            // line-relative value.
+            val textStart = matches.getOrNull(index - 1)?.range?.last?.plus(1) ?: 0
+            val textEnd = match.range.first
             val wordText = body.substring(textStart, textEnd)
                 .replace(QRC_WORD_TIME_REGEX, "")
             if (wordText.isBlank()) {
                 null
             } else {
                 QrcLyricWord(
-                    startMs = lineStartMs + relativeStartMs,
+                    startMs = if (encodedStartMs < lineStartMs) {
+                        lineStartMs + encodedStartMs
+                    } else {
+                        encodedStartMs
+                    },
                     durationMs = durationMs,
                     text = wordText
                 )

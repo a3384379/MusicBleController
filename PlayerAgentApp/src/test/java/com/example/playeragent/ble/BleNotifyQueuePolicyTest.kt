@@ -25,7 +25,7 @@ class BleNotifyQueuePolicyTest {
     }
 
     @Test
-    fun bulkYieldsToInteractiveEveryFourPacketsAndKeepsFifoPeers() {
+    fun bulkYieldsToInteractiveEveryFourPackets() {
         assertFalse(
             BleNotifyQueue.shouldYieldForPriorities(
                 BleNotifyQueue.Priority.P2_BULK,
@@ -47,6 +47,48 @@ class BleNotifyQueuePolicyTest {
                 packetsSinceYield = 10
             )
         )
+    }
+
+    @Test
+    fun equalPriorityBulkTransfersRotateBetweenControllers() {
+        assertFalse(
+            BleNotifyQueue.shouldYieldToPeerAtSamePriority(
+                BleNotifyQueue.Priority.P2_BULK,
+                packetsSinceYield = 3,
+                anotherDeviceWaiting = true
+            )
+        )
+        assertTrue(
+            BleNotifyQueue.shouldYieldToPeerAtSamePriority(
+                BleNotifyQueue.Priority.P2_BULK,
+                packetsSinceYield = 4,
+                anotherDeviceWaiting = true
+            )
+        )
+        assertTrue(
+            BleNotifyQueue.shouldYieldToPeerAtSamePriority(
+                BleNotifyQueue.Priority.P3_BACKGROUND,
+                packetsSinceYield = 1,
+                anotherDeviceWaiting = true
+            )
+        )
+        assertFalse(
+            BleNotifyQueue.shouldYieldToPeerAtSamePriority(
+                BleNotifyQueue.Priority.P0_REALTIME,
+                packetsSinceYield = 10,
+                anotherDeviceWaiting = true
+            )
+        )
+    }
+
+    @Test
+    fun interleavedStateCoalescingIsScopedByController() {
+        val iosKey = BleNotifyQueue.interleavedPacketKey("ios", "currentWord")
+        val androidKey = BleNotifyQueue.interleavedPacketKey("android", "currentWord")
+
+        assertEquals("ios|currentWord", iosKey)
+        assertEquals("android|currentWord", androidKey)
+        assertFalse(iosKey == androidKey)
     }
 
     @Test

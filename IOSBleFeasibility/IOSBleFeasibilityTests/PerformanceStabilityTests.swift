@@ -4,6 +4,22 @@ import XCTest
 @testable import sonyMusic
 
 final class PerformanceStabilityTests: XCTestCase {
+    func testSoftWriteRecoveryRetainsQueuedMediaRequests() {
+        XCTAssertTrue(
+            CommandWriteSoftRecoveryPolicy.shouldRetainPendingCommand(
+                "GET_LYRIC_SECONDARY"
+            )
+        )
+        XCTAssertTrue(
+            CommandWriteSoftRecoveryPolicy.shouldRetainPendingCommand(
+                "ALBUM_ART_REQUEST"
+            )
+        )
+        XCTAssertTrue(
+            CommandWriteSoftRecoveryPolicy.shouldRetainPendingCommand("PING")
+        )
+    }
+
     func testCurrentWordOrderingFenceRejectsDuplicatesAndSmallRegression() {
         var fence = CurrentWordOrderingFence()
         XCTAssertTrue(fence.shouldAccept(generation: 7, sequence: 1, positionMs: 1_000))
