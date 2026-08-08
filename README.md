@@ -68,6 +68,8 @@ devices without a cloud service:
 
 - **Synced QQ Music lyrics** — parses encrypted QRC lyrics, including word-level
   timing, translation and romanization where available.
+- **Automatic lyric timing** — maps Sony and iPhone monotonic clocks to compensate
+  BLE queueing and delivery latency while retaining a manual fine-tune control.
 - **Fast album art** — preview-first BLE delivery, HQ background upgrades,
   CRC validation and stale-while-revalidate caching.
 - **Remote playback controls** — play/pause, next, previous, seek and volume.

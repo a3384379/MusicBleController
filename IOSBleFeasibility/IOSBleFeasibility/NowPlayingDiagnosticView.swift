@@ -156,6 +156,33 @@ struct NowPlayingDiagnosticView: View {
                 diagnosticRow("轻量词丢弃", "\(snapshot.currentWord.dropCount) 次")
                 diagnosticRow("平均间隔", "\(snapshot.currentWord.averageUpdateIntervalMs)ms")
                 diagnosticRow("最近延迟", "\(snapshot.currentWord.lastLatencyMs)ms")
+                diagnosticRow(
+                    "自动校时",
+                    snapshot.currentWord.automaticSyncEnabled ? "开启" : "关闭"
+                )
+                diagnosticRow(
+                    "自动补偿",
+                    "\(snapshot.currentWord.automaticCompensationMs)ms"
+                )
+                diagnosticRow("人工微调", "\(snapshot.currentWord.manualFineTuneMs)ms")
+                if snapshot.currentWord.legacyFallbackMs != 0 {
+                    diagnosticRow(
+                        "旧协议补偿",
+                        "\(snapshot.currentWord.legacyFallbackMs)ms"
+                    )
+                }
+                diagnosticRow(
+                    "校时质量",
+                    snapshot.currentWord.clockSyncConfident ? "可信" : "采样中"
+                )
+                diagnosticRow(
+                    "校时 RTT",
+                    "\(snapshot.currentWord.clockBestRoundTripMs)ms"
+                )
+                diagnosticRow(
+                    "校时抖动",
+                    "\(snapshot.currentWord.clockOffsetJitterMs)ms"
+                )
             }
         }
     }

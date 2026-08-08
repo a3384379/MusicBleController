@@ -95,6 +95,7 @@ internal class ConnectionCommandCoordinator {
         val fullLyricsZlib: Boolean = false,
         val lyricWindow: Boolean = false,
         val ping: Boolean = false,
+        val clockSyncV1: Boolean = false,
         val transferRetry: Boolean = false,
         val negotiated: Boolean = false
     )

@@ -33,18 +33,36 @@ private let CONNECTION_DISPLAY_CONNECTED_MIN_HOLD_MS: Int64 = 5_000
 private let CONNECTION_DISPLAY_DISCONNECTED_CONFIRM_MS: Int64 = 1_000
 private let COMMAND_WRITE_CALLBACK_TIMEOUT_MS: Int64 = 2_500
 private let COMMAND_WRITE_RECENT_NOTIFY_GRACE_MS: Int64 = 3_000
-private let COMMAND_WRITE_LATE_CALLBACK_FENCE_MS: Int64 = 1_000
 private let COMMAND_WRITE_TIMEOUTS_BEFORE_RECONNECT = 2
+private let FOREGROUND_LINK_VALIDATION_TIMEOUT_MS: Int64 = 5_000
+private let FOREGROUND_INFLIGHT_SETTLE_TIMEOUT_MS: Int64 = 3_000
 private let FULL_LYRICS_REQUEST_DEDUP_WINDOW_MS: Int64 = 1_500
 private let FULL_LYRICS_REQUEST_START_TIMEOUT_MS: Int64 = 3_000
 private let FULL_LYRICS_REQUEST_START_MAX_RETRIES = 2
+private let CLOCK_SYNC_BOOTSTRAP_SAMPLE_COUNT = 5
+private let CLOCK_SYNC_REFRESH_SAMPLE_COUNT = 3
+private let CLOCK_SYNC_SAMPLE_SPACING_MS: Int64 = 150
+private let CLOCK_SYNC_REFRESH_INTERVAL_MS: Int64 = 120_000
+private let CLOCK_SYNC_PROBE_TTL_MS: Int64 = 5_000
 
-enum CommandWriteSoftRecoveryPolicy {
-    static func shouldRetainPendingCommand(_ command: String) -> Bool {
-        // Pending commands have not reached CoreBluetooth yet. Dropping one here can
-        // strand higher-level deduplication state (for example lyric secondary modes),
-        // so the late-callback fence must retain every queued command.
-        true
+enum CommandWriteTimeoutAction: Equatable {
+    case suspendUntilForeground
+    case extendWithoutAdvancingQueue
+    case reconnect
+}
+
+enum CommandWriteTimeoutPolicy {
+    static func action(
+        appIsActive: Bool,
+        transportReady: Bool,
+        timeoutCountAfterIncrement: Int,
+        reconnectThreshold: Int
+    ) -> CommandWriteTimeoutAction {
+        guard appIsActive else { return .suspendUntilForeground }
+        guard transportReady else { return .reconnect }
+        return timeoutCountAfterIncrement < reconnectThreshold
+            ? .extendWithoutAdvancingQueue
+            : .reconnect
     }
 }
 
@@ -117,6 +135,12 @@ private struct LyricSecondaryTransfer {
     var lines: [Int: LyricSecondaryLineParts]
 }
 
+private struct ClockSyncProbe {
+    let sequence: UInt64
+    let clientSendElapsedMs: Int64
+    let clientSendDate: Date
+}
+
 final class BLETestManager: NSObject, ObservableObject {
     private static let logTimestampFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -165,6 +189,8 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var mediaFieldDumpCopyStatus = ""
     @Published private(set) var isMediaFieldDumpReceiving = false
     @Published private(set) var mediaFieldDumpProgressText = ""
+    @Published private(set) var automaticLyricSyncEnabled =
+        PreferencesStore.shared.automaticLyricSyncEnabled
     @Published private(set) var karaokeOffsetMs: Int64 = Int64(PreferencesStore.shared.lyricOffsetMs)
     @Published private(set) var localLogActionStatus = ""
     @Published private(set) var liveActivityControlStatus = LiveActivityControlStatus()
@@ -210,6 +236,11 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var currentWordDropCount: Int64 = 0
     @Published private(set) var currentWordAverageUpdateIntervalMs: Int64 = 0
     @Published private(set) var currentWordLastLatencyMs: Int64 = 0
+    @Published private(set) var lyricAutomaticCompensationMs: Int64 = 0
+    @Published private(set) var lyricClockBestRoundTripMs: Int64 = 0
+    @Published private(set) var lyricClockOffsetJitterMs: Int64 = 0
+    @Published private(set) var lyricClockSampleCount = 0
+    @Published private(set) var lyricClockSyncConfident = false
 
     let connectionStateModel = ObservableStateSlice(BLEConnectionViewState())
     let playbackStateModel = ObservableStateSlice(BLEPlaybackViewState())
@@ -247,8 +278,6 @@ final class BLETestManager: NSObject, ObservableObject {
     private var commandWriteInflight: [CommandWriteInfo] = []
     private var pendingCommandWrites: [PendingCommandWrite] = []
     private var commandWriteTimeoutWorkItem: DispatchWorkItem?
-    private var commandWriteRecoveryWorkItem: DispatchWorkItem?
-    private var commandWriteRecoveryUntilMs: Int64 = 0
     private var consecutiveCommandWriteTimeouts = 0
     private var volumeWriteInFlightSeq: UInt64?
     private var lastVolumeSendAtMs: Int64 = 0
@@ -266,6 +295,14 @@ final class BLETestManager: NSObject, ObservableObject {
     private var lastMainHeartbeatAtMs: Int64 = 0
     private var lastMainHeartbeatAppState = "active"
     private var appLifecycleState = "active"
+    private var lifecycleGeneration: UInt64 = 0
+    private var backgroundEnteredAt: Date?
+    private var foregroundValidationPending = false
+    private var foregroundValidationWaitingForInflight = false
+    private var foregroundValidationCommandSeq: UInt64?
+    private var foregroundValidationStartedAt: Date?
+    private var foregroundValidationTimeoutWorkItem: DispatchWorkItem?
+    private var foregroundInflightSettleWorkItem: DispatchWorkItem?
     private var firstConnectionReadyAtMs: Int64 = 0
     private var lastKaraokeOffsetLogAtMs: Int64 = 0
     private var currentTrackID = ""
@@ -328,7 +365,9 @@ final class BLETestManager: NSObject, ObservableObject {
     private var trackInfoExpectedChunks = 0
     private var trackInfoChunks: [Int: Data] = [:]
     private var basePlaybackPositionMs: Int64 = 0
-    private var playbackStateReceivedAt = Date()
+    private var playbackAnchorElapsedMs = Int64(
+        (ProcessInfo.processInfo.systemUptime * 1_000).rounded()
+    )
     private var progressTimer: Timer?
     private var lastCurrentWordReceivedAtMs: Int64 = 0
     private var currentWordIntervalTotalMs: Int64 = 0
@@ -379,9 +418,18 @@ final class BLETestManager: NSObject, ObservableObject {
     private var reconnectStateSyncRequestedFullLyricsTrackIDs: Set<String> = []
     private var connectionReadyAt: Date?
     private var lastHealthProbeAt: Date?
+    private var healthProbeCommandSeq: UInt64?
     private var healthProbeStartedAt: Date?
     private var healthPingClockProbeStartedAt: Date?
     private var sonyClockOffsetMs: Int64?
+    private var serverSupportsClockSyncV1 = false
+    private var clockSynchronizer = MonotonicClockSynchronizer()
+    private var sonyUnixMinusElapsedMs: Int64?
+    private var clockSyncProbes: [String: ClockSyncProbe] = [:]
+    private var clockSyncBootstrapWorkItems: [DispatchWorkItem] = []
+    private var clockSyncRefreshWorkItem: DispatchWorkItem?
+    private var remotePlaybackSpeed = 1.0
+    private var lastStaleRemoteAnchorLogAtMs: Int64 = 0
     private var healthProbeFailureCount = 0
     private var serverProtocolVersion = 1
     private var serverSupportsFullLyricsZlib = false
@@ -561,6 +609,7 @@ final class BLETestManager: NSObject, ObservableObject {
     private func syncPreferencesStateFromStore() {
         appExperienceMode = preferences.appExperienceMode
         autoReconnectEnabled = preferences.autoReconnectEnabled
+        automaticLyricSyncEnabled = preferences.automaticLyricSyncEnabled
         karaokeOffsetMs = Int64(preferences.lyricOffsetMs)
     }
 
@@ -1143,6 +1192,8 @@ final class BLETestManager: NSObject, ObservableObject {
         healthCheckWorkItem?.cancel()
         healthProbeTimeoutWorkItem?.cancel()
         subscribeNotifyTimeoutWorkItem?.cancel()
+        foregroundValidationTimeoutWorkItem?.cancel()
+        foregroundInflightSettleWorkItem?.cancel()
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -1480,7 +1531,15 @@ final class BLETestManager: NSObject, ObservableObject {
                 pushCount: currentWordPushCount,
                 dropCount: currentWordDropCount,
                 averageUpdateIntervalMs: currentWordAverageUpdateIntervalMs,
-                lastLatencyMs: currentWordLastLatencyMs
+                lastLatencyMs: currentWordLastLatencyMs,
+                automaticSyncEnabled: automaticLyricSyncEnabled,
+                automaticCompensationMs: lyricAutomaticCompensationMs,
+                manualFineTuneMs: karaokeOffsetMs,
+                legacyFallbackMs: legacyLyricFallbackOffsetMs,
+                clockBestRoundTripMs: lyricClockBestRoundTripMs,
+                clockOffsetJitterMs: lyricClockOffsetJitterMs,
+                clockSampleCount: lyricClockSampleCount,
+                clockSyncConfident: lyricClockSyncConfident
             ),
             connection: connection,
             selfHealing: selfHealing
@@ -1491,7 +1550,17 @@ final class BLETestManager: NSObject, ObservableObject {
         let normalized = min(max(value, -2_000), 2_000)
         preferences.lyricOffsetMs = Int(normalized)
         karaokeOffsetMs = normalized
-        log("[Lyrics-iOS] karaoke offsetMs=\(value)")
+        log("[Lyrics-iOS] manual fine tune offsetMs=\(value)")
+    }
+
+    func setAutomaticLyricSyncEnabled(_ enabled: Bool) {
+        guard automaticLyricSyncEnabled != enabled else { return }
+        preferences.automaticLyricSyncEnabled = enabled
+        automaticLyricSyncEnabled = enabled
+        if !enabled {
+            lyricAutomaticCompensationMs = 0
+        }
+        log("[Lyrics-iOS] automatic sync enabled=\(enabled)")
     }
 
     func refreshLiveActivityAppearance() {
@@ -1553,7 +1622,124 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     func karaokePositionMs(rawPositionMs: Int64) -> Int64 {
-        rawPositionMs + karaokeOffsetMs
+        rawPositionMs + karaokeOffsetMs + legacyLyricFallbackOffsetMs
+    }
+
+    private var legacyLyricFallbackOffsetMs: Int64 {
+        automaticLyricSyncEnabled &&
+            !serverSupportsClockSyncV1 &&
+            karaokeOffsetMs == 0
+            ? 600
+            : 0
+    }
+
+    private func resolveRemotePlaybackAnchor(
+        object: [String: Any],
+        remotePositionMs: Int64,
+        timestampMs: Int64 = 0,
+        isPlaying: Bool
+    ) -> RemotePlaybackAnchorResolution {
+        guard automaticLyricSyncEnabled else {
+            return .unavailable
+        }
+        let parsedSpeed = Self.doubleValue(object["speed"])
+        let speed = parsedSpeed.isFinite && parsedSpeed > 0
+            ? parsedSpeed
+            : remotePlaybackSpeed
+        let sampleElapsedMs = Self.int64Value(object["sampleMono"])
+        if sampleElapsedMs > 0 {
+            let resolved = RemotePlaybackAnchorPolicy.resolve(
+                remotePositionMs: remotePositionMs,
+                serverSampleElapsedMs: sampleElapsedMs,
+                localReceiveElapsedMs: monotonicTimeMs(),
+                playbackSpeed: speed,
+                isPlaying: isPlaying,
+                durationMs: durationMs,
+                synchronizer: clockSynchronizer
+            )
+            if resolved != .unavailable {
+                return resolved
+            }
+        }
+        if timestampMs > 0,
+           serverSupportsClockSyncV1,
+           lyricClockSyncConfident,
+           let sonyUnixMinusElapsedMs {
+            let bridgedServerSampleElapsedMs = timestampMs - sonyUnixMinusElapsedMs
+            let resolved = RemotePlaybackAnchorPolicy.resolve(
+                remotePositionMs: remotePositionMs,
+                serverSampleElapsedMs: bridgedServerSampleElapsedMs,
+                localReceiveElapsedMs: monotonicTimeMs(),
+                playbackSpeed: speed,
+                isPlaying: isPlaying,
+                durationMs: durationMs,
+                synchronizer: clockSynchronizer
+            )
+            if resolved != .unavailable {
+                return resolved
+            }
+        }
+        if timestampMs > 0,
+           let sonyClockOffsetMs,
+           !serverSupportsClockSyncV1 || lyricClockSyncConfident {
+            let mappedSampleTimeMs = timestampMs - sonyClockOffsetMs
+            let measuredAgeMs = currentTimeMs() - mappedSampleTimeMs
+            return RemotePlaybackAnchorPolicy.resolve(
+                remotePositionMs: remotePositionMs,
+                measuredTransportAgeMs: measuredAgeMs,
+                playbackSpeed: speed,
+                isPlaying: isPlaying,
+                durationMs: durationMs
+            )
+        }
+        return .unavailable
+    }
+
+    private func calibratedRemotePosition(
+        from resolution: RemotePlaybackAnchorResolution,
+        remotePositionMs: Int64,
+        source: String
+    ) -> Int64? {
+        switch resolution {
+        case .unavailable:
+            lyricAutomaticCompensationMs = 0
+            return remotePositionMs
+        case let .stale(transportAgeMs):
+            lyricAutomaticCompensationMs = transportAgeMs
+            let nowMs = currentTimeMs()
+            if nowMs - lastStaleRemoteAnchorLogAtMs >= 1_000 {
+                lastStaleRemoteAnchorLogAtMs = nowMs
+                log(
+                    "[ClockSync] stale anchor discarded source=\(source) " +
+                        "ageMs=\(transportAgeMs) positionMs=\(remotePositionMs)"
+                )
+            }
+            return nil
+        case let .resolved(targetPositionMs, transportAgeMs):
+            lyricAutomaticCompensationMs = automaticLyricSyncEnabled
+                ? transportAgeMs
+                : 0
+            return RemotePlaybackAnchorPolicy.smoothedPosition(
+                currentPositionMs: displayPositionMs,
+                targetPositionMs: targetPositionMs
+            )
+        }
+    }
+
+    private func locallyResolvedWord(
+        positionMs: Int64
+    ) -> (lineIndex: Int, wordIndex: Int, text: String)? {
+        guard isSameTrackId(incoming: fullLyricsTrackId, current: currentTrackID),
+              let arrayIndex = currentLyricIndex(lines: fullLyrics, positionMs: positionMs),
+              fullLyrics.indices.contains(arrayIndex) else {
+            return nil
+        }
+        let line = fullLyrics[arrayIndex]
+        var wordIndex = -1
+        for (index, word) in line.words.enumerated() where word.startMs <= positionMs {
+            wordIndex = index
+        }
+        return (line.index, wordIndex, line.text)
     }
 
     func resolveCurrentLyric(
@@ -1612,7 +1798,10 @@ final class BLETestManager: NSObject, ObservableObject {
         guard now - lastKaraokeOffsetLogAtMs >= 3_000 else { return }
         lastKaraokeOffsetLogAtMs = now
         log(
-            "[Lyrics-iOS] karaoke offsetMs=\(karaokeOffsetMs) " +
+            "[Lyrics-iOS] automaticSync=\(automaticLyricSyncEnabled) " +
+                "autoCompensationMs=\(lyricAutomaticCompensationMs) " +
+                "manualOffsetMs=\(karaokeOffsetMs) " +
+                "legacyFallbackMs=\(legacyLyricFallbackOffsetMs) " +
                 "rawPosition=\(rawPositionMs) " +
                 "effectivePosition=\(karaokePositionMs(rawPositionMs: rawPositionMs))"
         )
@@ -1771,7 +1960,12 @@ final class BLETestManager: NSObject, ObservableObject {
         let startMs = currentTimeMs()
         var payload = extra
         payload["cmd"] = cmd
-        payload["time"] = startMs
+        // Capability payloads sit close to the common 182-byte ATT limit.
+        // Their wall-clock field was never consumed by Sony, so omit it to
+        // leave room for additive capability flags without fragmenting writes.
+        if cmd != "CLIENT_CAPABILITIES" {
+            payload["time"] = startMs
+        }
         payload["seq"] = seq
 
         let connected = sonyPeripheral?.state == .connected
@@ -1829,7 +2023,10 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     private func enqueueCommandWrite(_ request: PendingCommandWrite) {
-        if request.isControl,
+        if foregroundValidationPending,
+           foregroundValidationCommandSeq == request.seq {
+            pendingCommandWrites.insert(request, at: 0)
+        } else if request.isControl,
            let firstBackgroundIndex = pendingCommandWrites.firstIndex(where: { !$0.isControl }) {
             pendingCommandWrites.insert(request, at: firstBackgroundIndex)
         } else {
@@ -1845,9 +2042,11 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     private func flushCommandWriteQueue() {
-        let nowMs = currentTimeMs()
-        guard nowMs >= commandWriteRecoveryUntilMs else {
-            scheduleCommandWriteRecoveryFlush()
+        // Background execution is opportunistic. Keep queued synchronization
+        // work frozen until foreground, while still allowing a user initiated
+        // Live Activity control (which is ordered ahead of background work).
+        if appLifecycleState != "active",
+           pendingCommandWrites.first?.isControl != true {
             return
         }
         guard commandWriteInflight.isEmpty,
@@ -1894,12 +2093,30 @@ final class BLETestManager: NSObject, ObservableObject {
         }
         log("[BLE] write requested \(request.payloadText)")
         scheduleCommandWriteTimeout(seq: request.seq, cmd: request.cmd)
+        if healthProbeCommandSeq == request.seq {
+            startHealthProbeResponseTimeout(seq: request.seq, command: request.cmd)
+        }
+        if foregroundValidationPending,
+           foregroundValidationCommandSeq == request.seq {
+            startForegroundValidationTimeout(seq: request.seq)
+        }
     }
 
     private func scheduleCommandWriteTimeout(seq: UInt64, cmd: String) {
         commandWriteTimeoutWorkItem?.cancel()
+        guard appLifecycleState == "active" else {
+            commandWriteTimeoutWorkItem = nil
+            ctrlLog(
+                "[CTRL-iOS] write timeout suspended seq=\(seq) cmd=\(cmd) " +
+                    "appState=\(appLifecycleState)"
+            )
+            return
+        }
+        let expectedLifecycleGeneration = lifecycleGeneration
         let item = DispatchWorkItem { [weak self] in
             guard let self,
+                  self.appLifecycleState == "active",
+                  self.lifecycleGeneration == expectedLifecycleGeneration,
                   self.commandWriteInflight.first?.seq == seq else {
                 return
             }
@@ -1923,68 +2140,43 @@ final class BLETestManager: NSObject, ObservableObject {
         let recentNotifyAgeMs = lastStatusNotifyAt.map {
             Int64(now.timeIntervalSince($0) * 1_000)
         } ?? Int64.max
-        guard recentNotifyAgeMs <= COMMAND_WRITE_RECENT_NOTIFY_GRACE_MS,
-              sonyPeripheral?.state == .connected,
-              sonyCommandCharacteristic != nil else {
+        let transportReady = sonyPeripheral?.state == .connected &&
+            sonyCommandCharacteristic != nil
+        let nextTimeoutCount = consecutiveCommandWriteTimeouts + 1
+        let action = CommandWriteTimeoutPolicy.action(
+            appIsActive: appLifecycleState == "active",
+            transportReady: transportReady,
+            timeoutCountAfterIncrement: nextTimeoutCount,
+            reconnectThreshold: COMMAND_WRITE_TIMEOUTS_BEFORE_RECONNECT
+        )
+        switch action {
+        case .suspendUntilForeground:
+            ctrlLog(
+                "[CTRL-iOS] write timeout ignored during lifecycle suspension " +
+                    "seq=\(seq) cmd=\(cmd) appState=\(appLifecycleState)"
+            )
+        case .extendWithoutAdvancingQueue:
+            consecutiveCommandWriteTimeouts = nextTimeoutCount
+            // Never pop the in-flight request here. CoreBluetooth can deliver
+            // its callback late; advancing the queue would then attribute that
+            // callback to a different command.
+            setConnectionHealth(
+                .suspect,
+                reason: "write callback delayed recentNotifyAgeMs=\(recentNotifyAgeMs)"
+            )
+            ctrlLog(
+                "[CTRL-iOS] write timeout extended seq=\(seq) cmd=\(cmd) " +
+                    "count=\(consecutiveCommandWriteTimeouts) " +
+                    "recentNotify=\(recentNotifyAgeMs <= COMMAND_WRITE_RECENT_NOTIFY_GRACE_MS)"
+            )
+            scheduleCommandWriteTimeout(seq: seq, cmd: cmd)
+        case .reconnect:
+            consecutiveCommandWriteTimeouts = nextTimeoutCount
             performHardReconnect(
-                reason: "command write callback timeout without live notify cmd=\(cmd) seq=\(seq)",
+                reason: "command write callback timeout x\(nextTimeoutCount) cmd=\(cmd) seq=\(seq)",
                 manual: false
             )
-            return
         }
-
-        consecutiveCommandWriteTimeouts += 1
-        guard consecutiveCommandWriteTimeouts < COMMAND_WRITE_TIMEOUTS_BEFORE_RECONNECT else {
-            performHardReconnect(
-                reason: "command write callback timeout x\(consecutiveCommandWriteTimeouts) cmd=\(cmd) seq=\(seq)",
-                manual: false
-            )
-            return
-        }
-
-        if commandWriteInflight.first?.seq == seq {
-            commandWriteInflight.removeFirst()
-        }
-        if volumeWriteInFlightSeq == seq {
-            volumeWriteInFlightSeq = nil
-        }
-        let pendingBefore = pendingCommandWrites.count
-        pendingCommandWrites.removeAll(where: {
-            !CommandWriteSoftRecoveryPolicy.shouldRetainPendingCommand($0.cmd)
-        })
-        let retainedBackground = pendingCommandWrites.filter { !$0.isControl }.count
-        let droppedPending = pendingBefore - pendingCommandWrites.count
-        commandWriteRecoveryUntilMs = currentTimeMs() + COMMAND_WRITE_LATE_CALLBACK_FENCE_MS
-        setConnectionHealth(
-            .suspect,
-            reason: "write callback soft recovery recentNotifyAgeMs=\(recentNotifyAgeMs)"
-        )
-        ctrlLog(
-            "[CTRL-iOS] write soft recovery seq=\(seq) cmd=\(cmd) " +
-                "recentNotifyAgeMs=\(recentNotifyAgeMs) " +
-                "retainedBackground=\(retainedBackground) " +
-                "droppedPending=\(droppedPending)"
-        )
-        scheduleCommandWriteRecoveryFlush()
-    }
-
-    private func scheduleCommandWriteRecoveryFlush() {
-        guard commandWriteRecoveryUntilMs > 0 else { return }
-        commandWriteRecoveryWorkItem?.cancel()
-        let delayMs = max(commandWriteRecoveryUntilMs - currentTimeMs(), 0)
-        let item = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.commandWriteRecoveryWorkItem = nil
-            self.commandWriteRecoveryUntilMs = 0
-            self.ctrlLog("[CTRL-iOS] write soft recovery fence ended")
-            self.flushCommandWriteQueue()
-            self.flushPendingVolumeIfPossible()
-        }
-        commandWriteRecoveryWorkItem = item
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + Double(delayMs) / 1_000.0,
-            execute: item
-        )
     }
 
     func seek(to position: Int64) {
@@ -1997,7 +2189,7 @@ final class BLETestManager: NSObject, ObservableObject {
         displayPositionMs = targetPosition
         seekPositionMs = targetPosition
         basePlaybackPositionMs = targetPosition
-        playbackStateReceivedAt = Date()
+        playbackAnchorElapsedMs = monotonicTimeMs()
         log("[iOS][Seek] lyric line position=\(targetPosition)")
         updateLiveActivity(force: true, reason: "seek")
         seek(to: targetPosition)
@@ -2084,7 +2276,7 @@ final class BLETestManager: NSObject, ObservableObject {
         positionMs = targetPosition
         displayPositionMs = targetPosition
         basePlaybackPositionMs = targetPosition
-        playbackStateReceivedAt = Date()
+        playbackAnchorElapsedMs = monotonicTimeMs()
         isSeeking = false
         resetCurrentWordFence()
         log("[iOS][Seek] user set position=\(targetPosition)")
@@ -2501,6 +2693,169 @@ final class BLETestManager: NSObject, ObservableObject {
         Int64(Date().timeIntervalSince1970 * 1_000)
     }
 
+    private func monotonicTimeMs() -> Int64 {
+        Int64((ProcessInfo.processInfo.systemUptime * 1_000).rounded())
+    }
+
+    private func resetClockSync(reason: String) {
+        clockSyncBootstrapWorkItems.forEach { $0.cancel() }
+        clockSyncBootstrapWorkItems.removeAll()
+        clockSyncRefreshWorkItem?.cancel()
+        clockSyncRefreshWorkItem = nil
+        clockSyncProbes.removeAll()
+        clockSynchronizer.reset()
+        sonyUnixMinusElapsedMs = nil
+        sonyClockOffsetMs = nil
+        lyricAutomaticCompensationMs = 0
+        lyricClockBestRoundTripMs = 0
+        lyricClockOffsetJitterMs = 0
+        lyricClockSampleCount = 0
+        lyricClockSyncConfident = false
+        lastStaleRemoteAnchorLogAtMs = 0
+        log("[ClockSync] reset reason=\(reason)")
+    }
+
+    private func pauseClockSyncScheduling(reason: String) {
+        clockSyncBootstrapWorkItems.forEach { $0.cancel() }
+        clockSyncBootstrapWorkItems.removeAll()
+        clockSyncRefreshWorkItem?.cancel()
+        clockSyncRefreshWorkItem = nil
+        clockSyncProbes.removeAll()
+        log("[ClockSync] scheduling paused reason=\(reason)")
+    }
+
+    private func scheduleClockSyncBootstrap(reason: String) {
+        guard appLifecycleState == "active", serverSupportsClockSyncV1 else { return }
+        scheduleClockSyncProbes(
+            count: CLOCK_SYNC_BOOTSTRAP_SAMPLE_COUNT,
+            reason: reason
+        )
+        scheduleClockSyncRefresh()
+    }
+
+    private func scheduleClockSyncProbes(count: Int, reason: String) {
+        guard appLifecycleState == "active", count > 0 else { return }
+        clockSyncBootstrapWorkItems.forEach { $0.cancel() }
+        clockSyncBootstrapWorkItems.removeAll()
+        for index in 0..<count {
+            let item = DispatchWorkItem { [weak self] in
+                guard let self, self.appLifecycleState == "active" else { return }
+                self.sendClockSyncProbe(reason: reason, sample: index + 1, total: count)
+            }
+            clockSyncBootstrapWorkItems.append(item)
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() +
+                    Double(Int64(index) * CLOCK_SYNC_SAMPLE_SPACING_MS) / 1_000.0,
+                execute: item
+            )
+        }
+    }
+
+    private func scheduleClockSyncRefresh() {
+        clockSyncRefreshWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.appLifecycleState == "active",
+                  self.serverSupportsClockSyncV1 else { return }
+            self.scheduleClockSyncProbes(
+                count: CLOCK_SYNC_REFRESH_SAMPLE_COUNT,
+                reason: "periodic"
+            )
+            self.scheduleClockSyncRefresh()
+        }
+        clockSyncRefreshWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Double(CLOCK_SYNC_REFRESH_INTERVAL_MS) / 1_000.0,
+            execute: item
+        )
+    }
+
+    private func sendClockSyncProbe(reason: String, sample: Int, total: Int) {
+        guard appLifecycleState == "active",
+              serverSupportsClockSyncV1,
+              sonyCharacteristicsReady else { return }
+        let sequence = nextCommandSeq()
+        let sentAtElapsedMs = monotonicTimeMs()
+        let probe = ClockSyncProbe(
+            sequence: sequence,
+            clientSendElapsedMs: sentAtElapsedMs,
+            clientSendDate: Date()
+        )
+        clockSyncProbes[String(sequence)] = probe
+        log(
+            "[ClockSync] probe sent seq=\(sequence) reason=\(reason) " +
+                "sample=\(sample)/\(total)"
+        )
+        sendCommand(
+            cmd: "PING",
+            extra: [
+                "clockSyncV1": true,
+                "clientSendElapsedMs": sentAtElapsedMs
+            ],
+            seq: sequence
+        )
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Double(CLOCK_SYNC_PROBE_TTL_MS) / 1_000.0
+        ) { [weak self] in
+            guard let self,
+                  self.clockSyncProbes[String(sequence)]?.sequence == sequence else {
+                return
+            }
+            self.clockSyncProbes.removeValue(forKey: String(sequence))
+            self.log("[ClockSync] probe expired seq=\(sequence)")
+        }
+    }
+
+    @discardableResult
+    private func handleClockSyncPong(_ object: [String: Any]) -> Bool {
+        let sequence = Self.int64Value(object["seq"])
+        guard sequence > 0,
+              let probe = clockSyncProbes.removeValue(forKey: String(sequence)) else {
+            return false
+        }
+        let receivedAtElapsedMs = monotonicTimeMs()
+        let receivedAt = Date()
+        let echoedClientElapsedMs = Self.int64Value(object["clientSendElapsedMs"])
+        let serverReceiveElapsedMs = Self.int64Value(object["serverReceiveElapsedMs"])
+        let serverSendElapsedMs = Self.int64Value(object["serverSendElapsedMs"])
+        let sonyTimeMs = Self.int64Value(object["time"])
+        if sonyTimeMs > 0 {
+            let midpointMs = Int64(
+                (probe.clientSendDate.timeIntervalSince1970 +
+                    receivedAt.timeIntervalSince1970) * 500
+            )
+            sonyClockOffsetMs = sonyTimeMs - midpointMs
+        }
+        guard echoedClientElapsedMs == probe.clientSendElapsedMs,
+              serverReceiveElapsedMs > 0,
+              serverSendElapsedMs >= serverReceiveElapsedMs else {
+            log("[ClockSync] legacy pong seq=\(sequence) clockOffsetMs=\(sonyClockOffsetMs ?? 0)")
+            return true
+        }
+        if sonyTimeMs > 0 {
+            sonyUnixMinusElapsedMs = sonyTimeMs - serverSendElapsedMs
+        }
+        let snapshot = clockSynchronizer.record(
+            clientSendElapsedMs: probe.clientSendElapsedMs,
+            serverReceiveElapsedMs: serverReceiveElapsedMs,
+            serverSendElapsedMs: serverSendElapsedMs,
+            clientReceiveElapsedMs: receivedAtElapsedMs
+        )
+        if let snapshot {
+            lyricClockBestRoundTripMs = snapshot.bestRoundTripMs
+            lyricClockOffsetJitterMs = snapshot.offsetJitterMs
+            lyricClockSampleCount = snapshot.sampleCount
+            lyricClockSyncConfident = snapshot.isConfident
+            log(
+                "[ClockSync] pong seq=\(sequence) bestRttMs=\(snapshot.bestRoundTripMs) " +
+                    "offsetMs=\(Int64(snapshot.localMinusServerMs.rounded())) " +
+                    "jitterMs=\(snapshot.offsetJitterMs) samples=\(snapshot.sampleCount) " +
+                    "confident=\(snapshot.isConfident)"
+            )
+        }
+        return true
+    }
+
     private func isInStartupLoadWindow() -> Bool {
         guard firstConnectionReadyAtMs > 0 else { return false }
         return currentTimeMs() - firstConnectionReadyAtMs < 3_000
@@ -2663,6 +3018,7 @@ final class BLETestManager: NSObject, ObservableObject {
         healthProbeTimeoutWorkItem = nil
         subscribeNotifyTimeoutWorkItem?.cancel()
         subscribeNotifyTimeoutWorkItem = nil
+        healthProbeCommandSeq = nil
         healthProbeStartedAt = nil
         healthProbeFailureCount = 0
         connectionHealthProbeInFlight = false
@@ -2677,6 +3033,11 @@ final class BLETestManager: NSObject, ObservableObject {
 
     private func startHealthMonitoring(reason: String) {
         healthCheckWorkItem?.cancel()
+        guard appLifecycleState == "active" else {
+            healthCheckWorkItem = nil
+            log("[BLE-Health] start deferred appState=\(appLifecycleState) reason=\(reason)")
+            return
+        }
         log("[BLE-Health] started reason=\(reason)")
         updateConnectionHealthDebugFields()
         scheduleHealthTick()
@@ -2684,6 +3045,10 @@ final class BLETestManager: NSObject, ObservableObject {
 
     private func scheduleHealthTick() {
         healthCheckWorkItem?.cancel()
+        guard appLifecycleState == "active" else {
+            healthCheckWorkItem = nil
+            return
+        }
         let item = DispatchWorkItem { [weak self] in
             self?.runHealthTick()
         }
@@ -2696,6 +3061,11 @@ final class BLETestManager: NSObject, ObservableObject {
 
     private func runHealthTick() {
         updateConnectionHealthDebugFields()
+        guard appLifecycleState == "active" else {
+            healthCheckWorkItem = nil
+            log("[BLE-Health] tick suspended appState=\(appLifecycleState)")
+            return
+        }
         guard centralManager.state == .poweredOn else {
             setConnectionHealth(.disconnected, reason: "bluetooth not powered")
             return
@@ -2739,8 +3109,12 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     private func sendHealthProbeIfNeeded(reason: String) {
+        guard appLifecycleState == "active" else {
+            log("[BLE-Health] probe deferred appState=\(appLifecycleState) trigger=\(reason)")
+            return
+        }
         let now = Date()
-        if healthProbeStartedAt != nil {
+        if healthProbeCommandSeq != nil {
             log("[BLE-Health] probe skipped reason=in flight trigger=\(reason)")
             return
         }
@@ -2754,21 +3128,33 @@ final class BLETestManager: NSObject, ObservableObject {
             return
         }
         lastHealthProbeAt = now
-        healthProbeStartedAt = now
-        healthPingClockProbeStartedAt = serverSupportsPing ? now : nil
-        updateConnectionHealthDebugFields()
         let seq = nextCommandSeq()
-        log("[BLE-Health] probe sent seq=\(seq) reason=\(reason)")
+        healthProbeCommandSeq = seq
+        updateConnectionHealthDebugFields()
+        log("[BLE-Health] probe queued seq=\(seq) reason=\(reason)")
         sendCommand(cmd: serverSupportsPing ? "PING" : "GET_PLAYBACK_STATE", seq: seq)
-        let startedAt = now
+    }
+
+    private func startHealthProbeResponseTimeout(seq: UInt64, command: String) {
+        guard healthProbeCommandSeq == seq,
+              healthProbeStartedAt == nil,
+              appLifecycleState == "active" else { return }
+        let startedAt = Date()
+        healthProbeStartedAt = startedAt
+        healthPingClockProbeStartedAt = command == "PING" ? startedAt : nil
+        log("[BLE-Health] probe sent seq=\(seq) cmd=\(command)")
+        updateConnectionHealthDebugFields()
         let item = DispatchWorkItem { [weak self] in
             guard let self,
+                  self.appLifecycleState == "active",
+                  self.healthProbeCommandSeq == seq,
                   let healthProbeStartedAt = self.healthProbeStartedAt,
                   abs(healthProbeStartedAt.timeIntervalSince(startedAt)) < 0.001 else {
                 return
             }
             let costMs = Int64(Date().timeIntervalSince(startedAt) * 1_000)
             self.log("[BLE-Health] probe timeout costMs=\(costMs)")
+            self.healthProbeCommandSeq = nil
             self.healthProbeStartedAt = nil
             self.healthPingClockProbeStartedAt = nil
             self.healthProbeTimeoutWorkItem = nil
@@ -2790,6 +3176,8 @@ final class BLETestManager: NSObject, ObservableObject {
 
     private func markStatusNotifyReceived(type: String) {
         let now = Date()
+        let completesForegroundValidation = foregroundValidationPending &&
+            appLifecycleState == "active"
         let highVolume = isHighVolumeNotifyType(type)
         if !highVolume {
             log("[BLE-Health] notify received type=\(type)")
@@ -2805,6 +3193,7 @@ final class BLETestManager: NSObject, ObservableObject {
         if let probeStartedAt = healthProbeStartedAt {
             let ageMs = Int64(now.timeIntervalSince(probeStartedAt) * 1_000)
             log("[BLE-Health] probe success ageMs=\(ageMs) type=\(type)")
+            healthProbeCommandSeq = nil
             healthProbeStartedAt = nil
             healthProbeFailureCount = 0
             healthProbeTimeoutWorkItem?.cancel()
@@ -2816,9 +3205,15 @@ final class BLETestManager: NSObject, ObservableObject {
         }
         if highVolume,
            connectionHealthState == ConnectionHealthState.healthy.rawValue {
+            if completesForegroundValidation {
+                completeForegroundLinkValidation(type: type)
+            }
             return
         }
         setConnectionHealth(.healthy, reason: "notify type=\(type)")
+        if completesForegroundValidation {
+            completeForegroundLinkValidation(type: type)
+        }
     }
 
     private func isHighVolumeNotifyType(_ type: String) -> Bool {
@@ -3063,6 +3458,7 @@ final class BLETestManager: NSObject, ObservableObject {
 
     private func clearConnectionTransports(reason: String) {
         log("[BLE-Reconnect] clear characteristics reason=\(reason)")
+        resetClockSync(reason: reason)
         coreBluetoothRestoreTimeoutWorkItem?.cancel()
         coreBluetoothRestoreTimeoutWorkItem = nil
         sonyCommandCharacteristic = nil
@@ -3070,10 +3466,15 @@ final class BLETestManager: NSObject, ObservableObject {
         firstConnectionReadyAtMs = 0
         commandWriteTimeoutWorkItem?.cancel()
         commandWriteTimeoutWorkItem = nil
-        commandWriteRecoveryWorkItem?.cancel()
-        commandWriteRecoveryWorkItem = nil
-        commandWriteRecoveryUntilMs = 0
         consecutiveCommandWriteTimeouts = 0
+        foregroundValidationTimeoutWorkItem?.cancel()
+        foregroundValidationTimeoutWorkItem = nil
+        foregroundInflightSettleWorkItem?.cancel()
+        foregroundInflightSettleWorkItem = nil
+        foregroundValidationPending = false
+        foregroundValidationWaitingForInflight = false
+        foregroundValidationCommandSeq = nil
+        foregroundValidationStartedAt = nil
         coreBluetoothRestoreInProgress = false
         commandWriteInflight.removeAll()
         pendingCommandWrites.removeAll()
@@ -3124,19 +3525,57 @@ final class BLETestManager: NSObject, ObservableObject {
     }
 
     private func syncAfterReconnect(reason: String) {
+        guard appLifecycleState == "active",
+              sonyCharacteristicsReady,
+              !foregroundValidationPending else {
+            log(
+                "[BLE-Reconnect] sync deferred reason=\(reason) " +
+                    "appState=\(appLifecycleState) ready=\(sonyCharacteristicsReady) " +
+                    "validating=\(foregroundValidationPending)"
+            )
+            return
+        }
+        let expectedAttemptId = connectionAttemptId
+        let expectedLifecycleGeneration = lifecycleGeneration
         log("[BLE-Reconnect] sync playback state reason=\(reason)")
         sendGetPlaybackState()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            self?.log("[BLE-Reconnect] sync volume")
-            self?.sendGetVolume()
+            guard let self,
+                  self.canRunDeferredConnectionSync(
+                    attemptId: expectedAttemptId,
+                    lifecycleGeneration: expectedLifecycleGeneration
+                  ) else { return }
+            self.log("[BLE-Reconnect] sync volume")
+            self.sendGetVolume()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
-            self?.log("[BLE-Reconnect] defer full lyrics")
-            self?.requestFullLyricsIfNeeded(after: 0)
+            guard let self,
+                  self.canRunDeferredConnectionSync(
+                    attemptId: expectedAttemptId,
+                    lifecycleGeneration: expectedLifecycleGeneration
+                  ) else { return }
+            self.log("[BLE-Reconnect] defer full lyrics")
+            self.requestFullLyricsIfNeeded(after: 0)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            self?.log("[BLE-Reconnect] defer secondary")
+            guard let self,
+                  self.canRunDeferredConnectionSync(
+                    attemptId: expectedAttemptId,
+                    lifecycleGeneration: expectedLifecycleGeneration
+                  ) else { return }
+            self.log("[BLE-Reconnect] defer secondary")
         }
+    }
+
+    private func canRunDeferredConnectionSync(
+        attemptId: UUID,
+        lifecycleGeneration: UInt64
+    ) -> Bool {
+        appLifecycleState == "active" &&
+            connectionAttemptId == attemptId &&
+            self.lifecycleGeneration == lifecycleGeneration &&
+            sonyCharacteristicsReady &&
+            !foregroundValidationPending
     }
 
     private func startupLoadRemainingDelay() -> TimeInterval {
@@ -3200,10 +3639,12 @@ final class BLETestManager: NSObject, ObservableObject {
 
     @objc private func appWillResignActive() {
         updateAppLifecycleState(.inactive, emitLog: true)
+        pauseConnectionWatchdogsForLifecycle(reason: "will resign active")
     }
 
     @objc private func appDidEnterBackground() {
         updateAppLifecycleState(.background, emitLog: true)
+        pauseConnectionWatchdogsForLifecycle(reason: "did enter background")
     }
 
     private func updateAppLifecycleState(
@@ -3221,6 +3662,12 @@ final class BLETestManager: NSObject, ObservableObject {
         @unknown default:
             value = "unknown"
         }
+        if value != appLifecycleState {
+            lifecycleGeneration &+= 1
+        }
+        if value == "background", appLifecycleState != "background" {
+            backgroundEnteredAt = Date()
+        }
         appLifecycleState = value
         updateProgressTimerState()
         if emitLog {
@@ -3228,12 +3675,46 @@ final class BLETestManager: NSObject, ObservableObject {
         }
     }
 
+    private func pauseConnectionWatchdogsForLifecycle(reason: String) {
+        healthCheckWorkItem?.cancel()
+        healthCheckWorkItem = nil
+        healthProbeTimeoutWorkItem?.cancel()
+        healthProbeTimeoutWorkItem = nil
+        subscribeNotifyTimeoutWorkItem?.cancel()
+        subscribeNotifyTimeoutWorkItem = nil
+        commandWriteTimeoutWorkItem?.cancel()
+        commandWriteTimeoutWorkItem = nil
+        foregroundValidationTimeoutWorkItem?.cancel()
+        foregroundValidationTimeoutWorkItem = nil
+        foregroundInflightSettleWorkItem?.cancel()
+        foregroundInflightSettleWorkItem = nil
+        foregroundValidationPending = false
+        foregroundValidationWaitingForInflight = false
+        foregroundValidationCommandSeq = nil
+        foregroundValidationStartedAt = nil
+        healthProbeCommandSeq = nil
+        healthProbeStartedAt = nil
+        healthPingClockProbeStartedAt = nil
+        healthProbeFailureCount = 0
+        consecutiveCommandWriteTimeouts = 0
+        pauseClockSyncScheduling(reason: reason)
+        updateConnectionHealthDebugFields()
+        ctrlLog(
+            "[APP-LIFECYCLE] BLE watchdogs paused reason=\(reason) " +
+                "inflight=\(commandWriteInflight.count) pending=\(pendingCommandWrites.count)"
+        )
+    }
+
     private func handleAppForegroundReconnectCheck() {
         let connected = sonyPeripheral?.state == .connected
         let ready = connected && sonyCommandCharacteristic != nil && sonyStatusCharacteristic != nil
+        let suspendedMs = backgroundEnteredAt.map {
+            max(Int64(Date().timeIntervalSince($0) * 1_000), 0)
+        } ?? 0
+        backgroundEnteredAt = nil
         log(
             "[BLE-Reconnect] app foreground check connected=\(connected) " +
-                "ready=\(ready) health=\(connectionHealthState)"
+                "ready=\(ready) health=\(connectionHealthState) suspendedMs=\(suspendedMs)"
         )
         guard centralManager.state == .poweredOn else { return }
         if connected, coreBluetoothRestoreInProgress {
@@ -3268,16 +3749,116 @@ final class BLETestManager: NSObject, ObservableObject {
             log("[BLE-Reconnect] foreground rediscover services reason=characteristic missing")
             setAutoReconnectState(.serviceDiscovering)
             sonyPeripheral.discoverServices([BLEUUIDs.service])
-        } else if connectionHealthState == ConnectionHealthState.stale.rawValue ||
-                    connectionHealthState == ConnectionHealthState.disconnected.rawValue {
-            performHardReconnect(
-                reason: "foreground unhealthy state=\(connectionHealthState)",
+        } else {
+            setConnectionHealth(.suspect, reason: "foreground validation pending")
+            if commandWriteInflight.isEmpty {
+                beginForegroundLinkValidation(reason: "foreground ready")
+            } else {
+                scheduleForegroundInflightSettle()
+            }
+        }
+    }
+
+    private func scheduleForegroundInflightSettle() {
+        foregroundValidationWaitingForInflight = true
+        foregroundInflightSettleWorkItem?.cancel()
+        let expectedAttemptId = connectionAttemptId
+        let expectedLifecycleGeneration = lifecycleGeneration
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.appLifecycleState == "active",
+                  self.connectionAttemptId == expectedAttemptId,
+                  self.lifecycleGeneration == expectedLifecycleGeneration,
+                  self.foregroundValidationWaitingForInflight else { return }
+            self.foregroundInflightSettleWorkItem = nil
+            if self.commandWriteInflight.isEmpty {
+                self.foregroundValidationWaitingForInflight = false
+                self.beginForegroundLinkValidation(reason: "foreground inflight settled")
+            } else {
+                let command = self.commandWriteInflight.first?.cmd ?? "unknown"
+                self.performHardReconnect(
+                    reason: "foreground suspended write did not settle cmd=\(command)",
+                    manual: false
+                )
+            }
+        }
+        foregroundInflightSettleWorkItem = item
+        ctrlLog(
+            "[BLE-Health] foreground waiting for suspended write " +
+                "cmd=\(commandWriteInflight.first?.cmd ?? "unknown")"
+        )
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Double(FOREGROUND_INFLIGHT_SETTLE_TIMEOUT_MS) / 1_000.0,
+            execute: item
+        )
+    }
+
+    private func beginForegroundLinkValidation(reason: String) {
+        guard appLifecycleState == "active",
+              sonyCharacteristicsReady,
+              !foregroundValidationPending else { return }
+        foregroundInflightSettleWorkItem?.cancel()
+        foregroundInflightSettleWorkItem = nil
+        foregroundValidationWaitingForInflight = false
+        foregroundValidationPending = true
+        foregroundValidationStartedAt = nil
+        let seq = nextCommandSeq()
+        foregroundValidationCommandSeq = seq
+        let command = serverSupportsPing ? "PING" : "GET_PLAYBACK_STATE"
+        ctrlLog(
+            "[BLE-Health] foreground validation queued seq=\(seq) " +
+                "cmd=\(command) reason=\(reason)"
+        )
+        sendCommand(cmd: command, seq: seq)
+    }
+
+    private func startForegroundValidationTimeout(seq: UInt64) {
+        guard foregroundValidationPending,
+              foregroundValidationCommandSeq == seq,
+              foregroundValidationStartedAt == nil else { return }
+        let startedAt = Date()
+        foregroundValidationStartedAt = startedAt
+        let expectedAttemptId = connectionAttemptId
+        let expectedLifecycleGeneration = lifecycleGeneration
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.appLifecycleState == "active",
+                  self.connectionAttemptId == expectedAttemptId,
+                  self.lifecycleGeneration == expectedLifecycleGeneration,
+                  self.foregroundValidationPending,
+                  self.foregroundValidationCommandSeq == seq else { return }
+            self.foregroundValidationTimeoutWorkItem = nil
+            self.setConnectionHealth(.stale, reason: "foreground validation timeout")
+            self.performHardReconnect(
+                reason: "foreground link validation timeout seq=\(seq)",
                 manual: false
             )
-        } else {
-            startHealthMonitoring(reason: "foreground ready")
-            syncAfterReconnect(reason: "foreground ready")
         }
+        foregroundValidationTimeoutWorkItem?.cancel()
+        foregroundValidationTimeoutWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Double(FOREGROUND_LINK_VALIDATION_TIMEOUT_MS) / 1_000.0,
+            execute: item
+        )
+    }
+
+    private func completeForegroundLinkValidation(type: String) {
+        guard foregroundValidationPending,
+              appLifecycleState == "active" else { return }
+        let costMs = foregroundValidationStartedAt.map {
+            Int64(Date().timeIntervalSince($0) * 1_000)
+        } ?? 0
+        foregroundValidationTimeoutWorkItem?.cancel()
+        foregroundValidationTimeoutWorkItem = nil
+        foregroundValidationPending = false
+        foregroundValidationCommandSeq = nil
+        foregroundValidationStartedAt = nil
+        ctrlLog(
+            "[BLE-Health] foreground validation success type=\(type) costMs=\(costMs)"
+        )
+        startHealthMonitoring(reason: "foreground validated")
+        syncAfterReconnect(reason: "foreground validated")
+        scheduleClockSyncBootstrap(reason: "foreground validated")
     }
 
     func albumArtConsoleLog(_ message: String) {
@@ -3737,8 +4318,10 @@ extension BLETestManager: CBCentralManagerDelegate {
         lastNotifySubscribedAt = nil
         lastStatusNotifyAt = nil
         lastPlaybackStateAt = nil
+        healthProbeCommandSeq = nil
         healthProbeStartedAt = nil
         healthPingClockProbeStartedAt = nil
+        resetClockSync(reason: "didConnect")
         resetCurrentWordFence()
         reconnectStateSyncWindowUntilMs = 0
         reconnectStateSyncPlaybackLogged = false
@@ -3927,14 +4510,6 @@ extension BLETestManager: CBPeripheralDelegate {
             }
         } else {
             let errorText = error?.localizedDescription ?? "nil"
-            if error == nil, didWriteMs <= commandWriteRecoveryUntilMs {
-                consecutiveCommandWriteTimeouts = 0
-                ctrlLog(
-                    "[CTRL-iOS] ignored late didWrite during recovery fence " +
-                        "timeMs=\(didWriteMs)"
-                )
-                return
-            }
             ctrlLog(
                 "[CTRL-iOS] didWrite seq=unknown cmd=unknown " +
                     "timeMs=\(didWriteMs) costMs=unknown error=\(errorText)"
@@ -3962,7 +4537,15 @@ extension BLETestManager: CBPeripheralDelegate {
             log("[Command] \(completed?.cmd ?? "unknown") success")
         }
         if error == nil {
-            flushCommandWriteQueue()
+            if foregroundValidationWaitingForInflight,
+               appLifecycleState == "active" {
+                foregroundValidationWaitingForInflight = false
+                foregroundInflightSettleWorkItem?.cancel()
+                foregroundInflightSettleWorkItem = nil
+                beginForegroundLinkValidation(reason: "suspended write callback received")
+            } else {
+                flushCommandWriteQueue()
+            }
         }
     }
 
@@ -4013,10 +4596,17 @@ extension BLETestManager: CBPeripheralDelegate {
             serverSupportsFullLyricsZlib = false
             serverSupportsLyricWindow = false
             serverSupportsPing = false
+            serverSupportsClockSyncV1 = false
             serverSupportsTransferRetry = false
+            resetClockSync(reason: "notify subscribed")
             requestedLyricWindowTrackIDs.removeAll()
+            let expectedAttemptId = connectionAttemptId
+            let expectedLifecycleGeneration = lifecycleGeneration
             let subscribeTimeout = DispatchWorkItem { [weak self] in
                 guard let self,
+                      self.appLifecycleState == "active",
+                      self.connectionAttemptId == expectedAttemptId,
+                      self.lifecycleGeneration == expectedLifecycleGeneration,
                       let lastNotifySubscribedAt = self.lastNotifySubscribedAt,
                       self.lastStatusNotifyAt == nil ||
                           self.lastStatusNotifyAt! < lastNotifySubscribedAt else {
@@ -4038,25 +4628,45 @@ extension BLETestManager: CBPeripheralDelegate {
                     "fullLyricsZlib": true,
                     "lyricWindow": true,
                     "ping": true,
+                    "clockSyncV1": true,
                     "transferRetry": true
                 ]
             )
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                self?.log("[BLE-Reconnect] sync playback state")
-                self?.sendGetPlaybackState()
+                guard let self,
+                      self.canRunDeferredConnectionSync(
+                        attemptId: expectedAttemptId,
+                        lifecycleGeneration: expectedLifecycleGeneration
+                      ) else { return }
+                self.log("[BLE-Reconnect] sync playback state")
+                self.sendGetPlaybackState()
             }
             // Let the interactive lyric window finish before the non-critical
             // initial volume snapshot uses the ATT command/notify path.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                self?.log("[BLE-Reconnect] sync volume")
-                self?.sendGetVolume()
+                guard let self,
+                      self.canRunDeferredConnectionSync(
+                        attemptId: expectedAttemptId,
+                        lifecycleGeneration: expectedLifecycleGeneration
+                      ) else { return }
+                self.log("[BLE-Reconnect] sync volume")
+                self.sendGetVolume()
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
-                self?.log("[BLE-Reconnect] defer full lyrics")
-                self?.requestFullLyricsIfNeeded(after: 0)
+                guard let self,
+                      self.canRunDeferredConnectionSync(
+                        attemptId: expectedAttemptId,
+                        lifecycleGeneration: expectedLifecycleGeneration
+                      ) else { return }
+                self.log("[BLE-Reconnect] defer full lyrics")
+                self.requestFullLyricsIfNeeded(after: 0)
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                self?.setAutoReconnectState(.connected)
+                guard let self,
+                      self.connectionAttemptId == expectedAttemptId,
+                      self.lifecycleGeneration == expectedLifecycleGeneration,
+                      self.sonyCharacteristicsReady else { return }
+                self.setAutoReconnectState(.connected)
             }
         }
     }
@@ -4119,19 +4729,25 @@ extension BLETestManager: CBPeripheralDelegate {
                 self.serverSupportsFullLyricsZlib = object["fullLyricsZlib"] as? Bool ?? false
                 self.serverSupportsLyricWindow = object["lyricWindow"] as? Bool ?? false
                 self.serverSupportsPing = object["ping"] as? Bool ?? false
+                self.serverSupportsClockSyncV1 = object["clockSyncV1"] as? Bool ?? false
                 self.serverSupportsTransferRetry = object["transferRetry"] as? Bool ?? false
                 self.log(
                     "[BLE-iOS] capabilities ack protocolVersion=\(self.serverProtocolVersion) " +
                         "fullLyricsZlib=\(self.serverSupportsFullLyricsZlib) " +
                         "lyricWindow=\(self.serverSupportsLyricWindow) " +
                         "ping=\(self.serverSupportsPing) " +
+                        "clockSyncV1=\(self.serverSupportsClockSyncV1) " +
                         "transferRetry=\(self.serverSupportsTransferRetry)"
                 )
+                if self.serverSupportsClockSyncV1 {
+                    self.scheduleClockSyncBootstrap(reason: "capability ack")
+                }
                 if self.serverSupportsLyricWindow, !self.currentTrackID.isEmpty {
                     self.requestLyricWindow(trackID: self.currentTrackID)
                 }
 
             case "pong":
+                let handledClockSync = self.handleClockSyncPong(object)
                 if let startedAt = self.healthPingClockProbeStartedAt {
                     let receivedAt = Date()
                     let rttMs = Int64(receivedAt.timeIntervalSince(startedAt) * 1_000)
@@ -4149,7 +4765,7 @@ extension BLETestManager: CBPeripheralDelegate {
                             "rttMs=\(rttMs) " +
                             "clockOffsetMs=\(self.sonyClockOffsetMs ?? 0)"
                     )
-                } else {
+                } else if !handledClockSync {
                     self.log("[BLE-Health] pong seq=\(object["seq"] ?? "")")
                 }
 
@@ -4160,6 +4776,10 @@ extension BLETestManager: CBPeripheralDelegate {
                 let reconnectSyncWindow = self.isInReconnectStateSyncWindow()
                 self.isPlaying = object["playing"] as? Bool ?? false
                 self.durationMs = Self.int64Value(object["duration"])
+                let parsedSpeed = Self.doubleValue(object["speed"])
+                self.remotePlaybackSpeed = parsedSpeed.isFinite && parsedSpeed > 0
+                    ? parsedSpeed
+                    : 1.0
                 self.updateProgressTimerState()
                 self.updateLightweightLyricDiagnostic(from: object)
                 if let lyric = object["lyric"] as? String {
@@ -4204,11 +4824,23 @@ extension BLETestManager: CBPeripheralDelegate {
                     }
                 }
                 if !self.isSeeking {
-                    self.positionMs = Self.int64Value(object["position"])
-                    self.displayPositionMs = self.positionMs
-                    self.seekPositionMs = self.positionMs
-                    self.basePlaybackPositionMs = self.positionMs
-                    self.playbackStateReceivedAt = Date()
+                    let remotePositionMs = Self.int64Value(object["position"])
+                    let resolution = self.resolveRemotePlaybackAnchor(
+                        object: object,
+                        remotePositionMs: remotePositionMs,
+                        isPlaying: self.isPlaying
+                    )
+                    if let calibratedPositionMs = self.calibratedRemotePosition(
+                        from: resolution,
+                        remotePositionMs: remotePositionMs,
+                        source: "playbackState"
+                    ) {
+                        self.positionMs = calibratedPositionMs
+                        self.displayPositionMs = calibratedPositionMs
+                        self.seekPositionMs = calibratedPositionMs
+                        self.basePlaybackPositionMs = calibratedPositionMs
+                        self.playbackAnchorElapsedMs = self.monotonicTimeMs()
+                    }
                 }
                 self.log(
                     "[iOS][Status] playbackState " +
@@ -6219,8 +6851,40 @@ extension BLETestManager: CBPeripheralDelegate {
             return
         }
 
-        currentWordLineIndex = lineIndex
-        currentWordIndex = wordIndex
+        let anchorResolution = resolveRemotePlaybackAnchor(
+            object: object,
+            remotePositionMs: remotePositionMs,
+            timestampMs: timestampMs,
+            isPlaying: isPlaying
+        )
+        guard let calibratedPositionMs = calibratedRemotePosition(
+            from: anchorResolution,
+            remotePositionMs: remotePositionMs,
+            source: "currentWord"
+        ) else {
+            currentWordDropCount += 1
+            return
+        }
+        let transportAgeMs: Int64
+        if case let .resolved(_, ageMs) = anchorResolution {
+            transportAgeMs = ageMs
+        } else {
+            transportAgeMs = 0
+        }
+        var effectiveLineIndex = lineIndex
+        var effectiveWordIndex = wordIndex
+        var locallyResolvedLyric: String?
+        if transportAgeMs > 300,
+           let local = locallyResolvedWord(
+               positionMs: karaokePositionMs(rawPositionMs: calibratedPositionMs)
+           ) {
+            effectiveLineIndex = local.lineIndex
+            effectiveWordIndex = local.wordIndex
+            locallyResolvedLyric = local.text
+        }
+
+        currentWordLineIndex = effectiveLineIndex
+        currentWordIndex = effectiveWordIndex
         currentWordPushCount += 1
         if lastCurrentWordReceivedAtMs > 0 {
             currentWordIntervalTotalMs += max(nowMs - lastCurrentWordReceivedAtMs, 0)
@@ -6233,45 +6897,45 @@ extension BLETestManager: CBPeripheralDelegate {
             }
         }
         lastCurrentWordReceivedAtMs = nowMs
-        if timestampMs > 0, let sonyClockOffsetMs {
-            currentWordLastLatencyMs = max(
-                nowMs - (timestampMs - sonyClockOffsetMs),
-                0
-            )
-        } else {
-            currentWordLastLatencyMs = 0
-        }
-        let shouldLogDiagnostic = lineIndex != lastCurrentWordLoggedLineIndex ||
+        currentWordLastLatencyMs = transportAgeMs
+        let shouldLogDiagnostic = effectiveLineIndex != lastCurrentWordLoggedLineIndex ||
             nowMs - lastCurrentWordDiagnosticLogAtMs >= 5_000
         if shouldLogDiagnostic {
-            lastCurrentWordLoggedLineIndex = lineIndex
+            lastCurrentWordLoggedLineIndex = effectiveLineIndex
             lastCurrentWordDiagnosticLogAtMs = nowMs
             log(
                 "[LyricTrace-iOS] id=\(trackID) stage=currentWordAccepted " +
                     "generation=\(generation) seq=\(sequence) " +
-                    "line=\(lineIndex) word=\(wordIndex) position=\(remotePositionMs) " +
+                    "line=\(effectiveLineIndex) word=\(effectiveWordIndex) " +
+                    "remotePosition=\(remotePositionMs) " +
+                    "calibratedPosition=\(calibratedPositionMs) " +
                     "latencyMs=\(currentWordLastLatencyMs)"
             )
         }
 
-        let lineByOffset = fullLyrics.indices.contains(lineIndex) ? fullLyrics[lineIndex] : nil
+        let lineByOffset = fullLyrics.indices.contains(effectiveLineIndex)
+            ? fullLyrics[effectiveLineIndex]
+            : nil
         if isSameTrackId(incoming: trackID, current: fullLyricsTrackId),
-           let line = fullLyrics.first(where: { $0.index == lineIndex }) ?? lineByOffset {
+           let line = fullLyrics.first(where: { $0.index == effectiveLineIndex }) ?? lineByOffset {
             lyric = line.text
+        } else if let locallyResolvedLyric {
+            lyric = locallyResolvedLyric
         }
 
         if !isSeeking {
-            positionMs = remotePositionMs
-            displayPositionMs = remotePositionMs
-            seekPositionMs = remotePositionMs
-            basePlaybackPositionMs = remotePositionMs
-            playbackStateReceivedAt = Date()
+            positionMs = calibratedPositionMs
+            displayPositionMs = calibratedPositionMs
+            seekPositionMs = calibratedPositionMs
+            basePlaybackPositionMs = calibratedPositionMs
+            playbackAnchorElapsedMs = monotonicTimeMs()
         }
 
         if shouldLogDiagnostic {
             log(
-                "[Lyrics-iOS] currentWord line=\(lineIndex) word=\(wordIndex) " +
-                    "position=\(remotePositionMs) latencyMs=\(currentWordLastLatencyMs) " +
+                "[Lyrics-iOS] currentWord line=\(effectiveLineIndex) " +
+                    "word=\(effectiveWordIndex) position=\(calibratedPositionMs) " +
+                    "latencyMs=\(currentWordLastLatencyMs) " +
                     "count=\(currentWordPushCount) " +
                     "avgIntervalMs=\(currentWordAverageUpdateIntervalMs)"
             )
@@ -6279,7 +6943,7 @@ extension BLETestManager: CBPeripheralDelegate {
         if isInReconnectStateSyncWindow() {
             log(
                 "[Reconnect] currentWord accepted after reconnect " +
-                    "line=\(lineIndex) word=\(wordIndex)"
+                    "line=\(effectiveLineIndex) word=\(effectiveWordIndex)"
             )
         }
 
@@ -6358,8 +7022,11 @@ extension BLETestManager: CBPeripheralDelegate {
             return
         }
 
-        let elapsedMs = Int64(Date().timeIntervalSince(playbackStateReceivedAt) * 1_000)
-        let interpolated = (basePlaybackPositionMs + max(elapsedMs, 0))
+        let elapsedMs = max(monotonicTimeMs() - playbackAnchorElapsedMs, 0)
+        let scaledElapsedMs = Int64(
+            (Double(max(elapsedMs, 0)) * max(remotePlaybackSpeed, 0)).rounded()
+        )
+        let interpolated = (basePlaybackPositionMs + scaledElapsedMs)
             .clamped(to: 0...durationMs)
         if interpolated != displayPositionMs {
             displayPositionMs = interpolated
@@ -6582,6 +7249,9 @@ extension BLETestManager: CBPeripheralDelegate {
         if let number = value as? NSNumber {
             return number.int64Value
         }
+        if let string = value as? String {
+            return Int64(string) ?? 0
+        }
         return 0
     }
 
@@ -6599,12 +7269,18 @@ extension BLETestManager: CBPeripheralDelegate {
         if let number = value as? NSNumber {
             return number.intValue
         }
+        if let string = value as? String {
+            return Int(string) ?? 0
+        }
         return 0
     }
 
     private static func doubleValue(_ value: Any?) -> Double {
         if let number = value as? NSNumber {
             return number.doubleValue
+        }
+        if let string = value as? String {
+            return Double(string) ?? 0
         }
         return 0
     }

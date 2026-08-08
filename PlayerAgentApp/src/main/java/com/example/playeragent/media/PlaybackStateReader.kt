@@ -114,7 +114,12 @@ class PlaybackStateReader(
         }
         val playbackState = selected.playbackState
         val playing = playbackState?.state == PlaybackState.STATE_PLAYING
-        val position = calculatePosition(playbackState)
+        val positionSampleElapsedMs = SystemClock.elapsedRealtime()
+        val positionSampleUnixMs = System.currentTimeMillis()
+        val playbackSpeed = playbackState?.playbackSpeed
+            ?.takeIf { it.isFinite() && it > 0f }
+            ?: 1f
+        val position = calculatePosition(playbackState, positionSampleElapsedMs)
 
         val title = metadata?.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty()
         val artist = metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty()
@@ -293,6 +298,9 @@ class PlaybackStateReader(
             .put("artist", artist)
             .put("album", album)
             .put("position", position)
+            .put("positionSampleElapsedMs", positionSampleElapsedMs)
+            .put("positionSampleUnixMs", positionSampleUnixMs)
+            .put("speed", playbackSpeed.toDouble())
             .put("duration", duration)
             .put("lyric", lyric)
             .put("lyricStatus", lyricStatus)
@@ -305,8 +313,10 @@ class PlaybackStateReader(
             artist = artist,
             album = album,
             positionMs = position,
+            positionSampleElapsedMs = positionSampleElapsedMs,
             durationMs = duration,
             isPlaying = playing,
+            playbackSpeed = playbackSpeed,
             currentLine = lyric,
             lyricSource = diagnostic.source,
             lastPlaybackState = response,
@@ -821,7 +831,10 @@ class PlaybackStateReader(
         return 0L
     }
 
-    private fun calculatePosition(playbackState: PlaybackState?): Long {
+    private fun calculatePosition(
+        playbackState: PlaybackState?,
+        nowElapsedMs: Long = SystemClock.elapsedRealtime()
+    ): Long {
         if (playbackState == null) {
             return 0L
         }
@@ -831,7 +844,7 @@ class PlaybackStateReader(
             return basePosition
         }
 
-        val elapsedSinceUpdate = SystemClock.elapsedRealtime() - playbackState.lastPositionUpdateTime
+        val elapsedSinceUpdate = nowElapsedMs - playbackState.lastPositionUpdateTime
         val adjustedPosition = basePosition + (elapsedSinceUpdate * playbackState.playbackSpeed).toLong()
         return adjustedPosition.coerceAtLeast(0L)
     }

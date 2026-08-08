@@ -17,6 +17,7 @@ class CurrentWordPushEngine(
     private val logger: (String) -> Unit,
     private val sendStatusMessage: (String) -> Boolean,
     private val normalizeTrackId: (String) -> String = { it },
+    private val includeClockSyncFields: () -> Boolean = { false },
     private val expectedGeneration: () -> Long = { CurrentTrackRuntimeCache.currentGeneration() },
     private val currentWordState: () -> CurrentWordState? = {
         CurrentTrackRuntimeCache.currentWordState()
@@ -142,6 +143,9 @@ class CurrentWordPushEngine(
             .put("position", state.positionMs)
             .put("timestamp", state.timestampMs)
             .put("version", state.version)
+        if (includeClockSyncFields()) {
+            payload.put("sampleMono", state.sampleElapsedMs)
+        }
 
         val sent = sendStatusMessage(payload.toString())
         synchronized(lock) {

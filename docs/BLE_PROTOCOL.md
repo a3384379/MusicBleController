@@ -87,13 +87,24 @@
 
 ## V2 能力协商与回退
 
-1. iOS 完成 status notify 订阅后立即发送 `CLIENT_CAPABILITIES`，包含 `protocolVersion=2`、`fullLyricsZlib`、`lyricWindow`、`ping`、`transferRetry`。
+1. iOS 完成 status notify 订阅后立即发送 `CLIENT_CAPABILITIES`，包含 `protocolVersion=2`、`fullLyricsZlib`、`lyricWindow`、`ping`、`clockSyncV1`、`transferRetry`。
 2. Sony 返回 `clientCapabilitiesAck`。Sony 在 ACK 或 250ms 超时前暂缓首次封面 Offer；iOS 300ms 未收到 ACK 时保持旧协议。
 3. V2 `GET_FULL_LYRICS` 附带 `format=zlib-json-v1`。旧 Sony 忽略新字段并返回 legacy 逐行响应，新 iOS 同时解析两种格式。
 4. 压缩歌词正文为 zlib JSON，最大 24KB；分包头为 `0xA2 + version + index + total` 共 6 字节。start/end 在小 MTU 下可使用 `id/tid/g/s/u/c/n/crc` 别名。
 5. A1/A2 都使用 `trackId + generation + transferId + CRC32` 栅栏。缺包不超过 32 个时 `RETRY_TRANSFER` 局部重传，否则完整重试一次。
    - FullLyrics 重传只校验歌词自身的 `trackId + generation + transferId`，不得依赖当前封面 ID/状态。
 6. 协商失败、正文超限、metadata 超 MTU 或旧端连接时自动回退 legacy，不改变 QRC 解密和 secondary 协议。
+
+## 自动歌词时钟同步
+
+- `clockSyncV1` 只在双方能力 ACK 后启用。iOS 连接后连续发送 5 个低开销 PING，之后每 120 秒发送 3 个复验样本；旧端忽略新字段并维持原偏移逻辑。
+- PING 可携带 `clientSendElapsedMs`，PONG 回显该值并返回 `serverReceiveElapsedMs`、`serverSendElapsedMs`。两端均使用单调时钟，系统时区、手工校时或网络授时跳变不会改变播放锚点。
+- iOS 选取低 RTT 样本估算 Sony→iPhone 单调时钟映射。至少 3 个有效样本、最佳 RTT 不超过 300ms 且偏移抖动不超过 100ms 后才标记为可信。
+- 协商成功的 `playbackState` 使用 `sampleMono` 标记播放位置采样时刻；`currentWord` 在所有订阅端都支持该能力时也附带 `sampleMono`。原有 `timestamp` 保留用于旧协议和降级诊断。
+- 播放中接收端使用 `position + transportAge × speed` 建立本地锚点，暂停时不推进。小于 400ms 的校准差分段平滑；传输年龄超过 1.5 秒时丢弃旧锚点，避免积压歌词覆盖当前进度。
+- 自动补偿只消除时钟差和 BLE/调度延迟；QRC 文件自身偏差、MediaSession 与真实音频输出偏差仍通过 iOS“人工微调”设置处理。
+- 旧 Sony 不支持 `clockSyncV1` 时，iOS 在人工微调仍为 0 的情况下保留原有 600ms 兼容补偿；用户已有的自定义偏移不会被叠加覆盖。
+- Sony 将 `positionAnchorElapsedMs` 与歌词、封面等普通状态更新时间分离；非播放状态更新不得重置播放位置锚点。
 
 ## 自适应发送
 
@@ -106,8 +117,9 @@
 
 ## iOS 写回调容错
 
-- CoreBluetooth 偶发漏掉单次 `didWrite`，但 Sony 已处理命令且 status notify 仍持续时，iOS 先进入 1 秒 late-callback fence，丢弃待处理的后台写并保留控制写。
-- 后续真实写成功会清零计数；连续两次写回调超时才 hard reconnect。没有活动 notify 的超时仍按断链处理。
+- iOS 进入 inactive/background 时暂停健康探测、订阅超时、写回调超时和时钟同步调度；回到前台先用 `PING`（旧协议用 `GET_PLAYBACK_STATE`）验证链路，收到任意有效 notify 后才同步播放状态、音量和歌词。
+- CoreBluetooth 偶发漏掉单次 `didWrite` 时，第一次超时只标记 suspect 并延长等待，不弹出 in-flight 请求、不推进下一条写，避免迟到回调串到下一条命令；连续两次超时才 hard reconnect。
+- Sony 端 45 秒无业务流量只会按设备发送 `{"type":"link"}` 小探针，不再重建共享 GATT。探针的真实 notify 失败累计到阈值后，仅隔离失败地址，其他控制器继续工作。
 - 恢复连接的 smoke 参数通过一次性 App 容器标记传递，避免 CoreBluetooth 后台恢复抢先启动导致测试序列丢失。
 
 ## 不允许随便修改的点

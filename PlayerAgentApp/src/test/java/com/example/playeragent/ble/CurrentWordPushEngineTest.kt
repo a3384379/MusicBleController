@@ -70,6 +70,33 @@ class CurrentWordPushEngineTest {
         assertEquals(2, sent)
     }
 
+    @Test
+    fun clockSyncPayloadAddsMonotonicSampleOnlyWhenNegotiated() {
+        var nowMs = 1_000L
+        val payloads = mutableListOf<JSONObject>()
+        val engine = CurrentWordPushEngine(
+            logger = {},
+            sendStatusMessage = {
+                payloads += JSONObject(it)
+                true
+            },
+            includeClockSyncFields = { true },
+            expectedGeneration = { 7L },
+            currentWordState = {
+                word(positionMs = 1_000L, wordIndex = 1).copy(sampleElapsedMs = 88_000L)
+            },
+            elapsedRealtime = { nowMs }
+        )
+
+        assertNull(engine.pushCurrentWord())
+        nowMs += 500L
+        assertTrue(engine.pushCurrentWord() != null)
+
+        assertEquals(88_000L, payloads.single().getLong("sampleMono"))
+        assertTrue(payloads.single().has("timestamp"))
+        assertTrue(payloads.single().toString().toByteArray().size <= 182)
+    }
+
     private fun word(positionMs: Long, wordIndex: Int): CurrentWordState {
         return CurrentWordState(
             trackId = "track-1",

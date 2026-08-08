@@ -14,6 +14,8 @@ struct ContentView: View {
     @State private var showNowPlayingDiagnostic = false
     @State private var showSystemHealthOverview = false
     @State private var showPreferences = false
+    @State private var isVolumeFeedbackVisible = false
+    @State private var volumeFeedbackGeneration = 0
 
     init() {
         let manager = BLETestManager()
@@ -201,32 +203,80 @@ struct ContentView: View {
     private var darkSystemHeader: some View {
         HStack(spacing: 12) {
             Button {
-                bleManager.scanSonyFromMenu()
+                handleConnectionChipTap()
             } label: {
-                HStack(spacing: 10) {
-                    Circle()
-                        .fill(systemState.connection.color)
-                        .frame(width: 9, height: 9)
-                        .shadow(color: systemState.connection.color.opacity(0.55), radius: 7)
+                HStack(spacing: 7) {
+                    connectionStatusIndicator
 
-                    Text("Sony PlayerAgent")
-                        .font(.system(size: 15, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.94))
+                    Text(systemState.connection.compactTitle)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .foregroundStyle(connectionChipForegroundColor)
                         .lineLimit(1)
-
-                    Text(systemState.connection.title)
-                        .font(.system(size: 14, weight: .semibold, design: .rounded))
-                        .foregroundStyle(systemState.connection.color.opacity(0.98))
-                        .lineLimit(1)
+                        .contentTransition(.opacity)
+                }
+                .padding(.horizontal, 11)
+                .frame(height: 34)
+                .background(connectionChipBackground, in: Capsule())
+                .overlay {
+                    Capsule()
+                        .strokeBorder(connectionChipBorderColor, lineWidth: 1)
                 }
                 .contentShape(Rectangle())
+                .padding(.vertical, 5)
             }
             .buttonStyle(PressScaleButtonStyle(pressedScale: 0.98))
-            .accessibilityLabel("连接状态，点按扫描或重连")
+            .accessibilityLabel(systemState.connection.accessibilityLabel)
+            .accessibilityHint(
+                isConnected
+                    ? "点按查看连接详情"
+                    : "点按扫描并连接 Sony"
+            )
 
             Spacer()
 
             darkMenuButton
+        }
+        .animation(.easeInOut(duration: 0.18), value: systemState.connection)
+    }
+
+    @ViewBuilder
+    private var connectionStatusIndicator: some View {
+        if systemState.connection.showsProgressIndicator {
+            ProgressView()
+                .controlSize(.mini)
+                .tint(systemState.connection.color)
+                .frame(width: 12, height: 12)
+        } else if systemState.connection == .disconnected {
+            Image(systemName: "antenna.radiowaves.left.and.right.slash")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(systemState.connection.color)
+                .frame(width: 12, height: 12)
+        } else {
+            Circle()
+                .fill(systemState.connection.color)
+                .frame(width: 7, height: 7)
+                .shadow(color: systemState.connection.color.opacity(0.48), radius: 4)
+                .frame(width: 12, height: 12)
+        }
+    }
+
+    private var connectionChipForegroundColor: Color {
+        isConnected ? .white.opacity(0.88) : systemState.connection.color.opacity(0.96)
+    }
+
+    private var connectionChipBackground: Color {
+        isConnected ? .white.opacity(0.055) : systemState.connection.color.opacity(0.12)
+    }
+
+    private var connectionChipBorderColor: Color {
+        isConnected ? .white.opacity(0.07) : systemState.connection.color.opacity(0.20)
+    }
+
+    private func handleConnectionChipTap() {
+        if isConnected {
+            showPreferences = true
+        } else {
+            bleManager.scanSonyFromMenu()
         }
     }
 
@@ -484,54 +534,107 @@ struct ContentView: View {
     }
 
     private var darkVolumeControl: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 12) {
             Image(systemName: volumeIcon)
                 .font(.system(size: 20, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.92))
-                .frame(width: 26)
+                .frame(width: 24)
 
-            Slider(
-                value: Binding(
-                    get: {
-                        Double(
-                            bleManager.isVolumeSeeking
-                                ? bleManager.volumeSeekValue
-                                : bleManager.volumeCurrent
-                        )
-                    },
-                    set: { value in
-                        bleManager.updateVolumeSeekValue(value)
-                    }
-                ),
-                in: 0...Double(max(bleManager.volumeMax, 1)),
-                step: 1,
-                onEditingChanged: { editing in
-                    if editing {
-                        bleManager.beginVolumeSeeking()
-                    } else {
-                        bleManager.finishVolumeSeeking()
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Slider(
+                        value: volumeBinding,
+                        in: 0...Double(max(bleManager.volumeMax, 1)),
+                        step: 1,
+                        onEditingChanged: handleVolumeEditingChanged
+                    )
+                    .tint(uiState.playback.accentColor)
+                    .disabled(!isVolumeControlAvailable)
+
+                    if isVolumeFeedbackVisible, isVolumeControlAvailable {
+                        Text("音量 \(displayedVolume)")
+                            .font(.system(size: 11, weight: .semibold, design: .rounded).monospacedDigit())
+                            .foregroundStyle(.white.opacity(0.94))
+                            .padding(.horizontal, 8)
+                            .frame(height: 24)
+                            .background(.black.opacity(0.72), in: Capsule())
+                            .overlay {
+                                Capsule().strokeBorder(.white.opacity(0.10), lineWidth: 1)
+                            }
+                            .fixedSize()
+                            .position(
+                                x: volumeFeedbackXPosition(in: proxy.size.width),
+                                y: -7
+                            )
+                            .transition(.opacity.combined(with: .scale(scale: 0.94)))
+                            .allowsHitTesting(false)
                     }
                 }
-            )
-            .tint(uiState.playback.accentColor)
-            .disabled(!isConnected || bleManager.volumeMax <= 0)
+            }
+            .frame(height: 32)
 
-            Text("\(displayedVolume) / \(bleManager.volumeMax)")
-                .font(.system(size: 15, weight: .semibold, design: .rounded).monospacedDigit())
-                .foregroundStyle(.white.opacity(0.80))
-                .frame(width: 64, alignment: .trailing)
-                .contentTransition(.numericText())
         }
-        .padding(.horizontal, 16)
-        .frame(height: 48)
-        .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .padding(.horizontal, 14)
+        .frame(height: 44)
+        .background(Color.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .strokeBorder(.white.opacity(0.07), lineWidth: 1)
         }
         .disabled(!isConnected)
         .opacity(isConnected ? 1 : 0.48)
         .animation(.easeInOut(duration: 0.16), value: displayedVolume)
+        .animation(.easeInOut(duration: 0.16), value: isVolumeFeedbackVisible)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("音量")
+        .accessibilityValue(volumeAccessibilityValue)
+    }
+
+    private var volumeBinding: Binding<Double> {
+        Binding(
+            get: { Double(displayedVolume) },
+            set: { bleManager.updateVolumeSeekValue($0) }
+        )
+    }
+
+    private var isVolumeControlAvailable: Bool {
+        isConnected && bleManager.volumeMax > 0
+    }
+
+    private var volumeAccessibilityValue: String {
+        guard bleManager.volumeMax > 0 else { return "尚未同步" }
+        return "\(displayedVolume)，最大 \(bleManager.volumeMax)"
+    }
+
+    private func handleVolumeEditingChanged(_ editing: Bool) {
+        volumeFeedbackGeneration += 1
+        let generation = volumeFeedbackGeneration
+
+        if editing {
+            withAnimation(.easeOut(duration: 0.12)) {
+                isVolumeFeedbackVisible = true
+            }
+            bleManager.beginVolumeSeeking()
+            return
+        }
+
+        bleManager.finishVolumeSeeking()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) {
+            guard generation == volumeFeedbackGeneration else { return }
+            withAnimation(.easeInOut(duration: 0.16)) {
+                isVolumeFeedbackVisible = false
+            }
+        }
+    }
+
+    private func volumeFeedbackXPosition(in width: CGFloat) -> CGFloat {
+        let horizontalInset = CGFloat(18)
+        let usableWidth = max(width - horizontalInset * 2, 0)
+        let progress = CGFloat(CompactVolumePresentation.normalizedProgress(
+            current: displayedVolume,
+            maximum: bleManager.volumeMax
+        ))
+        return min(max(horizontalInset + usableWidth * progress, 30), max(width - 30, 30))
     }
 
     private var systemState: DarkControlSystemState {
@@ -585,115 +688,6 @@ struct ContentView: View {
         }
         .buttonStyle(PressScaleButtonStyle(pressedScale: 0.90))
         .accessibilityLabel(title)
-    }
-
-    private var connectionSection: some View {
-        HStack(spacing: 12) {
-            Button {
-                bleManager.scanSonyFromMenu()
-            } label: {
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(connectionColor)
-                        .frame(width: 8, height: 8)
-                        .shadow(color: connectionColor.opacity(0.42), radius: 5)
-
-                    Text(connectionStatusTitle)
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(.white.opacity(0.88))
-                        .lineLimit(1)
-                }
-                .padding(.horizontal, 14)
-                .frame(height: 42)
-                .contentShape(Capsule())
-            }
-            .buttonStyle(PressScaleButtonStyle(pressedScale: 0.97))
-            .background(.white.opacity(0.070), in: Capsule())
-            .overlay {
-                Capsule().stroke(.white.opacity(0.070), lineWidth: 1)
-            }
-            .accessibilityLabel("连接状态，点按扫描或重连")
-
-            Spacer()
-
-            Menu {
-                Button {
-                    bleManager.scanSonyFromMenu()
-                } label: {
-                    Label("扫描 / 重连", systemImage: "antenna.radiowaves.left.and.right")
-                }
-
-                Button {
-                    showPlaybackHistory = true
-                } label: {
-                    Label("播放历史", systemImage: "clock.arrow.circlepath")
-                }
-
-                Button {
-                    showPreferences = true
-                } label: {
-                    Label("设置", systemImage: "gearshape")
-                }
-
-                Button {
-                    bleManager.toggleAppExperienceMode()
-                } label: {
-                    Label(
-                        preferences.appExperienceMode.toggleTitle,
-                        systemImage: isDebugMode ? "person.fill" : "ladybug.fill"
-                    )
-                }
-
-                if isDebugMode {
-                    Divider()
-
-                    Button {
-                        showSystemHealthOverview = true
-                    } label: {
-                        Label("系统健康总览", systemImage: "heart.text.square")
-                    }
-
-                    Button {
-                        showNowPlayingDiagnostic = true
-                    } label: {
-                        Label("当前歌曲诊断", systemImage: "waveform.path.ecg.rectangle")
-                    }
-
-                    Button {
-                        bleManager.requestLyricDiagnostic(manual: true)
-                        showLyricDiagnostic = true
-                    } label: {
-                        Label("歌词诊断中心", systemImage: "text.magnifyingglass")
-                    }
-
-                    Button {
-                        showDebugPage = true
-                    } label: {
-                        Label("调试工具", systemImage: "slider.horizontal.3")
-                    }
-                }
-
-                Divider()
-
-                Picker("歌词显示", selection: lyricDisplayModeBinding) {
-                    ForEach(LyricDisplayMode.allCases) { mode in
-                        Text(mode.menuTitle).tag(mode)
-                    }
-                }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 19, weight: .bold))
-                    .frame(width: 42, height: 42)
-            }
-            .buttonStyle(PressScaleButtonStyle(pressedScale: 0.96))
-            .background(.white.opacity(0.075), in: Circle())
-            .overlay {
-                Circle().stroke(.white.opacity(0.075), lineWidth: 1)
-            }
-            .accessibilityLabel("更多操作")
-        }
-        .foregroundStyle(.white)
-        .animation(.easeInOut(duration: 0.2), value: bleManager.connectionDisplayState)
     }
 
     private var nowPlayingSection: some View {
@@ -953,83 +947,6 @@ struct ContentView: View {
         .disabled(!isConnected)
         .opacity(isConnected ? 1 : 0.46)
         .animation(.spring(response: 0.28, dampingFraction: 0.72), value: bleManager.isPlaying)
-    }
-
-    private var volumeSection: some View {
-        HStack(spacing: 12) {
-            Image(systemName: volumeIcon)
-                .font(.headline)
-                .frame(width: 24)
-
-            Slider(
-                value: Binding(
-                    get: {
-                        Double(
-                            bleManager.isVolumeSeeking
-                                ? bleManager.volumeSeekValue
-                                : bleManager.volumeCurrent
-                        )
-                    },
-                    set: { value in
-                        bleManager.updateVolumeSeekValue(value)
-                    }
-                ),
-                in: 0...Double(max(bleManager.volumeMax, 1)),
-                step: 1,
-                onEditingChanged: { editing in
-                    if editing {
-                        bleManager.beginVolumeSeeking()
-                    } else {
-                        bleManager.finishVolumeSeeking()
-                    }
-                }
-            )
-            .tint(.white.opacity(0.92))
-            .disabled(!isConnected || bleManager.volumeMax <= 0)
-
-            Text("\(displayedVolume) / \(bleManager.volumeMax)")
-                .font(.caption.monospacedDigit().weight(.semibold))
-                .foregroundStyle(.white.opacity(0.76))
-                .frame(width: 58, alignment: .trailing)
-                .contentTransition(.numericText())
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .foregroundStyle(.white)
-        .background(.white.opacity(0.070), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(.white.opacity(0.08), lineWidth: 1)
-        }
-        .disabled(!isConnected)
-        .opacity(isConnected ? 1 : 0.52)
-        .animation(.easeInOut(duration: 0.16), value: displayedVolume)
-    }
-
-    private var connectionColor: Color {
-        switch bleManager.connectionDisplayState {
-        case "connected":
-            return .green
-        case "reconnecting":
-            return .orange
-        case "disconnected":
-            return .secondary
-        default:
-            return .secondary
-        }
-    }
-
-    private var connectionStatusTitle: String {
-        switch bleManager.connectionDisplayState {
-        case "connected":
-            return "Sony 已连接"
-        case "reconnecting":
-            return "正在重连"
-        case "disconnected":
-            return "未连接"
-        default:
-            return "未连接"
-        }
     }
 
     private var isConnected: Bool {
@@ -1305,35 +1222,39 @@ private struct DarkControlUIState {
     let playback: DarkPlaybackVisualState
 }
 
-private enum DarkControlConnectionState: String {
+enum DarkControlConnectionState: String {
     case connected
     case reconnecting
     case connecting
     case disconnected
 
-    var title: String {
+    var compactTitle: String {
         switch self {
         case .connected:
-            return "已连接"
+            return "Sony"
         case .connecting:
             return "连接中"
         case .reconnecting:
             return "重连中"
         case .disconnected:
-            return "未连接"
+            return "连接"
         }
     }
 
-    var detail: String {
+    var showsProgressIndicator: Bool {
+        self == .connecting || self == .reconnecting
+    }
+
+    var accessibilityLabel: String {
         switch self {
         case .connected:
-            return "设备连接正常"
+            return "Sony 已连接"
         case .connecting:
             return "正在连接 Sony"
         case .reconnecting:
-            return "正在恢复连接"
+            return "正在重新连接 Sony"
         case .disconnected:
-            return "请检查设备连接"
+            return "Sony 未连接"
         }
     }
 
@@ -1344,23 +1265,17 @@ private enum DarkControlConnectionState: String {
         case .connecting:
             return .orange
         case .reconnecting:
-            return .purple
+            return .orange
         case .disconnected:
-            return .gray
+            return .orange
         }
     }
+}
 
-    var icon: String {
-        switch self {
-        case .connected:
-            return "checkmark.circle"
-        case .connecting:
-            return "dot.radiowaves.left.and.right"
-        case .reconnecting:
-            return "arrow.clockwise.circle"
-        case .disconnected:
-            return "link.slash"
-        }
+struct CompactVolumePresentation {
+    static func normalizedProgress(current: Int, maximum: Int) -> Double {
+        guard maximum > 0 else { return 0 }
+        return min(max(Double(current) / Double(maximum), 0), 1)
     }
 }
 

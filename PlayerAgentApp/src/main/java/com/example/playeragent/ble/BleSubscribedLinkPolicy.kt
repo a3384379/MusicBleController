@@ -2,9 +2,9 @@ package com.example.playeragent.ble
 
 /**
  * Detects a subscribed GATT link that has stopped producing any observable
- * activity. This must not depend on queued outbound work: some vendor stacks
- * miss the disconnect callback and otherwise leave an idle ghost subscriber
- * blocking advertising indefinitely.
+ * activity. Silence is only a reason to probe the link, never proof that the
+ * link is dead: iOS can legitimately suspend all business traffic while the
+ * app is in the background.
  */
 internal object BleSubscribedLinkPolicy {
     fun isActivityStale(
@@ -44,5 +44,32 @@ internal object BleSubscribedLinkPolicy {
             subscribedAtMs > 0L &&
             nowMs - subscribedAtMs >= 0L &&
             nowMs - subscribedAtMs > maxAgeMs
+    }
+
+    fun shouldSendProbe(
+        subscribedAtMs: Long,
+        lastCommandSuccessAtMs: Long,
+        lastNotifySuccessAtMs: Long,
+        lastProbeAtMs: Long,
+        nowMs: Long,
+        staleAfterMs: Long,
+        minimumProbeIntervalMs: Long
+    ): Boolean {
+        if (!isActivityStale(
+                subscribed = true,
+                subscribedAtMs = subscribedAtMs,
+                lastCommandSuccessAtMs = lastCommandSuccessAtMs,
+                lastNotifySuccessAtMs = lastNotifySuccessAtMs,
+                nowMs = nowMs,
+                maxAgeMs = staleAfterMs
+            )
+        ) {
+            return false
+        }
+        if (lastProbeAtMs <= 0L) {
+            return true
+        }
+        val sinceLastProbeMs = nowMs - lastProbeAtMs
+        return sinceLastProbeMs >= 0L && sinceLastProbeMs >= minimumProbeIntervalMs
     }
 }

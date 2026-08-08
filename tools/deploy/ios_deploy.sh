@@ -15,6 +15,7 @@ RENEW_PROFILE_WAIT_SECONDS="${RENEW_PROFILE_WAIT_SECONDS:-90}"
 IOS_DEVICE_ID="${IOS_DEVICE_ID:-}"
 XCODE_DESTINATION="${XCODE_DESTINATION:-}"
 XCODE_DESTINATION_ID="${XCODE_DESTINATION_ID:-}"
+XCODE_WARM_AFTER_PROFILE_REMOVAL="${XCODE_WARM_AFTER_PROFILE_REMOVAL:-true}"
 FORCE_REINSTALL=false
 REFRESH_ONLY=false
 RENEW_PROFILES=false
@@ -36,7 +37,7 @@ Options:
   -h, --help                Show this help.
 
 Environment overrides:
-  ROOT_DIR PROJECT_PATH SCHEME CONFIGURATION BUNDLE_ID APP_NAME DERIVED_DATA_PATH OUT_DIR SMOKE_CHECK RENEW_PROFILE_WAIT_SECONDS IOS_DEVICE_ID XCODE_DESTINATION XCODE_DESTINATION_ID
+  ROOT_DIR PROJECT_PATH SCHEME CONFIGURATION BUNDLE_ID APP_NAME DERIVED_DATA_PATH OUT_DIR SMOKE_CHECK RENEW_PROFILE_WAIT_SECONDS IOS_DEVICE_ID XCODE_DESTINATION XCODE_DESTINATION_ID XCODE_WARM_AFTER_PROFILE_REMOVAL
 EOF
 }
 
@@ -293,6 +294,22 @@ PY
   return 1
 }
 
+warm_xcode_after_profile_removal() {
+  if [[ "$XCODE_WARM_AFTER_PROFILE_REMOVAL" != true ]]; then
+    return 0
+  fi
+
+  echo "[Deploy] opening Xcode after profile removal to warm signing account state" | tee -a "$OUT_DIR/xcodebuild.log"
+  open -a Xcode "$PROJECT_PATH" >/dev/null 2>&1 || true
+  echo "[Deploy] waiting up to ${RENEW_PROFILE_WAIT_SECONDS}s for Xcode to regenerate profiles" | tee -a "$OUT_DIR/xcodebuild.log"
+  if wait_for_matching_profiles 2>&1 | tee -a "$OUT_DIR/xcodebuild.log"; then
+    echo "[Deploy] regenerated profiles found before xcodebuild" | tee -a "$OUT_DIR/xcodebuild.log"
+    sync_xcode_profiles
+  else
+    echo "[Deploy] Xcode did not regenerate profiles before xcodebuild; continuing" | tee -a "$OUT_DIR/xcodebuild.log"
+  fi
+}
+
 IOS_DEVICE_ID="$(find_device)"
 XCODE_DESTINATION="$(resolve_xcode_destination)"
 export ROOT_DIR OUT_DIR IOS_DEVICE_ID BUNDLE_ID XCODE_DESTINATION
@@ -329,6 +346,10 @@ if [[ "$RENEW_PROFILES" == true ]]; then
     echo "[Deploy] removing provisioning profile: $profile"
     rm -f "$profile"
   done < <(renew_matching_profiles)
+
+  if [[ -s "$backup_manifest" ]]; then
+    warm_xcode_after_profile_removal
+  fi
 fi
 
 set +e

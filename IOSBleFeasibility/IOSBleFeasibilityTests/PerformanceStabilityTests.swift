@@ -4,19 +4,42 @@ import XCTest
 @testable import sonyMusic
 
 final class PerformanceStabilityTests: XCTestCase {
-    func testSoftWriteRecoveryRetainsQueuedMediaRequests() {
-        XCTAssertTrue(
-            CommandWriteSoftRecoveryPolicy.shouldRetainPendingCommand(
-                "GET_LYRIC_SECONDARY"
-            )
+    func testWriteTimeoutDoesNotAdvanceQueueAndSuspendsInBackground() {
+        XCTAssertEqual(
+            CommandWriteTimeoutPolicy.action(
+                appIsActive: false,
+                transportReady: true,
+                timeoutCountAfterIncrement: 1,
+                reconnectThreshold: 2
+            ),
+            .suspendUntilForeground
         )
-        XCTAssertTrue(
-            CommandWriteSoftRecoveryPolicy.shouldRetainPendingCommand(
-                "ALBUM_ART_REQUEST"
-            )
+        XCTAssertEqual(
+            CommandWriteTimeoutPolicy.action(
+                appIsActive: true,
+                transportReady: true,
+                timeoutCountAfterIncrement: 1,
+                reconnectThreshold: 2
+            ),
+            .extendWithoutAdvancingQueue
         )
-        XCTAssertTrue(
-            CommandWriteSoftRecoveryPolicy.shouldRetainPendingCommand("PING")
+        XCTAssertEqual(
+            CommandWriteTimeoutPolicy.action(
+                appIsActive: true,
+                transportReady: true,
+                timeoutCountAfterIncrement: 2,
+                reconnectThreshold: 2
+            ),
+            .reconnect
+        )
+        XCTAssertEqual(
+            CommandWriteTimeoutPolicy.action(
+                appIsActive: true,
+                transportReady: false,
+                timeoutCountAfterIncrement: 1,
+                reconnectThreshold: 2
+            ),
+            .reconnect
         )
     }
 
@@ -32,6 +55,123 @@ final class PerformanceStabilityTests: XCTestCase {
 
         fence.reset()
         XCTAssertTrue(fence.shouldAccept(generation: 1, sequence: 1, positionMs: 20))
+    }
+
+    func testMonotonicClockSyncAndAutomaticPlaybackCompensation() {
+        var synchronizer = MonotonicClockSynchronizer()
+        XCTAssertEqual(
+            synchronizer.record(
+                clientSendElapsedMs: 1_000,
+                serverReceiveElapsedMs: 920,
+                serverSendElapsedMs: 922,
+                clientReceiveElapsedMs: 1_042
+            )?.isConfident,
+            false
+        )
+        _ = synchronizer.record(
+            clientSendElapsedMs: 2_000,
+            serverReceiveElapsedMs: 1_922,
+            serverSendElapsedMs: 1_924,
+            clientReceiveElapsedMs: 2_046
+        )
+        let snapshot = synchronizer.record(
+            clientSendElapsedMs: 3_000,
+            serverReceiveElapsedMs: 2_919,
+            serverSendElapsedMs: 2_921,
+            clientReceiveElapsedMs: 3_041
+        )
+        XCTAssertEqual(snapshot?.isConfident, true)
+        XCTAssertEqual(snapshot?.bestRoundTripMs, 39)
+        XCTAssertEqual(Int64(snapshot?.localMinusServerMs.rounded() ?? 0), 100)
+
+        XCTAssertEqual(
+            RemotePlaybackAnchorPolicy.resolve(
+                remotePositionMs: 10_000,
+                serverSampleElapsedMs: 4_000,
+                localReceiveElapsedMs: 4_220,
+                playbackSpeed: 1.0,
+                isPlaying: true,
+                durationMs: 60_000,
+                synchronizer: synchronizer
+            ),
+            .resolved(positionMs: 10_120, transportAgeMs: 120)
+        )
+        XCTAssertEqual(
+            RemotePlaybackAnchorPolicy.resolve(
+                remotePositionMs: 10_000,
+                measuredTransportAgeMs: 2_000,
+                playbackSpeed: 1.0,
+                isPlaying: true,
+                durationMs: 60_000
+            ),
+            .stale(transportAgeMs: 2_000)
+        )
+        XCTAssertEqual(
+            RemotePlaybackAnchorPolicy.resolve(
+                remotePositionMs: 10_000,
+                measuredTransportAgeMs: 200,
+                playbackSpeed: 1.0,
+                isPlaying: false,
+                durationMs: 60_000
+            ),
+            .resolved(positionMs: 10_000, transportAgeMs: 200)
+        )
+        XCTAssertEqual(
+            RemotePlaybackAnchorPolicy.smoothedPosition(
+                currentPositionMs: 10_000,
+                targetPositionMs: 10_200
+            ),
+            10_100
+        )
+    }
+
+    func testAutomaticLyricSyncMigratesOnlyLegacyDefaultOffset() {
+        XCTAssertEqual(
+            PreferencesStore.migratedLegacyLyricOffset(
+                storedOffset: 600,
+                migrationCompleted: false
+            ),
+            0
+        )
+        XCTAssertEqual(
+            PreferencesStore.migratedLegacyLyricOffset(
+                storedOffset: 300,
+                migrationCompleted: false
+            ),
+            300
+        )
+        XCTAssertEqual(
+            PreferencesStore.migratedLegacyLyricOffset(
+                storedOffset: 600,
+                migrationCompleted: true
+            ),
+            600
+        )
+    }
+
+    func testCompactConnectionAndVolumePresentation() {
+        XCTAssertEqual(
+            DarkControlConnectionState.connected.compactTitle,
+            "Sony"
+        )
+        XCTAssertEqual(
+            DarkControlConnectionState.disconnected.compactTitle,
+            "连接"
+        )
+        XCTAssertTrue(DarkControlConnectionState.connecting.showsProgressIndicator)
+        XCTAssertTrue(DarkControlConnectionState.reconnecting.showsProgressIndicator)
+        XCTAssertFalse(DarkControlConnectionState.connected.showsProgressIndicator)
+
+        XCTAssertEqual(
+            CompactVolumePresentation.normalizedProgress(current: 8, maximum: 16),
+            0.5,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            CompactVolumePresentation.normalizedProgress(current: 20, maximum: 15),
+            1,
+            accuracy: 0.001
+        )
     }
 
     func testA1AndA2DispatchAndOutOfOrderAssembly() {

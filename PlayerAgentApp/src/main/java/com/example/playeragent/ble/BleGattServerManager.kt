@@ -127,7 +127,13 @@ class BleGattServerManager(
     private val currentWordPushEngine = CurrentWordPushEngine(
         logger = logger,
         sendStatusMessage = { message -> sendStatusMessage(message) },
-        normalizeTrackId = { trackId -> normalizeCurrentWordTrackId(trackId) }
+        normalizeTrackId = { trackId -> normalizeCurrentWordTrackId(trackId) },
+        includeClockSyncFields = {
+            val addresses = subscribedDevices.keys.toList()
+            addresses.isNotEmpty() && addresses.all { address ->
+                connectionCommandCoordinator.capabilities(address).clockSyncV1
+            }
+        }
     )
     private val playbackStateBuffer = PlaybackStateBuffer(
         logger = logger,
@@ -200,8 +206,11 @@ class BleGattServerManager(
     @Volatile
     private var lastNotifyFailureAtMs = 0L
     private val notifyFailureCountByAddress = ConcurrentHashMap<String, Int>()
+    private val subscribedAtByAddress = ConcurrentHashMap<String, Long>()
+    private val lastCommandSuccessAtByAddress = ConcurrentHashMap<String, Long>()
     private val lastNotifySuccessAtByAddress = ConcurrentHashMap<String, Long>()
     private val lastNotifyFailureAtByAddress = ConcurrentHashMap<String, Long>()
+    private val lastLinkProbeAtByAddress = ConcurrentHashMap<String, Long>()
     @Volatile
     private var lastSubscribedAtMs = 0L
     @Volatile
@@ -263,8 +272,11 @@ class BleGattServerManager(
                     mtuByAddress.remove(address)
                     notifyQueue.removeDevice(address)
                     notifyFailureCountByAddress.remove(address)
+                    subscribedAtByAddress.remove(address)
+                    lastCommandSuccessAtByAddress.remove(address)
                     lastNotifySuccessAtByAddress.remove(address)
                     lastNotifyFailureAtByAddress.remove(address)
+                    lastLinkProbeAtByAddress.remove(address)
                     connectionCommandCoordinator.remove(address)
                     lyricsTransferCoordinator.resetAddress(address)
                     albumArtTransferCoordinator.resetAddress(address)
@@ -286,8 +298,11 @@ class BleGattServerManager(
                     mtuByAddress.clear()
                     notifyQueue.clearAllForDisconnect("unknown disconnect address")
                     notifyFailureCountByAddress.clear()
+                    subscribedAtByAddress.clear()
+                    lastCommandSuccessAtByAddress.clear()
                     lastNotifySuccessAtByAddress.clear()
                     lastNotifyFailureAtByAddress.clear()
+                    lastLinkProbeAtByAddress.clear()
                     connectionCommandCoordinator.clear()
                     lyricsTransferCoordinator.clearRetryState()
                     albumArtTransferCoordinator.reset()
@@ -414,7 +429,7 @@ class BleGattServerManager(
                 )
                 if (ok) {
                     notifyQueue.onCommandResponseSent()
-                    recordCommandSuccess(command)
+                    recordCommandSuccess(command, device?.address)
                 }
             }
             val dispatchExecutor = when (command) {
@@ -513,6 +528,10 @@ class BleGattServerManager(
                     subscribedDevices[device.address] = device
                     notifyFailureCountByAddress[device.address] = 0
                     lastSubscribedAtMs = SystemClock.elapsedRealtime()
+                    subscribedAtByAddress[device.address] = lastSubscribedAtMs
+                    lastCommandSuccessAtByAddress.remove(device.address)
+                    lastNotifySuccessAtByAddress.remove(device.address)
+                    lastLinkProbeAtByAddress.remove(device.address)
                     resetClientCapabilities(device.address)
                     val capabilityGeneration = connectionCommandCoordinator.beginNegotiation(
                         device.address,
@@ -543,8 +562,11 @@ class BleGattServerManager(
                     subscribedDevices.remove(device.address)
                     notifyQueue.removeDevice(device.address)
                     notifyFailureCountByAddress.remove(device.address)
+                    subscribedAtByAddress.remove(device.address)
+                    lastCommandSuccessAtByAddress.remove(device.address)
                     lastNotifySuccessAtByAddress.remove(device.address)
                     lastNotifyFailureAtByAddress.remove(device.address)
+                    lastLinkProbeAtByAddress.remove(device.address)
                     resetClientCapabilities(device.address)
                     connectionCommandCoordinator.remove(device.address)
                     albumArtRequestsInFlight
@@ -749,8 +771,11 @@ class BleGattServerManager(
         recentConnectionCallbacks.clear()
         recentMtuCallbacks.clear()
         notifyFailureCountByAddress.clear()
+        subscribedAtByAddress.clear()
+        lastCommandSuccessAtByAddress.clear()
         lastNotifySuccessAtByAddress.clear()
         lastNotifyFailureAtByAddress.clear()
+        lastLinkProbeAtByAddress.clear()
         statusCharacteristic = null
         mediaExecutionContext.close()
         playbackStateBuffer.shutdown()
@@ -812,12 +837,8 @@ class BleGattServerManager(
             !started || serverState == ServerState.STARTING -> BleHealthState.STARTING
             serverState != ServerState.READY -> BleHealthState.STARTING
             currentNotifyFailureCount >= NOTIFY_FAILURE_SUSPECT_THRESHOLD -> BleHealthState.SUSPECT
-            subscribedWithoutSuccessOlderThan(SUSPECT_NO_SUCCESS_HEARTBEAT_MS) ->
+            hasAnyStaleSubscriber(SUSPECT_NO_SUCCESS_HEARTBEAT_MS) ->
                 BleHealthState.SUSPECT
-            subscribedCount > 0 && isSuccessHeartbeatStale(
-                SystemClock.elapsedRealtime(),
-                SUSPECT_NO_SUCCESS_HEARTBEAT_MS
-            ) -> BleHealthState.SUSPECT
             subscribedCount > 0 && lastSuccessHeartbeatAtMs() > 0L -> BleHealthState.CONTROLLABLE
             subscribedCount > 0 -> BleHealthState.SUBSCRIBED
             connectedCount > 0 -> BleHealthState.CONNECTED
@@ -859,8 +880,11 @@ class BleGattServerManager(
             pendingFullLyricsRequests.remove(address)
             pendingLyricWindowRequests.remove(address)
             notifyFailureCountByAddress.remove(address)
+            subscribedAtByAddress.remove(address)
+            lastCommandSuccessAtByAddress.remove(address)
             lastNotifySuccessAtByAddress.remove(address)
             lastNotifyFailureAtByAddress.remove(address)
+            lastLinkProbeAtByAddress.remove(address)
             albumArtRequestsInFlight
                 .filter { it.startsWith("$address|") }
                 .forEach(albumArtRequestsInFlight::remove)
@@ -882,26 +906,18 @@ class BleGattServerManager(
         return true
     }
 
-    fun hasSuccessHeartbeatOlderThan(ageMs: Long): Boolean {
-        return BleSubscribedLinkPolicy.isActivityStale(
-            subscribed = subscribedDevices.isNotEmpty(),
-            subscribedAtMs = lastSubscribedAtMs,
-            lastCommandSuccessAtMs = lastCommandSuccessAtMs,
-            lastNotifySuccessAtMs = lastNotifySuccessAtMs,
-            nowMs = SystemClock.elapsedRealtime(),
-            maxAgeMs = ageMs
-        )
-    }
-
-    fun subscribedWithoutSuccessOlderThan(ageMs: Long): Boolean {
-        return BleSubscribedLinkPolicy.isWithoutSuccessStale(
-            subscribed = subscribedDevices.isNotEmpty(),
-            subscribedAtMs = lastSubscribedAtMs,
-            lastCommandSuccessAtMs = lastCommandSuccessAtMs,
-            lastNotifySuccessAtMs = lastNotifySuccessAtMs,
-            nowMs = SystemClock.elapsedRealtime(),
-            maxAgeMs = ageMs
-        )
+    fun hasAnyStaleSubscriber(ageMs: Long): Boolean {
+        val nowMs = SystemClock.elapsedRealtime()
+        return subscribedDevices.keys.any { address ->
+            BleSubscribedLinkPolicy.isActivityStale(
+                subscribed = true,
+                subscribedAtMs = subscribedAtByAddress[address] ?: lastSubscribedAtMs,
+                lastCommandSuccessAtMs = lastCommandSuccessAtByAddress[address] ?: 0L,
+                lastNotifySuccessAtMs = lastNotifySuccessAtByAddress[address] ?: 0L,
+                nowMs = nowMs,
+                maxAgeMs = ageMs
+            )
+        }
     }
 
     fun notifyFailureCount(): Int = notifyFailureCountByAddress.values.maxOrNull() ?: 0
@@ -911,6 +927,42 @@ class BleGattServerManager(
         return subscribedDevices.keys.filter { address ->
             (notifyFailureCountByAddress[address] ?: 0) >= threshold
         }
+    }
+
+    /**
+     * Queues one tiny notification for each silent subscriber. A successful
+     * notification refreshes that device's heartbeat through recordNotifySuccess;
+     * a real callback failure is handled by the existing per-device failure
+     * counter. Merely being quiet never tears down the shared GATT server.
+     */
+    fun probeStaleSubscribers(
+        staleAfterMs: Long,
+        minimumProbeIntervalMs: Long
+    ): Int {
+        val nowMs = SystemClock.elapsedRealtime()
+        val candidates = subscribedDevices.entries.filter { (address, _) ->
+            BleSubscribedLinkPolicy.shouldSendProbe(
+                subscribedAtMs = subscribedAtByAddress[address] ?: lastSubscribedAtMs,
+                lastCommandSuccessAtMs = lastCommandSuccessAtByAddress[address] ?: 0L,
+                lastNotifySuccessAtMs = lastNotifySuccessAtByAddress[address] ?: 0L,
+                lastProbeAtMs = lastLinkProbeAtByAddress[address] ?: 0L,
+                nowMs = nowMs,
+                staleAfterMs = staleAfterMs,
+                minimumProbeIntervalMs = minimumProbeIntervalMs
+            )
+        }
+        candidates.forEach { (address, device) ->
+            lastLinkProbeAtByAddress[address] = nowMs
+            // Keep the payload below the default 20-byte ATT payload so the
+            // probe works even before an MTU upgrade. Unknown status types are
+            // intentionally ignored by old controllers after refreshing health.
+            sendShortJsonIfFits(
+                device = device,
+                type = "linkProbe",
+                value = JSONObject().put("type", "link")
+            )
+        }
+        return candidates.size
     }
 
     @SuppressLint("MissingPermission")
@@ -947,8 +999,11 @@ class BleGattServerManager(
         logger("[BLE-GATT] state $oldState -> $newState")
     }
 
-    private fun recordCommandSuccess(command: String) {
+    private fun recordCommandSuccess(command: String, deviceAddress: String?) {
         lastCommandSuccessAtMs = SystemClock.elapsedRealtime()
+        if (!deviceAddress.isNullOrBlank()) {
+            lastCommandSuccessAtByAddress[deviceAddress] = lastCommandSuccessAtMs
+        }
         logger("[BleHealth] state=CONTROLLABLE reason=command_success cmd=$command")
     }
 
@@ -993,17 +1048,6 @@ class BleGattServerManager(
         return lastNotifySuccessAtMs
     }
 
-    private fun isSuccessHeartbeatStale(nowMs: Long, maxAgeMs: Long): Boolean {
-        return BleSubscribedLinkPolicy.isActivityStale(
-            subscribed = subscribedDevices.isNotEmpty(),
-            subscribedAtMs = lastSubscribedAtMs,
-            lastCommandSuccessAtMs = lastCommandSuccessAtMs,
-            lastNotifySuccessAtMs = lastNotifySuccessAtMs,
-            nowMs = nowMs,
-            maxAgeMs = maxAgeMs
-        )
-    }
-
     private fun logDisconnectDiagnostics(address: String) {
         val snapshot = notifyQueue.snapshot()
         logger(
@@ -1043,6 +1087,7 @@ class BleGattServerManager(
         seq: String? = null
     ) {
         val sourceAddress = sourceDevice.address
+        val commandReceivedElapsedMs = SystemClock.elapsedRealtime()
         when (command) {
             "PLAY_PAUSE",
             "NEXT",
@@ -1108,7 +1153,7 @@ class BleGattServerManager(
             "GET_PLAYBACK_STATE" -> {
                 sendPlaybackStateTo(sourceDevice, includeAlbumArt = true)
             }
-            "PING" -> sendPong(sourceDevice, request)
+            "PING" -> sendPong(sourceDevice, request, commandReceivedElapsedMs)
             "GET_VOLUME" -> sendStatusMessageTo(
                 sourceDevice,
                 mediaCommandExecutor.createVolumeState().toString()
@@ -1174,6 +1219,7 @@ class BleGattServerManager(
                 "albumArtBinary=${capabilities.binaryAlbumArt} " +
                 "fullLyricsZlib=${capabilities.fullLyricsZlib} " +
                 "lyricWindow=${capabilities.lyricWindow} ping=${capabilities.ping} " +
+                "clockSyncV1=${capabilities.clockSyncV1} " +
                 "transferRetry=${capabilities.transferRetry}"
         )
         sendShortJsonIfFits(
@@ -1186,6 +1232,7 @@ class BleGattServerManager(
                 .put("fullLyricsZlib", true)
                 .put("lyricWindow", true)
                 .put("ping", true)
+                .put("clockSyncV1", true)
                 .put("transferRetry", true)
         )
         sendPendingAlbumArtIfAny()
@@ -1200,6 +1247,7 @@ class BleGattServerManager(
             fullLyricsZlib = request.optBoolean("fullLyricsZlib", false),
             lyricWindow = request.optBoolean("lyricWindow", false),
             ping = request.optBoolean("ping", false),
+            clockSyncV1 = request.optBoolean("clockSyncV1", false),
             transferRetry = request.optBoolean("transferRetry", false),
             negotiated = true
         )
@@ -1232,14 +1280,28 @@ class BleGattServerManager(
         lastAutoPushPlaying = null
     }
 
-    private fun sendPong(device: BluetoothDevice, request: JSONObject) {
+    private fun sendPong(
+        device: BluetoothDevice,
+        request: JSONObject,
+        serverReceiveElapsedMs: Long
+    ) {
+        val serverSendElapsedMs = SystemClock.elapsedRealtime()
+        val value = JSONObject()
+            .put("type", "pong")
+            .put("seq", request.optString("seq"))
+            .put("time", System.currentTimeMillis())
+        if (request.optBoolean("clockSyncV1", false) &&
+            request.has("clientSendElapsedMs")
+        ) {
+            value
+                .put("clientSendElapsedMs", request.optLong("clientSendElapsedMs"))
+                .put("serverReceiveElapsedMs", serverReceiveElapsedMs)
+                .put("serverSendElapsedMs", serverSendElapsedMs)
+        }
         sendShortJsonIfFits(
             device = device,
             type = "pong",
-            value = JSONObject()
-                .put("type", "pong")
-                .put("seq", request.optString("seq"))
-                .put("time", System.currentTimeMillis())
+            value = value
         )
     }
 
@@ -1845,7 +1907,7 @@ class BleGattServerManager(
         coalesceCount: Int
     ): Boolean {
         val sent = sendCompactPlaybackState(source)
-        val payloadSize = compactPlaybackStatePayload(source)
+        val payloadSize = compactPlaybackStatePayload(source, includeClockSync = false)
             .toString()
             .toByteArray(Charsets.UTF_8)
             .size
@@ -1863,10 +1925,12 @@ class BleGattServerManager(
     }
 
     private fun sendCompactPlaybackState(source: JSONObject): Boolean {
-        val compactState = compactPlaybackStatePayload(source)
-        val payloadSizeBeforeFit = compactState.toString().toByteArray(Charsets.UTF_8).size
         val devices = subscribedDevices.values.toList()
         val maximumPayload = devices.minOfOrNull(::maximumPayloadFor) ?: 0
+        val payloadSizeBeforeFit = compactPlaybackStatePayload(
+            source,
+            includeClockSync = false
+        ).toString().toByteArray(Charsets.UTF_8).size
         logger(
             "[PlaybackState] compact payloadSize=$payloadSizeBeforeFit " +
                 "maxPayload=$maximumPayload positionMs=${source.optLong("position")} " +
@@ -1874,7 +1938,12 @@ class BleGattServerManager(
         )
         val sent = devices.fold(false) { anySent, device ->
             val fitted = fitCompactPlaybackState(
-                JSONObject(compactState.toString()),
+                compactPlaybackStatePayload(
+                    source,
+                    includeClockSync = connectionCommandCoordinator
+                        .capabilities(device.address)
+                        .clockSyncV1
+                ),
                 maximumPayloadFor(device)
             )
             sendStatusMessageTo(device, fitted.toString()) || anySent
@@ -1893,19 +1962,33 @@ class BleGattServerManager(
         source: JSONObject
     ): Boolean {
         val fitted = fitCompactPlaybackState(
-            compactPlaybackStatePayload(source),
+            compactPlaybackStatePayload(
+                source,
+                includeClockSync = connectionCommandCoordinator
+                    .capabilities(device.address)
+                    .clockSyncV1
+            ),
             maximumPayloadFor(device)
         )
         return sendStatusMessageTo(device, fitted.toString())
     }
 
-    private fun compactPlaybackStatePayload(source: JSONObject): JSONObject {
-        return JSONObject()
+    private fun compactPlaybackStatePayload(
+        source: JSONObject,
+        includeClockSync: Boolean
+    ): JSONObject {
+        val payload = JSONObject()
             .put("type", "playbackState")
             .put("playing", source.optBoolean("playing"))
             .put("position", source.optLong("position"))
             .put("duration", source.optLong("duration"))
             .put("lyric", source.optString("lyric").take(MAX_LYRIC_TEXT_LENGTH))
+        if (includeClockSync) {
+            payload
+                .put("sampleMono", source.optLong("positionSampleElapsedMs"))
+                .put("speed", source.optDouble("speed", 1.0))
+        }
+        return payload
     }
 
     private fun fitCompactPlaybackState(

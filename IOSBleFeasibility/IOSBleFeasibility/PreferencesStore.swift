@@ -69,7 +69,9 @@ final class PreferencesStore: ObservableObject {
     static let shared = PreferencesStore()
 
     static let autoReconnectEnabledKey = "autoReconnectEnabled"
+    static let automaticLyricSyncEnabledKey = "automaticLyricSyncEnabled"
     static let lyricOffsetMsKey = "lyricOffsetMs"
+    static let automaticLyricSyncMigrationV1Key = "automaticLyricSyncMigrationV1"
     static let artworkEnhancementEnabledKey = "artworkEnhancementEnabled"
     static let artworkEnhancementTargetPixelSizeKey = "artworkEnhancementTargetPixelSize"
     static let artworkEnhancementSharpnessKey = "artworkEnhancementSharpness"
@@ -84,6 +86,16 @@ final class PreferencesStore: ObservableObject {
 
     @Published var lyricOffsetMs: Int {
         didSet { persistInt(lyricOffsetMs, oldValue: oldValue, key: Self.lyricOffsetMsKey) }
+    }
+
+    @Published var automaticLyricSyncEnabled: Bool {
+        didSet {
+            persistBool(
+                automaticLyricSyncEnabled,
+                oldValue: oldValue,
+                key: Self.automaticLyricSyncEnabledKey
+            )
+        }
     }
 
     @Published var lyricDisplayMode: LyricDisplayMode {
@@ -110,6 +122,7 @@ final class PreferencesStore: ObservableObject {
 
     private init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+        Self.migrateAutomaticLyricSyncIfNeeded(defaults: defaults)
         appExperienceMode = Self.loadAppExperienceMode(defaults: defaults)
         autoReconnectEnabled = Self.loadBool(
             defaults: defaults,
@@ -119,7 +132,12 @@ final class PreferencesStore: ObservableObject {
         lyricOffsetMs = Self.loadInt(
             defaults: defaults,
             key: Self.lyricOffsetMsKey,
-            defaultValue: 600
+            defaultValue: 0
+        )
+        automaticLyricSyncEnabled = Self.loadBool(
+            defaults: defaults,
+            key: Self.automaticLyricSyncEnabledKey,
+            defaultValue: true
         )
         lyricDisplayMode = Self.loadLyricDisplayMode(defaults: defaults)
         artworkEnhancementEnabled = Self.loadBool(
@@ -143,7 +161,12 @@ final class PreferencesStore: ObservableObject {
         lyricOffsetMs = Self.loadInt(
             defaults: defaults,
             key: Self.lyricOffsetMsKey,
-            defaultValue: 600
+            defaultValue: 0
+        )
+        automaticLyricSyncEnabled = Self.loadBool(
+            defaults: defaults,
+            key: Self.automaticLyricSyncEnabledKey,
+            defaultValue: true
         )
         lyricDisplayMode = Self.loadLyricDisplayMode(defaults: defaults)
         artworkEnhancementEnabled = Self.loadBool(
@@ -160,7 +183,8 @@ final class PreferencesStore: ObservableObject {
     func resetToDefaults() {
         appExperienceMode = .defaultMode
         autoReconnectEnabled = true
-        lyricOffsetMs = 600
+        automaticLyricSyncEnabled = true
+        lyricOffsetMs = 0
         lyricDisplayMode = .originalTranslation
         artworkEnhancementEnabled = true
         artworkDisplaySize = .defaultOption
@@ -171,6 +195,33 @@ final class PreferencesStore: ObservableObject {
     private static func loadAppExperienceMode(defaults: UserDefaults) -> AppExperienceMode {
         let raw = defaults.string(forKey: AppExperienceMode.userDefaultsKey)
         return raw.flatMap(AppExperienceMode.init(rawValue:)) ?? .defaultMode
+    }
+
+    static func migratedLegacyLyricOffset(
+        storedOffset: Int?,
+        migrationCompleted: Bool
+    ) -> Int? {
+        guard !migrationCompleted else { return storedOffset }
+        if storedOffset == nil || storedOffset == 600 {
+            return 0
+        }
+        return storedOffset
+    }
+
+    private static func migrateAutomaticLyricSyncIfNeeded(defaults: UserDefaults) {
+        let completed = defaults.bool(forKey: automaticLyricSyncMigrationV1Key)
+        guard !completed else { return }
+        let storedOffset = (defaults.object(forKey: lyricOffsetMsKey) as? NSNumber)?.intValue
+        let migrated = migratedLegacyLyricOffset(
+            storedOffset: storedOffset,
+            migrationCompleted: completed
+        ) ?? 0
+        defaults.set(migrated, forKey: lyricOffsetMsKey)
+        defaults.set(true, forKey: automaticLyricSyncEnabledKey)
+        defaults.set(true, forKey: automaticLyricSyncMigrationV1Key)
+        AppLogStore.shared.append(
+            "[Preferences] migrated automatic lyric sync offsetMs=\(migrated)"
+        )
     }
 
     private static func loadLyricDisplayMode(defaults: UserDefaults) -> LyricDisplayMode {
@@ -252,7 +303,9 @@ final class PreferencesStore: ObservableObject {
     private func logLoaded() {
         AppLogStore.shared.append(
             "[Preferences] loaded mode=\(appExperienceMode.rawValue) " +
-                "autoReconnect=\(autoReconnectEnabled) lyricOffsetMs=\(lyricOffsetMs) " +
+                "autoReconnect=\(autoReconnectEnabled) " +
+                "automaticLyricSync=\(automaticLyricSyncEnabled) " +
+                "lyricOffsetMs=\(lyricOffsetMs) " +
                 "lyricDisplayMode=\(lyricDisplayMode.rawValue) " +
                 "artworkEnhancement=\(artworkEnhancementEnabled) " +
                 "artworkDisplaySize=\(artworkDisplaySize.rawValue) " +

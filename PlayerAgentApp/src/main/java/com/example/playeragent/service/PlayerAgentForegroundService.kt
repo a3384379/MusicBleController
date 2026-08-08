@@ -403,11 +403,7 @@ class PlayerAgentForegroundService : Service() {
             val failingAddresses = manager.failingSubscriberAddresses(
                 NOTIFY_FAILURE_RECOVERY_THRESHOLD
             )
-            if (MultiControllerPolicy.shouldIsolateOnlyFailingControllers(
-                    failingAddresses.size,
-                    snapshot.subscribedCount
-                )
-            ) {
+            if (failingAddresses.isNotEmpty()) {
                 val isolated = manager.disconnectSubscribers(
                     failingAddresses,
                     "notify_failures"
@@ -419,24 +415,25 @@ class PlayerAgentForegroundService : Service() {
                 publishBleHealthSnapshot("unhealthy controller isolated")
                 return
             }
-            manager.clearStaleSubscribers("notify_failures")
-            restartAdvertisingFromWatchdog("notify_failures")
-            recoverBleStack("notify_failures", respectCooldown = true)
-            return
+        }
+
+        if (snapshot.subscribedCount > 0) {
+            val probed = manager.probeStaleSubscribers(
+                staleAfterMs = SUBSCRIBED_STALE_PROBE_MS,
+                minimumProbeIntervalMs = SUBSCRIBED_PROBE_MIN_INTERVAL_MS
+            )
+            if (probed > 0) {
+                log(
+                    "[BleHealth] watchdog action=probe_silent_subscribers " +
+                        "count=$probed ageMs>=$SUBSCRIBED_STALE_PROBE_MS"
+                )
+                publishBleHealthSnapshot("silent subscribers probed")
+                return
+            }
         }
 
         if (snapshot.subscribedCount > 0 &&
-            (manager.hasSuccessHeartbeatOlderThan(SUBSCRIBED_STALE_RECOVERY_MS) ||
-                manager.subscribedWithoutSuccessOlderThan(SUBSCRIBED_STALE_RECOVERY_MS))
-        ) {
-            log("[BleHealth] state=SUSPECT reason=no_success_heartbeat ageMs>=$SUBSCRIBED_STALE_RECOVERY_MS")
-            recoverBleStack("subscribed_stale", respectCooldown = true)
-            return
-        }
-
-        if (snapshot.subscribedCount > 0 &&
-            (manager.hasSuccessHeartbeatOlderThan(SUBSCRIBED_SUSPECT_MS) ||
-                manager.subscribedWithoutSuccessOlderThan(SUBSCRIBED_SUSPECT_MS))
+            manager.hasAnyStaleSubscriber(SUBSCRIBED_SUSPECT_MS)
         ) {
             log("[BleHealth] state=SUSPECT reason=no_success_heartbeat ageMs>=$SUBSCRIBED_SUSPECT_MS")
             publishBleHealthSnapshot("subscribed suspect")
@@ -847,7 +844,8 @@ class PlayerAgentForegroundService : Service() {
         private const val BLE_HEALTH_WATCHDOG_INTERVAL_MS = 5_000L
         private const val BLE_RECOVERY_COOLDOWN_MS = 30_000L
         private const val SUBSCRIBED_SUSPECT_MS = 30_000L
-        private const val SUBSCRIBED_STALE_RECOVERY_MS = 45_000L
+        private const val SUBSCRIBED_STALE_PROBE_MS = 45_000L
+        private const val SUBSCRIBED_PROBE_MIN_INTERVAL_MS = 30_000L
         private const val NOTIFY_FAILURE_RECOVERY_THRESHOLD = 3
         @Volatile
         private var running = false

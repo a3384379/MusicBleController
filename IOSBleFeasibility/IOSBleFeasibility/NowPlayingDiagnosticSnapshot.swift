@@ -76,6 +76,14 @@ struct CurrentWordDiagnosticSnapshot: Equatable {
     let dropCount: Int64
     let averageUpdateIntervalMs: Int64
     let lastLatencyMs: Int64
+    let automaticSyncEnabled: Bool
+    let automaticCompensationMs: Int64
+    let manualFineTuneMs: Int64
+    let legacyFallbackMs: Int64
+    let clockBestRoundTripMs: Int64
+    let clockOffsetJitterMs: Int64
+    let clockSampleCount: Int
+    let clockSyncConfident: Bool
 }
 
 struct NowPlayingDiagnosticSnapshot {
@@ -231,6 +239,14 @@ struct NowPlayingDiagnosticSnapshot {
         lines.append("currentWordDropCount: \(currentWord.dropCount)")
         lines.append("currentWordAverageIntervalMs: \(currentWord.averageUpdateIntervalMs)")
         lines.append("currentWordLastLatencyMs: \(currentWord.lastLatencyMs)")
+        lines.append("automaticLyricSync: \(currentWord.automaticSyncEnabled)")
+        lines.append("automaticCompensationMs: \(currentWord.automaticCompensationMs)")
+        lines.append("manualFineTuneMs: \(currentWord.manualFineTuneMs)")
+        lines.append("legacyFallbackMs: \(currentWord.legacyFallbackMs)")
+        lines.append("clockBestRoundTripMs: \(currentWord.clockBestRoundTripMs)")
+        lines.append("clockOffsetJitterMs: \(currentWord.clockOffsetJitterMs)")
+        lines.append("clockSampleCount: \(currentWord.clockSampleCount)")
+        lines.append("clockSyncConfident: \(currentWord.clockSyncConfident)")
         lines.append("")
         lines.append("[Artwork]")
         lines.append("displayQuality: \(albumArtDisplayQuality)")

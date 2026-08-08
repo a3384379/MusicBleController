@@ -141,12 +141,14 @@ class MediaTransferCoordinatorsTest {
                 fullLyricsZlib = true,
                 lyricWindow = true,
                 ping = true,
+                clockSyncV1 = true,
                 transferRetry = true,
                 negotiated = true
             )
         )
         assertEquals(2, coordinator.capabilities("ios").protocolVersion)
         assertTrue(coordinator.capabilities("ios").transferRetry)
+        assertTrue(coordinator.capabilities("ios").clockSyncV1)
         assertFalse(coordinator.capabilities("android").negotiated)
     }
 

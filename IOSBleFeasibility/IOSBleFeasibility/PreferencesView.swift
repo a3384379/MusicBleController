@@ -123,8 +123,15 @@ struct PreferencesView: View {
     private var lyricSection: some View {
         PreferencesCard(title: "歌词", systemImage: "text.quote") {
             VStack(alignment: .leading, spacing: 10) {
+                Toggle("自动同步歌词时间", isOn: automaticLyricSyncBinding)
+                    .tint(.green)
+
+                Text("自动补偿 Sony 与 iPhone 时钟差及蓝牙传输延迟")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.58))
+
                 HStack {
-                    Text("歌词偏移校准")
+                    Text("人工微调")
                         .font(.subheadline.weight(.semibold))
                     Spacer()
                     Text(offsetLabel(Int64(preferences.lyricOffsetMs)))
@@ -252,6 +259,13 @@ struct PreferencesView: View {
         Binding(
             get: { Double(preferences.lyricOffsetMs) },
             set: { bleManager.setKaraokeOffsetMs(Int64($0)) }
+        )
+    }
+
+    private var automaticLyricSyncBinding: Binding<Bool> {
+        Binding(
+            get: { preferences.automaticLyricSyncEnabled },
+            set: { bleManager.setAutomaticLyricSyncEnabled($0) }
         )
     }
 

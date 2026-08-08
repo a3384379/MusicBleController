@@ -64,7 +64,7 @@ class BleGattServerManagerPolicyTest {
     }
 
     @Test
-    fun subscribedLinkStalenessDoesNotDependOnQueuedOutboundWork() {
+    fun subscribedLinkSilenceRequestsRateLimitedProbeInsteadOfRecovery() {
         assertFalse(
             BleSubscribedLinkPolicy.isActivityStale(
                 subscribed = true,
@@ -105,5 +105,59 @@ class BleGattServerManagerPolicyTest {
                 maxAgeMs = 45_000L
             )
         )
+        assertTrue(
+            BleSubscribedLinkPolicy.shouldSendProbe(
+                subscribedAtMs = 1_000L,
+                lastCommandSuccessAtMs = 1_100L,
+                lastNotifySuccessAtMs = 1_200L,
+                lastProbeAtMs = 0L,
+                nowMs = 46_201L,
+                staleAfterMs = 45_000L,
+                minimumProbeIntervalMs = 30_000L
+            )
+        )
+        assertFalse(
+            BleSubscribedLinkPolicy.shouldSendProbe(
+                subscribedAtMs = 1_000L,
+                lastCommandSuccessAtMs = 1_100L,
+                lastNotifySuccessAtMs = 1_200L,
+                lastProbeAtMs = 46_201L,
+                nowMs = 51_201L,
+                staleAfterMs = 45_000L,
+                minimumProbeIntervalMs = 30_000L
+            )
+        )
+        assertTrue(
+            BleSubscribedLinkPolicy.shouldSendProbe(
+                subscribedAtMs = 1_000L,
+                lastCommandSuccessAtMs = 1_100L,
+                lastNotifySuccessAtMs = 1_200L,
+                lastProbeAtMs = 46_201L,
+                nowMs = 76_201L,
+                staleAfterMs = 45_000L,
+                minimumProbeIntervalMs = 30_000L
+            )
+        )
+    }
+
+    @Test
+    fun activeControllerDoesNotMaskAnotherSilentController() {
+        val nowMs = 80_000L
+        val lastNotifyByAddress = mapOf(
+            "ios" to 1_000L,
+            "android" to 79_500L
+        )
+        val staleAddresses = lastNotifyByAddress.filter { (_, lastNotifyAtMs) ->
+            BleSubscribedLinkPolicy.isActivityStale(
+                subscribed = true,
+                subscribedAtMs = 500L,
+                lastCommandSuccessAtMs = 0L,
+                lastNotifySuccessAtMs = lastNotifyAtMs,
+                nowMs = nowMs,
+                maxAgeMs = 45_000L
+            )
+        }.keys
+
+        assertEquals(setOf("ios"), staleAddresses)
     }
 }

@@ -25,8 +25,9 @@
 5. Health timer 检查静默时间：播放中 15 秒、暂停中 30 秒才探测。
 6. V2 发送轻量 `PING/PONG`；旧 Sony 回退 `GET_PLAYBACK_STATE`。连续两次探测失败才 hard reconnect，明确断开回调仍立即处理。
 7. `connectionDisplayState` 给 UI，`connectionHealthState` 给诊断和控制保护。
-8. CoreBluetooth 状态恢复优先复用已连接 Sony 和已恢复 characteristic。恢复未完成时标为 `suspect`，前台生命周期检查必须等待 notify 确认，不能以初始 `disconnected` 强制断开有效连接。
-9. 单次 `didWrite` 回调超时但 3 秒内仍收到 status notify 时只做软恢复；连续两次写回调超时才 hard reconnect。
+8. CoreBluetooth 状态恢复优先复用已连接 Sony 和已恢复 characteristic。进入 inactive/background 后暂停 health、订阅/写超时和时钟同步；回到前台先用单次探针验证，收到有效 notify 后才恢复状态、音量和歌词同步。
+9. 单次 `didWrite` 回调超时只标记 suspect 并延长等待，不移除 in-flight 请求、不推进写队列；连续两次写回调超时才 hard reconnect。
+10. Sony 端业务静默只触发按地址的轻量 notify 探针；只有真实 notify 失败达到阈值才隔离该地址，禁止用静默时间直接重建共享 GATT。
 
 ## 关键状态
 
@@ -59,7 +60,8 @@
 - 一直显示重连：看 `autoReconnectState`、`connectionAttemptId`、`ignore stale callback`、`scan timeout`。
 - 假连接：看 `[BLE-Health] suspect`、`probe sent`、`probe timeout`、`hard reconnect reason=...`。
 - 恢复竞态：看 `[BLE-Restore] restored`、`foreground restore skipped`、`reuse restored notifying characteristic`。
-- 写回调偶发丢失：看 `[CTRL-iOS] write soft recovery`；仍有 notify 时不应紧跟 hard reconnect。
+- 写回调偶发丢失：看 `[CTRL-iOS] write timeout extended`；第一轮超时后 in-flight 序号应保持不变。
+- 前后台恢复：看 `BLE watchdogs paused`、`foreground validation queued/success`，验证成功前不应出现状态/音量/歌词同步突发。
 - 胶囊闪烁：区分 `connectionDisplayState` 和 `connectionHealthState`，日常模式不应展示技术细节。
 
 ## 修改后必须跑哪些 smoke test

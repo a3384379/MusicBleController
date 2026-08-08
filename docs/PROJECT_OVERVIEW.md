@@ -39,6 +39,7 @@
 ## 关键状态
 
 - Sony 是播放、历史、歌词和封面来源的权威端。
+- iOS 与 Sony 可协商 `clockSyncV1`，使用单调时钟和播放位置采样时间动态补偿 BLE 歌词延迟；严重积压的旧锚点不得覆盖当前进度。
 - iPhone 是同步、缓存和展示端。
 - Android Controller 是与 iPhone 对等的同步、缓存和展示端，不包含 Live Activity。
 - iOS `BLETestManager` 仍是连接/协议分发中心，但设置已拆到 `PreferencesStore`，封面接收已拆到 `AlbumArtReceiver`。
