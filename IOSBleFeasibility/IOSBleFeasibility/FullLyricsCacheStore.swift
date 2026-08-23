@@ -244,12 +244,22 @@ final class FullLyricsCacheStore {
         }
     }
 
-    private static func estimatedCost(_ entry: FullLyricsCacheEntry) -> Int {
-        entry.lines.reduce(0) { result, line in
-            result + line.text.utf8.count +
-                (line.translation?.utf8.count ?? 0) +
-                (line.romanization?.utf8.count ?? 0) +
-                line.words.reduce(0) { $0 + $1.text.utf8.count + 32 }
+    static func estimatedCost(_ entry: FullLyricsCacheEntry) -> Int {
+        var totalCost: Int = 0
+        for line in entry.lines {
+            var lineCost: Int = line.text.utf8.count
+            if let translation = line.translation {
+                lineCost += translation.utf8.count
+            }
+            if let romanization = line.romanization {
+                lineCost += romanization.utf8.count
+            }
+            for word in line.words {
+                lineCost += word.text.utf8.count
+                lineCost += 32
+            }
+            totalCost += lineCost
         }
+        return totalCost
     }
 }

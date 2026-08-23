@@ -518,6 +518,110 @@ final class PerformanceStabilityTests: XCTestCase {
         XCTAssertNil(removed)
     }
 
+    func testFullLyricsCacheEstimatedCostForEmptyAndOriginalOnlyLyrics() {
+        let empty = makeFullLyricsCacheEntry(lines: [])
+        XCTAssertEqual(FullLyricsCacheStore.estimatedCost(empty), 0)
+
+        let originalOnly = makeFullLyricsCacheEntry(
+            lines: [
+                .init(
+                    index: 0,
+                    timeMs: 0,
+                    durationMs: 1_000,
+                    text: "plain text",
+                    translation: nil,
+                    romanization: nil,
+                    words: []
+                )
+            ]
+        )
+        XCTAssertEqual(
+            FullLyricsCacheStore.estimatedCost(originalOnly),
+            "plain text".utf8.count
+        )
+    }
+
+    func testFullLyricsCacheEstimatedCostIncludesWordAndSecondaryText() {
+        let entry = makeFullLyricsCacheEntry(
+            lines: [
+                .init(
+                    index: 0,
+                    timeMs: 120,
+                    durationMs: 2_500,
+                    text: "原文",
+                    translation: "translation",
+                    romanization: "yuan wen",
+                    words: [
+                        .init(id: 0, startMs: 120, durationMs: 800, text: "原"),
+                        .init(id: 1, startMs: 920, durationMs: 1_700, text: "文")
+                    ]
+                )
+            ]
+        )
+        let expected: Int = "原文".utf8.count +
+            "translation".utf8.count +
+            "yuan wen".utf8.count +
+            "原".utf8.count + 32 +
+            "文".utf8.count + 32
+        XCTAssertEqual(FullLyricsCacheStore.estimatedCost(entry), expected)
+    }
+
+    func testFullLyricsCacheEstimatedCostUsesUTF8ForLongUnicodeAndEmoji() {
+        let unicode = String(repeating: "音乐🎵é", count: 512)
+        let entry = makeFullLyricsCacheEntry(
+            lines: [
+                .init(
+                    index: 0,
+                    timeMs: 0,
+                    durationMs: 1_000,
+                    text: unicode,
+                    translation: "🌍",
+                    romanization: "🎧",
+                    words: [
+                        .init(id: 0, startMs: 0, durationMs: 1_000, text: "👩‍🎤")
+                    ]
+                )
+            ]
+        )
+        let expected: Int = unicode.utf8.count + "🌍".utf8.count +
+            "🎧".utf8.count + "👩‍🎤".utf8.count + 32
+        XCTAssertEqual(FullLyricsCacheStore.estimatedCost(entry), expected)
+    }
+
+    func testFullLyricsCacheEstimatedCostPreservesLegacyRuleForLargeLyrics() {
+        let lines: [FullLyricsCacheEntry.Line] = (0..<1_500).map { index in
+            .init(
+                index: index,
+                timeMs: Int64(index * 1_000),
+                durationMs: 1_000,
+                text: "line-\(index)-歌词",
+                translation: index.isMultiple(of: 2) ? "translation-\(index)" : nil,
+                romanization: index.isMultiple(of: 3) ? "romanization-\(index)" : nil,
+                words: [
+                    .init(
+                        id: index,
+                        startMs: Int64(index * 1_000),
+                        durationMs: 1_000,
+                        text: "word-\(index)"
+                    )
+                ]
+            )
+        }
+        var legacyExpected: Int = 0
+        for line in lines {
+            legacyExpected += line.text.utf8.count
+            legacyExpected += line.translation?.utf8.count ?? 0
+            legacyExpected += line.romanization?.utf8.count ?? 0
+            for word in line.words {
+                legacyExpected += word.text.utf8.count + 32
+            }
+        }
+        XCTAssertEqual(
+            FullLyricsCacheStore.estimatedCost(makeFullLyricsCacheEntry(lines: lines)),
+            legacyExpected
+        )
+    }
+
     @MainActor
     func testLiveActivityArtworkThumbnailPipelineCompletes() async {
         let image = UIGraphicsImageRenderer(size: CGSize(width: 160, height: 100)).image { context in
@@ -2020,6 +2124,20 @@ final class PerformanceStabilityTests: XCTestCase {
                 )
             ],
             savedAt: savedAt
+        )
+    }
+
+    private func makeFullLyricsCacheEntry(
+        lines: [FullLyricsCacheEntry.Line]
+    ) -> FullLyricsCacheEntry {
+        FullLyricsCacheEntry(
+            version: FullLyricsCacheEntry.version,
+            trackId: "cost-test",
+            title: "Song",
+            artist: "Artist",
+            album: "Album",
+            lines: lines,
+            savedAt: Date(timeIntervalSince1970: 1_723_500_000)
         )
     }
 
