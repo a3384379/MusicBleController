@@ -20,6 +20,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import com.example.playeragent.MainActivity
+import com.example.playeragent.R
 import com.example.playeragent.StartupGuard
 import com.example.playeragent.ble.BleAdvertiserManager
 import com.example.playeragent.ble.BleGattServerManager
@@ -35,6 +36,9 @@ import com.example.playeragent.media.QrcMaintenanceCoordinator
 import com.example.playeragent.media.QrcWatcherStatus
 import com.example.playeragent.media.MaintenanceTaskType
 import com.example.playeragent.media.PlayerAgentExecutionHub
+import com.example.playeragent.ui.ForegroundNotificationUiState
+import com.example.playeragent.ui.PlayerAgentUiStateMapper
+import com.example.playeragent.ui.resolve
 
 class PlayerAgentForegroundService : Service() {
 
@@ -65,6 +69,7 @@ class PlayerAgentForegroundService : Service() {
     private var bleRecoveryCount = 0
     @Volatile
     private var lastPublishedBleHealthState: BleHealthState? = null
+    private var lastNotificationUiState: ForegroundNotificationUiState? = null
     private val bluetoothStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) {
@@ -85,7 +90,7 @@ class PlayerAgentForegroundService : Service() {
         serviceStopping = false
         executionHub = PlayerAgentExecutionHub("PlayerAgent")
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, createNotification("PlayerAgent is running"))
+        startForeground(NOTIFICATION_ID, createNotification(BleHealthState.STARTING))
         registerReceiver(
             bluetoothStateReceiver,
             IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
@@ -476,6 +481,7 @@ class PlayerAgentForegroundService : Service() {
             lastPublishedBleHealthState = snapshot.healthState
             log("[BleHealth] state=${snapshot.healthState} reason=${snapshot.reason ?: reason}")
         }
+        updateForegroundNotification(snapshot.healthState)
         return snapshot
     }
 
@@ -703,7 +709,8 @@ class PlayerAgentForegroundService : Service() {
         }
     }
 
-    private fun createNotification(contentText: String): Notification {
+    private fun createNotification(healthState: BleHealthState): Notification {
+        val presentation = PlayerAgentUiStateMapper.notification(healthState)
         val pendingIntentFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         } else {
@@ -715,6 +722,14 @@ class PlayerAgentForegroundService : Service() {
             Intent(this, MainActivity::class.java),
             pendingIntentFlags
         )
+        val recoverIntent = PendingIntent.getService(
+            this,
+            1,
+            Intent(this, PlayerAgentForegroundService::class.java).apply {
+                action = ACTION_RECOVER_BLE_STACK
+            },
+            pendingIntentFlags
+        )
 
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
@@ -724,11 +739,30 @@ class PlayerAgentForegroundService : Service() {
 
         return builder
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentTitle("PlayerAgent")
-            .setContentText(contentText)
+            .setContentTitle(presentation.title.resolve(this))
+            .setContentText(presentation.detail.resolve(this))
             .setContentIntent(pendingIntent)
+            .addAction(
+                android.R.drawable.ic_popup_sync,
+                getString(R.string.notification_check_connection),
+                recoverIntent
+            )
+            .addAction(
+                android.R.drawable.ic_menu_view,
+                getString(R.string.notification_open_app),
+                pendingIntent
+            )
             .setOngoing(true)
             .build()
+    }
+
+    private fun updateForegroundNotification(healthState: BleHealthState) {
+        if (!running || serviceStopping) return
+        val presentation = PlayerAgentUiStateMapper.notification(healthState)
+        if (presentation == lastNotificationUiState) return
+        lastNotificationUiState = presentation
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, createNotification(healthState))
     }
 
     private fun log(message: String) {

@@ -43,9 +43,9 @@ enum PlaybackPerformanceMode: String, CaseIterable, Identifiable {
 }
 
 enum ArtworkDisplaySizeOption: Int, CaseIterable, Identifiable {
-    case small = 200
-    case medium = 220
-    case large = 260
+    case small = 184
+    case medium = 224
+    case large = 272
 
     var id: Int { rawValue }
 
@@ -259,7 +259,23 @@ final class PreferencesStore: ObservableObject {
 
     private static func loadArtworkDisplaySize(defaults: UserDefaults) -> ArtworkDisplaySizeOption {
         let value = defaults.integer(forKey: ArtworkDisplaySizeOption.userDefaultsKey)
-        return ArtworkDisplaySizeOption(rawValue: value) ?? .defaultOption
+        let option = migratedArtworkDisplaySize(storedValue: value)
+        if value > 0, value != option.rawValue {
+            defaults.set(option.rawValue, forKey: ArtworkDisplaySizeOption.userDefaultsKey)
+        }
+        return option
+    }
+
+    static func migratedArtworkDisplaySize(storedValue: Int) -> ArtworkDisplaySizeOption {
+        if let current = ArtworkDisplaySizeOption(rawValue: storedValue) {
+            return current
+        }
+        switch storedValue {
+        case 200: return .small
+        case 220: return .medium
+        case 260: return .large
+        default: return .defaultOption
+        }
     }
 
     private static func loadDynamicIslandStyle(defaults: UserDefaults) -> DynamicIslandStyle {

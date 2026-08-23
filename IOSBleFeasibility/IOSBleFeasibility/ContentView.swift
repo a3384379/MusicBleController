@@ -1,18 +1,5 @@
 import SwiftUI
 
-enum PlayerLayoutMode: Equatable {
-    case regular
-    case compact
-    case accessibility
-
-    static func resolve(availableHeight: CGFloat, dynamicTypeSize: DynamicTypeSize) -> Self {
-        if dynamicTypeSize.isAccessibilitySize { return .accessibility }
-        return availableHeight <= 700 ? .compact : .regular
-    }
-
-    var isCompact: Bool { self != .regular }
-}
-
 private final class BLETestManagerOwner: ObservableObject {
     let manager: BLETestManager
 
@@ -31,6 +18,7 @@ struct ContentView: View {
     @State private var showNowPlayingDiagnostic = false
     @State private var showSystemHealthOverview = false
     @State private var showPreferences = false
+    @State private var showDeviceDetails = false
 
     private var manager: BLETestManager { managerOwner.manager }
 
@@ -44,13 +32,15 @@ struct ContentView: View {
                     ResponsivePlayerLayout(
                         manager: manager,
                         availableSize: proxy.size,
+                        safeAreaInsets: proxy.safeAreaInsets,
                         showFullLyrics: $showFullLyrics,
                         showDebugPage: $showDebugPage,
                         showPlaybackHistory: $showPlaybackHistory,
                         showLyricDiagnostic: $showLyricDiagnostic,
                         showNowPlayingDiagnostic: $showNowPlayingDiagnostic,
                         showSystemHealthOverview: $showSystemHealthOverview,
-                        showPreferences: $showPreferences
+                        showPreferences: $showPreferences,
+                        showDeviceDetails: $showDeviceDetails
                     )
                 }
             }
@@ -63,6 +53,14 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showPreferences) {
                 PreferencesView(bleManager: manager, onDismiss: { showPreferences = false })
+            }
+            .sheet(isPresented: $showDeviceDetails) {
+                DeviceDetailView(
+                    manager: manager,
+                    onShowAdvancedDiagnostics: {
+                        showNowPlayingDiagnostic = true
+                    }
+                )
             }
             .sheet(isPresented: $showLyricDiagnostic) {
                 LyricDiagnosticView(
@@ -125,6 +123,7 @@ private struct PlayerBackgroundHost: View {
 private struct ResponsivePlayerLayout: View {
     let manager: BLETestManager
     let availableSize: CGSize
+    let safeAreaInsets: EdgeInsets
     @Binding var showFullLyrics: Bool
     @Binding var showDebugPage: Bool
     @Binding var showPlaybackHistory: Bool
@@ -132,83 +131,94 @@ private struct ResponsivePlayerLayout: View {
     @Binding var showNowPlayingDiagnostic: Bool
     @Binding var showSystemHealthOverview: Bool
     @Binding var showPreferences: Bool
+    @Binding var showDeviceDetails: Bool
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @ObservedObject private var preferences = PreferencesStore.shared
 
     var body: some View {
-        let mode = PlayerLayoutMode.resolve(
-            availableHeight: availableSize.height,
-            dynamicTypeSize: dynamicTypeSize
+        let metrics = PlayerLayoutMetrics.resolve(
+            availableSize: availableSize,
+            safeAreaInsets: safeAreaInsets,
+            dynamicTypeSize: dynamicTypeSize,
+            artworkPreference: preferences.artworkDisplaySize
         )
-        let horizontalPadding: CGFloat = availableSize.width >= 430 ? 32 : 24
 
         Group {
-            if mode == .regular {
-                regularContent
+            if metrics.mode == .regular {
+                regularContent(metrics: metrics)
             } else {
-                ViewThatFits(in: .vertical) {
-                    compactContent(mode: mode)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    ScrollView(.vertical, showsIndicators: false) {
-                        compactContent(mode: mode)
-                            .padding(.vertical, 4)
-                    }
-                    .scrollBounceBehavior(.basedOnSize)
-                }
+                compactContent(metrics: metrics)
             }
         }
-        .padding(.horizontal, horizontalPadding)
-        .safeAreaPadding(.top, mode.isCompact ? 4 : 12)
-        .safeAreaPadding(.bottom, mode.isCompact ? 8 : 20)
+        .padding(.horizontal, metrics.horizontalPadding)
+        .safeAreaPadding(.top, metrics.mode.isCompact ? 4 : 8)
+        .safeAreaPadding(.bottom, metrics.mode.isCompact ? 6 : 12)
         .frame(width: availableSize.width, height: availableSize.height, alignment: .top)
     }
 
-    private var regularContent: some View {
-        VStack(spacing: 0) {
+    private func regularContent(metrics: PlayerLayoutMetrics) -> some View {
+        VStack(spacing: metrics.sectionSpacing) {
             header(mode: .regular)
 
             if showsConnectionGuide {
-                Spacer(minLength: 18)
                 connectionGuide
                     .frame(maxHeight: .infinity)
-                Spacer(minLength: 8)
             } else {
-                Spacer(minLength: 24)
-                TrackInfoStoreView(manager: manager, mode: .regular)
-                Spacer(minLength: 28)
+                connectionBanner
+                TrackInfoStoreView(manager: manager, metrics: metrics)
                 LyricsPreviewStoreView(
                     manager: manager,
-                    mode: .regular,
+                    metrics: metrics,
                     showFullLyrics: $showFullLyrics
                 )
-                Spacer(minLength: 22)
                 PlaybackProgressStoreView(manager: manager)
-                    .padding(.bottom, 26)
                 PlaybackControlsStoreView(manager: manager, mode: .regular)
-                    .padding(.bottom, 30)
                 VolumeControlStoreView(manager: manager)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func compactContent(mode: PlayerLayoutMode) -> some View {
-        VStack(spacing: mode.isCompact ? 10 : 18) {
-            header(mode: mode)
+    private func compactContent(metrics: PlayerLayoutMetrics) -> some View {
+        VStack(spacing: metrics.sectionSpacing) {
+            header(mode: metrics.mode)
 
+            connectionBanner
             PlayerContentStoreRouter(
                 manager: manager,
-                mode: mode,
+                metrics: metrics,
                 showFullLyrics: $showFullLyrics
             )
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var showsConnectionGuide: Bool {
         !manager.connectionStore.presentation.isConnected &&
-            !manager.artworkStore.state.isRestoredSnapshot
+            !hasPlaybackSnapshot
+    }
+
+    private var hasPlaybackSnapshot: Bool {
+        NowPlayingSnapshotPolicy.hasDisplayableSnapshot(
+            title: manager.playbackStore.metadata.title,
+            artist: manager.playbackStore.metadata.artist,
+            hasArtwork: manager.artworkStore.state.image != nil,
+            isRestoredSnapshot: manager.artworkStore.state.isRestoredSnapshot
+        )
+    }
+
+    @ViewBuilder
+    private var connectionBanner: some View {
+        if let presentation = ReconnectBannerPresentation.resolve(
+            connection: manager.connectionStore.presentation,
+            hasSnapshot: hasPlaybackSnapshot
+        ) {
+            ConnectionStatusBanner(
+                presentation: presentation,
+                onRetry: manager.scanSonyFromMenu
+            )
+        }
     }
 
     private var connectionGuide: some View {
@@ -227,7 +237,8 @@ private struct ResponsivePlayerLayout: View {
             showLyricDiagnostic: $showLyricDiagnostic,
             showNowPlayingDiagnostic: $showNowPlayingDiagnostic,
             showSystemHealthOverview: $showSystemHealthOverview,
-            showPreferences: $showPreferences
+            showPreferences: $showPreferences,
+            showDeviceDetails: $showDeviceDetails
         )
     }
 }
@@ -241,6 +252,7 @@ private struct PlayerHeaderStoreView: View {
     @Binding var showNowPlayingDiagnostic: Bool
     @Binding var showSystemHealthOverview: Bool
     @Binding var showPreferences: Bool
+    @Binding var showDeviceDetails: Bool
 
     @ObservedObject private var preferences = PreferencesStore.shared
 
@@ -270,7 +282,9 @@ private struct PlayerHeaderStoreView: View {
             )
             .accessibilityHint(
                 AppLocalization.string(
-                    isConnected ? "点按查看连接详情" : "点按扫描并连接 Sony"
+                    statusPresentation.opensDeviceDetail
+                        ? "点按查看连接详情"
+                        : "点按扫描并连接 Sony"
                 )
             )
 
@@ -323,7 +337,7 @@ private struct PlayerHeaderStoreView: View {
                     }
                 }
             } label: {
-                Image(systemName: "gearshape")
+                Image(systemName: "ellipsis")
                     .font(.system(size: 22, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.86))
                     .frame(width: 42, height: 42)
@@ -331,7 +345,7 @@ private struct PlayerHeaderStoreView: View {
                     .overlay { Circle().stroke(.white.opacity(0.08), lineWidth: 1) }
             }
             .buttonStyle(PressScaleButtonStyle(pressedScale: 0.96))
-            .accessibilityLabel("设置")
+            .accessibilityLabel("更多")
         }
     }
 
@@ -346,21 +360,12 @@ private struct PlayerHeaderStoreView: View {
         default: return false
         }
     }
-    private var statusColor: Color { isConnected ? .green : .orange }
+    private var statusPresentation: ConnectionStatusPresentation {
+        ConnectionStatusPresentation.resolve(presentation)
+    }
+    private var statusColor: Color { statusPresentation.color }
     private var statusTitle: String {
-        let key: String = switch presentation {
-        case .connected: "已连接"
-        case .scanning: "扫描中"
-        case .connecting: "连接中"
-        case .reconnecting: "恢复连接"
-        case .unavailable(.poweredOff): "蓝牙已关闭"
-        case .unavailable(.unauthorized): "未授权"
-        case .unavailable(.unsupported): "不支持蓝牙"
-        case .unavailable: "蓝牙不可用"
-        case .failed: "连接失败"
-        case .disconnected: "连接"
-        }
-        return AppLocalization.string(key)
+        AppLocalization.string(statusPresentation.title)
     }
     @ViewBuilder
     private var statusIndicator: some View {
@@ -392,11 +397,13 @@ private struct PlayerHeaderStoreView: View {
         }
     }
     private func handleConnectionTap() {
-        if isConnected {
-            showPreferences = true
+        if statusPresentation.opensDeviceDetail {
+            showDeviceDetails = true
         } else if case .unavailable(.unauthorized) = presentation,
                   let url = URL(string: UIApplication.openSettingsURLString) {
             UIApplication.shared.open(url)
+        } else if statusPresentation.isBusy {
+            return
         } else {
             manager.scanSonyFromMenu()
         }
@@ -405,12 +412,17 @@ private struct PlayerHeaderStoreView: View {
 
 private struct PlayerContentStoreRouter: View {
     let manager: BLETestManager
-    let mode: PlayerLayoutMode
+    let metrics: PlayerLayoutMetrics
     @Binding var showFullLyrics: Bool
 
     var body: some View {
         if !manager.connectionStore.presentation.isConnected,
-           !manager.artworkStore.state.isRestoredSnapshot {
+           !NowPlayingSnapshotPolicy.hasDisplayableSnapshot(
+                title: manager.playbackStore.metadata.title,
+                artist: manager.playbackStore.metadata.artist,
+                hasArtwork: manager.artworkStore.state.image != nil,
+                isRestoredSnapshot: manager.artworkStore.state.isRestoredSnapshot
+           ) {
             ConnectionGuideStoreView(
                 presentation: manager.connectionStore.presentation,
                 onConnect: manager.scanSonyFromMenu
@@ -418,7 +430,7 @@ private struct PlayerContentStoreRouter: View {
         } else {
             PlayerStoreSections(
                 manager: manager,
-                mode: mode,
+                metrics: metrics,
                 showFullLyrics: $showFullLyrics
             )
         }
@@ -545,19 +557,19 @@ private struct ConnectionGuideStoreView: View {
 
 private struct PlayerStoreSections: View {
     let manager: BLETestManager
-    let mode: PlayerLayoutMode
+    let metrics: PlayerLayoutMetrics
     @Binding var showFullLyrics: Bool
 
     var body: some View {
-        VStack(spacing: mode.isCompact ? 12 : 22) {
-            TrackInfoStoreView(manager: manager, mode: mode)
+        VStack(spacing: metrics.sectionSpacing) {
+            TrackInfoStoreView(manager: manager, metrics: metrics)
             LyricsPreviewStoreView(
                 manager: manager,
-                mode: mode,
+                metrics: metrics,
                 showFullLyrics: $showFullLyrics
             )
             PlaybackProgressStoreView(manager: manager)
-            PlaybackControlsStoreView(manager: manager, mode: mode)
+            PlaybackControlsStoreView(manager: manager, mode: metrics.mode)
             VolumeControlStoreView(manager: manager)
         }
     }
@@ -565,12 +577,14 @@ private struct PlayerStoreSections: View {
 
 private struct TrackInfoStoreView: View {
     let manager: BLETestManager
-    let mode: PlayerLayoutMode
+    let metrics: PlayerLayoutMetrics
+
+    private var mode: PlayerLayoutMode { metrics.mode }
 
     var body: some View {
         Group {
-            if mode == .accessibility {
-                VStack(spacing: 12) {
+            if mode == .regular || mode == .accessibility {
+                VStack(spacing: mode == .regular ? 12 : 8) {
                     artwork
                     metadata.multilineTextAlignment(.center)
                 }
@@ -584,7 +598,7 @@ private struct TrackInfoStoreView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private var artworkSize: CGFloat { mode.isCompact ? 140 : 204 }
+    private var artworkSize: CGFloat { metrics.artworkSize }
     private var artwork: some View {
         Group {
             if let image = manager.artworkStore.state.image {
@@ -607,22 +621,19 @@ private struct TrackInfoStoreView: View {
     }
     private var metadata: some View {
         let metadata = manager.playbackStore.metadata
-        return VStack(alignment: mode == .accessibility ? .center : .leading, spacing: mode.isCompact ? 7 : 11) {
+        let centered = mode == .regular || mode == .accessibility
+        return VStack(alignment: centered ? .center : .leading, spacing: mode.isCompact ? 5 : 7) {
             Text(display(metadata.title, fallback: AppLocalization.string("等待同步")))
                 .font(
                     mode.isCompact
                         ? .system(.title2, design: .rounded, weight: .bold)
-                        : .system(.largeTitle, design: .rounded, weight: .bold)
+                        : .system(size: 31, weight: .bold, design: .rounded)
                 )
                 .foregroundStyle(.white)
                 .lineLimit(mode == .accessibility ? 3 : 2)
                 .minimumScaleFactor(0.58)
             Text(display(metadata.artist, fallback: AppLocalization.string("等待同步")))
-                .font(
-                    mode.isCompact
-                        ? .system(.body, design: .rounded, weight: .medium)
-                        : .system(.title3, design: .rounded, weight: .medium)
-                )
+                .font(mode.isCompact ? .body.weight(.medium) : .body.weight(.semibold))
                 .foregroundStyle(.white.opacity(0.74))
                 .lineLimit(2)
             Text(
@@ -631,7 +642,7 @@ private struct TrackInfoStoreView: View {
                     display(metadata.album, fallback: AppLocalization.string("等待同步"))
                 )
             )
-                .font(.system(.subheadline, design: .rounded, weight: .medium))
+                .font(.system(.caption, design: .rounded, weight: .medium))
                 .foregroundStyle(.white.opacity(0.48))
                 .lineLimit(2)
             DarkPlaybackStatusBadge(state: playerVisualState(manager: manager))
@@ -645,7 +656,7 @@ private struct TrackInfoStoreView: View {
                     }
                 }
         }
-        .frame(maxWidth: .infinity, alignment: mode == .accessibility ? .center : .leading)
+        .frame(maxWidth: .infinity, alignment: centered ? .center : .leading)
     }
     private func display(_ value: String, fallback: String) -> String {
         value == "-" || value.isEmpty ? fallback : value
@@ -654,9 +665,11 @@ private struct TrackInfoStoreView: View {
 
 private struct LyricsPreviewStoreView: View {
     let manager: BLETestManager
-    let mode: PlayerLayoutMode
+    let metrics: PlayerLayoutMetrics
     @Binding var showFullLyrics: Bool
     @ObservedObject private var preferences = PreferencesStore.shared
+
+    private var mode: PlayerLayoutMode { metrics.mode }
 
     var body: some View {
         Button(action: openFullLyrics) {
@@ -681,8 +694,15 @@ private struct LyricsPreviewStoreView: View {
                         alignment: .center
                     )
                     .minimumScaleFactor(0.76)
-                    .frame(maxWidth: .infinity, minHeight: mode.isCompact ? 46 : 64)
+                    .frame(maxWidth: .infinity, minHeight: mode.isCompact ? 38 : 50)
                     .clipped()
+                    if let auxiliaryLine {
+                        Text(auxiliaryLine)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(PlayerDesignTokens.secondaryText.opacity(0.72))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                    }
                     Text(line(offset: 1))
                         .font(secondaryLineFont)
                         .foregroundStyle(.white.opacity(0.40))
@@ -699,12 +719,12 @@ private struct LyricsPreviewStoreView: View {
                         .frame(width: proxy.size.width * 0.5, height: mode.isCompact ? 24 : 36)
                         .frame(maxWidth: .infinity)
                     }
-                    .frame(height: mode.isCompact ? 24 : 36)
+                    .frame(height: mode.isCompact ? 18 : 24)
                 }
                 .frame(
                     maxWidth: .infinity,
-                    minHeight: mode.isCompact ? 120 : 176,
-                    maxHeight: mode == .regular ? 176 : nil
+                    minHeight: metrics.lyricHeight,
+                    maxHeight: metrics.lyricHeight
                 )
                 DarkLyricSideDots(color: visualState.accentColor)
             }
@@ -737,6 +757,20 @@ private struct LyricsPreviewStoreView: View {
         )
     }
     private var visualState: DarkPlaybackVisualState { playerVisualState(manager: manager) }
+    private var auxiliaryLine: String? {
+        guard let line = lineModel(offset: 0) else { return nil }
+        let candidate: String?
+        switch preferences.lyricDisplayMode {
+        case .original:
+            candidate = nil
+        case .originalRomanization:
+            candidate = line.romanization
+        case .originalTranslation, .originalTranslationRomanization:
+            candidate = line.translation
+        }
+        let text = candidate?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text?.isEmpty == false ? text : nil
+    }
     private var secondaryLineFont: Font {
         if mode == .accessibility {
             return .system(.body, design: .rounded, weight: .medium)
@@ -955,46 +989,6 @@ private struct VolumeControlStoreView: View {
     }
 }
 
-private struct FullLyricsStoreHost: View {
-    let manager: BLETestManager
-    let onDismiss: () -> Void
-    let onShowDiagnostic: () -> Void
-    @ObservedObject private var preferences = PreferencesStore.shared
-
-    var body: some View {
-        let metadata = manager.playbackStore.metadata
-        let timeline = manager.playbackStore.timeline
-        let document = manager.lyricsStore.document
-        let lines = document.isCurrent ? document.lines : []
-        let rawPosition = timeline.isSeeking ? timeline.seekPositionMs : timeline.displayPositionMs
-        let position = manager.karaokePositionMs(rawPositionMs: rawPosition)
-
-        FullLyricsView(
-            title: display(metadata.title, fallback: "等待同步"),
-            artist: display(metadata.artist, fallback: "等待同步"),
-            albumArtImage: manager.artworkStore.state.image,
-            lyrics: lines,
-            currentIndex: LyricTimelineHelper.currentIndex(lines: lines, positionMs: position) ?? -1,
-            positionMs: position,
-            translationState: document.translationState,
-            romanizationState: document.romanizationState,
-            isPlaying: timeline.isPlaying,
-            isConnected: manager.connectionStore.presentation.isConnected,
-            onDismiss: onDismiss,
-            onPrevious: manager.sendPrevious,
-            onPlayPause: manager.sendPlayPause,
-            onNext: manager.sendNext,
-            onSeekToLine: manager.seekToLyricLine,
-            showDiagnosticButton: preferences.appExperienceMode == .debug,
-            onShowDiagnostic: onShowDiagnostic
-        )
-    }
-
-    private func display(_ value: String, fallback: String) -> String {
-        value == "-" || value.isEmpty ? fallback : value
-    }
-}
-
 private func playerVisualState(manager: BLETestManager) -> DarkPlaybackVisualState {
     let connection = DarkControlConnectionState(
         rawValue: manager.connectionStore.state.displayState
@@ -1201,15 +1195,15 @@ private enum DarkPlaybackVisualState: Equatable {
     var accentColor: Color {
         switch self {
         case .playing:
-            return .green
+            return PlayerDesignTokens.stableAccent
         case .paused:
             return .blue
         case .loading:
-            return .orange
+            return PlayerDesignTokens.warning
         case .reconnecting:
-            return .purple
+            return PlayerDesignTokens.warning
         case .stopped:
-            return .gray
+            return PlayerDesignTokens.disconnected
         }
     }
 
@@ -1398,6 +1392,7 @@ private struct DarkLyricRhythmLine: View {
             }
         }
         .frame(maxWidth: .infinity)
+        .accessibilityHidden(true)
     }
 
     private var frameInterval: TimeInterval? {

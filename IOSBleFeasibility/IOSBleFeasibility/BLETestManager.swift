@@ -963,6 +963,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
             log("[SmokeTest] force protocol V3")
         }
         if arguments.contains("--smoke-test-preferences") {
+            let expectedArtworkSize = ArtworkDisplaySizeOption.small.rawValue
             setAppExperienceMode(.debug)
             preferences.artworkDisplaySize = .small
             setKaraokeOffsetMs(300)
@@ -972,11 +973,15 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
                 guard let self else { return }
                 self.log("[SmokeTest] preferences written")
                 let verified = self.preferences.appExperienceMode == .debug &&
-                    self.preferences.artworkDisplaySize.rawValue == 200 &&
+                    self.preferences.artworkDisplaySize.rawValue == expectedArtworkSize &&
                     self.karaokeOffsetMs == 300 &&
                     self.preferences.autoReconnectEnabled
                 if verified {
-                    self.log("[SmokeTest] preferences verified mode=debug artworkDisplaySize=200 lyricOffsetMs=300 autoReconnect=true")
+                    self.log(
+                        "[SmokeTest] preferences verified mode=debug " +
+                            "artworkDisplaySize=\(expectedArtworkSize) " +
+                            "lyricOffsetMs=300 autoReconnect=true"
+                    )
                 } else {
                     self.log(
                         "[SmokeTest] preferences verification failed " +
@@ -988,7 +993,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
             }
         } else if defaults.bool(forKey: markerKey),
                   preferences.appExperienceMode == .debug,
-                  preferences.artworkDisplaySize.rawValue == 200,
+                  preferences.artworkDisplaySize == .small,
                   karaokeOffsetMs == 300,
                   preferences.autoReconnectEnabled {
             log("[SmokeTest] preferences persisted")
@@ -1548,6 +1553,10 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     func forceReconnect() {
         log("[BLE-Reconnect] hard reconnect requested reason=manual")
         performHardReconnect(reason: "manual force reconnect", manual: true)
+    }
+
+    func resyncCurrentPlaybackFromDevice() {
+        syncAfterReconnect(reason: "device detail manual resync")
     }
 
     private func performHardReconnect(reason: String, manual: Bool) {

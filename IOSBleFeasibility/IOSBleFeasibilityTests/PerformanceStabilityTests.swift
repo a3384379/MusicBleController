@@ -79,6 +79,7 @@ final class PerformanceStabilityTests: XCTestCase {
                         artist: "测试歌手",
                         albumArtImage: nil,
                         lyrics: lyrics,
+                        lyricsIdentity: "test|2|0|2000",
                         currentIndex: 0,
                         positionMs: 750,
                         translationState: .ready,
@@ -105,6 +106,7 @@ final class PerformanceStabilityTests: XCTestCase {
                     artist: "测试歌手",
                     albumArtImage: nil,
                     lyrics: [],
+                    lyricsIdentity: "empty|0|-1|-1",
                     currentIndex: -1,
                     positionMs: 0,
                     translationState: .failed(reason: "测试失败"),
@@ -1618,6 +1620,84 @@ final class PerformanceStabilityTests: XCTestCase {
             ),
             .accessibility
         )
+
+        let seMetrics = PlayerLayoutMetrics.resolve(
+            availableSize: CGSize(width: 375, height: 667),
+            safeAreaInsets: EdgeInsets(top: 20, leading: 0, bottom: 0, trailing: 0),
+            dynamicTypeSize: .large,
+            artworkPreference: .large
+        )
+        XCTAssertEqual(seMetrics.mode, .compact)
+        XCTAssertTrue((112...144).contains(seMetrics.artworkSize))
+
+        let standardMetrics = PlayerLayoutMetrics.resolve(
+            availableSize: CGSize(width: 393, height: 852),
+            safeAreaInsets: EdgeInsets(top: 59, leading: 0, bottom: 34, trailing: 0),
+            dynamicTypeSize: .large,
+            artworkPreference: .medium
+        )
+        XCTAssertEqual(standardMetrics.mode, .regular)
+        XCTAssertEqual(standardMetrics.artworkSize, 224)
+
+        let largeMetrics = PlayerLayoutMetrics.resolve(
+            availableSize: CGSize(width: 430, height: 932),
+            safeAreaInsets: EdgeInsets(top: 59, leading: 0, bottom: 34, trailing: 0),
+            dynamicTypeSize: .large,
+            artworkPreference: .large
+        )
+        XCTAssertEqual(largeMetrics.mode, .regular)
+        XCTAssertEqual(largeMetrics.artworkSize, 272)
+    }
+
+    func testProductUiStateMappingsAndLegacyArtworkMigration() {
+        XCTAssertEqual(ArtworkDisplaySizeOption.small.pointSize, 184)
+        XCTAssertEqual(ArtworkDisplaySizeOption.medium.pointSize, 224)
+        XCTAssertEqual(ArtworkDisplaySizeOption.large.pointSize, 272)
+        XCTAssertEqual(PreferencesStore.migratedArtworkDisplaySize(storedValue: 200), .small)
+        XCTAssertEqual(PreferencesStore.migratedArtworkDisplaySize(storedValue: 220), .medium)
+        XCTAssertEqual(PreferencesStore.migratedArtworkDisplaySize(storedValue: 260), .large)
+
+        XCTAssertEqual(
+            ConnectionStatusPresentation.resolve(.connected(deviceName: "Sony", health: "healthy")).title,
+            "已连接"
+        )
+        XCTAssertEqual(
+            ConnectionStatusPresentation.resolve(.reconnecting(deviceName: "Sony", attempt: 2)).title,
+            "正在重连"
+        )
+        let banner = ReconnectBannerPresentation.resolve(
+            connection: .disconnected(lastDeviceName: "Sony"),
+            hasSnapshot: true
+        )
+        XCTAssertEqual(banner?.showsRetry, true)
+        XCTAssertNil(ReconnectBannerPresentation.resolve(
+            connection: .disconnected(lastDeviceName: "Sony"),
+            hasSnapshot: false
+        ))
+        XCTAssertTrue(NowPlayingSnapshotPolicy.hasDisplayableSnapshot(
+            title: "Song",
+            artist: "Artist",
+            hasArtwork: false,
+            isRestoredSnapshot: false
+        ))
+        XCTAssertFalse(NowPlayingSnapshotPolicy.hasDisplayableSnapshot(
+            title: "-",
+            artist: "等待同步",
+            hasArtwork: false,
+            isRestoredSnapshot: false
+        ))
+    }
+
+    func testFullLyricsFollowStateOnlyResumesExplicitlyOrOnTrackChange() {
+        var state = FullLyricsFollowState()
+        XCTAssertFalse(state.showsReturnToCurrent)
+        state.userDidBrowse()
+        XCTAssertTrue(state.showsReturnToCurrent)
+        state.returnToCurrent()
+        XCTAssertFalse(state.showsReturnToCurrent)
+        state.userDidBrowse()
+        state.trackDidChange()
+        XCTAssertFalse(state.showsReturnToCurrent)
     }
 
     func testLiveArtworkRevisionFenceRejectsLateCompletion() {

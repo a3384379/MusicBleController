@@ -16,7 +16,7 @@ if ! grep -q '\[SmokeTest\] preferences written' "$OUT_DIR/ios_ble_after_prefere
   exit 1
 fi
 
-if ! grep -q '\[SmokeTest\] preferences verified mode=debug artworkDisplaySize=200 lyricOffsetMs=300 autoReconnect=true' "$OUT_DIR/ios_ble_after_preferences.log"; then
+if ! grep -q '\[SmokeTest\] preferences verified mode=debug artworkDisplaySize=184 lyricOffsetMs=300 autoReconnect=true' "$OUT_DIR/ios_ble_after_preferences.log"; then
   echo "Missing preferences verified log" >&2
   exit 1
 fi
