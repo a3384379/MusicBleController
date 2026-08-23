@@ -8,7 +8,7 @@ struct NextLiveActivityIntent: LiveActivityIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        LiveActivityCommandBridge.shared.performIntent(command: .next)
+        _ = LiveActivityCommandBridge.shared.performIntent(command: .next)
         return .result()
     }
 }

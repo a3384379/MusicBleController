@@ -13,12 +13,15 @@ struct SonyMusicLiveActivityWidget: Widget {
                 .activitySystemActionForegroundColor(.white)
         } dynamicIsland: { context in
             let visualState = DynamicIslandPlaybackVisualState.resolve(state: context.state)
+            let islandStyle = DynamicIslandStyle(
+                rawValue: context.state.dynamicIslandStyle
+            ) ?? .defaultStyle
             return DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
-                    LiveActivityArtworkView(
-                        artworkKey: context.state.artworkKey,
-                        artworkRevision: context.state.artworkRevision,
-                        size: 44
+                    ExpandedStyleLeadingView(
+                        state: context.state,
+                        style: islandStyle,
+                        visualState: visualState
                     )
                 }
                 DynamicIslandExpandedRegion(.trailing) {
@@ -34,17 +37,88 @@ struct SonyMusicLiveActivityWidget: Widget {
                     ExpandedBottomView(state: context.state)
                 }
             } compactLeading: {
-                CompactArtworkProgressView(state: context.state, size: 26)
+                CompactStyleLeadingView(
+                    state: context.state,
+                    style: islandStyle,
+                    visualState: visualState
+                )
             } compactTrailing: {
                 CompactPlaybackGlyphView(
                     visualState: visualState,
                     size: 18
                 )
             } minimal: {
-                MinimalPlaybackGlyphView(visualState: visualState)
+                if islandStyle == .compactDefault {
+                    MinimalPlaybackGlyphView(visualState: visualState)
+                } else if islandStyle == .lyricFocused {
+                    Image(systemName: "quote.bubble.fill")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(visualState.accentColor)
+                } else {
+                    DynamicIslandStatusStrip(
+                        visualState: visualState,
+                        width: 14,
+                        height: 11
+                    )
+                }
             }
             .keylineTint(visualState.accentColor)
             .widgetURL(URL(string: "sonymusic://nowplaying"))
+        }
+    }
+}
+
+private struct ExpandedStyleLeadingView: View {
+    let state: SonyMusicActivityAttributes.ContentState
+    let style: DynamicIslandStyle
+    let visualState: DynamicIslandPlaybackVisualState
+
+    var body: some View {
+        switch style {
+        case .compactDefault:
+            LiveActivityArtworkView(
+                artworkKey: state.artworkKey,
+                artworkRevision: state.artworkRevision,
+                size: 44
+            )
+        case .lyricFocused:
+            Image(systemName: "quote.bubble.fill")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(visualState.accentColor)
+                .frame(width: 44, height: 44)
+                .background(visualState.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+        case .waveformFocused:
+            DynamicIslandStatusStrip(
+                visualState: visualState,
+                width: 44,
+                height: 22
+            )
+            .frame(width: 44, height: 44)
+        }
+    }
+}
+
+private struct CompactStyleLeadingView: View {
+    let state: SonyMusicActivityAttributes.ContentState
+    let style: DynamicIslandStyle
+    let visualState: DynamicIslandPlaybackVisualState
+
+    var body: some View {
+        switch style {
+        case .compactDefault:
+            CompactArtworkProgressView(state: state, size: 26)
+        case .lyricFocused:
+            Image(systemName: "quote.bubble.fill")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(visualState.accentColor)
+                .frame(width: 26, height: 26)
+        case .waveformFocused:
+            DynamicIslandStatusStrip(
+                visualState: visualState,
+                width: 26,
+                height: 14
+            )
+            .frame(width: 26, height: 26)
         }
     }
 }
@@ -649,21 +723,24 @@ private struct TrackSummaryView: View {
                 .minimumScaleFactor(0.75)
                 .truncationMode(.tail)
 
-            Text(state.artist)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.white.opacity(0.68))
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
-                .truncationMode(.tail)
-
-            Text(lyricState.text)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(lyricForegroundStyle)
-                .lineLimit(1)
-                .minimumScaleFactor(0.76)
-                .truncationMode(.tail)
-
-            if dynamicIslandStyle == .waveformFocused {
+            if dynamicIslandStyle == .compactDefault {
+                Text(state.artist)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.68))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                    .truncationMode(.tail)
+            } else if dynamicIslandStyle == .lyricFocused {
+                Text(lyricState.text)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(lyricForegroundStyle)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.76)
+                    .truncationMode(.tail)
+            } else {
+                Text(visualState.statusText)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(visualState.accentColor.opacity(0.90))
                 DynamicIslandStatusStrip(
                     visualState: visualState,
                     width: 96,

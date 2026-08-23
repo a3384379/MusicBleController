@@ -108,7 +108,13 @@ struct LyricDiagnostic: Equatable {
         if normalized.contains("loading") {
             return "歌词正在加载。"
         }
-        return raw.isEmpty ? statusTitle : raw
+        if !raw.isEmpty {
+            return raw
+        }
+        let fallback = normalizedStatus
+            .replacingOccurrences(of: "_", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return fallback.isEmpty ? "未知歌词状态" : fallback
     }
 
     var suggestionText: String {

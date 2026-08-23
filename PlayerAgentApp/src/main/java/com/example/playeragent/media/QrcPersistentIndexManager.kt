@@ -25,12 +25,16 @@ class QrcPersistentIndexManager(
             }
         }
     private val rebuilding = AtomicBoolean(false)
+    private val deferredRebuildScheduled = AtomicBoolean(false)
     private val lock = Any()
+    @Volatile
+    private var stopped = false
     private var entries: List<QrcGroupIndexEntry> = emptyList()
     private var metadata: IndexMetadata? = null
     private var dirty = false
 
     fun shutdown() {
+        stopped = true
         rebuildExecutor.shutdownNow()
     }
 
@@ -137,6 +141,45 @@ class QrcPersistentIndexManager(
         logger("[QrcIndex] marked dirty groupId=${groupId.orEmpty()}")
     }
 
+    /** Incrementally enrich a group after its QRC has already been decrypted. */
+    fun updateParsedMetadata(groupId: String, parsed: ParsedLyric) {
+        val currentEntries = getIndexForForeground()
+        val currentMetadata = synchronized(lock) { metadata }
+        if (currentEntries.isEmpty() || currentMetadata == null) {
+            markDirty(groupId)
+            rebuildAsync("parsed metadata unavailable groupId=$groupId")
+            return
+        }
+        val updatedEntries = currentEntries.map { entry ->
+            if (entry.groupId != groupId) {
+                entry
+            } else {
+                val group = entry.toFileGroup()
+                entry.copy(
+                    title = parsed.title,
+                    artist = parsed.artist,
+                    album = parsed.album,
+                    normalizedTitle = QrcLyricUtils.normalizeForMatch(parsed.title),
+                    normalizedArtist = QrcLyricUtils.normalizeForMatch(parsed.artist),
+                    normalizedAlbum = QrcLyricUtils.normalizeForMatch(parsed.album),
+                    firstLyricTitleCandidate = QrcCurrentTrackMatchPolicy.extractTitleCandidate(
+                        parsed.lines.map(QrcLyricLine::text)
+                    ),
+                    lastLyricEndMs = QrcCurrentTrackMatchPolicy.lastLineEndMs(parsed.lines),
+                    metadataComplete = parsed.title.isNotBlank() && parsed.artist.isNotBlank(),
+                    fingerprint = QrcLyricUtils.fingerprintKey(group),
+                    exSavingTime = QrcLyricUtils.readExSavingTime(group.exFile),
+                    sidecarLastModified = QrcLyricUtils.sidecarLastModified(group)
+                )
+            }
+        }
+        synchronized(lock) {
+            entries = updatedEntries
+        }
+        saveIndex(currentMetadata, updatedEntries)
+        logger("[QrcIndex] incremental metadata updated groupId=$groupId lines=${parsed.lines.size}")
+    }
+
     fun rebuildAsync() {
         rebuildAsync("requested")
     }
@@ -152,6 +195,7 @@ class QrcPersistentIndexManager(
         )
         if (token == null) {
             rebuilding.set(false)
+            scheduleDeferredRebuild(reason)
             return
         }
         logger("[QrcIndex] rebuild scheduled background reason=$reason")
@@ -166,6 +210,32 @@ class QrcPersistentIndexManager(
             } finally {
                 QrcMaintenanceCoordinator.finish(token, logger)
                 rebuilding.set(false)
+            }
+        }
+    }
+
+    private fun scheduleDeferredRebuild(reason: String) {
+        if (stopped || !deferredRebuildScheduled.compareAndSet(false, true)) return
+        val guard = MaintenanceGuard.snapshot()
+        val now = System.currentTimeMillis()
+        val delayMs = if (guard.realtimeWindowActive) {
+            (guard.protectedUntil - now + DEFERRED_REBUILD_GRACE_MS)
+                .coerceIn(DEFERRED_REBUILD_MIN_MS, DEFERRED_REBUILD_MAX_MS)
+        } else {
+            DEFERRED_REBUILD_MIN_MS
+        }
+        logger("[QrcIndex] rebuild deferred delayMs=$delayMs reason=$reason")
+        rebuildExecutor.execute {
+            try {
+                Thread.sleep(delayMs)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return@execute
+            } finally {
+                deferredRebuildScheduled.set(false)
+            }
+            if (!stopped) {
+                rebuildAsync("deferred $reason")
             }
         }
     }
@@ -354,6 +424,7 @@ class QrcPersistentIndexManager(
                     .toByteArray(Charsets.UTF_8)
                     .size
                 val metadata = QrcLyricUtils.parseProducerMetadata(group.producerFile)
+                val exSavingTime = QrcLyricUtils.readExSavingTime(group.exFile)
                 QrcGroupIndexEntry(
                     groupId = group.groupId,
                     qrcFile = group.qrcFile,
@@ -373,7 +444,11 @@ class QrcPersistentIndexManager(
                     hasQrc = group.qrcFile != null,
                     hasProducer = group.producerFile != null,
                     hasTranslrc = group.translrcFile != null,
-                    hasRomaqrc = group.romaqrcFile != null
+                    hasRomaqrc = group.romaqrcFile != null,
+                    exSavingTime = exSavingTime,
+                    sidecarLastModified = QrcLyricUtils.sidecarLastModified(group),
+                    metadataComplete = metadata.first.isNotBlank() && metadata.second.isNotBlank(),
+                    fingerprint = QrcLyricUtils.fingerprintKey(group)
                 )
             }
         val metadata = IndexMetadata(
@@ -404,7 +479,8 @@ class QrcPersistentIndexManager(
         metadata: IndexMetadata,
         entries: List<QrcGroupIndexEntry>
     ) {
-        try {
+        synchronized(indexWriteLock) {
+          try {
             val objectValue = JSONObject()
                 .put("version", INDEX_VERSION)
                 .put("dirPath", metadata.dirPath)
@@ -417,9 +493,15 @@ class QrcPersistentIndexManager(
                         array.put(entry.toJson())
                     }
                 })
-            indexFile.writeText(objectValue.toString(), Charsets.UTF_8)
-        } catch (exception: Exception) {
-            logger("[QrcIndex] save failed error=${exception.message}")
+            val temporary = File(indexFile.parentFile, "$INDEX_FILE_NAME.tmp")
+            temporary.writeText(objectValue.toString(), Charsets.UTF_8)
+            if (!temporary.renameTo(indexFile)) {
+                temporary.copyTo(indexFile, overwrite = true)
+                temporary.delete()
+            }
+          } catch (exception: Exception) {
+              logger("[QrcIndex] save failed error=${exception.message}")
+          }
         }
     }
 
@@ -476,7 +558,13 @@ class QrcPersistentIndexManager(
             hasQrc = optBoolean("hasQrc"),
             hasProducer = optBoolean("hasProducer"),
             hasTranslrc = optBoolean("hasTranslrc"),
-            hasRomaqrc = optBoolean("hasRomaqrc")
+            hasRomaqrc = optBoolean("hasRomaqrc"),
+            exSavingTime = optLong("exSavingTime"),
+            sidecarLastModified = optLong("sidecarLastModified"),
+            firstLyricTitleCandidate = optString("firstLyricTitleCandidate"),
+            lastLyricEndMs = optLong("lastLyricEndMs"),
+            metadataComplete = optBoolean("metadataComplete"),
+            fingerprint = optString("fingerprint")
         )
     }
 
@@ -501,6 +589,12 @@ class QrcPersistentIndexManager(
             .put("normalizedAlbum", normalizedAlbum)
             .put("normalizedProducerText", normalizedProducerText)
             .put("producerTextLoaded", producerTextLoaded)
+            .put("exSavingTime", exSavingTime)
+            .put("sidecarLastModified", sidecarLastModified)
+            .put("firstLyricTitleCandidate", firstLyricTitleCandidate)
+            .put("lastLyricEndMs", lastLyricEndMs)
+            .put("metadataComplete", metadataComplete)
+            .put("fingerprint", fingerprint)
     }
 
     private fun String.toFileOrNull(): File? {
@@ -576,11 +670,15 @@ class QrcPersistentIndexManager(
     }
 
     companion object {
-        private const val INDEX_VERSION = 1
+        private const val INDEX_VERSION = 2
         private const val INDEX_FILE_NAME = "QrcIndex.json"
+        private const val DEFERRED_REBUILD_MIN_MS = 500L
+        private const val DEFERRED_REBUILD_GRACE_MS = 150L
+        private const val DEFERRED_REBUILD_MAX_MS = 10_000L
         private const val MAX_PRODUCER_BYTES = 8 * 1024
         private const val MAX_TOTAL_PRODUCER_TEXT_BYTES = 3 * 1024 * 1024
         private val globalDirty = AtomicBoolean(false)
+        private val indexWriteLock = Any()
         private val GROUP_FILE_REGEX =
             Regex("""^(-?\d+)\.(qrc|producer|ex|translrc|romaqrc)$""")
     }

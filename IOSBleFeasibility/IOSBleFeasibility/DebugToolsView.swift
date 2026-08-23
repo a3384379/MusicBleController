@@ -39,6 +39,12 @@ struct DebugToolsView: View {
         }
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
+        .onAppear {
+            bleManager.setUILogStreamingEnabled(true)
+        }
+        .onDisappear {
+            bleManager.setUILogStreamingEnabled(false)
+        }
         .sheet(isPresented: $showLyricDiagnostic) {
             LyricDiagnosticView(
                 bleManager: bleManager,
@@ -151,7 +157,7 @@ struct DebugToolsView: View {
     private var autoReconnectSection: some View {
         DebugCard {
             VStack(alignment: .leading, spacing: 12) {
-                Label("Auto Reconnect", systemImage: "arrow.triangle.2.circlepath")
+                Label("自动重连", systemImage: "arrow.triangle.2.circlepath")
                     .font(.headline)
 
                 Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
@@ -224,7 +230,7 @@ struct DebugToolsView: View {
         let status = bleManager.artworkEnhancementStatus
         return DebugCard {
             VStack(alignment: .leading, spacing: 12) {
-                Label("Artwork Enhancement", systemImage: "photo.on.rectangle.angled")
+                Label("封面增强", systemImage: "photo.on.rectangle.angled")
                     .font(.headline)
 
                 Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
@@ -241,7 +247,7 @@ struct DebugToolsView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Target Size")
+                    Text("目标尺寸")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                     LazyVGrid(
@@ -267,7 +273,7 @@ struct DebugToolsView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Sharpness")
+                    Text("锐度")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                     LazyVGrid(
@@ -334,7 +340,7 @@ struct DebugToolsView: View {
         let status = bleManager.liveActivityControlStatus
         return DebugCard {
             VStack(alignment: .leading, spacing: 12) {
-                Label("Live Activity Control", systemImage: "playpause.circle")
+                Label("实时活动控制", systemImage: "playpause.circle")
                     .font(.headline)
 
                 Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
@@ -356,7 +362,7 @@ struct DebugToolsView: View {
         DebugCard {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Label("Karaoke Offset", systemImage: "textformat")
+                    Label("歌词偏移", systemImage: "textformat")
                         .font(.headline)
                     Spacer()
                     Text(offsetLabel(bleManager.karaokeOffsetMs))
@@ -499,18 +505,18 @@ struct DebugToolsView: View {
                 if showIOSLogs {
                     HStack(spacing: 10) {
                         Button(action: bleManager.copyIOSLogs) {
-                            Label("Copy iOS Logs", systemImage: "doc.on.doc")
+                            Label("复制 iOS 日志", systemImage: "doc.on.doc")
                         }
                         .buttonStyle(.bordered)
 
                         Button(role: .destructive, action: bleManager.clearIOSLogs) {
-                            Label("Clear", systemImage: "trash")
+                            Label("清空", systemImage: "trash")
                         }
                         .buttonStyle(.bordered)
 
                         if AppLogStore.shared.currentLogFileExists() {
                             ShareLink(item: AppLogStore.shared.currentLogURL) {
-                                Label("Share", systemImage: "square.and.arrow.up")
+                                Label("分享", systemImage: "square.and.arrow.up")
                             }
                             .buttonStyle(.bordered)
                         }

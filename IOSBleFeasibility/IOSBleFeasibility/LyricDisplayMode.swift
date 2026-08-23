@@ -11,26 +11,26 @@ enum LyricDisplayMode: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .original:
-            return "原文"
+            return AppLocalization.string("原文")
         case .originalTranslation:
-            return "翻译"
+            return AppLocalization.string("翻译")
         case .originalRomanization:
-            return "罗马音"
+            return AppLocalization.string("罗马音")
         case .originalTranslationRomanization:
-            return "全部"
+            return AppLocalization.string("全部")
         }
     }
 
     var menuTitle: String {
         switch self {
         case .original:
-            return "原文"
+            return AppLocalization.string("原文")
         case .originalTranslation:
-            return "原文 + 翻译"
+            return AppLocalization.string("原文 + 翻译")
         case .originalRomanization:
-            return "原文 + 罗马音"
+            return AppLocalization.string("原文 + 罗马音")
         case .originalTranslationRomanization:
-            return "原文 + 翻译 + 罗马音"
+            return AppLocalization.string("原文 + 翻译 + 罗马音")
         }
     }
 

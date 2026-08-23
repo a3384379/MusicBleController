@@ -124,7 +124,13 @@ class QrcAliasCacheManager(
             val root = JSONObject()
                 .put("version", CACHE_VERSION)
                 .put("items", array)
-            cacheFile().writeText(root.toString(), Charsets.UTF_8)
+            val target = cacheFile()
+            val temporary = File(target.parentFile, "${target.name}.tmp")
+            temporary.writeText(root.toString(), Charsets.UTF_8)
+            if (!temporary.renameTo(target)) {
+                temporary.copyTo(target, overwrite = true)
+                temporary.delete()
+            }
         } catch (exception: Exception) {
             logger("[QrcAlias] save failed: ${exception.message}")
         }

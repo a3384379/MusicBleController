@@ -1,0 +1,27 @@
+{
+  "sourceLanguage" : "zh-Hans",
+  "strings" : {
+    "CFBundleDisplayName" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Sony Music" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Sony 音乐" } }
+      }
+    },
+    "NSBluetoothAlwaysUsageDescription" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Bluetooth connects to your Sony player to control playback and sync lyrics, artwork, and Live Activities." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "蓝牙用于连接 Sony 播放端，以控制播放并同步歌词、封面和实时活动。" } }
+      }
+    },
+    "NSBluetoothPeripheralUsageDescription" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Bluetooth connects to your Sony player to control playback and sync media information." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "蓝牙用于连接 Sony 播放端，以控制播放并同步媒体信息。" } }
+      }
+    }
+  },
+  "version" : "1.0"
+}

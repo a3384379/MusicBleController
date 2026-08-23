@@ -321,6 +321,11 @@ class QrcLyricCacheManager(
         directory.mkdirs()
         val existing = readBySongKeyFromDirectory(canonicalParsed.songKey, directory)
         if (existing != null && shouldKeepExisting(existing, canonicalParsed)) {
+            if (runCatching { directory.canonicalPath == cacheRoot().canonicalPath }
+                    .getOrDefault(false)
+            ) {
+                registerValidatedCache(existing)
+            }
             logger("[QrcPrebuild] duplicate songKey=${canonicalParsed.songKey} keep=existing")
             return
         }
@@ -340,6 +345,44 @@ class QrcLyricCacheManager(
             memoryCache[canonicalParsed.songKey] = canonicalParsed
         }
         logger("[QrcCache] saved songKey=${canonicalParsed.songKey} lines=${canonicalParsed.lines.size}")
+    }
+
+    /**
+     * Makes an already-validated group cache immediately queryable without
+     * decrypting or rewriting it. This is important during an app upgrade: the
+     * parsed cache can be valid while the versioned index is still rebuilding
+     * behind the real-time playback guard.
+     */
+    @Synchronized
+    fun registerValidatedCache(parsed: ParsedLyric): ParsedLyric? {
+        if (parsed.lines.isEmpty()) return null
+        val safeTitle = parsed.title.ifBlank {
+            QrcCurrentTrackMatchPolicy.extractTitleCandidate(
+                parsed.lines.map(QrcLyricLine::text)
+            )
+        }
+        if (safeTitle.isBlank()) {
+            logger("[QrcCacheIndex] validated cache ignored reason=title missing groupId=${parsed.groupId}")
+            return null
+        }
+        val indexed = parsed.copy(
+            songKey = QrcLyricUtils.buildSongKey(safeTitle, parsed.artist, parsed.album),
+            title = safeTitle
+        )
+        val songFile = songCacheFile(indexed.songKey)
+        val groupFile = groupCacheFile(indexed.groupId)
+        val sourceFile = when {
+            songFile.isFile -> songFile
+            groupFile.isFile -> groupFile
+            else -> return null
+        }
+        memoryCache[indexed.songKey] = indexed
+        upsertParsedIndex(indexed, sourceFile)
+        logger(
+            "[QrcCacheIndex] validated cache registered groupId=${indexed.groupId} " +
+                "title=${indexed.title} lines=${indexed.lines.size}"
+        )
+        return indexed
     }
 
     @Synchronized
@@ -577,9 +620,7 @@ class QrcLyricCacheManager(
             return null
         }
         val currentTitle = QrcLyricUtils.normalizeForMatch(title)
-        if (currentTitle.length < MIN_FUZZY_TITLE_LENGTH ||
-            GENERIC_TITLES.contains(currentTitle)
-        ) {
+        if (currentTitle.isBlank() || GENERIC_TITLES.contains(currentTitle)) {
             logger("[QrcCache] fuzzy rejected reason=bad title")
             trace(traceId, "fuzzy", "result=skipped reason=bad_title costMs=${System.currentTimeMillis() - startedAt}")
             return null
@@ -633,6 +674,19 @@ class QrcLyricCacheManager(
             )
             listOf(direct to DIRECT_TITLE_ARTIST_SCORE)
         } else {
+            // A one-character CJK title is unsafe for a broad fuzzy scan, but a
+            // unique exact title+artist row above is deterministic and should
+            // still use the parsed cache (for example QQ Music's 《当》).
+            if (currentTitle.length < MIN_FUZZY_TITLE_LENGTH) {
+                logger("[QrcCache] fuzzy rejected reason=short title without exact artist")
+                trace(
+                    traceId,
+                    "fuzzy",
+                    "result=skipped reason=short_title_without_exact_artist " +
+                        "costMs=${System.currentTimeMillis() - startedAt}"
+                )
+                return null
+            }
             val scoredCandidates = mutableListOf<Pair<CacheIndexEntry, Int>>()
             // Most alias cases differ only in artist spelling. Restrict those
             // lookups to exact-title rows instead of scoring the whole parsed

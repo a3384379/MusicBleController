@@ -6,7 +6,7 @@ import UIKit
 ///
 /// CoreBluetooth callbacks use the main queue in this app, so neither file
 /// reads nor ImageIO decoding should run inline with a notification callback.
-final class ArtworkImageCache {
+final class ArtworkImageCache: @unchecked Sendable {
     static let shared = ArtworkImageCache()
 
     static let mainArtworkMaximumPixelSize = 780

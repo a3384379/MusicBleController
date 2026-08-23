@@ -266,6 +266,15 @@ private struct HistoryArtworkView: View {
 }
 
 enum PlaybackHistoryFormat {
+    private static let dateTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.doesRelativeDateFormatting = true
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
     static func duration(_ ms: Int64) -> String {
         let totalSeconds = max(ms, 0) / 1_000
         let hours = totalSeconds / 3_600
@@ -279,12 +288,7 @@ enum PlaybackHistoryFormat {
 
     static func dateTime(_ ms: Int64) -> String {
         let date = Date(timeIntervalSince1970: TimeInterval(ms) / 1_000)
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.doesRelativeDateFormatting = true
-        formatter.dateStyle = .short
-        formatter.timeStyle = .short
-        return formatter.string(from: date)
+        return dateTimeFormatter.string(from: date)
     }
 
     static func percent(_ value: Double) -> String {

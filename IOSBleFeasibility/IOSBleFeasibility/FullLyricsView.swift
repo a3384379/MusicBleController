@@ -8,6 +8,8 @@ struct FullLyricsView: View {
     let lyrics: [LyricLine]
     let currentIndex: Int
     let positionMs: Int64
+    let translationState: LyricSecondaryLoadState
+    let romanizationState: LyricSecondaryLoadState
     let isPlaying: Bool
     let isConnected: Bool
     let onDismiss: () -> Void
@@ -68,11 +70,51 @@ struct FullLyricsView: View {
         guard !lyrics.isEmpty else { return nil }
         switch displayMode {
         case .originalTranslation:
-            return hasAnyTranslation ? nil : "该歌曲暂无翻译"
+            return secondaryMessage(
+                state: translationState,
+                hasContent: hasAnyTranslation,
+                title: "翻译"
+            )
         case .originalRomanization:
-            return hasAnyRomanization ? nil : "该歌曲暂无罗马音"
-        case .original, .originalTranslationRomanization:
+            return secondaryMessage(
+                state: romanizationState,
+                hasContent: hasAnyRomanization,
+                title: "罗马音"
+            )
+        case .originalTranslationRomanization:
+            return [
+                secondaryMessage(
+                    state: translationState,
+                    hasContent: hasAnyTranslation,
+                    title: "翻译"
+                ),
+                secondaryMessage(
+                    state: romanizationState,
+                    hasContent: hasAnyRomanization,
+                    title: "罗马音"
+                )
+            ]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+            .nilIfEmpty
+        case .original:
             return nil
+        }
+    }
+
+    private func secondaryMessage(
+        state: LyricSecondaryLoadState,
+        hasContent: Bool,
+        title: String
+    ) -> String? {
+        guard !hasContent else { return nil }
+        switch state {
+        case .idle, .loading:
+            return "正在获取\(title)…"
+        case .ready, .unavailable:
+            return "该歌曲暂无\(title)"
+        case .failed:
+            return "\(title)获取失败，可稍后切换模式重试"
         }
     }
 
@@ -133,19 +175,25 @@ struct FullLyricsView: View {
                             if lyrics.isEmpty {
                                 emptyLyricsView
                             } else {
-                                ForEach(Array(lyrics.enumerated()), id: \.element.id) { index, line in
-                                    lyricRow(index: index, line: line)
-                                        .id(line.id)
-                                        .background(
-                                            GeometryReader { rowProxy in
-                                                Color.clear.preference(
-                                                    key: LyricLineCenterPreferenceKey.self,
-                                                    value: [
-                                                        index: rowProxy.frame(in: .named("lyricsScroll")).midY
-                                                    ]
-                                                )
+                                ForEach(lyrics.indices, id: \.self) { index in
+                                    lyricRow(index: index, line: lyrics[index])
+                                        .id(lyrics[index].id)
+                                        .background {
+                                            if isBrowsingLyrics {
+                                                GeometryReader { rowProxy in
+                                                    Color.clear.preference(
+                                                        key: LyricLineCenterPreferenceKey.self,
+                                                        value: [
+                                                            index: rowProxy.frame(
+                                                                in: .named("lyricsScroll")
+                                                            ).midY
+                                                        ]
+                                                    )
+                                                }
+                                            } else {
+                                                Color.clear
                                             }
-                                        )
+                                        }
                                 }
                             }
                             Color.clear
@@ -292,6 +340,7 @@ struct FullLyricsView: View {
                     progress: lineProgress(index: index),
                     words: line.words,
                     positionMs: positionMs,
+                    isPlaying: isPlaying,
                     highlightColor: Color.green.opacity(0.98),
                     normalColor: Color.white.opacity(isSelected ? 0.58 : 0.36),
                     font: .system(size: 28, weight: .bold, design: .rounded),
@@ -499,6 +548,12 @@ struct FullLyricsView: View {
     private func formatTime(_ milliseconds: Int64) -> String {
         let totalSeconds = max(milliseconds, 0) / 1_000
         return String(format: "%02lld:%02lld", totalSeconds / 60, totalSeconds % 60)
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
     }
 }
 

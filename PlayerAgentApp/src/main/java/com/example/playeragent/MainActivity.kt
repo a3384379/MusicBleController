@@ -58,10 +58,15 @@ import com.example.playeragent.media.QrcV2RebuildStatus
 import com.example.playeragent.media.QrcWatcherStatus
 import com.example.playeragent.service.PlayerAgentForegroundService
 import com.example.playeragent.service.QQMusicLyricAccessibilityService
+import com.example.playeragent.ui.SonyPlayerUiState
+import com.example.playeragent.ui.PlayerLogAdapter
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import java.text.SimpleDateFormat
 import java.security.MessageDigest
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
 
@@ -72,6 +77,7 @@ class MainActivity : Activity() {
     private lateinit var currentLyricTextView: TextView
     private lateinit var currentAlbumArtImageView: ImageView
     private lateinit var currentAlbumArtTextView: TextView
+    private lateinit var suggestedActionButton: Button
     private lateinit var artworkDiscoveryStatusTextView: TextView
     private lateinit var qrcCacheBuildTextView: TextView
     private lateinit var qrcStaleCacheRebuildTextView: TextView
@@ -80,8 +86,8 @@ class MainActivity : Activity() {
     private lateinit var qrcCacheOverviewTextView: TextView
     private lateinit var maintenanceStatusTextView: TextView
     private lateinit var historyStatusTextView: TextView
-    private lateinit var logTextView: TextView
-    private lateinit var logScrollView: ScrollView
+    private lateinit var logRecyclerView: RecyclerView
+    private lateinit var logAdapter: PlayerLogAdapter
     private lateinit var logSectionBody: LinearLayout
     private lateinit var buildTaskStatusTextView: TextView
     private lateinit var buildTaskBadgeTextView: TextView
@@ -110,6 +116,9 @@ class MainActivity : Activity() {
     private var qrcStaleCacheRebuildManager: QrcStaleCacheRebuildManager? = null
     private var lyricWarmupManager: LyricWarmupManager? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val uiMediaExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "PlayerAgent-UiMediaIO")
+    }
     @Volatile private var debugStatsLoading = false
     @Volatile private var lastDebugStatsLoadAt = 0L
     private var debugStatsLoadRunnable: Runnable? = null
@@ -117,6 +126,7 @@ class MainActivity : Activity() {
     private var lastPlayerUiLyric: String = ""
     private var lastPlayerUiLyricStatus: String = ""
     private var lastPlayerUiAlbumArtStatus: String = "未检测"
+    private var lastSonyPlayerUiState = SonyPlayerUiState()
     private var albumArtRefreshGeneration = 0L
     private var controlServiceStatusRefreshRunnable: Runnable? = null
     private var lastQrcV2BuildProgress = QrcV2RebuildProgress()
@@ -202,7 +212,6 @@ class MainActivity : Activity() {
         refreshControlServiceStatus()
         appendLog("[PlayerAgent] UI ready")
         appendLog("[UI] first lightweight render ready costMs=${System.currentTimeMillis() - startedAt}")
-        scheduleDebugStatsLoad()
         refreshCurrentMedia()
     }
 
@@ -244,6 +253,7 @@ class MainActivity : Activity() {
         artworkDiscoveryManager?.shutdown()
         controllerScannerManager?.stopScan()
         rfcommClientManager?.close()
+        uiMediaExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -297,11 +307,8 @@ class MainActivity : Activity() {
         accessibilityStatusTextView = statusValue("通知读取权限：未知")
         serviceCard.addView(accessibilityStatusTextView)
         serviceCard.addView(buttonGrid(listOf(
-            "启动控制服务" to ::startPlayerAgentService,
-            "停止控制服务" to ::stopPlayerAgentService,
-            "恢复蓝牙服务" to ::recoverBleStack,
-            "打开通知读取权限" to ::openNotificationAccessSettings,
-            "打开无障碍设置" to ::openAccessibilitySettings
+            "启动服务" to ::startPlayerAgentService,
+            "恢复 BLE" to ::recoverBleStack
         )))
 
         val playerCard = collapsibleCard(content, "当前播放", expanded = true)
@@ -312,7 +319,7 @@ class MainActivity : Activity() {
         }
         playerCard.addView(
             currentAlbumArtImageView,
-            LinearLayout.LayoutParams(dp(150), dp(150)).apply {
+            LinearLayout.LayoutParams(dp(112), dp(112)).apply {
                 gravity = Gravity.CENTER_HORIZONTAL
                 bottomMargin = dp(10)
             }
@@ -320,70 +327,70 @@ class MainActivity : Activity() {
         currentAlbumArtTextView = statusValue("封面：未检测").also(playerCard::addView)
         currentSongTextView = statusValue("歌曲：未检测").also(playerCard::addView)
         currentLyricTextView = statusValue("当前歌词：暂无歌词").also(playerCard::addView)
+        suggestedActionButton = fullWidthActionButton("重新关联当前歌词", ::refreshCurrentLyric)
+            .also(playerCard::addView)
 
-        val historyCard = collapsibleCard(content, "播放历史与收听统计", expanded = false)
-        historyStatusTextView = statusValue("播放历史：未刷新").also(historyCard::addView)
-        historyCard.addView(buttonGrid(listOf(
-            "刷新历史状态" to ::refreshHistoryStatus,
-            "显示最近 10 条" to ::showRecentHistory,
-            "显示今日统计" to ::showTodayHistoryStats,
-            "清空播放历史" to { confirmAction("清空 Sony 本地播放历史？", ::clearPlayHistory) }
-        )))
-
-        val lyricCard = collapsibleCard(content, "歌词缓存与逐字时间", expanded = false)
-        setupMaintenancePanel(lyricCard)
-
-        val connectionCard = collapsibleCard(content, "连接与兼容", expanded = false)
-        connectionCard.addView(buttonGrid(listOf(
-            "扫描控制端" to ::startControllerScan,
-            "连接经典蓝牙控制端" to ::connectRfcommServer,
-            "恢复蓝牙服务" to ::recoverBleStack,
-            "启动 QRC 监听器" to ::startQrcWatcher,
-            "停止 QRC 监听器" to ::stopQrcWatcher
-        )))
-
-        val mediaCard = collapsibleCard(content, "媒体诊断", expanded = false)
-        artworkDiscoveryStatusTextView = statusValue(
-            ArtworkDiscoveryStatus().displayText()
-        ).also(mediaCard::addView)
-        mediaCard.addView(buttonGrid(listOf(
-            "扫描歌词文件" to ::scanLrcFiles,
-            "测试当前封面" to ::testAlbumArt,
-            "发现高清封面" to ::discoverHqArtwork,
-            "停止封面发现" to ::stopArtworkDiscovery,
-            "检测歌词来源" to ::testLyricSource,
-            "测试当前歌词" to ::testCurrentLyric,
-            "歌词解析诊断" to ::testLrcDebug,
-            "解析首个 QRC 文件" to ::dumpFirstQrc,
-            "无障碍节点诊断" to ::dumpAccessibilityTree,
-            "刷新歌词统计" to ::refreshLyricStats,
-            "重置歌词统计" to ::resetLyricStats
-        )))
-
-        logSectionBody = collapsibleCard(content, "日志", expanded = false)
-        logSectionBody.addView(buttonGrid(listOf(
-            "显示/隐藏日志" to ::toggleLogs,
-            "导出日志" to ::exportLog,
-            "清空日志" to ::clearLog
-        )))
-        logTextView = TextView(this).apply {
-            textSize = 12f
-            setTextColor(Color.rgb(215, 218, 224))
-            setTextIsSelectable(true)
-            setPadding(dp(10), dp(10), dp(10), dp(10))
+        lazyCollapsibleCard(content, "播放历史与统计") { historyCard ->
+            historyStatusTextView = statusValue("播放历史：进入后按需加载").also(historyCard::addView)
+            historyCard.addView(buttonGrid(listOf(
+                "刷新历史" to ::refreshHistoryStatus,
+                "最近 10 条" to ::showRecentHistory,
+                "今日统计" to ::showTodayHistoryStats,
+                "清空历史" to { confirmAction("清空 Sony 本地播放历史？", ::clearPlayHistory) }
+            )))
         }
-        logScrollView = ScrollView(this).apply {
-            visibility = View.GONE
-            background = roundedBackground(Color.rgb(24, 25, 29), dp(12))
-            addView(logTextView)
+        lazyCollapsibleCard(content, "歌词缓存与维护") { lyricCard ->
+            setupMaintenancePanel(lyricCard)
+            scheduleDebugStatsLoad()
         }
-        logSectionBody.addView(
-            logScrollView,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(260)
-            )
-        )
+        lazyCollapsibleCard(content, "连接与兼容") { connectionCard ->
+            connectionCard.addView(buttonGrid(listOf(
+                "扫描控制端" to ::startControllerScan,
+                "经典蓝牙兼容" to ::connectRfcommServer,
+                "恢复蓝牙服务" to ::recoverBleStack,
+                "启动 QRC 监听" to ::startQrcWatcher,
+                "停止 QRC 监听" to ::stopQrcWatcher,
+                "通知读取权限" to ::openNotificationAccessSettings
+            )))
+        }
+        lazyCollapsibleCard(content, "诊断工具") { mediaCard ->
+            artworkDiscoveryStatusTextView = statusValue(
+                ArtworkDiscoveryStatus().displayText()
+            ).also(mediaCard::addView)
+            mediaCard.addView(buttonGrid(listOf(
+                "扫描歌词文件" to ::scanLrcFiles,
+                "测试当前封面" to ::testAlbumArt,
+                "发现高清封面" to ::discoverHqArtwork,
+                "停止封面发现" to ::stopArtworkDiscovery,
+                "检测歌词来源" to ::testLyricSource,
+                "测试当前歌词" to ::testCurrentLyric,
+                "歌词解析诊断" to ::testLrcDebug,
+                "解析首个 QRC" to ::dumpFirstQrc,
+                "无障碍诊断" to ::dumpAccessibilityTree,
+                "打开无障碍设置" to ::openAccessibilitySettings
+            )))
+        }
+        lazyCollapsibleCard(content, "日志") { body ->
+            logSectionBody = body
+            body.addView(buttonGrid(listOf(
+                "显示/隐藏日志" to ::toggleLogs,
+                "导出日志" to ::exportLog,
+                "清空日志" to ::clearLog
+            )))
+            logAdapter = PlayerLogAdapter().apply {
+                replace(LogBuffer.getRecentLogs(PlayerLogAdapter.MAX_ROWS))
+            }
+            logRecyclerView = RecyclerView(this).apply {
+                visibility = View.GONE
+                background = roundedBackground(Color.rgb(24, 25, 29), dp(12))
+                layoutManager = LinearLayoutManager(this@MainActivity)
+                adapter = logAdapter
+                setHasFixedSize(true)
+            }
+            body.addView(logRecyclerView, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(260)
+            ))
+        }
 
         setContentView(ScrollView(this).apply { addView(content) })
     }
@@ -897,6 +904,44 @@ class MainActivity : Activity() {
         return body
     }
 
+    private fun lazyCollapsibleCard(
+        parent: LinearLayout,
+        title: String,
+        builder: (LinearLayout) -> Unit
+    ) {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundedBackground(Color.rgb(30, 31, 36), dp(18))
+            setPadding(dp(14), dp(12), dp(14), dp(14))
+        }
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        var built = false
+        val header = TextView(this).apply {
+            text = "▶ $title"
+            textSize = 17f
+            setTextColor(Color.WHITE)
+            setPadding(0, 0, 0, dp(10))
+            setOnClickListener {
+                val expanding = body.visibility != View.VISIBLE
+                if (expanding && !built) {
+                    built = true
+                    builder(body)
+                }
+                body.visibility = if (expanding) View.VISIBLE else View.GONE
+                text = if (expanding) "▼ $title" else "▶ $title"
+            }
+        }
+        card.addView(header)
+        card.addView(body)
+        parent.addView(card, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = dp(12) })
+    }
+
     private fun buttonGrid(items: List<Pair<String, () -> Unit>>): GridLayout {
         return GridLayout(this).apply {
             columnCount = 2
@@ -1066,7 +1111,7 @@ class MainActivity : Activity() {
     }
 
     private fun refreshCurrentMedia() {
-        Thread {
+        uiMediaExecutor.execute {
             val state = try {
                 PlaybackStateReader(
                     context = this,
@@ -1116,9 +1161,6 @@ class MainActivity : Activity() {
                 }
                 refreshMaintenanceUiState()
             }
-        }.apply {
-            name = "MainStatusRefreshThread"
-            start()
         }
     }
 
@@ -1162,6 +1204,19 @@ class MainActivity : Activity() {
         val safeAlbum = album.ifBlank { "-" }
         val songKey = "$safeTitle|$safeArtist|$safeAlbum"
         val songChanged = songKey != lastPlayerUiSongKey
+        val lyricText = lyric.ifBlank { "暂无歌词" }
+        val rawStatus = lyricStatus.ifBlank { "unknown" }
+        val nextUiState = lastSonyPlayerUiState.copy(
+            playback = SonyPlayerUiState.PlaybackState(
+                title = safeTitle,
+                artist = safeArtist,
+                album = safeAlbum
+            ),
+            lyrics = SonyPlayerUiState.LyricsState(
+                text = lyricText,
+                rawStatus = rawStatus
+            )
+        )
         if (songChanged) {
             lastPlayerUiSongKey = songKey
             appendLog(
@@ -1176,27 +1231,31 @@ class MainActivity : Activity() {
             }
         }
 
-        currentSongTextView.text = "歌曲名：$safeTitle\n歌手：$safeArtist\n专辑：$safeAlbum"
-            .replace("歌曲名：-\n歌手：-\n专辑：-", "歌曲：未检测")
-        val lyricText = lyric.ifBlank { "暂无歌词" }
-        val statusText = lyricStatus.ifBlank { "unknown" }
-        lastPlayerUiLyricStatus = statusText
-        val hint = if (statusText == "waiting QQMusic lyric cache") {
-            "\n提示：QQ音乐可能尚未生成歌词缓存，可在 QQ音乐中打开歌词/桌面歌词后稍等。"
-        } else {
-            ""
+        if (nextUiState.playback != lastSonyPlayerUiState.playback) {
+            currentSongTextView.text = "歌曲名：$safeTitle\n歌手：$safeArtist\n专辑：$safeAlbum"
+                .replace("歌曲名：-\n歌手：-\n专辑：-", "歌曲：未检测")
         }
-        currentLyricTextView.text = "当前歌词：$lyricText\nLyric status：$statusText$hint"
-        if (lyricText != lastPlayerUiLyric) {
+        if (nextUiState.lyrics != lastSonyPlayerUiState.lyrics) {
+            lastPlayerUiLyricStatus = rawStatus
+            currentLyricTextView.text =
+                "当前歌词：$lyricText\n${nextUiState.lyrics.displayStatus}"
+            suggestedActionButton.visibility = if (nextUiState.lyrics.needsRelink) {
+                View.VISIBLE
+            } else {
+                View.GONE
+            }
+        }
+        if (lyricText != lastPlayerUiLyric && lyricText != "暂无歌词") {
             lastPlayerUiLyric = lyricText
             appendLog("[PlayerUI] lyric changed text=$lyricText")
         }
-        refreshMaintenanceUiState()
+        lastSonyPlayerUiState = nextUiState
+        if (songChanged) refreshMaintenanceUiState()
     }
 
     private fun refreshCurrentAlbumArtForSong(songKey: String) {
         val generation = ++albumArtRefreshGeneration
-        Thread {
+        uiMediaExecutor.execute {
             val albumArt = try {
                 AlbumArtTestManager(
                     context = this,
@@ -1234,9 +1293,6 @@ class MainActivity : Activity() {
                 }
                 refreshMaintenanceUiState()
             }
-        }.apply {
-            name = "MainAlbumArtRefreshThread"
-            start()
         }
     }
 
@@ -2032,10 +2088,14 @@ class MainActivity : Activity() {
     }
 
     private fun toggleLogs() {
-        logScrollView.visibility = if (logScrollView.visibility == View.VISIBLE) {
-            View.GONE
-        } else {
+        val show = logRecyclerView.visibility != View.VISIBLE
+        logRecyclerView.visibility = if (show) {
+            val logs = LogBuffer.getRecentLogs(PlayerLogAdapter.MAX_ROWS)
+            logAdapter.replace(logs)
+            if (logs.isNotEmpty()) logRecyclerView.scrollToPosition(logs.lastIndex)
             View.VISIBLE
+        } else {
+            View.GONE
         }
     }
 
@@ -2136,7 +2196,7 @@ class MainActivity : Activity() {
 
     private fun clearLog() {
         LogBuffer.clear()
-        logTextView.text = ""
+        if (::logAdapter.isInitialized) logAdapter.replace(emptyList())
         appendLog("[PlayerAgent] Log cleared")
     }
 
@@ -2201,13 +2261,17 @@ class MainActivity : Activity() {
         if (storeInBuffer) {
             LogBuffer.append(message)
         }
-        if (!::logTextView.isInitialized || !::logScrollView.isInitialized) {
+        if (!::logRecyclerView.isInitialized || !::logAdapter.isInitialized) {
             android.util.Log.i("PlayerAgent", message)
             return
         }
-        logTextView.append("$message\n")
-        logScrollView.post {
-            logScrollView.fullScroll(View.FOCUS_DOWN)
+        if (logRecyclerView.visibility != View.VISIBLE) {
+            return
+        }
+        val logs = LogBuffer.getRecentLogs(PlayerLogAdapter.MAX_ROWS)
+        logAdapter.replace(logs)
+        logRecyclerView.post {
+            if (logs.isNotEmpty()) logRecyclerView.scrollToPosition(logs.lastIndex)
         }
     }
 

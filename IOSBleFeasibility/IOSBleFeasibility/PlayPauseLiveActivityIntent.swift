@@ -8,7 +8,7 @@ struct PlayPauseLiveActivityIntent: LiveActivityIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        LiveActivityCommandBridge.shared.performIntent(command: .playPause)
+        _ = LiveActivityCommandBridge.shared.performIntent(command: .playPause)
         return .result()
     }
 }
@@ -20,7 +20,7 @@ struct ReconnectLiveActivityIntent: LiveActivityIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        LiveActivityCommandBridge.shared.performIntent(command: .reconnect)
+        _ = LiveActivityCommandBridge.shared.performIntent(command: .reconnect)
         return .result()
     }
 }

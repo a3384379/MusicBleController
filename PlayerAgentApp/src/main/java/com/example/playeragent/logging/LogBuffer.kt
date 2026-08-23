@@ -56,7 +56,7 @@ object LogBuffer {
     }
 
     private const val MAX_ENTRIES = 300
-    private const val MAX_REQUEST_LIMIT = 100
+    private const val MAX_REQUEST_LIMIT = 300
     private const val MAX_MESSAGE_LENGTH = 300
     private const val TRUNCATED_SUFFIX = "...<truncated>"
     private const val TAG = "PlayerAgentLogBuffer"

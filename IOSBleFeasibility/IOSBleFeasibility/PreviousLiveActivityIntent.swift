@@ -8,7 +8,7 @@ struct PreviousLiveActivityIntent: LiveActivityIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        LiveActivityCommandBridge.shared.performIntent(command: .previous)
+        _ = LiveActivityCommandBridge.shared.performIntent(command: .previous)
         return .result()
     }
 }

@@ -284,7 +284,7 @@ class QrcLyricManager(
                 if (parsed != null &&
                     parsedMatchesTitle(parsed, normalizedTitle)
                 ) {
-                    applyParsedResult(songKey, entry, parsed)
+                    applyParsedResult(songKey, entry, parsed, title, artist, album)
                     logger("[QrcLyric] cache hit songKey=$songKey")
                     logger(
                         "[QrcLyric] parsed lines=${cachedLines.size} " +
@@ -305,7 +305,7 @@ class QrcLyricManager(
             normalizedTitle = normalizedTitle,
             normalizedArtist = normalizedArtist,
             normalizedAlbum = normalizedAlbum,
-            allowRecentFallback = allowIndexRefresh,
+            allowRecentFallback = true,
             shouldCancel = shouldCancel,
             traceId = traceId
         )
@@ -416,7 +416,7 @@ class QrcLyricManager(
             )
         }
 
-        applyParsedResult(songKey, best.entry, parsed)
+        applyParsedResult(songKey, best.entry, parsed, title, artist, album)
         negativeCacheManager.removeNegative(songKey)
         logger(
             "[QrcLyric] best group=${best.entry.groupId} score=${best.score}"
@@ -779,27 +779,12 @@ class QrcLyricManager(
             val attemptedGroupIds = producerConfirmCandidates
                 .map { it.entry.groupId }
                 .toSet()
-            val fallbackCount = if (
-                normalizedTitle.isNotBlank() &&
-                sortedProducerCandidates.isEmpty() &&
-                hasRecentQrcFiles(entries)
-            ) {
-                RECENT_FALLBACK_DECRYPT_CANDIDATES
-            } else {
-                FALLBACK_DECRYPT_CANDIDATES
-            }
             val fallbackCandidates = fallbackRecentCandidates(
                 entries = entries,
                 excludedGroupIds = attemptedGroupIds,
-                limit = fallbackCount
+                limit = FALLBACK_DECRYPT_CANDIDATES
             )
-            if (fallbackCount == RECENT_FALLBACK_DECRYPT_CANDIDATES) {
-                logger(
-                    "[QrcLyric] recent fallback decrypt candidates=$fallbackCount " +
-                        "reason=new qrc files"
-                )
-            }
-            confirmed = confirmCandidates(
+            confirmed = confirmRecentCandidates(
                 candidates = fallbackCandidates,
                 normalizedTitle = normalizedTitle,
                 normalizedArtist = normalizedArtist,
@@ -809,17 +794,6 @@ class QrcLyricManager(
             logger(
                 "[QrcLyric] fallback decrypt candidates=${fallbackCandidates.size} " +
                 "costMs=${System.currentTimeMillis() - fallbackStartedAt}"
-            )
-        } else if (confirmed == null && !allowRecentFallback) {
-            // The foreground player path must not decrypt unrelated recent
-            // groups when the current title has no indexed producer match.
-            // QrcDirectoryWatcher parses the newly written current group after
-            // its size/mtime stabilise and then retries the exact song.
-            logger("[QrcLyric] foreground recent fallback skipped")
-            trace(
-                traceId,
-                "fuzzy",
-                "result=skipped reason=foreground_no_recent_fallback"
             )
         }
         return SearchResult(
@@ -833,15 +807,18 @@ class QrcLyricManager(
         excludedGroupIds: Set<String>,
         limit: Int
     ): List<ScoredGroup> {
-        return entries
-            .asSequence()
-            .filter { it.groupId !in excludedGroupIds }
-            .sortedByDescending(QrcGroupIndexEntry::lastModified)
-            .take(limit)
-            .map { entry ->
-                ScoredGroup(entry = entry, score = 100)
+        val selected = ArrayList<QrcGroupIndexEntry>(limit)
+        entries.forEach { entry ->
+            if (entry.groupId in excludedGroupIds) return@forEach
+            val insertAt = selected.indexOfFirst {
+                entry.effectiveModifiedAt() > it.effectiveModifiedAt()
             }
-            .toList()
+            if (insertAt >= 0) selected.add(insertAt, entry) else selected.add(entry)
+            if (selected.size > limit) selected.removeAt(selected.lastIndex)
+        }
+        return selected.map { entry ->
+            ScoredGroup(entry = entry, score = 100)
+        }
     }
 
     private fun hasRecentQrcFiles(entries: List<QrcGroupIndexEntry>): Boolean {
@@ -896,6 +873,49 @@ class QrcLyricManager(
             return confirmed
         }
         return null
+    }
+
+    private fun confirmRecentCandidates(
+        candidates: List<ScoredGroup>,
+        normalizedTitle: String,
+        normalizedArtist: String,
+        shouldCancel: () -> Boolean,
+        traceId: String
+    ): ScoredGroup? {
+        val parsedCandidates = candidates.mapNotNull { candidate ->
+            if (shouldCancel()) return null
+            val parsed = decryptAndParseQrc(candidate.entry, traceId) ?: return@mapNotNull null
+            candidate to parsed
+        }
+        val decision = QrcCurrentTrackMatchPolicy.evaluateRecent(
+            track = QrcCurrentTrackMatchPolicy.Track(
+                title = normalizedTitle,
+                artist = normalizedArtist,
+                requestStillValid = !shouldCancel()
+            ),
+            candidates = parsedCandidates.map { (candidate, parsed) ->
+                QrcCurrentTrackMatchPolicy.Candidate(
+                    groupId = candidate.entry.groupId,
+                    metadataTitle = parsed.title,
+                    metadataArtist = parsed.artist,
+                    lyricTitleCandidate = QrcCurrentTrackMatchPolicy.extractTitleCandidate(
+                        parsed.lines.map(LyricLine::text)
+                    ),
+                    lastLineEndMs = parsed.lines.lastOrNull()?.let {
+                        maxOf(it.timeMs + it.durationMs, it.timeMs)
+                    } ?: 0L,
+                    effectiveModifiedAtMs = candidate.entry.effectiveModifiedAt()
+                )
+            },
+            recentCandidateCount = 1
+        )
+        logger(
+            "[QrcCurrentMatch] result=${if (decision.matched) "matched" else "rejected"} " +
+                "reason=${decision.reason} groupId=${decision.candidate?.groupId.orEmpty()}"
+        )
+        val matchedId = decision.candidate?.groupId ?: return null
+        val (candidate, parsed) = parsedCandidates.first { it.first.entry.groupId == matchedId }
+        return candidate.copy(score = candidate.score + 50, parsed = parsed)
     }
 
     private fun decryptAndParseQrc(
@@ -996,10 +1016,18 @@ class QrcLyricManager(
     private fun applyParsedResult(
         songKey: String,
         entry: QrcGroupIndexEntry,
-        parsed: ParsedQrc
+        parsed: ParsedQrc,
+        requestedTitle: String,
+        requestedArtist: String,
+        requestedAlbum: String
     ) {
+        val bound = parsed.copy(
+            title = requestedTitle.ifBlank { parsed.title },
+            artist = requestedArtist.ifBlank { parsed.artist },
+            album = requestedAlbum.ifBlank { parsed.album }
+        )
         cachedGroupId = entry.groupId
-        cachedLines = parsed.lines
+        cachedLines = bound.lines
         removeUncertainCooldown(songKey, "qrc parsed")
         songGroupCache[songKey] = entry.groupId
         if (parsed.lines.isNotEmpty()) {
@@ -1007,12 +1035,12 @@ class QrcLyricManager(
             cacheManager.save(
                 ParsedLyric(
                     songKey = songKey,
-                    title = parsed.title,
-                    artist = parsed.artist,
-                    album = parsed.album,
+                    title = bound.title,
+                    artist = bound.artist,
+                    album = bound.album,
                     groupId = entry.groupId,
                     qrcLastModified = entry.qrcFile?.lastModified() ?: 0L,
-                    lines = parsed.lines.map {
+                    lines = bound.lines.map {
                         QrcLyricLine(
                             timeMs = it.timeMs,
                             text = it.text,
@@ -1021,29 +1049,31 @@ class QrcLyricManager(
                             translation = it.translation,
                             romanization = it.romanization
                         )
-                    }
+                    },
+                    qrcPath = entry.qrcFile?.absolutePath.orEmpty(),
+                    groupFingerprint = QrcLyricUtils.buildFingerprint(entry.toFileGroup())
                 )
             )
             val parsedSongKey = QrcLyricUtils.buildSongKey(
-                parsed.title,
-                parsed.artist,
-                parsed.album
+                bound.title,
+                bound.artist,
+                bound.album
             )
             if (shouldSaveAlias(
                     sourceSongKey = songKey,
                     targetSongKey = parsedSongKey,
-                    parsed = parsed
+                    parsed = bound
                 )
             ) {
                 cacheManager.save(
                     ParsedLyric(
                         songKey = parsedSongKey,
-                        title = parsed.title,
-                        artist = parsed.artist,
-                        album = parsed.album,
+                        title = bound.title,
+                        artist = bound.artist,
+                        album = bound.album,
                         groupId = entry.groupId,
                         qrcLastModified = entry.qrcFile?.lastModified() ?: 0L,
-                        lines = parsed.lines.map {
+                        lines = bound.lines.map {
                             QrcLyricLine(
                                 timeMs = it.timeMs,
                                 text = it.text,
@@ -1057,6 +1087,29 @@ class QrcLyricManager(
                 )
                 cacheManager.saveAlias(songKey, parsedSongKey)
             }
+            persistentIndexManager.updateParsedMetadata(
+                entry.groupId,
+                ParsedLyric(
+                    songKey = songKey,
+                    title = bound.title,
+                    artist = bound.artist,
+                    album = bound.album,
+                    groupId = entry.groupId,
+                    qrcLastModified = entry.qrcFile?.lastModified() ?: 0L,
+                    lines = bound.lines.map {
+                        QrcLyricLine(
+                            timeMs = it.timeMs,
+                            text = it.text,
+                            durationMs = it.durationMs,
+                            words = it.words,
+                            translation = it.translation,
+                            romanization = it.romanization
+                        )
+                    },
+                    qrcPath = entry.qrcFile?.absolutePath.orEmpty(),
+                    groupFingerprint = QrcLyricUtils.buildFingerprint(entry.toFileGroup())
+                )
+            )
             trimSongCaches()
         }
     }
@@ -1174,12 +1227,15 @@ class QrcLyricManager(
                 )
             }
 
-        return ParsedQrc(
-            title = QrcLyricUtils.sanitizeMetadataTitle(
+        val metadataTitle = QrcLyricUtils.sanitizeMetadataTitle(
                 metadata["ti"].orEmpty(),
                 entry.groupId,
                 logger
-            ),
+            )
+        return ParsedQrc(
+            title = metadataTitle.ifBlank {
+                QrcCurrentTrackMatchPolicy.extractTitleCandidate(lines.map(LyricLine::text))
+            },
             artist = metadata["ar"].orEmpty(),
             album = metadata["al"].orEmpty(),
             lines = lines,
@@ -1387,12 +1443,11 @@ class QrcLyricManager(
         private const val MIN_MATCH_SCORE = 100
         private const val DECRYPT_CONFIRM_CANDIDATES = 3
         private const val FALLBACK_DECRYPT_CANDIDATES = 3
-        private const val RECENT_FALLBACK_DECRYPT_CANDIDATES = 10
         private const val MAX_PARSED_QRC_CACHE_SIZE = 80
         private const val MAX_SONG_CACHE_SIZE = 80
         private const val MIN_HEX_LENGTH = 128
         private const val UNCERTAIN_MISS_COOLDOWN_MS = 10 * 60_000L
-        private const val ACTIVE_SONG_UNCERTAIN_MISS_COOLDOWN_MS = 2 * 60_000L
+        private const val ACTIVE_SONG_UNCERTAIN_MISS_COOLDOWN_MS = 3_000L
 
         private val QRC_LYRIC_CONTENT_REGEX =
             Regex("""LyricContent\s*=\s*"([\s\S]*?)"""")

@@ -20,7 +20,8 @@ class PlaybackStateReader(
     private val logger: (String) -> Unit,
     private val includeLyric: Boolean = true,
     private val reactiveMediaController: ReactiveMediaController = ReactiveMediaController(logger),
-    private val onLyricsReady: (LyricsReadyGateSnapshot) -> Unit = {}
+    private val onLyricsReady: (LyricsReadyGateSnapshot) -> Unit = {},
+    private val executionHub: PlayerAgentExecutionHub? = null
 ) {
 
     private val appContext = context.applicationContext
@@ -30,6 +31,7 @@ class PlaybackStateReader(
         LyricManager(
             context = appContext,
             logger = logger,
+            executionHub = executionHub,
             onLyricsReady = { snapshot ->
                 reactiveMediaController.markLyricsTaskFinished(
                     trackId = snapshot.trackId,

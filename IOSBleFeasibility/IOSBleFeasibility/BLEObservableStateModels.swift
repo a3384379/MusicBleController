@@ -1,5 +1,22 @@
 import Combine
+import Observation
 import UIKit
+
+final class BLEInboundPipeline: @unchecked Sendable {
+    private let queue = DispatchQueue(
+        label: "com.musicblecontroller.ble-inbound-pipeline",
+        qos: .userInitiated
+    )
+
+    func submit(_ operation: @escaping @Sendable () -> Void) {
+        queue.async(execute: operation)
+    }
+}
+
+final class BLEStatusObjectBox: @unchecked Sendable {
+    let value: [String: Any]
+    init(_ value: [String: Any]) { self.value = value }
+}
 
 final class ObservableStateSlice<Value: Equatable>: ObservableObject {
     @Published private(set) var value: Value
@@ -48,6 +65,8 @@ struct BLELyricsViewState: Equatable {
     var currentWordLineIndex = -1
     var currentWordIndex = -1
     var loadingStage: LyricLoadingStage = .idle
+    var translationState: LyricSecondaryLoadState = .idle
+    var romanizationState: LyricSecondaryLoadState = .idle
 }
 
 struct BLEArtworkViewState: Equatable {
@@ -73,6 +92,398 @@ struct BLEDiagnosticsViewState: Equatable {
     var remoteLogInProgress = false
     var mediaDumpInProgress = false
     var lyricDiagnosticLoading = false
+}
+
+enum BLEBluetoothAvailability: String, Equatable {
+    case unknown
+    case available
+    case poweredOff
+    case unauthorized
+    case unsupported
+    case resetting
+}
+
+enum BLEConnectionFailure: String, Equatable {
+    case deviceNotFound
+    case timeout
+    case serviceUnavailable
+    case incompatibleProtocol
+    case connectionLost
+    case unknown
+}
+
+enum BLEConnectionPresentationState: Equatable {
+    case unavailable(BLEBluetoothAvailability)
+    case disconnected(lastDeviceName: String?)
+    case scanning
+    case connecting(deviceName: String?)
+    case reconnecting(deviceName: String?, attempt: Int)
+    case connected(deviceName: String, health: String)
+    case failed(BLEConnectionFailure)
+
+    var isConnected: Bool {
+        if case .connected = self { return true }
+        return false
+    }
+}
+
+struct BLEPlaybackMetadataState: Equatable {
+    var title = "-"
+    var artist = "-"
+    var album = "-"
+}
+
+struct BLEPlaybackTimelineState: Equatable {
+    var isPlaying = false
+    var positionMs: Int64 = 0
+    var displayPositionMs: Int64 = 0
+    var durationMs: Int64 = 0
+    var seekPositionMs: Int64 = 0
+    var isSeeking = false
+}
+
+struct BLEVolumeViewState: Equatable {
+    var current = 0
+    var maximum = 0
+    var seekValue = 0
+    var isSeeking = false
+}
+
+struct BLELiveLyricState: Equatable {
+    var text = ""
+    var currentWordLineIndex = -1
+    var currentWordIndex = -1
+    var loadingStage: LyricLoadingStage = .idle
+}
+
+struct BLEFullLyricsViewState: Equatable {
+    var lines: [LyricLine] = []
+    var trackId = ""
+    var isCurrent = false
+    var isReceiving = false
+    var translationState: LyricSecondaryLoadState = .idle
+    var romanizationState: LyricSecondaryLoadState = .idle
+}
+
+@Observable
+final class ConnectionStore {
+    private(set) var state = BLEConnectionViewState()
+    private(set) var presentation: BLEConnectionPresentationState = .disconnected(lastDeviceName: nil)
+
+    func update(
+        state newState: BLEConnectionViewState,
+        presentation newPresentation: BLEConnectionPresentationState
+    ) {
+        if state != newState { state = newState }
+        if presentation != newPresentation { presentation = newPresentation }
+    }
+}
+
+@Observable
+final class PlaybackStore {
+    private(set) var metadata = BLEPlaybackMetadataState()
+    private(set) var timeline = BLEPlaybackTimelineState()
+    private(set) var volume = BLEVolumeViewState()
+
+    func updateMetadata(_ value: BLEPlaybackMetadataState) {
+        if metadata != value { metadata = value }
+    }
+
+    func updateTimeline(_ value: BLEPlaybackTimelineState) {
+        if timeline != value { timeline = value }
+    }
+
+    func updateVolume(_ value: BLEVolumeViewState) {
+        if volume != value { volume = value }
+    }
+}
+
+@Observable
+final class LyricsStore {
+    private(set) var live = BLELiveLyricState()
+    private(set) var document = BLEFullLyricsViewState()
+
+    func updateLive(_ value: BLELiveLyricState) {
+        if live != value { live = value }
+    }
+
+    func updateDocument(_ value: BLEFullLyricsViewState) {
+        if document != value { document = value }
+    }
+}
+
+@Observable
+final class ArtworkStore {
+    private(set) var state = BLEArtworkViewState()
+
+    func update(_ value: BLEArtworkViewState) {
+        if state != value { state = value }
+    }
+}
+
+@Observable
+final class DiagnosticsStore {
+    private(set) var state = BLEDiagnosticsViewState()
+
+    func update(_ value: BLEDiagnosticsViewState) {
+        if state != value { state = value }
+    }
+}
+
+struct BLEProtocolV3Features: OptionSet, Equatable, Sendable {
+    let rawValue: Int
+
+    static let statusMetaV1 = Self(rawValue: 1 << 0)
+    static let structuredErrorV1 = Self(rawValue: 1 << 1)
+    static let mediaLoadStateV1 = Self(rawValue: 1 << 2)
+    static let all: Self = [.statusMetaV1, .structuredErrorV1, .mediaLoadStateV1]
+}
+
+struct BLEProtocolV2Features: OptionSet, Equatable, Sendable {
+    let rawValue: Int
+
+    static let albumArtBinary = Self(rawValue: 1 << 0)
+    static let fullLyricsZlib = Self(rawValue: 1 << 1)
+    static let lyricWindow = Self(rawValue: 1 << 2)
+    static let ping = Self(rawValue: 1 << 3)
+    static let clockSyncV1 = Self(rawValue: 1 << 4)
+    static let transferRetry = Self(rawValue: 1 << 5)
+}
+
+struct BLECapabilitiesAck: Equatable, Sendable {
+    var protocolVersion = 1
+    var v2Features: BLEProtocolV2Features = []
+    var v3Features: BLEProtocolV3Features = []
+    var sessionId: String?
+}
+
+struct BLEStatusMetadata: Equatable, Sendable {
+    let sessionId: String
+    let eventSequence: UInt64
+}
+
+enum BLEEventSequenceObservation: Equatable, Sendable {
+    case first
+    case inOrder
+    case duplicate
+    case gap(missing: UInt64)
+    case outOfOrder
+    case newSession
+}
+
+struct BLEEventSequenceDiagnostics: Sendable {
+    private(set) var sessionId: String?
+    private(set) var highestSequence: UInt64 = 0
+
+    mutating func reset(sessionId: String? = nil) {
+        self.sessionId = sessionId
+        highestSequence = 0
+    }
+
+    mutating func observe(_ metadata: BLEStatusMetadata) -> BLEEventSequenceObservation {
+        guard sessionId == metadata.sessionId else {
+            let hadSession = sessionId != nil
+            sessionId = metadata.sessionId
+            highestSequence = metadata.eventSequence
+            return hadSession ? .newSession : .first
+        }
+        if metadata.eventSequence == highestSequence { return .duplicate }
+        if metadata.eventSequence < highestSequence { return .outOfOrder }
+        let previous = highestSequence
+        highestSequence = metadata.eventSequence
+        if previous > 0, metadata.eventSequence > previous + 1 {
+            return .gap(missing: metadata.eventSequence - previous - 1)
+        }
+        return previous == 0 ? .first : .inOrder
+    }
+}
+
+struct LiveActivityArtworkRevisionFence: Sendable {
+    private(set) var current: UInt64 = 0
+
+    mutating func begin() -> UInt64 {
+        current &+= 1
+        return current
+    }
+
+    mutating func invalidate() {
+        current &+= 1
+    }
+
+    func accepts(_ revision: UInt64) -> Bool {
+        revision == current
+    }
+}
+
+enum BLECommandErrorDomain: String, Equatable, Sendable {
+    case `protocol`
+    case lyrics
+    case artwork
+    case history
+    case connection
+    case unknown
+}
+
+struct BLECommandErrorPayload: Equatable, Sendable {
+    let sequence: UInt64?
+    let command: String
+    let domain: BLECommandErrorDomain
+    let code: String
+    let retryable: Bool
+    let retryAfterMs: Int64?
+    let trackId: String?
+    let generation: Int64?
+    let metadata: BLEStatusMetadata?
+}
+
+enum BLEMediaResource: String, Equatable, Sendable {
+    case lyrics
+    case artwork
+}
+
+enum BLEMediaLoadStage: String, Equatable, Sendable {
+    case waiting
+    case preparing
+    case transferring
+    case ready
+    case unavailable
+    case failed
+}
+
+struct BLEMediaLoadPayload: Equatable, Sendable {
+    let resource: BLEMediaResource
+    let stage: BLEMediaLoadStage
+    let reason: String
+    let retryable: Bool
+    let retryAfterMs: Int64?
+    let trackId: String
+    let generation: Int64?
+    let metadata: BLEStatusMetadata?
+
+    var deduplicationKey: String {
+        "\(trackId)|\(generation ?? -1)|\(resource.rawValue)|\(stage.rawValue)|\(reason)"
+    }
+}
+
+enum BLEProtocolV3Parser {
+    static let maximumJSONNotifyBytes = 64 * 1_024
+
+    static func jsonObject(from data: Data) -> [String: Any]? {
+        guard !data.isEmpty, data.count <= maximumJSONNotifyBytes else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+
+    static func capabilitiesAck(from object: [String: Any]) -> BLECapabilitiesAck {
+        let protocolVersion = int(object["protocolVersion"], default: 1)
+        if protocolVersion >= 3, object["f2"] != nil {
+            return BLECapabilitiesAck(
+                protocolVersion: protocolVersion,
+                v2Features: BLEProtocolV2Features(rawValue: int(object["f2"])),
+                v3Features: BLEProtocolV3Features(rawValue: int(object["f3"])),
+                sessionId: nonEmptyString(object["sid"])
+            )
+        }
+
+        var v2: BLEProtocolV2Features = []
+        if bool(object["albumArtBinary"]) { v2.insert(.albumArtBinary) }
+        if bool(object["fullLyricsZlib"]) { v2.insert(.fullLyricsZlib) }
+        if bool(object["lyricWindow"]) { v2.insert(.lyricWindow) }
+        if bool(object["ping"]) { v2.insert(.ping) }
+        if bool(object["clockSyncV1"]) { v2.insert(.clockSyncV1) }
+        if bool(object["transferRetry"]) { v2.insert(.transferRetry) }
+        return BLECapabilitiesAck(protocolVersion: protocolVersion, v2Features: v2)
+    }
+
+    static func statusMetadata(from object: [String: Any]) -> BLEStatusMetadata? {
+        guard let sessionId = nonEmptyString(object["sid"]),
+              let sequence = uint64(object["es"]) else {
+            return nil
+        }
+        return BLEStatusMetadata(sessionId: sessionId, eventSequence: sequence)
+    }
+
+    static func commandError(from object: [String: Any]) -> BLECommandErrorPayload? {
+        guard let command = nonEmptyString(object["cmd"]),
+              let code = nonEmptyString(object["code"]) else {
+            return nil
+        }
+        return BLECommandErrorPayload(
+            sequence: uint64(object["seq"]),
+            command: command,
+            domain: BLECommandErrorDomain(
+                rawValue: nonEmptyString(object["domain"]) ?? ""
+            ) ?? .unknown,
+            code: code,
+            retryable: bool(object["retryable"]),
+            retryAfterMs: int64(object["retryAfterMs"]),
+            trackId: nonEmptyString(object["trackId"]),
+            generation: int64(object["generation"]),
+            metadata: statusMetadata(from: object)
+        )
+    }
+
+    static func mediaLoadState(from object: [String: Any]) -> BLEMediaLoadPayload? {
+        guard let resourceRaw = nonEmptyString(object["resource"]),
+              let resource = BLEMediaResource(rawValue: resourceRaw),
+              let stageRaw = nonEmptyString(object["stage"]),
+              let stage = BLEMediaLoadStage(rawValue: stageRaw),
+              let trackId = nonEmptyString(object["trackId"]) else {
+            return nil
+        }
+        return BLEMediaLoadPayload(
+            resource: resource,
+            stage: stage,
+            reason: nonEmptyString(object["reason"]) ?? "unknown",
+            retryable: bool(object["retryable"]),
+            retryAfterMs: int64(object["retryAfterMs"]),
+            trackId: trackId,
+            generation: int64(object["generation"]),
+            metadata: statusMetadata(from: object)
+        )
+    }
+
+    private static func nonEmptyString(_ value: Any?) -> String? {
+        let text: String?
+        if let value = value as? String {
+            text = value
+        } else if let value = value as? NSNumber {
+            text = value.stringValue
+        } else {
+            text = nil
+        }
+        let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func bool(_ value: Any?) -> Bool {
+        if let value = value as? Bool { return value }
+        if let value = value as? NSNumber { return value.boolValue }
+        if let value = value as? String { return value == "true" || value == "1" }
+        return false
+    }
+
+    private static func int(_ value: Any?, default defaultValue: Int = 0) -> Int {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        if let value = value as? String, let result = Int(value) { return result }
+        return defaultValue
+    }
+
+    private static func int64(_ value: Any?) -> Int64? {
+        if let value = value as? Int64 { return value }
+        if let value = value as? Int { return Int64(value) }
+        if let value = value as? NSNumber { return value.int64Value }
+        if let value = value as? String { return Int64(value) }
+        return nil
+    }
+
+    private static func uint64(_ value: Any?) -> UInt64? {
+        if let value = value as? UInt64 { return value }
+        if let value = value as? Int, value >= 0 { return UInt64(value) }
+        if let value = value as? NSNumber { return value.uint64Value }
+        if let value = value as? String { return UInt64(value) }
+        return nil
+    }
 }
 
 enum PlaybackClockPolicy {

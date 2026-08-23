@@ -13,7 +13,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 class LyricManager(
     context: Context,
     private val logger: (String) -> Unit,
-    private val onLyricsReady: (LyricsReadyGateSnapshot) -> Unit = {}
+    private val onLyricsReady: (LyricsReadyGateSnapshot) -> Unit = {},
+    executionHub: PlayerAgentExecutionHub? = null
 ) {
 
     private val appContext = context.applicationContext
@@ -53,14 +54,15 @@ class LyricManager(
     private var lyricsReadyState: LyricsReadyState = LyricsReadyState.NOT_STARTED
     private var activeLyricsTaskId: Long = 0L
     private val requestCancellationGate = LyricRequestCancellationGate()
-    private val lyricExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "QrcLyricLoaderThread")
-    }
-    private val foregroundLyricExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "QrcForegroundLyricThread").apply {
-            priority = Thread.NORM_PRIORITY + 1
+    private val ownsLyricExecutors = executionHub == null
+    private val lyricExecutor = executionHub?.foregroundIO
+        ?: Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "QrcLyricLoaderThread") }
+    private val foregroundLyricExecutor = executionHub?.foregroundIO
+        ?: Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "QrcForegroundLyricThread").apply {
+                priority = Thread.NORM_PRIORITY + 1
+            }
         }
-    }
     private val parsedCache = object : LinkedHashMap<String, LyricsParsedCacheEntry>(
         PARSED_CACHE_MAX_KEYS,
         0.75f,
@@ -114,7 +116,8 @@ class LyricManager(
         logger = logger,
         retryCallback = { reason, bypassRetryableCooldown ->
             retryActiveSongFromRecovery(reason, bypassRetryableCooldown)
-        }
+        },
+        scheduledExecutor = executionHub?.scheduled
     )
     private val closed = AtomicBoolean(false)
     private val fuzzyIndexReadyListener: (QrcFuzzyIndexStatus) -> Unit = {
@@ -156,8 +159,10 @@ class LyricManager(
         MaintenanceGuard.removeWindowEndListener(maintenanceWindowEndListener)
         recoveryEngine.shutdown()
         requestCancellationGate.cancelAll()
-        lyricExecutor.shutdownNow()
-        foregroundLyricExecutor.shutdownNow()
+        if (ownsLyricExecutors) {
+            lyricExecutor.shutdownNow()
+            foregroundLyricExecutor.shutdownNow()
+        }
         qrcLyricManager.close()
         synchronized(this) {
             pendingRequest = null
@@ -1781,7 +1786,13 @@ class LyricManager(
             currentTrack.artist,
             currentTrack.album
         )
-        if (!isSameIncrementalLyricTrack(
+        val adoptRuntimeTrack = canAdoptIncrementalLyricTrack(
+            activeSongKey = activeSongKey,
+            activeTrackId = activeTrackId,
+            snapshotSongKey = activeKey,
+            snapshotTrackId = currentTrack.trackId
+        )
+        if (!adoptRuntimeTrack && !isSameIncrementalLyricTrack(
                 activeSongKey = activeSongKey,
                 activeTrackId = activeTrackId,
                 snapshotSongKey = activeKey,
@@ -1793,6 +1804,24 @@ class LyricManager(
                     "songKey=${currentTrack.songKey} trackId=${currentTrack.trackId}"
             )
             return false
+        }
+        if (adoptRuntimeTrack) {
+            // The Sony UI deliberately reads playback state without triggering a
+            // raw-QRC lookup. A watcher can therefore finish before any BLE
+            // client has established LyricManager's active identity. Adopt only
+            // that empty state; never replace an already-active different song.
+            activeSongKey = activeKey
+            activeTitle = currentTrack.title
+            activeArtist = currentTrack.artist
+            activeAlbum = currentTrack.album
+            activeTrackId = currentTrack.trackId
+            activeDurationMs = currentTrack.durationMs
+            activePositionMs = currentTrack.positionMs
+            activeTrackChangedAtMs = currentTrack.trackChangedAtMs
+            logger(
+                "[Lyric] incremental lyrics adopted runtime track " +
+                    "songKey=${currentTrack.songKey} trackId=${currentTrack.trackId}"
+            )
         }
         val lines = ready.parsed.lines.map {
             LyricLine(
@@ -2504,4 +2533,16 @@ internal fun isSameIncrementalLyricTrack(
     return activeTrackId.isNotBlank() &&
         snapshotTrackId.isNotBlank() &&
         activeTrackId == snapshotTrackId
+}
+
+internal fun canAdoptIncrementalLyricTrack(
+    activeSongKey: String?,
+    activeTrackId: String,
+    snapshotSongKey: String,
+    snapshotTrackId: String
+): Boolean {
+    return activeSongKey.isNullOrBlank() &&
+        activeTrackId.isBlank() &&
+        snapshotSongKey.isNotBlank() &&
+        snapshotTrackId.isNotBlank()
 }

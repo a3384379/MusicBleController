@@ -8,10 +8,10 @@ enum RecoveryDomain: String, CaseIterable {
 
     var title: String {
         switch self {
-        case .albumArt: return "AlbumArt"
-        case .lyrics: return "Lyrics"
-        case .ble: return "BLE"
-        case .health: return "Health"
+        case .albumArt: return "封面"
+        case .lyrics: return "歌词"
+        case .ble: return "蓝牙"
+        case .health: return "连接健康"
         }
     }
 }
@@ -27,13 +27,13 @@ enum RecoveryStage: String {
 
     var title: String {
         switch self {
-        case .idle: return "Idle"
-        case .detect: return "Detect"
-        case .recover: return "Recover"
-        case .verify: return "Verify"
-        case .success: return "Success"
-        case .fail: return "Fail"
-        case .diagnostics: return "Diagnostics"
+        case .idle: return "空闲"
+        case .detect: return "检测"
+        case .recover: return "恢复"
+        case .verify: return "验证"
+        case .success: return "成功"
+        case .fail: return "失败"
+        case .diagnostics: return "诊断"
         }
     }
 }
@@ -166,7 +166,7 @@ struct SelfHealingSnapshot: Equatable {
     var summaryText: String {
         let active = activeReports
         guard !active.isEmpty else {
-            return "Self-Healing Engine 已就绪，当前没有需要恢复的异常。"
+            return "自愈引擎已就绪，当前没有需要恢复的异常。"
         }
         return active.map { "\($0.domain.title): \($0.summary)" }.joined(separator: "\n")
     }

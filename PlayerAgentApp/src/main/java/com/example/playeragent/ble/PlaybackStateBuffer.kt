@@ -12,11 +12,13 @@ import java.util.concurrent.TimeUnit
 class PlaybackStateBuffer(
     private val logger: (String) -> Unit,
     private val flushDelayMs: Long = DEFAULT_FLUSH_DELAY_MS,
+    scheduledExecutor: ScheduledExecutorService? = null,
     private val flush: (JSONObject, PlaybackStateSnapshot, PlaybackStateDiff, String, Int) -> Boolean
 ) {
     private val lock = Any()
+    private val ownsExecutor = scheduledExecutor == null
     private val executor: ScheduledExecutorService =
-        Executors.newSingleThreadScheduledExecutor { runnable ->
+        scheduledExecutor ?: Executors.newSingleThreadScheduledExecutor { runnable ->
             Thread(runnable, "PlaybackStateBufferThread")
         }
 
@@ -92,7 +94,7 @@ class PlaybackStateBuffer(
 
     fun shutdown() {
         reset()
-        executor.shutdownNow()
+        if (ownsExecutor) executor.shutdownNow()
     }
 
     private fun isImmediate(diff: PlaybackStateDiff): Boolean {

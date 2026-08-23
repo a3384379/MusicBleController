@@ -10,20 +10,20 @@ enum PlaybackPerformanceMode: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .automatic: return "自动"
-        case .smooth: return "流畅"
-        case .powerSaving: return "省电"
+        case .automatic: return AppLocalization.string("自动")
+        case .smooth: return AppLocalization.string("流畅")
+        case .powerSaving: return AppLocalization.string("省电")
         }
     }
 
     var detail: String {
         switch self {
         case .automatic:
-            return "根据低电量模式和播放状态自动平衡实时性与耗电。"
+            return AppLocalization.string("根据低电量模式和播放状态自动平衡实时性与耗电。")
         case .smooth:
-            return "优先频谱、封面和灵动岛的响应速度。"
+            return AppLocalization.string("优先频谱、封面和灵动岛的响应速度。")
         case .powerSaving:
-            return "降低动画和后台刷新频率，HQ 封面仍会延后加载。"
+            return AppLocalization.string("降低动画和后台刷新频率，高清封面仍会延后加载。")
         }
     }
 
@@ -51,9 +51,9 @@ enum ArtworkDisplaySizeOption: Int, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .small: return "小"
-        case .medium: return "中"
-        case .large: return "大"
+        case .small: return AppLocalization.string("小")
+        case .medium: return AppLocalization.string("中")
+        case .large: return AppLocalization.string("大")
         }
     }
 
@@ -75,6 +75,11 @@ final class PreferencesStore: ObservableObject {
     static let artworkEnhancementEnabledKey = "artworkEnhancementEnabled"
     static let artworkEnhancementTargetPixelSizeKey = "artworkEnhancementTargetPixelSize"
     static let artworkEnhancementSharpnessKey = "artworkEnhancementSharpness"
+    static let forceProtocolV2Key = "forceProtocolV2"
+
+    @Published var appLanguage: AppLanguage {
+        didSet { persistAppLanguage(oldValue: oldValue) }
+    }
 
     @Published var appExperienceMode: AppExperienceMode {
         didSet { persistAppExperienceMode(oldValue: oldValue) }
@@ -118,11 +123,16 @@ final class PreferencesStore: ObservableObject {
         didSet { persistPlaybackPerformanceMode(oldValue: oldValue) }
     }
 
+    @Published var forceProtocolV2: Bool {
+        didSet { persistBool(forceProtocolV2, oldValue: oldValue, key: Self.forceProtocolV2Key) }
+    }
+
     private let defaults: UserDefaults
 
     private init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         Self.migrateAutomaticLyricSyncIfNeeded(defaults: defaults)
+        appLanguage = Self.loadAppLanguage(defaults: defaults)
         appExperienceMode = Self.loadAppExperienceMode(defaults: defaults)
         autoReconnectEnabled = Self.loadBool(
             defaults: defaults,
@@ -148,10 +158,16 @@ final class PreferencesStore: ObservableObject {
         artworkDisplaySize = Self.loadArtworkDisplaySize(defaults: defaults)
         dynamicIslandStyle = Self.loadDynamicIslandStyle(defaults: defaults)
         playbackPerformanceMode = Self.loadPlaybackPerformanceMode(defaults: defaults)
+        forceProtocolV2 = Self.loadBool(
+            defaults: defaults,
+            key: Self.forceProtocolV2Key,
+            defaultValue: false
+        )
         logLoaded()
     }
 
     func load() {
+        appLanguage = Self.loadAppLanguage(defaults: defaults)
         appExperienceMode = Self.loadAppExperienceMode(defaults: defaults)
         autoReconnectEnabled = Self.loadBool(
             defaults: defaults,
@@ -177,10 +193,16 @@ final class PreferencesStore: ObservableObject {
         artworkDisplaySize = Self.loadArtworkDisplaySize(defaults: defaults)
         dynamicIslandStyle = Self.loadDynamicIslandStyle(defaults: defaults)
         playbackPerformanceMode = Self.loadPlaybackPerformanceMode(defaults: defaults)
+        forceProtocolV2 = Self.loadBool(
+            defaults: defaults,
+            key: Self.forceProtocolV2Key,
+            defaultValue: false
+        )
         logLoaded()
     }
 
     func resetToDefaults() {
+        appLanguage = .defaultLanguage
         appExperienceMode = .defaultMode
         autoReconnectEnabled = true
         automaticLyricSyncEnabled = true
@@ -190,11 +212,17 @@ final class PreferencesStore: ObservableObject {
         artworkDisplaySize = .defaultOption
         dynamicIslandStyle = .defaultStyle
         playbackPerformanceMode = .defaultMode
+        forceProtocolV2 = false
     }
 
     private static func loadAppExperienceMode(defaults: UserDefaults) -> AppExperienceMode {
         let raw = defaults.string(forKey: AppExperienceMode.userDefaultsKey)
         return raw.flatMap(AppExperienceMode.init(rawValue:)) ?? .defaultMode
+    }
+
+    private static func loadAppLanguage(defaults: UserDefaults) -> AppLanguage {
+        let raw = defaults.string(forKey: AppLanguage.userDefaultsKey)
+        return raw.flatMap(AppLanguage.init(rawValue:)) ?? .defaultLanguage
     }
 
     static func migratedLegacyLyricOffset(
@@ -258,6 +286,15 @@ final class PreferencesStore: ObservableObject {
         logChanged(key: AppExperienceMode.userDefaultsKey, value: appExperienceMode.rawValue)
     }
 
+    private func persistAppLanguage(oldValue: AppLanguage) {
+        guard appLanguage != oldValue else { return }
+        defaults.set(appLanguage.rawValue, forKey: AppLanguage.userDefaultsKey)
+        UserDefaults(
+            suiteName: LiveActivitySharedConstants.appGroupIdentifier
+        )?.set(appLanguage.rawValue, forKey: AppLanguage.userDefaultsKey)
+        logChanged(key: AppLanguage.userDefaultsKey, value: appLanguage.rawValue)
+    }
+
     private func persistLyricDisplayMode(oldValue: LyricDisplayMode) {
         guard lyricDisplayMode != oldValue else { return }
         defaults.set(lyricDisplayMode.rawValue, forKey: LyricDisplayMode.userDefaultsKey)
@@ -302,7 +339,8 @@ final class PreferencesStore: ObservableObject {
 
     private func logLoaded() {
         AppLogStore.shared.append(
-            "[Preferences] loaded mode=\(appExperienceMode.rawValue) " +
+            "[Preferences] loaded language=\(appLanguage.rawValue) " +
+                "mode=\(appExperienceMode.rawValue) " +
                 "autoReconnect=\(autoReconnectEnabled) " +
                 "automaticLyricSync=\(automaticLyricSyncEnabled) " +
                 "lyricOffsetMs=\(lyricOffsetMs) " +
@@ -310,7 +348,8 @@ final class PreferencesStore: ObservableObject {
                 "artworkEnhancement=\(artworkEnhancementEnabled) " +
                 "artworkDisplaySize=\(artworkDisplaySize.rawValue) " +
                 "dynamicIslandStyle=\(dynamicIslandStyle.rawValue) " +
-                "performanceMode=\(playbackPerformanceMode.rawValue)"
+                "performanceMode=\(playbackPerformanceMode.rawValue) " +
+                "forceProtocolV2=\(forceProtocolV2)"
         )
     }
 

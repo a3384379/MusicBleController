@@ -25,7 +25,7 @@
 5. Health timer 检查静默时间：播放中 15 秒、暂停中 30 秒才探测。
 6. V2 发送轻量 `PING/PONG`；旧 Sony 回退 `GET_PLAYBACK_STATE`。连续两次探测失败才 hard reconnect，明确断开回调仍立即处理。
 7. `connectionDisplayState` 给 UI，`connectionHealthState` 给诊断和控制保护。
-8. CoreBluetooth 状态恢复优先复用已连接 Sony 和已恢复 characteristic。进入 inactive/background 后暂停 health、订阅/写超时和时钟同步；回到前台先用单次探针验证，收到有效 notify 后才恢复状态、音量和歌词同步。
+8. CoreBluetooth 状态恢复优先复用已连接 Sony 和已恢复 characteristic；iOS 17+ 同时启用系统自动重连，系统重连期间禁止自建 reconnect work item 竞争，前台超过连接超时后再回退主动扫描。进入 inactive/background 后暂停 health、订阅/写超时和时钟同步；回到前台先用单次探针验证，收到有效 notify 后才恢复状态、音量和歌词同步。
 9. 单次 `didWrite` 回调超时只标记 suspect 并延长等待，不移除 in-flight 请求、不推进写队列；连续两次写回调超时才 hard reconnect。
 10. Sony 端业务静默只触发按地址的轻量 notify 探针；只有真实 notify 失败达到阈值才隔离该地址，禁止用静默时间直接重建共享 GATT。
 

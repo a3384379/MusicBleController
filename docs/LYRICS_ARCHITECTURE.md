@@ -40,7 +40,7 @@
 7. V2 完整歌词为 zlib JSON + A2 binary + CRC32；协商/大小失败自动回退 legacy 逐行协议。
    - `RETRY_TRANSFER` 使用歌词传输自己的 `trackId + generation + transferId`，与封面是否存在、是否完成无关。
    - 重传结果仍受当前 generation 栅栏保护，旧歌曲不得覆盖新歌。
-8. 翻译/罗马音继续通过 `GET_LYRIC_SECONDARY mode=translation|romanization` 独立分片发送。
+8. 翻译/罗马音继续通过 `GET_LYRIC_SECONDARY mode=translation|romanization` 独立分片发送。iOS 分别维护开始、分包空闲和总传输超时；临时错误或缺包只重试一次，明确 unavailable 不重试，切歌/断线会取消旧连接代次的请求。
 9. QRC 就绪回调会立即恢复 currentWord 边界调度；暂停时无周期任务，seek/恢复/切歌重新计算，最长 500ms 漂移校正。
 10. iOS 主界面显示等待 QQ QRC、歌词窗口、完整歌词、完成或明确失败；“重试歌词”只清理当前歌曲 cooldown/失败状态，并用 `GET_FULL_LYRICS forceRefresh=true` 触发兼容刷新。
 
@@ -52,6 +52,7 @@
 - `QrcParsedCacheIndex.json`：只保存 songKey、标准化 metadata、groupId、文件名、行数、时间和 fingerprint；500ms 防抖、临时文件原子替换。
 - `LyricRecoveryState`：`WAITING_QQMUSIC_CACHE`、`WATCHING_RECENT_QRC`、`RETRY_SCHEDULED`、`RETRYING`、`RESOLVED`、`EXPIRED` 等。
 - iOS `LyricLine`：解析 fullLyrics 和 secondary 后合并，secondary 会清洗 `//`、`/`、`暂无翻译` 等占位。
+- iOS `FullLyricsCacheStore`：按精确 trackId 并复核标准化 title+artist，最多 80 首/8MB/30 天；缓存命中只做即时展示，仍请求 Sony 复验，远端主歌词刷新时保留已有翻译/罗马音直到新结果到达。
 - 压缩缓存 key 包含 songKey、fingerprint、generation、格式和逐字行集合；翻译/罗马音、fingerprint、generation 改变时不复用旧正文。
 
 ## 不允许随便修改的点

@@ -39,6 +39,11 @@ private let FOREGROUND_INFLIGHT_SETTLE_TIMEOUT_MS: Int64 = 3_000
 private let FULL_LYRICS_REQUEST_DEDUP_WINDOW_MS: Int64 = 1_500
 private let FULL_LYRICS_REQUEST_START_TIMEOUT_MS: Int64 = 3_000
 private let FULL_LYRICS_REQUEST_START_MAX_RETRIES = 2
+private let LYRIC_SECONDARY_START_TIMEOUT_MS: Int64 = 3_000
+private let LYRIC_SECONDARY_IDLE_TIMEOUT_MS: Int64 = 3_000
+private let LYRIC_SECONDARY_TOTAL_TIMEOUT_MS: Int64 = 10_000
+private let LYRIC_SECONDARY_MAX_RETRIES = 1
+private let LYRIC_SECONDARY_FAILURE_COOLDOWN_MS: Int64 = 10_000
 private let CLOCK_SYNC_BOOTSTRAP_SAMPLE_COUNT = 5
 private let CLOCK_SYNC_REFRESH_SAMPLE_COUNT = 3
 private let CLOCK_SYNC_SAMPLE_SPACING_MS: Int64 = 150
@@ -63,6 +68,42 @@ enum CommandWriteTimeoutPolicy {
         return timeoutCountAfterIncrement < reconnectThreshold
             ? .extendWithoutAdvancingQueue
             : .reconnect
+    }
+}
+
+enum LyricSecondaryLoadState: Equatable {
+    case idle
+    case loading
+    case ready
+    case unavailable
+    case failed(reason: String)
+}
+
+enum LyricSecondaryRetryAction: Equatable {
+    case retry
+    case markUnavailable
+    case markFailed
+}
+
+enum LyricSecondaryRetryPolicy {
+    static func action(
+        explicitlyUnavailable: Bool,
+        retryCount: Int,
+        maximumRetries: Int = LYRIC_SECONDARY_MAX_RETRIES
+    ) -> LyricSecondaryRetryAction {
+        if explicitlyUnavailable {
+            return .markUnavailable
+        }
+        return retryCount < maximumRetries ? .retry : .markFailed
+    }
+}
+
+enum SystemReconnectPolicy {
+    static func shouldScheduleManualReconnect(
+        autoReconnectEnabled: Bool,
+        systemIsReconnecting: Bool
+    ) -> Bool {
+        autoReconnectEnabled && !systemIsReconnecting
     }
 }
 
@@ -132,7 +173,17 @@ private struct LyricSecondaryTransfer {
     let transferId: String
     let mode: LyricSecondaryMode
     let itemCount: Int
+    let requestToken: UUID
+    let connectionAttemptId: UUID
     var lines: [Int: LyricSecondaryLineParts]
+}
+
+private struct LyricSecondaryRequest {
+    let trackId: String
+    let mode: LyricSecondaryMode
+    let token: UUID
+    let connectionAttemptId: UUID
+    let retryCount: Int
 }
 
 private struct ClockSyncProbe {
@@ -141,7 +192,7 @@ private struct ClockSyncProbe {
     let clientSendDate: Date
 }
 
-final class BLETestManager: NSObject, ObservableObject {
+final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private static let logTimestampFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -151,43 +202,110 @@ final class BLETestManager: NSObject, ObservableObject {
 
     @Published private(set) var appExperienceMode: AppExperienceMode = PreferencesStore.shared.appExperienceMode
     @Published private(set) var mode = "BLE Central / GATT Client"
-    @Published private(set) var connectionStatus = "未连接"
-    @Published private(set) var logs: [String] = []
-    @Published private(set) var title = "-"
-    @Published private(set) var artist = "-"
-    @Published private(set) var album = "-"
-    @Published private(set) var lyric = ""
-    @Published private(set) var fullLyrics: [LyricLine] = []
-    @Published private(set) var fullLyricsTrackId = ""
-    @Published private(set) var isFullLyricsCurrent = false
-    @Published private(set) var isFullLyricsReceiving = false
+    @Published private(set) var connectionStatus = "未连接" {
+        didSet { syncConnectionStore() }
+    }
+    @Published private(set) var logs: [String] = [] {
+        didSet { syncDiagnosticsStore() }
+    }
+    @Published private(set) var title = "-" {
+        didSet { syncPlaybackMetadataStore() }
+    }
+    @Published private(set) var artist = "-" {
+        didSet { syncPlaybackMetadataStore() }
+    }
+    @Published private(set) var album = "-" {
+        didSet { syncPlaybackMetadataStore() }
+    }
+    @Published private(set) var lyric = "" {
+        didSet { syncLiveLyricsStore() }
+    }
+    @Published private(set) var fullLyrics: [LyricLine] = [] {
+        didSet { syncFullLyricsStore() }
+    }
+    @Published private(set) var fullLyricsTrackId = "" {
+        didSet { syncFullLyricsStore() }
+    }
+    @Published private(set) var isFullLyricsCurrent = false {
+        didSet { syncFullLyricsStore() }
+    }
+    @Published private(set) var isFullLyricsReceiving = false {
+        didSet { syncFullLyricsStore() }
+    }
+    @Published private(set) var translationLyricsState: LyricSecondaryLoadState = .idle {
+        didSet { syncFullLyricsStore() }
+    }
+    @Published private(set) var romanizationLyricsState: LyricSecondaryLoadState = .idle {
+        didSet { syncFullLyricsStore() }
+    }
     @Published private(set) var lyricDiagnostic: LyricDiagnostic?
-    @Published private(set) var lyricDiagnosticLoading = false
+    @Published private(set) var lyricDiagnosticLoading = false {
+        didSet { syncDiagnosticsStore() }
+    }
     @Published private(set) var lyricDiagnosticLastUpdatedAt: Date?
-    @Published private(set) var isPlaying = false
-    @Published private(set) var positionMs: Int64 = 0
-    @Published private(set) var displayPositionMs: Int64 = 0
-    @Published private(set) var durationMs: Int64 = 0
-    @Published private(set) var seekPositionMs: Int64 = 0
-    @Published private(set) var isSeeking = false
-    @Published private(set) var volumeCurrent = 0
-    @Published private(set) var volumeMax = 0
-    @Published private(set) var volumeSeekValue = 0
-    @Published private(set) var isVolumeSeeking = false
-    @Published private(set) var albumArtImage: UIImage?
-    @Published private(set) var connectedDeviceName = "-"
-    @Published private(set) var artworkDisplayQuality: ArtworkDisplayQuality = .placeholder
-    @Published private(set) var artworkEnhancementStatus = ArtworkEnhancementDebugStatus()
-    @Published private(set) var isShowingLastNowPlayingSnapshot = false
-    @Published private(set) var mediaLoadingState = MediaLoadingState()
+    @Published private(set) var isPlaying = false {
+        didSet { syncPlaybackTimelineStore() }
+    }
+    @Published private(set) var positionMs: Int64 = 0 {
+        didSet { syncPlaybackTimelineStore() }
+    }
+    @Published private(set) var displayPositionMs: Int64 = 0 {
+        didSet { syncPlaybackTimelineStore() }
+    }
+    @Published private(set) var durationMs: Int64 = 0 {
+        didSet { syncPlaybackTimelineStore() }
+    }
+    @Published private(set) var seekPositionMs: Int64 = 0 {
+        didSet { syncPlaybackTimelineStore() }
+    }
+    @Published private(set) var isSeeking = false {
+        didSet { syncPlaybackTimelineStore() }
+    }
+    @Published private(set) var volumeCurrent = 0 {
+        didSet { syncPlaybackVolumeStore() }
+    }
+    @Published private(set) var volumeMax = 0 {
+        didSet { syncPlaybackVolumeStore() }
+    }
+    @Published private(set) var volumeSeekValue = 0 {
+        didSet { syncPlaybackVolumeStore() }
+    }
+    @Published private(set) var isVolumeSeeking = false {
+        didSet { syncPlaybackVolumeStore() }
+    }
+    @Published private(set) var albumArtImage: UIImage? {
+        didSet { syncArtworkStore() }
+    }
+    @Published private(set) var connectedDeviceName = "-" {
+        didSet { syncConnectionStore() }
+    }
+    @Published private(set) var artworkDisplayQuality: ArtworkDisplayQuality = .placeholder {
+        didSet { syncArtworkStore() }
+    }
+    @Published private(set) var artworkEnhancementStatus = ArtworkEnhancementDebugStatus() {
+        didSet { syncArtworkStore() }
+    }
+    @Published private(set) var isShowingLastNowPlayingSnapshot = false {
+        didSet { syncArtworkStore() }
+    }
+    @Published private(set) var mediaLoadingState = MediaLoadingState() {
+        didSet {
+            syncLiveLyricsStore()
+            syncArtworkStore()
+        }
+    }
     @Published private(set) var artworkEnhancementTargetPixelSize = 780
     @Published private(set) var artworkEnhancementSharpness = 0.30
     @Published private(set) var remoteLogText = ""
     @Published private(set) var remoteLogCopyStatus = ""
-    @Published private(set) var isRemoteLogTransferInProgress = false
+    @Published private(set) var isRemoteLogTransferInProgress = false {
+        didSet { syncDiagnosticsStore() }
+    }
     @Published private(set) var mediaFieldDumpText = ""
     @Published private(set) var mediaFieldDumpCopyStatus = ""
-    @Published private(set) var isMediaFieldDumpReceiving = false
+    @Published private(set) var isMediaFieldDumpReceiving = false {
+        didSet { syncDiagnosticsStore() }
+    }
     @Published private(set) var mediaFieldDumpProgressText = ""
     @Published private(set) var automaticLyricSyncEnabled =
         PreferencesStore.shared.automaticLyricSyncEnabled
@@ -199,8 +317,12 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var isPlaybackHistorySyncing = false
     @Published private(set) var playbackHistoryStatus = ""
     @Published private(set) var autoReconnectEnabled = PreferencesStore.shared.autoReconnectEnabled
-    @Published private(set) var autoReconnectState = AutoReconnectState.idle.rawValue
-    @Published private(set) var autoReconnectAttempt = 0
+    @Published private(set) var autoReconnectState = AutoReconnectState.idle.rawValue {
+        didSet { syncConnectionStore() }
+    }
+    @Published private(set) var autoReconnectAttempt = 0 {
+        didSet { syncConnectionStore() }
+    }
     @Published private(set) var autoReconnectNextRetryAt: Date?
     @Published private(set) var autoReconnectWorkItemExists = false
     @Published private(set) var autoReconnectScheduledAgeMs: Int64 = -1
@@ -217,21 +339,35 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var autoReconnectLastSubscribeCostMs: Int64 = 0
     @Published private(set) var manualReconnectCount = 0
     @Published private(set) var autoReconnectCount = 0
-    @Published private(set) var connectionHealthState = ConnectionHealthState.disconnected.rawValue
+    @Published private(set) var connectionHealthState = ConnectionHealthState.disconnected.rawValue {
+        didSet { syncConnectionStore() }
+    }
     @Published private(set) var connectionHealthLastNotifyAgeMs: Int64 = -1
     @Published private(set) var connectionHealthLastProbeAtText = "-"
     @Published private(set) var connectionHealthProbeInFlight = false
-    @Published private(set) var connectionHealthLastHardReconnectReason = "-"
-    @Published private(set) var connectionHealthAttemptId = "-"
+    @Published private(set) var connectionHealthLastHardReconnectReason = "-" {
+        didSet { syncDiagnosticsStore() }
+    }
+    @Published private(set) var connectionHealthAttemptId = "-" {
+        didSet { syncDiagnosticsStore() }
+    }
     @Published private(set) var connectionHealthPeripheralState = "-"
-    @Published private(set) var connectionHealthCharacteristicReady = false
-    @Published private(set) var connectionDisplayState = ConnectionDisplayState.disconnected.rawValue
+    @Published private(set) var connectionHealthCharacteristicReady = false {
+        didSet { syncConnectionStore() }
+    }
+    @Published private(set) var connectionDisplayState = ConnectionDisplayState.disconnected.rawValue {
+        didSet { syncConnectionStore() }
+    }
     @Published private(set) var connectionHealthSuspectCount = 0
     @Published private(set) var connectionHealthStaleCount = 0
     @Published private(set) var connectionHealthHardReconnectCount = 0
     @Published private(set) var connectionHealthMaxNotifyGapMs: Int64 = 0
-    @Published private(set) var currentWordLineIndex = -1
-    @Published private(set) var currentWordIndex = -1
+    @Published private(set) var currentWordLineIndex = -1 {
+        didSet { syncLiveLyricsStore() }
+    }
+    @Published private(set) var currentWordIndex = -1 {
+        didSet { syncLiveLyricsStore() }
+    }
     @Published private(set) var currentWordPushCount: Int64 = 0
     @Published private(set) var currentWordDropCount: Int64 = 0
     @Published private(set) var currentWordAverageUpdateIntervalMs: Int64 = 0
@@ -242,13 +378,29 @@ final class BLETestManager: NSObject, ObservableObject {
     @Published private(set) var lyricClockSampleCount = 0
     @Published private(set) var lyricClockSyncConfident = false
 
+    let connectionStore = ConnectionStore()
+    let playbackStore = PlaybackStore()
+    let lyricsStore = LyricsStore()
+    let artworkStore = ArtworkStore()
+    let diagnosticsStore = DiagnosticsStore()
+
+    // Transitional read-only slices keep older diagnostic views and tests
+    // source-compatible while production UI observes the focused stores above.
     let connectionStateModel = ObservableStateSlice(BLEConnectionViewState())
     let playbackStateModel = ObservableStateSlice(BLEPlaybackViewState())
     let lyricsStateModel = ObservableStateSlice(BLELyricsViewState())
     let artworkStateModel = ObservableStateSlice(BLEArtworkViewState())
-    let diagnosticsStateModel = ObservableStateSlice(BLEDiagnosticsViewState())
+
+    @Published private(set) var bluetoothAvailability: BLEBluetoothAvailability = .unknown {
+        didSet { syncConnectionStore() }
+    }
+    @Published private(set) var negotiatedV3Features: BLEProtocolV3Features = []
+    @Published private(set) var serverSessionId = "-"
+    @Published private(set) var lastServerEventSequence: UInt64 = 0
+    @Published private(set) var lastCommandErrorSummary = "-"
 
     private let preferences = PreferencesStore.shared
+    private let inboundPipeline = BLEInboundPipeline()
     private let protocolDecodeQueue = DispatchQueue(
         label: "com.musicblecontroller.protocol-decode",
         qos: .userInitiated
@@ -259,8 +411,7 @@ final class BLETestManager: NSObject, ObservableObject {
     )
     private var pendingUILogLines: [String] = []
     private var isUILogFlushScheduled = false
-    private var stateModelCancellable: AnyCancellable?
-    private var stateModelSyncScheduled = false
+    private var isUILogStreamingEnabled = false
     private lazy var centralManager = CBCentralManager(
         delegate: self,
         queue: nil,
@@ -306,8 +457,10 @@ final class BLETestManager: NSObject, ObservableObject {
     private var firstConnectionReadyAtMs: Int64 = 0
     private var lastKaraokeOffsetLogAtMs: Int64 = 0
     private var currentTrackID = ""
+    private var currentTrackGeneration: Int64 = 0
     private var currentLiveArtworkKey: String?
     private var currentLiveArtworkRevision = 0
+    private var liveArtworkRevisionFence = LiveActivityArtworkRevisionFence()
     private var lastLiveActivityRequestAt = Date.distantPast
     private var pendingLiveActivityUpdateWorkItem: DispatchWorkItem?
     private var lastLiveActivityRequestTrackID = ""
@@ -326,6 +479,13 @@ final class BLETestManager: NSObject, ObservableObject {
     private var ignoredLyricSecondaryPlaceholderKeys: Set<String> = []
     private var pendingLyricSecondaryModes: [LyricSecondaryMode] = []
     private var lyricSecondaryTransfer: LyricSecondaryTransfer?
+    private var activeLyricSecondaryRequest: LyricSecondaryRequest?
+    private var lyricSecondaryRetryCounts: [String: Int] = [:]
+    private var lyricSecondaryFailureCooldownUntilMs: [String: Int64] = [:]
+    private var lyricSecondaryStartTimeoutWorkItem: DispatchWorkItem?
+    private var lyricSecondaryIdleTimeoutWorkItem: DispatchWorkItem?
+    private var lyricSecondaryTotalTimeoutWorkItem: DispatchWorkItem?
+    private var lyricSecondaryDeferredRequestWorkItem: DispatchWorkItem?
     private var lastAutomaticLyricDiagnosticRequestAt: [String: Date] = [:]
     private var fullLyricsReceivingTrackID = ""
     private var fullLyricsExpectedCount = 0
@@ -364,6 +524,7 @@ final class BLETestManager: NSObject, ObservableObject {
     private var trackInfoExpectedSize = 0
     private var trackInfoExpectedChunks = 0
     private var trackInfoChunks: [Int: Data] = [:]
+    private var trackInfoTransferToken = UUID()
     private var basePlaybackPositionMs: Int64 = 0
     private var playbackAnchorElapsedMs = Int64(
         (ProcessInfo.processInfo.systemUptime * 1_000).rounded()
@@ -408,6 +569,8 @@ final class BLETestManager: NSObject, ObservableObject {
     private var currentConnectIsAutoReconnect = false
     private var currentConnectIsRetrievedPeripheral = false
     private var coreBluetoothRestoreInProgress = false
+    private var systemAutoReconnectInProgress = false
+    private var systemAutoReconnectStartedAt: Date?
     private var connectionAttemptId = UUID()
     private var lastStatusNotifyAt: Date?
     private var lastPlaybackStateAt: Date?
@@ -432,10 +595,13 @@ final class BLETestManager: NSObject, ObservableObject {
     private var lastStaleRemoteAnchorLogAtMs: Int64 = 0
     private var healthProbeFailureCount = 0
     private var serverProtocolVersion = 1
+    private var serverSupportsAlbumArtBinary = false
     private var serverSupportsFullLyricsZlib = false
     private var serverSupportsLyricWindow = false
     private var serverSupportsPing = false
     private var serverSupportsTransferRetry = false
+    private var lastMediaLoadStateKeyByResource: [BLEMediaResource: String] = [:]
+    private var eventSequenceDiagnostics = BLEEventSequenceDiagnostics()
     private var lastHardReconnectAt: Date?
     private var connectionDisplayStateChangedAt = Date()
     private var connectionDisplayWorkItem: DispatchWorkItem?
@@ -455,6 +621,15 @@ final class BLETestManager: NSObject, ObservableObject {
         let isControl: Bool
         let volumeValue: Int?
         let volumeReason: String?
+    }
+
+    private struct TrackInfoTransferPayload: Decodable, Sendable {
+        let type: String
+        let title: String?
+        let artist: String?
+        let album: String?
+        let trackId: String?
+        let generation: Int64?
     }
 
     private enum HistoryRequestKind {
@@ -497,8 +672,7 @@ final class BLETestManager: NSObject, ObservableObject {
 
     override init() {
         super.init()
-        installObservableStateModels()
-        preferences.load()
+        syncAllStores()
         syncPreferencesStateFromStore()
         logAppExperienceModeLoaded()
         log("[BLE-iOS] app log store ready")
@@ -509,67 +683,131 @@ final class BLETestManager: NSObject, ObservableObject {
         updateAppLifecycleState(UIApplication.shared.applicationState, emitLog: false)
         registerAppLifecycleDiagnostics()
         _ = centralManager
+        #if DEBUG
         startMainHeartbeatDiagnostics()
+        #endif
         loadCachedPlaybackHistory()
         restoreLastNowPlayingSnapshot()
         syncAlbumArtReceiverState(albumArtReceiver)
         runDebugSmokeTestIfNeeded()
     }
 
-    private func installObservableStateModels() {
-        stateModelCancellable = objectWillChange.sink { [weak self] _ in
-            guard let self, !self.stateModelSyncScheduled else { return }
-            self.stateModelSyncScheduled = true
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.stateModelSyncScheduled = false
-                self.syncObservableStateModels()
-            }
-        }
-        syncObservableStateModels()
+    private func syncAllStores() {
+        syncConnectionStore()
+        syncPlaybackMetadataStore()
+        syncPlaybackTimelineStore()
+        syncPlaybackVolumeStore()
+        syncLiveLyricsStore()
+        syncFullLyricsStore()
+        syncArtworkStore()
+        syncDiagnosticsStore()
     }
 
-    private func syncObservableStateModels() {
-        connectionStateModel.update(
-            BLEConnectionViewState(
-                status: connectionStatus,
-                displayState: connectionDisplayState,
-                healthState: connectionHealthState,
-                deviceName: connectedDeviceName,
-                characteristicReady: connectionHealthCharacteristicReady,
-                autoReconnectState: autoReconnectState
-            )
+    private func syncConnectionStore() {
+        let state = BLEConnectionViewState(
+            status: connectionStatus,
+            displayState: connectionDisplayState,
+            healthState: connectionHealthState,
+            deviceName: connectedDeviceName,
+            characteristicReady: connectionHealthCharacteristicReady,
+            autoReconnectState: autoReconnectState
         )
-        playbackStateModel.update(
-            BLEPlaybackViewState(
-                title: title,
-                artist: artist,
-                album: album,
+        let deviceName = connectedDeviceName == "-" ? nil : connectedDeviceName
+        let presentation: BLEConnectionPresentationState
+        if bluetoothAvailability != .available,
+           bluetoothAvailability != .unknown {
+            presentation = .unavailable(bluetoothAvailability)
+        } else {
+            switch connectionDisplayState {
+            case ConnectionDisplayState.connected.rawValue:
+                presentation = .connected(
+                    deviceName: deviceName ?? "Sony",
+                    health: connectionHealthState
+                )
+            case ConnectionDisplayState.reconnecting.rawValue:
+                if connectionStatus.contains("搜索") || connectionStatus.contains("扫描") {
+                    presentation = .scanning
+                } else if connectionStatus.contains("连接") && autoReconnectAttempt == 0 {
+                    presentation = .connecting(deviceName: deviceName)
+                } else {
+                    presentation = .reconnecting(
+                        deviceName: deviceName,
+                        attempt: autoReconnectAttempt
+                    )
+                }
+            default:
+                if connectionStatus.contains("未找到") {
+                    presentation = .failed(.deviceNotFound)
+                } else {
+                    presentation = .disconnected(lastDeviceName: deviceName)
+                }
+            }
+        }
+        connectionStore.update(state: state, presentation: presentation)
+        connectionStateModel.update(state)
+    }
+
+    private func syncPlaybackMetadataStore() {
+        playbackStore.updateMetadata(
+            BLEPlaybackMetadataState(title: title, artist: artist, album: album)
+        )
+        syncLegacyPlaybackSlice()
+    }
+
+    private func syncPlaybackTimelineStore() {
+        playbackStore.updateTimeline(
+            BLEPlaybackTimelineState(
                 isPlaying: isPlaying,
                 positionMs: positionMs,
                 displayPositionMs: displayPositionMs,
                 durationMs: durationMs,
                 seekPositionMs: seekPositionMs,
-                isSeeking: isSeeking,
-                volumeCurrent: volumeCurrent,
-                volumeMax: volumeMax,
-                volumeSeekValue: volumeSeekValue,
-                isVolumeSeeking: isVolumeSeeking
+                isSeeking: isSeeking
             )
         )
-        lyricsStateModel.update(
-            BLELyricsViewState(
-                lyric: lyric,
-                fullLyrics: fullLyrics,
-                fullLyricsTrackId: fullLyricsTrackId,
-                isCurrent: isFullLyricsCurrent,
-                isReceiving: isFullLyricsReceiving,
+        syncLegacyPlaybackSlice()
+    }
+
+    private func syncPlaybackVolumeStore() {
+        playbackStore.updateVolume(
+            BLEVolumeViewState(
+                current: volumeCurrent,
+                maximum: volumeMax,
+                seekValue: volumeSeekValue,
+                isSeeking: isVolumeSeeking
+            )
+        )
+        syncLegacyPlaybackSlice()
+    }
+
+    private func syncLiveLyricsStore() {
+        lyricsStore.updateLive(
+            BLELiveLyricState(
+                text: lyric,
                 currentWordLineIndex: currentWordLineIndex,
                 currentWordIndex: currentWordIndex,
                 loadingStage: mediaLoadingState.lyric
             )
         )
-        artworkStateModel.update(
+        syncLegacyLyricsSlice()
+    }
+
+    private func syncFullLyricsStore() {
+        lyricsStore.updateDocument(
+            BLEFullLyricsViewState(
+                lines: fullLyrics,
+                trackId: fullLyricsTrackId,
+                isCurrent: isFullLyricsCurrent,
+                isReceiving: isFullLyricsReceiving,
+                translationState: translationLyricsState,
+                romanizationState: romanizationLyricsState
+            )
+        )
+        syncLegacyLyricsSlice()
+    }
+
+    private func syncArtworkStore() {
+        artworkStore.update(
             BLEArtworkViewState(
                 image: albumArtImage,
                 displayQuality: artworkDisplayQuality,
@@ -578,7 +816,48 @@ final class BLETestManager: NSObject, ObservableObject {
                 loadingStage: mediaLoadingState.artwork
             )
         )
-        diagnosticsStateModel.update(
+        artworkStateModel.update(artworkStore.state)
+    }
+
+    private func syncLegacyPlaybackSlice() {
+        playbackStateModel.update(
+            BLEPlaybackViewState(
+                title: playbackStore.metadata.title,
+                artist: playbackStore.metadata.artist,
+                album: playbackStore.metadata.album,
+                isPlaying: playbackStore.timeline.isPlaying,
+                positionMs: playbackStore.timeline.positionMs,
+                displayPositionMs: playbackStore.timeline.displayPositionMs,
+                durationMs: playbackStore.timeline.durationMs,
+                seekPositionMs: playbackStore.timeline.seekPositionMs,
+                isSeeking: playbackStore.timeline.isSeeking,
+                volumeCurrent: playbackStore.volume.current,
+                volumeMax: playbackStore.volume.maximum,
+                volumeSeekValue: playbackStore.volume.seekValue,
+                isVolumeSeeking: playbackStore.volume.isSeeking
+            )
+        )
+    }
+
+    private func syncLegacyLyricsSlice() {
+        lyricsStateModel.update(
+            BLELyricsViewState(
+                lyric: lyricsStore.live.text,
+                fullLyrics: lyricsStore.document.lines,
+                fullLyricsTrackId: lyricsStore.document.trackId,
+                isCurrent: lyricsStore.document.isCurrent,
+                isReceiving: lyricsStore.document.isReceiving,
+                currentWordLineIndex: lyricsStore.live.currentWordLineIndex,
+                currentWordIndex: lyricsStore.live.currentWordIndex,
+                loadingStage: lyricsStore.live.loadingStage,
+                translationState: lyricsStore.document.translationState,
+                romanizationState: lyricsStore.document.romanizationState
+            )
+        )
+    }
+
+    private func syncDiagnosticsStore() {
+        diagnosticsStore.update(
             BLEDiagnosticsViewState(
                 logCount: logs.count,
                 connectionAttemptId: connectionHealthAttemptId,
@@ -676,6 +955,13 @@ final class BLETestManager: NSObject, ObservableObject {
         var arguments = ProcessInfo.processInfo.arguments
         arguments.append(contentsOf: consumeDebugSmokeLaunchArguments())
         let markerKey = "smokeTestPreferencesWritten"
+        if arguments.contains("--smoke-force-v2") {
+            preferences.forceProtocolV2 = true
+            log("[SmokeTest] force protocol V2")
+        } else if arguments.contains("--smoke-force-v3") {
+            preferences.forceProtocolV2 = false
+            log("[SmokeTest] force protocol V3")
+        }
         if arguments.contains("--smoke-test-preferences") {
             setAppExperienceMode(.debug)
             preferences.artworkDisplaySize = .small
@@ -1248,6 +1534,13 @@ final class BLETestManager: NSObject, ObservableObject {
             scheduleReconnect(reason: "enabled", immediate: true)
         } else {
             cancelPendingReconnect(reason: "disabled")
+            if systemAutoReconnectInProgress, let sonyPeripheral {
+                systemAutoReconnectInProgress = false
+                systemAutoReconnectStartedAt = nil
+                isConnectingToSony = false
+                centralManager.cancelPeripheralConnection(sonyPeripheral)
+                self.sonyPeripheral = nil
+            }
             setAutoReconnectState(.idle)
         }
     }
@@ -1267,6 +1560,8 @@ final class BLETestManager: NSObject, ObservableObject {
             return
         }
         lastHardReconnectAt = now
+        systemAutoReconnectInProgress = false
+        systemAutoReconnectStartedAt = nil
         connectionHealthHardReconnectCount += 1
         log("[BLE-Health] hard reconnect reason=\(reason)")
         cancelPendingReconnect(reason: manual ? "manual hard reconnect" : "force reconnect")
@@ -1576,6 +1871,25 @@ final class BLETestManager: NSObject, ObservableObject {
             } else {
                 UIPasteboard.general.string = text
                 self.localLogActionStatus = "已复制 iOS 日志"
+            }
+        }
+    }
+
+    func setUILogStreamingEnabled(_ enabled: Bool) {
+        uiLogQueue.async { [weak self] in
+            guard let self else { return }
+            self.isUILogStreamingEnabled = enabled
+            if !enabled {
+                self.pendingUILogLines.removeAll(keepingCapacity: true)
+                self.isUILogFlushScheduled = false
+                return
+            }
+            AppLogStore.shared.readRecentText { [weak self] text in
+                guard let self else { return }
+                self.logs = text
+                    .split(separator: "\n", omittingEmptySubsequences: true)
+                    .suffix(300)
+                    .map(String.init)
             }
         }
     }
@@ -2216,6 +2530,16 @@ final class BLETestManager: NSObject, ObservableObject {
 
     private func enqueueLyricSecondaryIfNeeded(mode: LyricSecondaryMode, trackID: String) {
         let key = lyricSecondaryKey(trackID: trackID, mode: mode)
+        let nowMs = currentTimeMs()
+        if let cooldownUntil = lyricSecondaryFailureCooldownUntilMs[key],
+           cooldownUntil > nowMs {
+            log(
+                "[Lyrics-iOS] secondary cooldown mode=\(mode.rawValue) " +
+                    "remainingMs=\(cooldownUntil - nowMs)"
+            )
+            return
+        }
+        lyricSecondaryFailureCooldownUntilMs.removeValue(forKey: key)
         guard !completedLyricSecondaryKeys.contains(key),
               !requestedLyricSecondaryKeys.contains(key),
               !pendingLyricSecondaryModes.contains(mode),
@@ -2224,10 +2548,12 @@ final class BLETestManager: NSObject, ObservableObject {
         }
         requestedLyricSecondaryKeys.insert(key)
         pendingLyricSecondaryModes.append(mode)
+        setLyricSecondaryState(.loading, mode: mode)
         log("[Lyrics-iOS] secondary queued mode=\(mode.rawValue) trackId=\(trackID)")
     }
 
     private func requestNextLyricSecondaryIfPossible() {
+        guard activeLyricSecondaryRequest == nil else { return }
         guard lyricSecondaryTransfer == nil else { return }
         guard !pendingLyricSecondaryModes.isEmpty else { return }
         let trackID = currentTrackID
@@ -2236,13 +2562,27 @@ final class BLETestManager: NSObject, ObservableObject {
               !fullLyrics.isEmpty else { return }
         if isInStartupLoadWindow() {
             let delay = startupLoadRemainingDelay()
+            guard lyricSecondaryDeferredRequestWorkItem == nil else { return }
             log("[StartupLoad] defer request=GET_LYRIC_SECONDARY reason=first connection warmup delayMs=\(Int(delay * 1_000))")
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            let item = DispatchWorkItem { [weak self] in
+                self?.lyricSecondaryDeferredRequestWorkItem = nil
                 self?.requestNextLyricSecondaryIfPossible()
             }
+            lyricSecondaryDeferredRequestWorkItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
             return
         }
         let mode = pendingLyricSecondaryModes.removeFirst()
+        let key = lyricSecondaryKey(trackID: trackID, mode: mode)
+        let request = LyricSecondaryRequest(
+            trackId: trackID,
+            mode: mode,
+            token: UUID(),
+            connectionAttemptId: connectionAttemptId,
+            retryCount: lyricSecondaryRetryCounts[key] ?? 0
+        )
+        activeLyricSecondaryRequest = request
+        setLyricSecondaryState(.loading, mode: mode)
         log("[Lyrics-iOS] secondary request mode=\(mode.rawValue) trackId=\(trackID)")
         sendCommand(
             cmd: "GET_LYRIC_SECONDARY",
@@ -2251,10 +2591,147 @@ final class BLETestManager: NSObject, ObservableObject {
                 "mode": mode.rawValue
             ]
         )
+        scheduleLyricSecondaryStartTimeout(for: request)
+        scheduleLyricSecondaryTotalTimeout(for: request)
     }
 
     private func lyricSecondaryKey(trackID: String, mode: LyricSecondaryMode) -> String {
         "\(trackID)|\(mode.rawValue)"
+    }
+
+    private func setLyricSecondaryState(
+        _ state: LyricSecondaryLoadState,
+        mode: LyricSecondaryMode
+    ) {
+        switch mode {
+        case .translation:
+            guard translationLyricsState != state else { return }
+            translationLyricsState = state
+        case .romanization:
+            guard romanizationLyricsState != state else { return }
+            romanizationLyricsState = state
+        }
+    }
+
+    private func scheduleLyricSecondaryStartTimeout(for request: LyricSecondaryRequest) {
+        lyricSecondaryStartTimeoutWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.activeLyricSecondaryRequest?.token == request.token,
+                  self.lyricSecondaryTransfer == nil else { return }
+            self.handleLyricSecondaryFailure(
+                trackID: request.trackId,
+                mode: request.mode,
+                reason: "start timeout",
+                explicitlyUnavailable: false
+            )
+        }
+        lyricSecondaryStartTimeoutWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(Int(LYRIC_SECONDARY_START_TIMEOUT_MS)),
+            execute: item
+        )
+    }
+
+    private func scheduleLyricSecondaryIdleTimeout(for request: LyricSecondaryRequest) {
+        lyricSecondaryIdleTimeoutWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.activeLyricSecondaryRequest?.token == request.token,
+                  self.lyricSecondaryTransfer?.requestToken == request.token else { return }
+            self.handleLyricSecondaryFailure(
+                trackID: request.trackId,
+                mode: request.mode,
+                reason: "chunk idle timeout",
+                explicitlyUnavailable: false
+            )
+        }
+        lyricSecondaryIdleTimeoutWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(Int(LYRIC_SECONDARY_IDLE_TIMEOUT_MS)),
+            execute: item
+        )
+    }
+
+    private func scheduleLyricSecondaryTotalTimeout(for request: LyricSecondaryRequest) {
+        lyricSecondaryTotalTimeoutWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.activeLyricSecondaryRequest?.token == request.token else { return }
+            self.handleLyricSecondaryFailure(
+                trackID: request.trackId,
+                mode: request.mode,
+                reason: "total timeout",
+                explicitlyUnavailable: false
+            )
+        }
+        lyricSecondaryTotalTimeoutWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(Int(LYRIC_SECONDARY_TOTAL_TIMEOUT_MS)),
+            execute: item
+        )
+    }
+
+    private func cancelLyricSecondaryTimeouts() {
+        lyricSecondaryStartTimeoutWorkItem?.cancel()
+        lyricSecondaryStartTimeoutWorkItem = nil
+        lyricSecondaryIdleTimeoutWorkItem?.cancel()
+        lyricSecondaryIdleTimeoutWorkItem = nil
+        lyricSecondaryTotalTimeoutWorkItem?.cancel()
+        lyricSecondaryTotalTimeoutWorkItem = nil
+    }
+
+    private func handleLyricSecondaryFailure(
+        trackID: String,
+        mode: LyricSecondaryMode,
+        reason: String,
+        explicitlyUnavailable: Bool
+    ) {
+        guard trackID == currentTrackID else { return }
+        let key = lyricSecondaryKey(trackID: trackID, mode: mode)
+        let retryCount = activeLyricSecondaryRequest?.retryCount ??
+            lyricSecondaryRetryCounts[key] ?? 0
+        let action = LyricSecondaryRetryPolicy.action(
+            explicitlyUnavailable: explicitlyUnavailable,
+            retryCount: retryCount
+        )
+        cancelLyricSecondaryTimeouts()
+        activeLyricSecondaryRequest = nil
+        lyricSecondaryTransfer = nil
+
+        switch action {
+        case .retry:
+            let nextRetry = retryCount + 1
+            lyricSecondaryRetryCounts[key] = nextRetry
+            if !pendingLyricSecondaryModes.contains(mode) {
+                pendingLyricSecondaryModes.insert(mode, at: 0)
+            }
+            setLyricSecondaryState(.loading, mode: mode)
+            log(
+                "[Lyrics-iOS] secondary retry mode=\(mode.rawValue) " +
+                    "attempt=\(nextRetry) reason=\(reason)"
+            )
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                guard let self, self.currentTrackID == trackID else { return }
+                self.requestNextLyricSecondaryIfPossible()
+            }
+            return
+        case .markUnavailable:
+            completedLyricSecondaryKeys.insert(key)
+            lyricSecondaryRetryCounts.removeValue(forKey: key)
+            setLyricSecondaryState(.unavailable, mode: mode)
+        case .markFailed:
+            requestedLyricSecondaryKeys.remove(key)
+            lyricSecondaryRetryCounts.removeValue(forKey: key)
+            lyricSecondaryFailureCooldownUntilMs[key] =
+                currentTimeMs() + LYRIC_SECONDARY_FAILURE_COOLDOWN_MS
+            setLyricSecondaryState(.failed(reason: reason), mode: mode)
+        }
+        log(
+            "[Lyrics-iOS] secondary finished mode=\(mode.rawValue) " +
+                "state=\(action) reason=\(reason)"
+        )
+        requestNextLyricSecondaryIfPossible()
     }
 
     func beginSeeking() {
@@ -2656,7 +3133,7 @@ final class BLETestManager: NSObject, ObservableObject {
         #endif
         let timestamp = Date()
         uiLogQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.isUILogStreamingEnabled else { return }
             self.pendingUILogLines.append(
                 "[\(Self.logTimestampFormatter.string(from: timestamp))] \(message)"
             )
@@ -3224,7 +3701,8 @@ final class BLETestManager: NSObject, ObservableObject {
             type == "lyricSecondaryPart" ||
             type == "mediaFieldDumpChunk" ||
             type == "logChunk" ||
-            type == "currentWord"
+            type == "currentWord" ||
+            type == "link"
     }
 
     private func setAutoReconnectState(_ state: AutoReconnectState) {
@@ -3280,6 +3758,10 @@ final class BLETestManager: NSObject, ObservableObject {
         log("[BLE-Reconnect] schedule requested reason=\(reason) immediate=\(immediate)")
         guard autoReconnectEnabled else {
             log("[BLE-Reconnect] schedule skipped reason=disabled trigger=\(reason)")
+            return
+        }
+        guard !systemAutoReconnectInProgress else {
+            log("[BLE-Reconnect] schedule skipped reason=system auto reconnecting trigger=\(reason)")
             return
         }
         guard centralManager.state == .poweredOn else {
@@ -3419,7 +3901,12 @@ final class BLETestManager: NSObject, ObservableObject {
             "[BLE-Reconnect] connect id=\(peripheral.identifier.uuidString) " +
                 "reason=\(reason) attempt=\(connectionAttemptId.uuidString)"
         )
-        centralManager.connect(peripheral)
+        systemAutoReconnectInProgress = false
+        systemAutoReconnectStartedAt = nil
+        let options: [String: Any] = autoReconnectEnabled
+            ? [CBConnectPeripheralOptionEnableAutoReconnect: true]
+            : [:]
+        centralManager.connect(peripheral, options: options)
         let timeoutMs = isRetrieved ? FAST_RETRIEVE_CONNECT_TIMEOUT_MS : DEFAULT_CONNECT_TIMEOUT_MS
         let timeout = DispatchWorkItem { [weak self, weak peripheral] in
             guard let self,
@@ -3486,8 +3973,18 @@ final class BLETestManager: NSObject, ObservableObject {
         resetMediaFieldDumpTransfer()
         resetTrackInfoTransfer()
         resetFullLyricsTransfer()
+        cancelLyricSecondaryTimeouts()
+        lyricSecondaryDeferredRequestWorkItem?.cancel()
+        lyricSecondaryDeferredRequestWorkItem = nil
+        activeLyricSecondaryRequest = nil
         lyricSecondaryTransfer = nil
         pendingLyricSecondaryModes.removeAll()
+        requestedLyricSecondaryKeys.removeAll()
+        completedLyricSecondaryKeys.removeAll()
+        lyricSecondaryRetryCounts.removeAll()
+        lyricSecondaryFailureCooldownUntilMs.removeAll()
+        translationLyricsState = .idle
+        romanizationLyricsState = .idle
         isRemoteLogTransferInProgress = false
         isMediaFieldDumpReceiving = false
         mediaFieldDumpProgressText = ""
@@ -3722,6 +4219,28 @@ final class BLETestManager: NSObject, ObservableObject {
             return
         }
         if !connected {
+            if systemAutoReconnectInProgress {
+                let ageMs = systemAutoReconnectStartedAt.map {
+                    Int64(Date().timeIntervalSince($0) * 1_000)
+                } ?? 0
+                if ageMs < DEFAULT_CONNECT_TIMEOUT_MS {
+                    log(
+                        "[BLE-Reconnect] foreground reconnect skipped " +
+                            "reason=system auto reconnecting ageMs=\(ageMs)"
+                    )
+                    setStatus("正在连接 Sony")
+                    setAutoReconnectState(.connecting)
+                    return
+                }
+                log("[BLE-Reconnect] system auto reconnect expired ageMs=\(ageMs)")
+                systemAutoReconnectInProgress = false
+                systemAutoReconnectStartedAt = nil
+                isConnectingToSony = false
+                if let sonyPeripheral {
+                    centralManager.cancelPeripheralConnection(sonyPeripheral)
+                }
+                self.sonyPeripheral = nil
+            }
             if AutoReconnectState(rawValue: autoReconnectState) == .connecting,
                currentConnectIsRetrievedPeripheral,
                let sonyPeripheral {
@@ -4158,6 +4677,22 @@ extension BLETestManager: LiveActivityBLECommandSending {
 extension BLETestManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         log("[BLE] central state=\(central.state.rawValue)")
+        switch central.state {
+        case .poweredOn:
+            bluetoothAvailability = .available
+        case .poweredOff:
+            bluetoothAvailability = .poweredOff
+        case .unauthorized:
+            bluetoothAvailability = .unauthorized
+        case .unsupported:
+            bluetoothAvailability = .unsupported
+        case .resetting:
+            bluetoothAvailability = .resetting
+        case .unknown:
+            bluetoothAvailability = .unknown
+        @unknown default:
+            bluetoothAvailability = .unknown
+        }
         if central.state == .poweredOn, shouldScanWhenPoweredOn {
             beginSonyScan(reason: "poweredOn pending scan", isAutoReconnect: false, force: false)
         } else if central.state == .poweredOn, autoReconnectEnabled, sonyPeripheral?.state != .connected {
@@ -4307,6 +4842,8 @@ extension BLETestManager: CBCentralManagerDelegate {
             centralManager.cancelPeripheralConnection(peripheral)
             return
         }
+        systemAutoReconnectInProgress = false
+        systemAutoReconnectStartedAt = nil
         isConnectingToSony = false
         updateAutoReconnectDebugFields()
         connectTimeoutWorkItem?.cancel()
@@ -4356,6 +4893,8 @@ extension BLETestManager: CBCentralManagerDelegate {
             log("[BLE-Reconnect] ignore stale didFailToConnect id=\(peripheral.identifier.uuidString)")
             return
         }
+        systemAutoReconnectInProgress = false
+        systemAutoReconnectStartedAt = nil
         isConnectingToSony = false
         connectTimeoutWorkItem?.cancel()
         connectTimeoutWorkItem = nil
@@ -4376,33 +4915,83 @@ extension BLETestManager: CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
+        handlePeripheralDisconnect(
+            peripheral,
+            error: error,
+            systemIsReconnecting: false
+        )
+    }
+
+    @available(iOS 17.0, *)
+    func centralManager(
+        _ central: CBCentralManager,
+        didDisconnectPeripheral peripheral: CBPeripheral,
+        timestamp: CFAbsoluteTime,
+        isReconnecting: Bool,
+        error: Error?
+    ) {
+        handlePeripheralDisconnect(
+            peripheral,
+            error: error,
+            systemIsReconnecting: isReconnecting
+        )
+    }
+
+    private func handlePeripheralDisconnect(
+        _ peripheral: CBPeripheral,
+        error: Error?,
+        systemIsReconnecting: Bool
+    ) {
         guard sonyPeripheral?.identifier == peripheral.identifier else {
             log("[BLE-Reconnect] ignore stale didDisconnect id=\(peripheral.identifier.uuidString)")
             return
         }
-        isConnectingToSony = false
         connectTimeoutWorkItem?.cancel()
         connectTimeoutWorkItem = nil
         let errorText = error?.localizedDescription ?? "none"
         autoReconnectLastDisconnectError = errorText
-        setStatus(autoReconnectEnabled ? "正在连接" : "未连接")
-        if !autoReconnectEnabled {
-            setAutoReconnectState(.idle)
-        }
-        log("[BLE] disconnected error=\(errorText)")
-        log("[BLE-iOS] didDisconnect error=\(errorText)")
-        log("[BLE-Reconnect] disconnected error=\(errorText)")
+        self.systemAutoReconnectInProgress = systemIsReconnecting
+        systemAutoReconnectStartedAt = systemIsReconnecting ? Date() : nil
+        isConnectingToSony = systemIsReconnecting
+        log(
+            "[BLE] disconnected error=\(errorText) " +
+                "systemReconnecting=\(systemIsReconnecting)"
+        )
+        log(
+            "[BLE-iOS] didDisconnect error=\(errorText) " +
+                "systemReconnecting=\(systemIsReconnecting)"
+        )
+        log(
+            "[BLE-Reconnect] disconnected error=\(errorText) " +
+                "systemReconnecting=\(systemIsReconnecting)"
+        )
         reconnectStateSyncWindowUntilMs = 0
         reconnectStateSyncPlaybackLogged = false
         stopHealthMonitoring(reason: "didDisconnect")
         setConnectionHealth(.disconnected, reason: "didDisconnect")
-        sonyPeripheral = nil
-        connectedDeviceName = "-"
         clearConnectionTransports(reason: "disconnect")
         clearPendingVolume()
+
+        if systemIsReconnecting {
+            setStatus("正在连接 Sony")
+            setAutoReconnectState(.connecting)
+            connectedDeviceName = peripheral.name ?? connectedDeviceName
+            log("[BLE-Reconnect] waiting for CoreBluetooth automatic reconnect")
+            return
+        }
+
+        sonyPeripheral = nil
+        connectedDeviceName = "-"
+        setStatus(autoReconnectEnabled ? "正在连接" : "未连接")
+        if !autoReconnectEnabled {
+            setAutoReconnectState(.idle)
+        }
         log("[BLE-Reconnect] update LiveActivity disconnected")
         updateLiveActivityDisconnected()
-        if autoReconnectEnabled {
+        if SystemReconnectPolicy.shouldScheduleManualReconnect(
+            autoReconnectEnabled: autoReconnectEnabled,
+            systemIsReconnecting: systemIsReconnecting
+        ) {
             scheduleReconnect(reason: "disconnect", immediate: false)
         }
     }
@@ -4593,11 +5182,17 @@ extension BLETestManager: CBPeripheralDelegate {
             setConnectionHealth(.suspect, reason: "notify subscribed waiting status")
             startHealthMonitoring(reason: "notify subscribed")
             serverProtocolVersion = 1
+            serverSupportsAlbumArtBinary = false
             serverSupportsFullLyricsZlib = false
             serverSupportsLyricWindow = false
             serverSupportsPing = false
             serverSupportsClockSyncV1 = false
             serverSupportsTransferRetry = false
+            negotiatedV3Features = []
+            serverSessionId = "-"
+            lastServerEventSequence = 0
+            eventSequenceDiagnostics.reset()
+            lastMediaLoadStateKeyByResource.removeAll()
             resetClockSync(reason: "notify subscribed")
             requestedLyricWindowTrackIDs.removeAll()
             let expectedAttemptId = connectionAttemptId
@@ -4619,18 +5214,26 @@ extension BLETestManager: CBPeripheralDelegate {
                 deadline: .now() + Double(CONNECTION_SUBSCRIBE_NOTIFY_TIMEOUT_MS) / 1_000.0,
                 execute: subscribeTimeout
             )
-            log("[BLE-Reconnect] send CLIENT_CAPABILITIES")
+            let requestedProtocolVersion = preferences.forceProtocolV2 ? 2 : 3
+            log(
+                "[BLE-Reconnect] send CLIENT_CAPABILITIES " +
+                    "protocolVersion=\(requestedProtocolVersion) f3=\(requestedProtocolVersion >= 3 ? BLEProtocolV3Features.all.rawValue : 0)"
+            )
+            var capabilities: [String: Any] = [
+                "protocolVersion": requestedProtocolVersion,
+                "albumArtBinary": true,
+                "fullLyricsZlib": true,
+                "lyricWindow": true,
+                "ping": true,
+                "clockSyncV1": true,
+                "transferRetry": true
+            ]
+            if requestedProtocolVersion >= 3 {
+                capabilities["f3"] = BLEProtocolV3Features.all.rawValue
+            }
             sendCommand(
                 cmd: "CLIENT_CAPABILITIES",
-                extra: [
-                    "protocolVersion": 2,
-                    "albumArtBinary": true,
-                    "fullLyricsZlib": true,
-                    "lyricWindow": true,
-                    "ping": true,
-                    "clockSyncV1": true,
-                    "transferRetry": true
-                ]
+                extra: capabilities
             )
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                 guard let self,
@@ -4691,53 +5294,88 @@ extension BLETestManager: CBPeripheralDelegate {
             log("[Status] empty notify")
             return
         }
-        if data.first == 0xA1 {
-            markStatusNotifyReceived(type: "albumArtBinaryChunk")
-            albumArtReceiver.handleBinaryChunk(data)
-            return
-        }
-        if data.first == 0xA2 {
-            markStatusNotifyReceived(type: "fullLyricsBinaryChunk")
-            handleFullLyricsBinaryChunk(data)
-            return
-        }
-
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let type = object["type"] as? String else {
-            if let text = String(data: data, encoding: .utf8) {
-                log("[BLE] status notify received: \(text)")
-            } else {
-                log("[Status] invalid UTF-8")
+        let peripheralID = peripheral.identifier
+        inboundPipeline.submit { [weak self] in
+            guard let self else { return }
+            if data.first == 0xA1 {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          self.sonyPeripheral?.identifier == peripheralID else { return }
+                    self.markStatusNotifyReceived(type: "albumArtBinaryChunk")
+                    self.albumArtReceiver.handleBinaryChunk(data)
+                }
+                return
             }
-            log("[Status] JSON parse failed")
-            return
+            if data.first == 0xA2 {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          self.sonyPeripheral?.identifier == peripheralID else { return }
+                    self.markStatusNotifyReceived(type: "fullLyricsBinaryChunk")
+                    self.handleFullLyricsBinaryChunk(data)
+                }
+                return
+            }
+            let decodeState = AppPerformanceLog.protocolSignposter.beginInterval("Status JSON Decode")
+            let objectBox = BLEProtocolV3Parser.jsonObject(from: data).map(BLEStatusObjectBox.init)
+            let type = objectBox?.value["type"] as? String
+            let text = String(data: data, encoding: .utf8)
+            AppPerformanceLog.protocolSignposter.endInterval("Status JSON Decode", decodeState)
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.sonyPeripheral?.identifier == peripheralID else { return }
+                guard let object = objectBox?.value, let type else {
+                    if let text {
+                        self.log("[BLE] status notify received: \(text)")
+                    } else {
+                        self.log("[Status] invalid UTF-8")
+                    }
+                    self.log("[Status] JSON parse failed")
+                    return
+                }
+                if type == "albumArtChunk" || type == "trackInfoChunk" {
+                    self.log("[BLE] status notify received type=\(type)")
+                } else if !self.isHighVolumeNotifyType(type) {
+                    self.log("[BLE] status notify received: \(text ?? type)")
+                }
+                self.parseStatus(object, type: type)
+            }
         }
-        if type == "albumArtChunk" || type == "trackInfoChunk" {
-            log("[BLE] status notify received type=\(type)")
-        } else if !isHighVolumeNotifyType(type) {
-            log("[BLE] status notify received: \(String(data: data, encoding: .utf8) ?? type)")
-        }
-        parseStatus(object, type: type)
     }
 
     private func parseStatus(_ object: [String: Any], type: String) {
         let apply: () -> Void = {
             self.markStatusNotifyReceived(type: type)
+            self.observeV3StatusMetadata(object, type: type)
             switch type {
+            case "link":
+                // Sony's per-client keepalive already refreshed connection
+                // health above. It intentionally carries no media payload.
+                break
+
             case "clientCapabilitiesAck":
-                self.serverProtocolVersion = Self.intValue(object["protocolVersion"])
-                self.serverSupportsFullLyricsZlib = object["fullLyricsZlib"] as? Bool ?? false
-                self.serverSupportsLyricWindow = object["lyricWindow"] as? Bool ?? false
-                self.serverSupportsPing = object["ping"] as? Bool ?? false
-                self.serverSupportsClockSyncV1 = object["clockSyncV1"] as? Bool ?? false
-                self.serverSupportsTransferRetry = object["transferRetry"] as? Bool ?? false
+                let ack = BLEProtocolV3Parser.capabilitiesAck(from: object)
+                self.serverProtocolVersion = ack.protocolVersion
+                self.serverSupportsAlbumArtBinary = ack.v2Features.contains(.albumArtBinary)
+                self.serverSupportsFullLyricsZlib = ack.v2Features.contains(.fullLyricsZlib)
+                self.serverSupportsLyricWindow = ack.v2Features.contains(.lyricWindow)
+                self.serverSupportsPing = ack.v2Features.contains(.ping)
+                self.serverSupportsClockSyncV1 = ack.v2Features.contains(.clockSyncV1)
+                self.serverSupportsTransferRetry = ack.v2Features.contains(.transferRetry)
+                self.negotiatedV3Features = ack.v3Features.intersection(.all)
+                if let sessionId = ack.sessionId {
+                    self.serverSessionId = sessionId
+                    self.lastServerEventSequence = 0
+                    self.eventSequenceDiagnostics.reset(sessionId: sessionId)
+                }
                 self.log(
                     "[BLE-iOS] capabilities ack protocolVersion=\(self.serverProtocolVersion) " +
+                        "albumArtBinary=\(self.serverSupportsAlbumArtBinary) " +
                         "fullLyricsZlib=\(self.serverSupportsFullLyricsZlib) " +
                         "lyricWindow=\(self.serverSupportsLyricWindow) " +
                         "ping=\(self.serverSupportsPing) " +
                         "clockSyncV1=\(self.serverSupportsClockSyncV1) " +
-                        "transferRetry=\(self.serverSupportsTransferRetry)"
+                        "transferRetry=\(self.serverSupportsTransferRetry) " +
+                        "f3=\(self.negotiatedV3Features.rawValue) sid=\(self.serverSessionId)"
                 )
                 if self.serverSupportsClockSyncV1 {
                     self.scheduleClockSyncBootstrap(reason: "capability ack")
@@ -4745,6 +5383,12 @@ extension BLETestManager: CBPeripheralDelegate {
                 if self.serverSupportsLyricWindow, !self.currentTrackID.isEmpty {
                     self.requestLyricWindow(trackID: self.currentTrackID)
                 }
+
+            case "commandError":
+                self.handleStructuredCommandError(object)
+
+            case "mediaLoadState":
+                self.handleNegotiatedMediaLoadState(object)
 
             case "pong":
                 let handledClockSync = self.handleClockSyncPong(object)
@@ -4957,8 +5601,11 @@ extension BLETestManager: CBPeripheralDelegate {
             case "lyricSecondaryEnd":
                 self.handleLyricSecondaryEnd(object)
 
-            case "lyricSecondaryUnavailable", "lyricSecondaryError":
-                self.handleLyricSecondaryUnavailable(object)
+            case "lyricSecondaryUnavailable":
+                self.handleLyricSecondaryUnavailable(object, isError: false)
+
+            case "lyricSecondaryError":
+                self.handleLyricSecondaryUnavailable(object, isError: true)
 
             case "volumeState":
                 self.volumeMax = Self.intValue(object["max"])
@@ -5165,6 +5812,166 @@ extension BLETestManager: CBPeripheralDelegate {
         }
     }
 
+    private func observeV3StatusMetadata(_ object: [String: Any], type: String) {
+        guard negotiatedV3Features.contains(.statusMetaV1),
+              let metadata = BLEProtocolV3Parser.statusMetadata(from: object) else {
+            return
+        }
+
+        let previousSession = serverSessionId
+        let observation = eventSequenceDiagnostics.observe(metadata)
+        serverSessionId = metadata.sessionId
+        lastServerEventSequence = eventSequenceDiagnostics.highestSequence
+        switch observation {
+        case .first, .inOrder:
+            break
+        case .newSession:
+            log(
+                "[BLE-V3] session changed previous=\(previousSession) " +
+                    "current=\(metadata.sessionId) type=\(type)"
+            )
+        case .duplicate:
+            log("[BLE-V3] duplicate event sid=\(metadata.sessionId) es=\(metadata.eventSequence) type=\(type)")
+        case let .gap(missing):
+            log(
+                "[BLE-V3] event gap sid=\(metadata.sessionId) " +
+                    "es=\(metadata.eventSequence) missing=\(missing) type=\(type)"
+            )
+        case .outOfOrder:
+            log(
+                "[BLE-V3] out-of-order event sid=\(metadata.sessionId) " +
+                    "es=\(metadata.eventSequence) last=\(lastServerEventSequence) type=\(type)"
+            )
+        }
+    }
+
+    private func handleStructuredCommandError(_ object: [String: Any]) {
+        guard negotiatedV3Features.contains(.structuredErrorV1) else {
+            log("[BLE-V3] commandError ignored because capability was not negotiated")
+            return
+        }
+        guard let payload = BLEProtocolV3Parser.commandError(from: object) else {
+            log("[BLE-V3] malformed commandError ignored")
+            return
+        }
+        guard isCurrentV3MediaPayload(
+            trackId: payload.trackId,
+            generation: payload.generation
+        ) else {
+            log(
+                "[BLE-V3] stale commandError ignored cmd=\(payload.command) " +
+                    "trackId=\(payload.trackId ?? "-") generation=\(payload.generation ?? -1)"
+            )
+            return
+        }
+
+        let correlatedCommand: String = {
+            guard let sequence = payload.sequence else { return payload.command }
+            if let command = commandWriteInflight.first(where: { $0.seq == sequence })?.cmd {
+                return command
+            }
+            if let command = pendingCommandWrites.first(where: { $0.seq == sequence })?.cmd {
+                return command
+            }
+            return payload.command
+        }()
+        let retryText = payload.retryable
+            ? "，可重试\(payload.retryAfterMs.map { "（\($0)ms 后）" } ?? "")"
+            : ""
+        lastCommandErrorSummary = "\(correlatedCommand)：\(payload.code)\(retryText)"
+        log(
+            "[BLE-V3] commandError seq=\(payload.sequence.map { String($0) } ?? "-") " +
+                "cmd=\(correlatedCommand) domain=\(payload.domain.rawValue) " +
+                "code=\(payload.code) retryable=\(payload.retryable) " +
+                "retryAfterMs=\(payload.retryAfterMs ?? -1)"
+        )
+
+        switch payload.domain {
+        case .lyrics:
+            mediaLoadingState.lyric = .failed(reason: payload.code)
+        case .artwork:
+            mediaLoadingState.artwork = .failed(reason: payload.code)
+        case .protocol, .history, .connection, .unknown:
+            break
+        }
+    }
+
+    private func handleNegotiatedMediaLoadState(_ object: [String: Any]) {
+        guard negotiatedV3Features.contains(.mediaLoadStateV1) else {
+            log("[BLE-V3] mediaLoadState ignored because capability was not negotiated")
+            return
+        }
+        guard let payload = BLEProtocolV3Parser.mediaLoadState(from: object) else {
+            log("[BLE-V3] malformed mediaLoadState ignored")
+            return
+        }
+        guard isCurrentV3MediaPayload(
+            trackId: payload.trackId,
+            generation: payload.generation
+        ) else {
+            log(
+                "[BLE-V3] stale mediaLoadState ignored resource=\(payload.resource.rawValue) " +
+                    "trackId=\(payload.trackId) generation=\(payload.generation ?? -1)"
+            )
+            return
+        }
+        guard lastMediaLoadStateKeyByResource[payload.resource] != payload.deduplicationKey else {
+            log("[BLE-V3] duplicate mediaLoadState ignored key=\(payload.deduplicationKey)")
+            return
+        }
+        lastMediaLoadStateKeyByResource[payload.resource] = payload.deduplicationKey
+
+        switch payload.resource {
+        case .lyrics:
+            switch payload.stage {
+            case .waiting, .preparing:
+                mediaLoadingState.lyric = .waitingQqQrc
+            case .transferring:
+                if fullLyrics.isEmpty {
+                    mediaLoadingState.lyric = .fullLyrics(received: 0, expected: 0)
+                }
+            case .ready:
+                let lineCount = fullLyrics.count
+                mediaLoadingState.lyric = lineCount > 0
+                    ? .ready(lineCount: lineCount)
+                    : .windowReady(lineCount: 0)
+            case .unavailable, .failed:
+                mediaLoadingState.lyric = .failed(reason: payload.reason)
+            }
+        case .artwork:
+            switch payload.stage {
+            case .waiting, .preparing, .transferring:
+                if artworkDisplayQuality == .placeholder {
+                    mediaLoadingState.artwork = .preview(received: 0, expected: 0)
+                }
+            case .ready:
+                mediaLoadingState.artwork = artworkDisplayQuality == .hq
+                    ? .hqReady
+                    : .previewReady
+            case .unavailable, .failed:
+                mediaLoadingState.artwork = .failed(reason: payload.reason)
+            }
+        }
+        log(
+            "[BLE-V3] mediaLoadState resource=\(payload.resource.rawValue) " +
+                "stage=\(payload.stage.rawValue) reason=\(payload.reason) " +
+                "trackId=\(payload.trackId) generation=\(payload.generation ?? -1)"
+        )
+    }
+
+    private func isCurrentV3MediaPayload(trackId: String?, generation: Int64?) -> Bool {
+        if let trackId, !trackId.isEmpty,
+           !isSameTrackId(incoming: trackId, current: currentTrackID) {
+            return false
+        }
+        if let generation, generation > 0,
+           currentTrackGeneration > 0,
+           generation != currentTrackGeneration {
+            return false
+        }
+        return true
+    }
+
     private func handleHistoryPayloadStart(_ object: [String: Any]) {
         let requestId = object["requestId"] as? String ?? ""
         let responseType = object["responseType"] as? String ?? ""
@@ -5204,21 +6011,35 @@ extension BLETestManager: CBPeripheralDelegate {
             log("[HistorySync] payload end missing chunks requestId=\(requestId)")
             return
         }
-        var data = Data()
-        for index in 0..<assembly.expectedChunks {
-            guard let chunk = assembly.chunks[index] else {
-                log("[HistorySync] payload missing chunk requestId=\(requestId) index=\(index)")
-                return
+        protocolDecodeQueue.async { [weak self] in
+            guard let self else { return }
+            let signpost = AppPerformanceLog.protocolSignposter.beginInterval("History Payload Decode")
+            var data = Data()
+            data.reserveCapacity(assembly.expectedSize)
+            for index in 0..<assembly.expectedChunks {
+                guard let chunk = assembly.chunks[index] else {
+                    AppPerformanceLog.protocolSignposter.endInterval("History Payload Decode", signpost)
+                    DispatchQueue.main.async { [weak self] in
+                        self?.log("[HistorySync] payload missing chunk requestId=\(requestId) index=\(index)")
+                    }
+                    return
+                }
+                data.append(chunk)
             }
-            data.append(chunk)
+            let decoded = data.count == assembly.expectedSize
+                ? (try? JSONSerialization.jsonObject(with: data) as? [String: Any])
+                : nil
+            AppPerformanceLog.protocolSignposter.endInterval("History Payload Decode", signpost)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard let decoded else {
+                    self.log("[HistorySync] payload decode failed requestId=\(requestId)")
+                    return
+                }
+                self.log("[HistorySync] payload decoded requestId=\(requestId) bytes=\(data.count)")
+                self.handleHistoryPayload(decoded)
+            }
         }
-        guard data.count == assembly.expectedSize,
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            log("[HistorySync] payload decode failed requestId=\(requestId)")
-            return
-        }
-        log("[HistorySync] payload decoded requestId=\(requestId) bytes=\(data.count)")
-        handleHistoryPayload(object)
     }
 
     private func handleHistoryPayload(_ object: [String: Any]) {
@@ -5345,6 +6166,7 @@ extension BLETestManager: CBPeripheralDelegate {
         let newArtist = object["artist"] as? String ?? "-"
         let newAlbum = object["album"] as? String ?? "-"
         let trackID = object["trackId"] as? String ?? ""
+        let generation = Self.optionalInt64Value(object["generation"]) ?? 0
 
         // An empty trackId is Sony's explicit "QQ Music has no active media
         // session" response. Never retain the preceding track here: doing so
@@ -5357,7 +6179,8 @@ extension BLETestManager: CBPeripheralDelegate {
         let trackChanged = newTitle != title ||
             newArtist != artist ||
             newAlbum != album ||
-            (!trackID.isEmpty && trackID != currentTrackID)
+            (!trackID.isEmpty && trackID != currentTrackID) ||
+            (generation > 0 && currentTrackGeneration > 0 && generation != currentTrackGeneration)
         if trackChanged {
             resetCurrentWordFence()
             lyric = ""
@@ -5377,7 +6200,15 @@ extension BLETestManager: CBPeripheralDelegate {
             completedLyricSecondaryKeys.removeAll()
             ignoredLyricSecondaryPlaceholderKeys.removeAll()
             pendingLyricSecondaryModes.removeAll()
+            cancelLyricSecondaryTimeouts()
+            lyricSecondaryDeferredRequestWorkItem?.cancel()
+            lyricSecondaryDeferredRequestWorkItem = nil
+            activeLyricSecondaryRequest = nil
             lyricSecondaryTransfer = nil
+            lyricSecondaryRetryCounts.removeAll()
+            lyricSecondaryFailureCooldownUntilMs.removeAll()
+            translationLyricsState = .idle
+            romanizationLyricsState = .idle
             lyricDiagnostic = nil
             lyricDiagnosticLoading = false
             lyricDiagnosticLastUpdatedAt = nil
@@ -5390,7 +6221,15 @@ extension BLETestManager: CBPeripheralDelegate {
         album = newAlbum
         if !trackID.isEmpty {
             currentTrackID = trackID
+            currentTrackGeneration = generation
             isShowingLastNowPlayingSnapshot = false
+            if trackChanged {
+                restoreFullLyricsCacheIfAvailable(
+                    trackID: trackID,
+                    title: newTitle,
+                    artist: newArtist
+                )
+            }
             let nowMs = currentTimeMs()
             lyricTraceTrackInfoAtMs[trackID] = nowMs
             log(
@@ -5438,12 +6277,21 @@ extension BLETestManager: CBPeripheralDelegate {
         completedLyricSecondaryKeys.removeAll()
         ignoredLyricSecondaryPlaceholderKeys.removeAll()
         pendingLyricSecondaryModes.removeAll()
+        cancelLyricSecondaryTimeouts()
+        lyricSecondaryDeferredRequestWorkItem?.cancel()
+        lyricSecondaryDeferredRequestWorkItem = nil
+        activeLyricSecondaryRequest = nil
         lyricSecondaryTransfer = nil
+        lyricSecondaryRetryCounts.removeAll()
+        lyricSecondaryFailureCooldownUntilMs.removeAll()
+        translationLyricsState = .idle
+        romanizationLyricsState = .idle
         lyricTraceFullLyricsRequestAtMs.removeAll()
         lyricTraceFullLyricsStartAtMs.removeAll()
         lyricTraceFirstPlaybackLyricAtMs.removeAll()
 
         currentTrackID = ""
+        currentTrackGeneration = 0
         title = "-"
         artist = "-"
         album = "-"
@@ -6420,20 +7268,39 @@ extension BLETestManager: CBPeripheralDelegate {
         guard trackID == currentTrackID,
               fullLyricsTrackId == trackID,
               let mode = LyricSecondaryMode(rawValue: modeRaw),
+              let request = activeLyricSecondaryRequest,
+              request.trackId == trackID,
+              request.mode == mode,
+              request.connectionAttemptId == connectionAttemptId,
               !transferID.isEmpty else {
             log("[Lyrics-iOS] secondary discarded stale trackId=\(trackID)")
             return
         }
+        let itemCount = Self.intValue(object["itemCount"])
+        guard itemCount > 0 else {
+            handleLyricSecondaryFailure(
+                trackID: trackID,
+                mode: mode,
+                reason: "empty transfer",
+                explicitlyUnavailable: true
+            )
+            return
+        }
+        lyricSecondaryStartTimeoutWorkItem?.cancel()
+        lyricSecondaryStartTimeoutWorkItem = nil
         lyricSecondaryTransfer = LyricSecondaryTransfer(
             trackId: trackID,
             transferId: transferID,
             mode: mode,
-            itemCount: Self.intValue(object["itemCount"]),
+            itemCount: itemCount,
+            requestToken: request.token,
+            connectionAttemptId: request.connectionAttemptId,
             lines: [:]
         )
+        scheduleLyricSecondaryIdleTimeout(for: request)
         log(
             "[Lyrics-iOS] secondary start mode=\(mode.rawValue) " +
-                "items=\(Self.intValue(object["itemCount"]))"
+                "items=\(itemCount)"
         )
     }
 
@@ -6443,9 +7310,12 @@ extension BLETestManager: CBPeripheralDelegate {
         let modeRaw = object["mode"] as? String ?? ""
         guard trackID == currentTrackID,
               var transfer = lyricSecondaryTransfer,
+              let request = activeLyricSecondaryRequest,
               transfer.trackId == trackID,
               transfer.transferId == transferID,
-              transfer.mode.rawValue == modeRaw else {
+              transfer.mode.rawValue == modeRaw,
+              transfer.requestToken == request.token,
+              transfer.connectionAttemptId == connectionAttemptId else {
             return
         }
         let lineIndex = Self.intValue(object["lineIndex"])
@@ -6453,6 +7323,7 @@ extension BLETestManager: CBPeripheralDelegate {
         let partCount = Self.intValue(object["partCount"])
         guard lineIndex >= 0,
               partIndex >= 0,
+              partIndex < partCount,
               partCount > 0,
               let text = object["text"] as? String else {
             return
@@ -6465,6 +7336,7 @@ extension BLETestManager: CBPeripheralDelegate {
         lineParts.parts[partIndex] = text
         transfer.lines[lineIndex] = lineParts
         lyricSecondaryTransfer = transfer
+        scheduleLyricSecondaryIdleTimeout(for: request)
         if lineParts.parts.count == partCount {
             let assembled = (0..<partCount).compactMap { lineParts.parts[$0] }.joined()
             log(
@@ -6481,9 +7353,12 @@ extension BLETestManager: CBPeripheralDelegate {
         let modeRaw = object["mode"] as? String ?? ""
         guard trackID == currentTrackID,
               let transfer = lyricSecondaryTransfer,
+              let request = activeLyricSecondaryRequest,
               transfer.trackId == trackID,
               transfer.transferId == transferID,
-              transfer.mode.rawValue == modeRaw else {
+              transfer.mode.rawValue == modeRaw,
+              transfer.requestToken == request.token,
+              transfer.connectionAttemptId == connectionAttemptId else {
             log("[Lyrics-iOS] secondary end discarded stale trackId=\(trackID)")
             return
         }
@@ -6501,7 +7376,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 missing += 1
             }
         }
-        let itemMissing = max(transfer.itemCount - assembled.count, 0) + missing
+        let itemMissing = max(max(transfer.itemCount - assembled.count, 0), missing)
         log(
             "[Lyrics-iOS] secondary end mode=\(transfer.mode.rawValue) " +
                 "completed=\(assembled.count) missing=\(itemMissing)"
@@ -6511,8 +7386,12 @@ extension BLETestManager: CBPeripheralDelegate {
                 "[Lyrics-iOS] secondary incomplete mode=\(transfer.mode.rawValue) " +
                     "missingLines=\(itemMissing)"
             )
-            lyricSecondaryTransfer = nil
-            requestNextLyricSecondaryIfPossible()
+            handleLyricSecondaryFailure(
+                trackID: transfer.trackId,
+                mode: transfer.mode,
+                reason: "missing \(itemMissing) lines",
+                explicitlyUnavailable: false
+            )
             return
         }
         mergeLyricSecondary(
@@ -6523,7 +7402,14 @@ extension BLETestManager: CBPeripheralDelegate {
         completedLyricSecondaryKeys.insert(
             lyricSecondaryKey(trackID: transfer.trackId, mode: transfer.mode)
         )
+        lyricSecondaryRetryCounts.removeValue(
+            forKey: lyricSecondaryKey(trackID: transfer.trackId, mode: transfer.mode)
+        )
+        cancelLyricSecondaryTimeouts()
+        activeLyricSecondaryRequest = nil
         lyricSecondaryTransfer = nil
+        setLyricSecondaryState(.ready, mode: transfer.mode)
+        saveFullLyricsCacheIfCurrent(reason: "secondary \(transfer.mode.rawValue)")
         log(
             "[Lyrics-iOS] secondary publish mode=\(transfer.mode.rawValue) " +
                 "lines=\(assembled.count)"
@@ -6531,18 +7417,33 @@ extension BLETestManager: CBPeripheralDelegate {
         requestNextLyricSecondaryIfPossible()
     }
 
-    private func handleLyricSecondaryUnavailable(_ object: [String: Any]) {
+    private func handleLyricSecondaryUnavailable(
+        _ object: [String: Any],
+        isError: Bool
+    ) {
         let trackID = object["trackId"] as? String ?? currentTrackID
         let modeRaw = object["mode"] as? String ?? ""
-        if let mode = LyricSecondaryMode(rawValue: modeRaw) {
-            completedLyricSecondaryKeys.insert(lyricSecondaryKey(trackID: trackID, mode: mode))
+        guard trackID == currentTrackID,
+              let mode = LyricSecondaryMode(rawValue: modeRaw),
+              let request = activeLyricSecondaryRequest,
+              request.trackId == trackID,
+              request.mode == mode,
+              request.connectionAttemptId == connectionAttemptId else {
+            log("[Lyrics-iOS] secondary unavailable discarded stale trackId=\(trackID)")
+            return
         }
-        lyricSecondaryTransfer = nil
+        let reason = object["reason"] as? String ?? object["message"] as? String ??
+            (isError ? "remote error" : "not available")
         log(
-            "[Lyrics-iOS] secondary unavailable mode=\(modeRaw) " +
-                "reason=\(object["reason"] as? String ?? object["message"] as? String ?? "")"
+            "[Lyrics-iOS] secondary \(isError ? "error" : "unavailable") " +
+                "mode=\(modeRaw) reason=\(reason)"
         )
-        requestNextLyricSecondaryIfPossible()
+        handleLyricSecondaryFailure(
+            trackID: trackID,
+            mode: mode,
+            reason: reason,
+            explicitlyUnavailable: !isError
+        )
     }
 
     private func mergeLyricSecondary(
@@ -6624,7 +7525,40 @@ extension BLETestManager: CBPeripheralDelegate {
         trackID: String,
         isFinal: Bool
     ) {
-        let sortedLines = lines.sorted { $0.index < $1.index }
+        let existingByIndex: [Int: LyricLine]
+        if fullLyricsTrackId == trackID {
+            existingByIndex = Dictionary(uniqueKeysWithValues: fullLyrics.map { ($0.index, $0) })
+        } else {
+            existingByIndex = [:]
+        }
+        let incomingLines = lines
+            .map { line in
+                guard let existing = existingByIndex[line.index] else { return line }
+                return LyricLine(
+                    index: line.index,
+                    timeMs: line.timeMs,
+                    durationMs: line.durationMs,
+                    text: line.text,
+                    translation: sanitizedSecondaryText(line.translation) ??
+                        sanitizedSecondaryText(existing.translation),
+                    romanization: sanitizedSecondaryText(line.romanization) ??
+                        sanitizedSecondaryText(existing.romanization),
+                    words: line.words
+                )
+            }
+            .sorted { $0.index < $1.index }
+        let sortedLines: [LyricLine]
+        if !isFinal,
+           !existingByIndex.isEmpty,
+           existingByIndex.count > incomingLines.count {
+            var merged = existingByIndex
+            for line in incomingLines {
+                merged[line.index] = line
+            }
+            sortedLines = merged.values.sorted { $0.index < $1.index }
+        } else {
+            sortedLines = incomingLines
+        }
         fullLyrics = sortedLines
         fullLyricsTrackId = trackID
         isFullLyricsCurrent = true
@@ -6645,6 +7579,13 @@ extension BLETestManager: CBPeripheralDelegate {
         if isFinal {
             completedFullLyricsTrackIDs.insert(trackID)
             mediaLoadingState.lyric = .ready(lineCount: sortedLines.count)
+            if transCount > 0 {
+                translationLyricsState = .ready
+            }
+            if romaCount > 0 {
+                romanizationLyricsState = .ready
+            }
+            saveFullLyricsCacheIfCurrent(reason: "fullLyrics")
             log(
                 "[FullLyrics] end count=\(fullLyrics.count) " +
                     "transCount=\(transCount) romaCount=\(romaCount)"
@@ -6671,6 +7612,64 @@ extension BLETestManager: CBPeripheralDelegate {
         scheduleLastNowPlayingSnapshotSave(
             reason: isFinal ? "fullLyrics" : "lyricWindow",
             force: isFinal
+        )
+    }
+
+    private func restoreFullLyricsCacheIfAvailable(
+        trackID: String,
+        title: String,
+        artist: String
+    ) {
+        FullLyricsCacheStore.shared.load(
+            trackId: trackID,
+            title: title,
+            artist: artist
+        ) { [weak self] entry in
+            guard let self,
+                  let entry,
+                  self.currentTrackID == trackID,
+                  !self.completedFullLyricsTrackIDs.contains(trackID) else {
+                return
+            }
+            let lines = entry.lines.map(Self.lyricLine(from:))
+            guard !lines.isEmpty else { return }
+            self.fullLyrics = lines.sorted { $0.index < $1.index }
+            self.fullLyricsTrackId = trackID
+            self.isFullLyricsCurrent = true
+            self.mediaLoadingState.lyric = .windowReady(lineCount: lines.count)
+            if lines.contains(where: { sanitizedSecondaryText($0.translation) != nil }) {
+                self.translationLyricsState = .ready
+            }
+            if lines.contains(where: { sanitizedSecondaryText($0.romanization) != nil }) {
+                self.romanizationLyricsState = .ready
+            }
+            self.log(
+                "[FullLyricsCache] hit trackId=\(trackID) lines=\(lines.count) " +
+                    "ageMs=\(Int64(Date().timeIntervalSince(entry.savedAt) * 1_000))"
+            )
+        }
+    }
+
+    private func saveFullLyricsCacheIfCurrent(reason: String) {
+        guard !currentTrackID.isEmpty,
+              fullLyricsTrackId == currentTrackID,
+              !fullLyrics.isEmpty,
+              !isShowingLastNowPlayingSnapshot else {
+            return
+        }
+        let entry = FullLyricsCacheEntry(
+            version: FullLyricsCacheEntry.version,
+            trackId: currentTrackID,
+            title: title,
+            artist: artist,
+            album: album,
+            lines: fullLyrics.map(Self.cacheLine(from:)),
+            savedAt: Date()
+        )
+        FullLyricsCacheStore.shared.save(entry)
+        log(
+            "[FullLyricsCache] save queued reason=\(reason) " +
+                "trackId=\(currentTrackID) lines=\(fullLyrics.count)"
         )
     }
 
@@ -6778,6 +7777,44 @@ extension BLETestManager: CBPeripheralDelegate {
     }
 
     private static func lyricLine(from line: LastNowPlayingSnapshot.Line) -> LyricLine {
+        LyricLine(
+            index: line.index,
+            timeMs: line.timeMs,
+            durationMs: line.durationMs,
+            text: line.text,
+            translation: line.translation,
+            romanization: line.romanization,
+            words: line.words.map {
+                LyricWord(
+                    id: $0.id,
+                    startMs: $0.startMs,
+                    durationMs: $0.durationMs,
+                    text: $0.text
+                )
+            }
+        )
+    }
+
+    private static func cacheLine(from line: LyricLine) -> FullLyricsCacheEntry.Line {
+        FullLyricsCacheEntry.Line(
+            index: line.index,
+            timeMs: line.timeMs,
+            durationMs: line.durationMs,
+            text: line.text,
+            translation: line.translation,
+            romanization: line.romanization,
+            words: line.words.map {
+                FullLyricsCacheEntry.Word(
+                    id: $0.id,
+                    startMs: $0.startMs,
+                    durationMs: $0.durationMs,
+                    text: $0.text
+                )
+            }
+        )
+    }
+
+    private static func lyricLine(from line: FullLyricsCacheEntry.Line) -> LyricLine {
         LyricLine(
             index: line.index,
             timeMs: line.timeMs,
@@ -6917,7 +7954,7 @@ extension BLETestManager: CBPeripheralDelegate {
             ? fullLyrics[effectiveLineIndex]
             : nil
         if isSameTrackId(incoming: trackID, current: fullLyricsTrackId),
-           let line = fullLyrics.first(where: { $0.index == effectiveLineIndex }) ?? lineByOffset {
+           let line = fullLyricLine(withIndex: effectiveLineIndex) ?? lineByOffset {
             lyric = line.text
         } else if let locallyResolvedLyric {
             lyric = locallyResolvedLyric
@@ -7006,6 +8043,24 @@ extension BLETestManager: CBPeripheralDelegate {
         }
     }
 
+    private func fullLyricLine(withIndex target: Int) -> LyricLine? {
+        var lower = 0
+        var upper = fullLyrics.count - 1
+        while lower <= upper {
+            let middle = lower + (upper - lower) / 2
+            let line = fullLyrics[middle]
+            if line.index == target {
+                return line
+            }
+            if line.index < target {
+                lower = middle + 1
+            } else {
+                upper = middle - 1
+            }
+        }
+        return nil
+    }
+
     private func updateInterpolatedProgress() {
         guard !isSeeking else { return }
         guard durationMs > 0 else {
@@ -7044,32 +8099,56 @@ extension BLETestManager: CBPeripheralDelegate {
             return
         }
 
-        var data = Data()
-        data.reserveCapacity(trackInfoExpectedSize)
-        for index in 0..<trackInfoExpectedChunks {
-            guard let chunk = trackInfoChunks[index] else {
-                log("[TrackInfo] decode failed missing index=\(index)")
-                resetTrackInfoTransfer()
-                return
-            }
-            data.append(chunk)
-        }
+        let expectedSize = trackInfoExpectedSize
+        let expectedChunks = trackInfoExpectedChunks
+        let chunks = trackInfoChunks
+        let token = trackInfoTransferToken
+        trackInfoExpectedSize = 0
+        trackInfoExpectedChunks = 0
+        trackInfoChunks.removeAll(keepingCapacity: true)
 
-        guard data.count == trackInfoExpectedSize,
-              let object = try? JSONSerialization.jsonObject(
-                with: data
-              ) as? [String: Any],
-              object["type"] as? String == "trackInfo" else {
-            log("[TrackInfo] decode failed")
-            resetTrackInfoTransfer()
-            return
+        protocolDecodeQueue.async { [weak self] in
+            let signpost = AppPerformanceLog.protocolSignposter.beginInterval("TrackInfo Decode")
+            var data = Data()
+            data.reserveCapacity(expectedSize)
+            for index in 0..<expectedChunks {
+                guard let chunk = chunks[index] else {
+                    AppPerformanceLog.protocolSignposter.endInterval("TrackInfo Decode", signpost)
+                    DispatchQueue.main.async { [weak self] in
+                        self?.log("[TrackInfo] decode failed missing index=\(index)")
+                    }
+                    return
+                }
+                data.append(chunk)
+            }
+            let payload = data.count == expectedSize
+                ? try? JSONDecoder().decode(TrackInfoTransferPayload.self, from: data)
+                : nil
+            AppPerformanceLog.protocolSignposter.endInterval("TrackInfo Decode", signpost)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.trackInfoTransferToken == token else {
+                    self?.log("[TrackInfo] stale decode ignored")
+                    return
+                }
+                guard let payload, payload.type == "trackInfo" else {
+                    self.log("[TrackInfo] decode failed")
+                    return
+                }
+                self.applyTrackInfo([
+                    "type": payload.type,
+                    "title": payload.title ?? "-",
+                    "artist": payload.artist ?? "-",
+                    "album": payload.album ?? "-",
+                    "trackId": payload.trackId ?? "",
+                    "generation": payload.generation ?? 0
+                ])
+                self.log("[TrackInfo] decode success bytes=\(data.count)")
+            }
         }
-        applyTrackInfo(object)
-        log("[TrackInfo] decode success bytes=\(data.count)")
-        resetTrackInfoTransfer()
     }
 
     private func resetTrackInfoTransfer() {
+        trackInfoTransferToken = UUID()
         trackInfoExpectedSize = 0
         trackInfoExpectedChunks = 0
         trackInfoChunks.removeAll()
@@ -7082,39 +8161,43 @@ extension BLETestManager: CBPeripheralDelegate {
     ) {
         let trackAtStart = currentTrackID
         let revision = currentLiveArtworkRevision + 1
+        let writeRequest = liveArtworkRevisionFence.begin()
         log("[LiveArtwork] current main album key=\(key)")
-        let wrote = LiveActivityArtworkStore.shared.writeThumbnail(
+        LiveActivityArtworkStore.shared.writeThumbnail(
             image: image,
             key: key,
             revision: revision,
-            logger: { [weak self] message in
-                self?.log(message)
+            completion: { [weak self] result in
+                guard let self else { return }
+                result.messages.forEach(self.log)
+                guard self.liveArtworkRevisionFence.accepts(writeRequest),
+                      self.currentTrackID == trackAtStart,
+                      self.albumArtReceiver.currentAlbumArtID == key else {
+                    self.log(
+                        "[LiveArtwork] stale result ignored oldTrackId=\(trackAtStart) " +
+                            "currentTrackId=\(self.currentTrackID)"
+                    )
+                    return
+                }
+                guard result.succeeded else {
+                    self.log("[LiveArtwork] update skipped reason=write failed key=\(key)")
+                    return
+                }
+
+                self.currentLiveArtworkKey = key
+                self.currentLiveArtworkRevision = revision
+                self.log(
+                    "[LiveArtwork] update requested key=\(key) " +
+                        "revision=\(revision) source=\(reason)"
+                )
+                self.updateLiveActivity(force: true, reason: "artworkReady")
             }
         )
-        guard currentTrackID == trackAtStart,
-              albumArtReceiver.currentAlbumArtID == key else {
-            log(
-                "[LiveArtwork] stale result ignored oldTrackId=\(trackAtStart) " +
-                    "currentTrackId=\(currentTrackID)"
-            )
-            return
-        }
-        guard wrote else {
-            log("[LiveArtwork] update skipped reason=write failed key=\(key)")
-            return
-        }
-
-        currentLiveArtworkKey = key
-        currentLiveArtworkRevision = revision
-        log(
-            "[LiveArtwork] update requested key=\(key) " +
-                "revision=\(revision) source=\(reason)"
-        )
-        updateLiveActivity(force: true, reason: "artworkReady")
     }
 
     private func clearLiveArtwork(reason: String, shouldUpdate: Bool) {
         guard currentLiveArtworkKey != nil else { return }
+        liveArtworkRevisionFence.invalidate()
         currentLiveArtworkKey = nil
         currentLiveArtworkRevision += 1
         log("[LiveArtwork] update requested key=nil revision=\(currentLiveArtworkRevision) reason=\(reason)")

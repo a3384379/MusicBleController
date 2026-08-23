@@ -95,6 +95,29 @@
    - FullLyrics 重传只校验歌词自身的 `trackId + generation + transferId`，不得依赖当前封面 ID/状态。
 6. 协商失败、正文超限、metadata 超 MTU 或旧端连接时自动回退 legacy，不改变 QRC 解密和 secondary 协议。
 
+## 可选 V3 基础协商
+
+V3 是逐项可选能力层，不替换 V2。UUID、命令名、A1/A2、legacy 和全部 V2 字段保持不变；任一能力未协商时立即沿用现有 V2/legacy 行为。
+
+- 客户端必须同时发送 `protocolVersion=3` 和 `f3` 才进入 V3 协商。只发送版本号不会启用任何 V3 行为。
+- `f3` bit0=`statusMetaV1`、bit1=`structuredErrorV1`、bit2=`mediaLoadStateV1`。Sony 只回显双方都支持的位；单项不支持时仅关闭该位。
+- `statusMetaV1` 仅在该设备有效 notify payload 不小于 247 bytes 时启用，小 MTU 会自动清除 bit0，不影响另外两个能力。
+- V3 ACK 使用紧凑格式：`{"type":"clientCapabilitiesAck","protocolVersion":3,"f2":63,"f3":<negotiated>,"sid":"1234abcd"}`。`sid` 是本次 Sony 服务进程的 8 位十六进制会话 ID。
+- `f2` bit0～bit5 依次表示 `albumArtBinary`、`fullLyricsZlib`、`lyricWindow`、`ping`、`clockSyncV1`、`transferRetry`。客户端仍发送原有 V2 boolean，Sony 据此生成 `f2`。
+- V1/V2 客户端继续收到原有 verbose ACK（`protocolVersion=2` 加六个 boolean）；旧端不会收到 `f2`、`f3`、`sid` 或 `es`。
+
+协商 `statusMetaV1` 后，Sony 可为该设备的 JSON 状态附加 `sid` 和 `es`。`es` 是每设备 UInt64 enqueue 序号，只用于发现 notify 缺口或重复；不同优先级可能交错，接收端不得按 `es` 全局丢弃状态。媒体正确性仍以 `trackId + generation + transferId` 为准。
+
+协商 `structuredErrorV1` 后，Sony 可发送：
+
+```json
+{"type":"commandError","seq":"42","cmd":"GET_FULL_LYRICS","domain":"lyrics","code":"qrc_pending","retryable":true,"retryAfterMs":1200,"trackId":"...","generation":7,"sid":"1234abcd","es":9}
+```
+
+`domain` 为 `protocol/lyrics/artwork/history/connection`。错误必须关联原命令 `seq`；ATT 写响应只表示命令已收到，不能冒充业务成功。正常成功状态仍由现有 authoritative status 表示。
+
+协商 `mediaLoadStateV1` 后，Sony 可发送 P1 `mediaLoadState`：`resource=lyrics/artwork`，`stage=waiting/preparing/transferring/ready/unavailable/failed`。状态按设备与 `trackId/resource/stage/reason/generation` 去重，仅转换时发送；`ready` 表示对应传输已经完成。歌词 reason 包含 `qrc_pending/qrc_not_found/qrc_ambiguous/qrc_parse_failed/transfer_preparing/transfer_failed`，封面包含 `source_pending/source_unavailable/encode_failed/transfer_preparing/transfer_failed`。
+
 ## 自动歌词时钟同步
 
 - `clockSyncV1` 只在双方能力 ACK 后启用。iOS 连接后连续发送 5 个低开销 PING，之后每 120 秒发送 3 个复验样本；旧端忽略新字段并维持原偏移逻辑。

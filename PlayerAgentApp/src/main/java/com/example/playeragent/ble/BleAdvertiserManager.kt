@@ -98,6 +98,10 @@ class BleAdvertiserManager(
 
         val advertiseData = AdvertiseData.Builder()
             .setIncludeDeviceName(true)
+            // CoreBluetooth service-filtered scans may discard a legacy
+            // advertisement before its scan response is merged. Keep A001 in
+            // the primary packet so a cold iOS scan can discover this server.
+            .addServiceUuid(ParcelUuid(PlayerAgentUuids.SERVICE_UUID))
             .build()
 
         val scanResponse = AdvertiseData.Builder()
@@ -107,7 +111,10 @@ class BleAdvertiserManager(
         try {
             updateState(AdvertisingState.STARTING)
             advertiser.startAdvertising(settings, advertiseData, scanResponse, advertiseCallback)
-            logger("BLE advertising start requested")
+            logger(
+                "BLE advertising start requested " +
+                    "primaryService=${PlayerAgentUuids.SERVICE_UUID} scanResponseService=true"
+            )
         } catch (securityException: SecurityException) {
             updateState(AdvertisingState.STOPPED)
             restartPending = false

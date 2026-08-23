@@ -1,11 +1,28 @@
 import SwiftUI
 
+enum PlayerLayoutMode: Equatable {
+    case regular
+    case compact
+    case accessibility
+
+    static func resolve(availableHeight: CGFloat, dynamicTypeSize: DynamicTypeSize) -> Self {
+        if dynamicTypeSize.isAccessibilitySize { return .accessibility }
+        return availableHeight <= 700 ? .compact : .regular
+    }
+
+    var isCompact: Bool { self != .regular }
+}
+
+private final class BLETestManagerOwner: ObservableObject {
+    let manager: BLETestManager
+
+    init(manager: BLETestManager = BLETestManager()) {
+        self.manager = manager
+    }
+}
+
 struct ContentView: View {
-    @State private var bleManager: BLETestManager
-    @ObservedObject private var connectionStateModel: ObservableStateSlice<BLEConnectionViewState>
-    @ObservedObject private var playbackStateModel: ObservableStateSlice<BLEPlaybackViewState>
-    @ObservedObject private var lyricsStateModel: ObservableStateSlice<BLELyricsViewState>
-    @ObservedObject private var artworkStateModel: ObservableStateSlice<BLEArtworkViewState>
+    @StateObject private var managerOwner = BLETestManagerOwner()
     @ObservedObject private var preferences = PreferencesStore.shared
     @State private var showFullLyrics = false
     @State private var showDebugPage = false
@@ -14,94 +31,76 @@ struct ContentView: View {
     @State private var showNowPlayingDiagnostic = false
     @State private var showSystemHealthOverview = false
     @State private var showPreferences = false
-    @State private var isVolumeFeedbackVisible = false
-    @State private var volumeFeedbackGeneration = 0
 
-    init() {
-        let manager = BLETestManager()
-        _bleManager = State(initialValue: manager)
-        _connectionStateModel = ObservedObject(wrappedValue: manager.connectionStateModel)
-        _playbackStateModel = ObservedObject(wrappedValue: manager.playbackStateModel)
-        _lyricsStateModel = ObservedObject(wrappedValue: manager.lyricsStateModel)
-        _artworkStateModel = ObservedObject(wrappedValue: manager.artworkStateModel)
-    }
+    private var manager: BLETestManager { managerOwner.manager }
 
     var body: some View {
         NavigationStack {
             ZStack {
-                PlayerBackgroundView(image: bleManager.albumArtImage)
+                PlayerBackgroundHost(store: manager.artworkStore)
                     .ignoresSafeArea()
 
                 GeometryReader { proxy in
-                    darkControlLayout(size: proxy.size)
+                    ResponsivePlayerLayout(
+                        manager: manager,
+                        availableSize: proxy.size,
+                        showFullLyrics: $showFullLyrics,
+                        showDebugPage: $showDebugPage,
+                        showPlaybackHistory: $showPlaybackHistory,
+                        showLyricDiagnostic: $showLyricDiagnostic,
+                        showNowPlayingDiagnostic: $showNowPlayingDiagnostic,
+                        showSystemHealthOverview: $showSystemHealthOverview,
+                        showPreferences: $showPreferences
+                    )
                 }
             }
             .toolbar(.hidden, for: .navigationBar)
             .sheet(isPresented: $showDebugPage) {
-                DebugToolsView(bleManager: bleManager)
+                DebugToolsView(bleManager: manager)
             }
             .sheet(isPresented: $showPlaybackHistory) {
-                PlaybackHistoryView(bleManager: bleManager)
+                PlaybackHistoryView(bleManager: manager)
             }
             .sheet(isPresented: $showPreferences) {
-                PreferencesView(
-                    bleManager: bleManager,
-                    onDismiss: { showPreferences = false }
-                )
+                PreferencesView(bleManager: manager, onDismiss: { showPreferences = false })
             }
             .sheet(isPresented: $showLyricDiagnostic) {
                 LyricDiagnosticView(
-                    bleManager: bleManager,
+                    bleManager: manager,
                     onDismiss: { showLyricDiagnostic = false }
                 )
             }
             .sheet(isPresented: $showNowPlayingDiagnostic) {
                 NowPlayingDiagnosticView(
-                    bleManager: bleManager,
+                    bleManager: manager,
                     onDismiss: { showNowPlayingDiagnostic = false }
                 )
             }
             .sheet(isPresented: $showSystemHealthOverview) {
                 SystemHealthOverviewView(
-                    bleManager: bleManager,
+                    bleManager: manager,
                     onDismiss: { showSystemHealthOverview = false }
                 )
             }
             .fullScreenCover(isPresented: $showFullLyrics) {
-                FullLyricsView(
-                    title: nowPlayingInfo.title,
-                    artist: nowPlayingInfo.artist,
-                    albumArtImage: bleManager.albumArtImage,
-                    lyrics: currentTrackFullLyrics,
-                    currentIndex: currentFullLyricIndex,
-                    positionMs: karaokePositionMs,
-                    isPlaying: bleManager.isPlaying,
-                    isConnected: isConnected,
+                FullLyricsStoreHost(
+                    manager: manager,
                     onDismiss: { showFullLyrics = false },
-                    onPrevious: bleManager.sendPrevious,
-                    onPlayPause: bleManager.sendPlayPause,
-                    onNext: bleManager.sendNext,
-                    onSeekToLine: bleManager.seekToLyricLine,
-                    showDiagnosticButton: isDebugMode,
                     onShowDiagnostic: {
                         showFullLyrics = false
                         showLyricDiagnostic = true
                     }
                 )
             }
-            .onChange(of: displayedPositionMs) { _, newValue in
-                bleManager.logKaraokeOffset(rawPositionMs: newValue)
+            .onChange(of: preferences.lyricDisplayMode) { _, mode in
+                manager.requestFullLyricsOptionalFieldsIfNeeded(displayMode: mode)
             }
-            .onChange(of: preferences.lyricDisplayMode) { _, _ in
-                requestOptionalLyricsIfNeeded()
-            }
-            .onChange(of: showFullLyrics) { _, isPresented in
-                if isPresented {
-                    requestOptionalLyricsIfNeeded()
+            .onChange(of: showFullLyrics) { _, presented in
+                if presented {
+                    manager.requestFullLyricsOptionalFieldsIfNeeded(
+                        displayMode: preferences.lyricDisplayMode
+                    )
                 }
-            }
-            .onChange(of: bleManager.fullLyrics) { _, _ in
-                requestOptionalLyricsIfNeeded()
             }
             .onChange(of: preferences.appExperienceMode) { _, mode in
                 if mode == .daily {
@@ -113,1018 +112,897 @@ struct ContentView: View {
             }
         }
     }
+}
 
-    private func darkControlLayout(size: CGSize) -> some View {
-        let horizontalPadding = size.width >= 430 ? CGFloat(32) : CGFloat(24)
-        return darkMainPlayerPanel
-            .padding(.horizontal, horizontalPadding)
-            .padding(.top, 22)
-            .padding(.bottom, 24)
-            .frame(width: size.width, height: size.height)
+private struct PlayerBackgroundHost: View {
+    let store: ArtworkStore
+
+    var body: some View {
+        PlayerBackgroundView(image: store.state.image)
+    }
+}
+
+private struct ResponsivePlayerLayout: View {
+    let manager: BLETestManager
+    let availableSize: CGSize
+    @Binding var showFullLyrics: Bool
+    @Binding var showDebugPage: Bool
+    @Binding var showPlaybackHistory: Bool
+    @Binding var showLyricDiagnostic: Bool
+    @Binding var showNowPlayingDiagnostic: Bool
+    @Binding var showSystemHealthOverview: Bool
+    @Binding var showPreferences: Bool
+
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    var body: some View {
+        let mode = PlayerLayoutMode.resolve(
+            availableHeight: availableSize.height,
+            dynamicTypeSize: dynamicTypeSize
+        )
+        let horizontalPadding: CGFloat = availableSize.width >= 430 ? 32 : 24
+
+        Group {
+            if mode == .regular {
+                regularContent
+            } else {
+                ViewThatFits(in: .vertical) {
+                    compactContent(mode: mode)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    ScrollView(.vertical, showsIndicators: false) {
+                        compactContent(mode: mode)
+                            .padding(.vertical, 4)
+                    }
+                    .scrollBounceBehavior(.basedOnSize)
+                }
+            }
+        }
+        .padding(.horizontal, horizontalPadding)
+        .safeAreaPadding(.top, mode.isCompact ? 4 : 12)
+        .safeAreaPadding(.bottom, mode.isCompact ? 8 : 20)
+        .frame(width: availableSize.width, height: availableSize.height, alignment: .top)
     }
 
-    private var darkMainPlayerPanel: some View {
+    private var regularContent: some View {
         VStack(spacing: 0) {
-            darkSystemHeader
+            header(mode: .regular)
 
-            Spacer(minLength: 24)
-
-            darkTrackInfoSection
-
-            Spacer(minLength: 28)
-
-            darkLyricsSection
-
-            Spacer(minLength: 22)
-
-            darkProgressSection
-                .padding(.bottom, 26)
-
-            darkControlSection
-                .padding(.bottom, 30)
-
-            darkVolumeControl
+            if showsConnectionGuide {
+                Spacer(minLength: 18)
+                connectionGuide
+                    .frame(maxHeight: .infinity)
+                Spacer(minLength: 8)
+            } else {
+                Spacer(minLength: 24)
+                TrackInfoStoreView(manager: manager, mode: .regular)
+                Spacer(minLength: 28)
+                LyricsPreviewStoreView(
+                    manager: manager,
+                    mode: .regular,
+                    showFullLyrics: $showFullLyrics
+                )
+                Spacer(minLength: 22)
+                PlaybackProgressStoreView(manager: manager)
+                    .padding(.bottom, 26)
+                PlaybackControlsStoreView(manager: manager, mode: .regular)
+                    .padding(.bottom, 30)
+                VolumeControlStoreView(manager: manager)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .overlay(alignment: .top) {
-            if isDebugMode, bleManager.title != "-" {
-                mediaLoadingOverlay
-                    .padding(.top, 48)
-            }
-        }
     }
 
-    private var mediaLoadingOverlay: some View {
-        HStack(spacing: 8) {
-            Text(bleManager.mediaLoadingState.lyric.title)
-                .foregroundStyle(
-                    bleManager.mediaLoadingState.lyric.isFailure
-                        ? Color.orange
-                        : Color.white.opacity(0.68)
-                )
-                .lineLimit(1)
+    private func compactContent(mode: PlayerLayoutMode) -> some View {
+        VStack(spacing: mode.isCompact ? 10 : 18) {
+            header(mode: mode)
 
-            Button {
-                bleManager.retryCurrentLyricsFromMain()
-            } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .accessibilityLabel("重试当前歌词")
-
-            Rectangle()
-                .fill(.white.opacity(0.16))
-                .frame(width: 1, height: 13)
-
-            Text(bleManager.mediaLoadingState.artwork.title)
-                .foregroundStyle(
-                    bleManager.mediaLoadingState.artwork.isFailure
-                        ? Color.orange
-                        : Color.white.opacity(0.68)
-                )
-                .lineLimit(1)
-
-            Button {
-                bleManager.retryCurrentAlbumArtFromMain()
-            } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .accessibilityLabel("重试当前封面")
+            PlayerContentStoreRouter(
+                manager: manager,
+                mode: mode,
+                showFullLyrics: $showFullLyrics
+            )
         }
-        .font(.system(size: 10, weight: .semibold, design: .rounded))
-        .padding(.horizontal, 10)
-        .frame(height: 25)
-        .background(.black.opacity(0.42), in: Capsule())
-        .overlay {
-            Capsule().stroke(.white.opacity(0.08), lineWidth: 1)
-        }
-        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
     }
 
-    private var darkSystemHeader: some View {
+    private var showsConnectionGuide: Bool {
+        !manager.connectionStore.presentation.isConnected &&
+            !manager.artworkStore.state.isRestoredSnapshot
+    }
+
+    private var connectionGuide: some View {
+        ConnectionGuideStoreView(
+            presentation: manager.connectionStore.presentation,
+            onConnect: manager.scanSonyFromMenu
+        )
+    }
+
+    private func header(mode: PlayerLayoutMode) -> some View {
+        PlayerHeaderStoreView(
+            manager: manager,
+            mode: mode,
+            showDebugPage: $showDebugPage,
+            showPlaybackHistory: $showPlaybackHistory,
+            showLyricDiagnostic: $showLyricDiagnostic,
+            showNowPlayingDiagnostic: $showNowPlayingDiagnostic,
+            showSystemHealthOverview: $showSystemHealthOverview,
+            showPreferences: $showPreferences
+        )
+    }
+}
+
+private struct PlayerHeaderStoreView: View {
+    let manager: BLETestManager
+    let mode: PlayerLayoutMode
+    @Binding var showDebugPage: Bool
+    @Binding var showPlaybackHistory: Bool
+    @Binding var showLyricDiagnostic: Bool
+    @Binding var showNowPlayingDiagnostic: Bool
+    @Binding var showSystemHealthOverview: Bool
+    @Binding var showPreferences: Bool
+
+    @ObservedObject private var preferences = PreferencesStore.shared
+
+    var body: some View {
         HStack(spacing: 12) {
-            Button {
-                handleConnectionChipTap()
-            } label: {
+            Button(action: handleConnectionTap) {
                 HStack(spacing: 7) {
-                    connectionStatusIndicator
-
-                    Text(systemState.connection.compactTitle)
-                        .font(.system(size: 13, weight: .semibold, design: .rounded))
-                        .foregroundStyle(connectionChipForegroundColor)
-                        .lineLimit(1)
-                        .contentTransition(.opacity)
+                    statusIndicator
+                    if mode != .accessibility {
+                        Text(statusTitle)
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .foregroundStyle(isConnected ? .white.opacity(0.88) : statusColor)
+                            .lineLimit(1)
+                            .contentTransition(.opacity)
+                    }
                 }
                 .padding(.horizontal, 11)
                 .frame(height: 34)
-                .background(connectionChipBackground, in: Capsule())
-                .overlay {
-                    Capsule()
-                        .strokeBorder(connectionChipBorderColor, lineWidth: 1)
-                }
+                .background(statusColor.opacity(isConnected ? 0.06 : 0.13), in: Capsule())
+                .overlay { Capsule().strokeBorder(statusColor.opacity(0.20), lineWidth: 1) }
                 .contentShape(Rectangle())
                 .padding(.vertical, 5)
             }
             .buttonStyle(PressScaleButtonStyle(pressedScale: 0.98))
-            .accessibilityLabel(systemState.connection.accessibilityLabel)
+            .accessibilityLabel(
+                isConnected ? AppLocalization.string("Sony 已连接") : statusTitle
+            )
             .accessibilityHint(
-                isConnected
-                    ? "点按查看连接详情"
-                    : "点按扫描并连接 Sony"
+                AppLocalization.string(
+                    isConnected ? "点按查看连接详情" : "点按扫描并连接 Sony"
+                )
             )
 
             Spacer()
 
-            darkMenuButton
+            Menu {
+                Button { manager.scanSonyFromMenu() } label: {
+                    Label("扫描 / 重连", systemImage: "antenna.radiowaves.left.and.right")
+                }
+                Button { showPlaybackHistory = true } label: {
+                    Label("播放历史", systemImage: "clock.arrow.circlepath")
+                }
+                Button { showPreferences = true } label: {
+                    Label("更多设置", systemImage: "gearshape")
+                }
+                Button { manager.toggleAppExperienceMode() } label: {
+                    Label(
+                        preferences.appExperienceMode.toggleTitle,
+                        systemImage: isDebugMode ? "person.fill" : "ladybug.fill"
+                    )
+                }
+                if isDebugMode {
+                    Divider()
+                    Button { showSystemHealthOverview = true } label: {
+                        Label("系统健康总览", systemImage: "heart.text.square")
+                    }
+                    Button { showNowPlayingDiagnostic = true } label: {
+                        Label("当前歌曲诊断", systemImage: "waveform.path.ecg.rectangle")
+                    }
+                    Button {
+                        manager.requestLyricDiagnostic(manual: true)
+                        showLyricDiagnostic = true
+                    } label: {
+                        Label("歌词诊断中心", systemImage: "text.magnifyingglass")
+                    }
+                    Button { showDebugPage = true } label: {
+                        Label("调试工具", systemImage: "slider.horizontal.3")
+                    }
+                }
+                Divider()
+                Picker(
+                    "歌词显示",
+                    selection: Binding(
+                        get: { preferences.lyricDisplayMode },
+                        set: { preferences.lyricDisplayMode = $0 }
+                    )
+                ) {
+                    ForEach(LyricDisplayMode.allCases) { mode in
+                        Text(mode.menuTitle).tag(mode)
+                    }
+                }
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.86))
+                    .frame(width: 42, height: 42)
+                    .background(.white.opacity(0.05), in: Circle())
+                    .overlay { Circle().stroke(.white.opacity(0.08), lineWidth: 1) }
+            }
+            .buttonStyle(PressScaleButtonStyle(pressedScale: 0.96))
+            .accessibilityLabel("设置")
         }
-        .animation(.easeInOut(duration: 0.18), value: systemState.connection)
     }
 
+    private var presentation: BLEConnectionPresentationState {
+        manager.connectionStore.presentation
+    }
+    private var isConnected: Bool { presentation.isConnected }
+    private var isDebugMode: Bool { preferences.appExperienceMode == .debug }
+    private var showsProgress: Bool {
+        switch presentation {
+        case .scanning, .connecting, .reconnecting: return true
+        default: return false
+        }
+    }
+    private var statusColor: Color { isConnected ? .green : .orange }
+    private var statusTitle: String {
+        let key: String = switch presentation {
+        case .connected: "已连接"
+        case .scanning: "扫描中"
+        case .connecting: "连接中"
+        case .reconnecting: "恢复连接"
+        case .unavailable(.poweredOff): "蓝牙已关闭"
+        case .unavailable(.unauthorized): "未授权"
+        case .unavailable(.unsupported): "不支持蓝牙"
+        case .unavailable: "蓝牙不可用"
+        case .failed: "连接失败"
+        case .disconnected: "连接"
+        }
+        return AppLocalization.string(key)
+    }
     @ViewBuilder
-    private var connectionStatusIndicator: some View {
-        if systemState.connection.showsProgressIndicator {
+    private var statusIndicator: some View {
+        if showsProgress {
             ProgressView()
                 .controlSize(.mini)
-                .tint(systemState.connection.color)
+                .tint(statusColor)
                 .frame(width: 12, height: 12)
-        } else if systemState.connection == .disconnected {
-            Image(systemName: "antenna.radiowaves.left.and.right.slash")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(systemState.connection.color)
+        } else if isConnected {
+            Circle()
+                .fill(statusColor)
+                .frame(width: 7, height: 7)
+                .shadow(color: statusColor.opacity(0.48), radius: 4)
                 .frame(width: 12, height: 12)
         } else {
-            Circle()
-                .fill(systemState.connection.color)
-                .frame(width: 7, height: 7)
-                .shadow(color: systemState.connection.color.opacity(0.48), radius: 4)
+            Image(systemName: statusIcon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(statusColor)
                 .frame(width: 12, height: 12)
         }
     }
-
-    private var connectionChipForegroundColor: Color {
-        isConnected ? .white.opacity(0.88) : systemState.connection.color.opacity(0.96)
+    private var statusIcon: String {
+        switch presentation {
+        case .connected: return "antenna.radiowaves.left.and.right"
+        case .unavailable(.poweredOff): return "power"
+        case .unavailable(.unauthorized): return "lock.trianglebadge.exclamationmark"
+        case .failed: return "exclamationmark.triangle.fill"
+        default: return "antenna.radiowaves.left.and.right.slash"
+        }
     }
-
-    private var connectionChipBackground: Color {
-        isConnected ? .white.opacity(0.055) : systemState.connection.color.opacity(0.12)
-    }
-
-    private var connectionChipBorderColor: Color {
-        isConnected ? .white.opacity(0.07) : systemState.connection.color.opacity(0.20)
-    }
-
-    private func handleConnectionChipTap() {
+    private func handleConnectionTap() {
         if isConnected {
             showPreferences = true
+        } else if case .unavailable(.unauthorized) = presentation,
+                  let url = URL(string: UIApplication.openSettingsURLString) {
+            UIApplication.shared.open(url)
         } else {
-            bleManager.scanSonyFromMenu()
+            manager.scanSonyFromMenu()
         }
     }
+}
 
-    private var darkMenuButton: some View {
-        Menu {
-            Button {
-                bleManager.scanSonyFromMenu()
-            } label: {
-                Label("扫描 / 重连", systemImage: "antenna.radiowaves.left.and.right")
-            }
+private struct PlayerContentStoreRouter: View {
+    let manager: BLETestManager
+    let mode: PlayerLayoutMode
+    @Binding var showFullLyrics: Bool
 
-            Button {
-                showPlaybackHistory = true
-            } label: {
-                Label("播放历史", systemImage: "clock.arrow.circlepath")
-            }
-
-            Button {
-                showPreferences = true
-            } label: {
-                Label("更多设置", systemImage: "gearshape")
-            }
-
-            Button {
-                bleManager.toggleAppExperienceMode()
-            } label: {
-                Label(
-                    preferences.appExperienceMode.toggleTitle,
-                    systemImage: isDebugMode ? "person.fill" : "ladybug.fill"
-                )
-            }
-
-            if isDebugMode {
-                Divider()
-
-                Button {
-                    showSystemHealthOverview = true
-                } label: {
-                    Label("系统健康总览", systemImage: "heart.text.square")
-                }
-
-                Button {
-                    showNowPlayingDiagnostic = true
-                } label: {
-                    Label("当前歌曲诊断", systemImage: "waveform.path.ecg.rectangle")
-                }
-
-                Button {
-                    bleManager.requestLyricDiagnostic(manual: true)
-                    showLyricDiagnostic = true
-                } label: {
-                    Label("歌词诊断中心", systemImage: "text.magnifyingglass")
-                }
-
-                Button {
-                    showDebugPage = true
-                } label: {
-                    Label("调试工具", systemImage: "slider.horizontal.3")
-                }
-            }
-
-            Divider()
-
-            Picker("歌词显示", selection: lyricDisplayModeBinding) {
-                ForEach(LyricDisplayMode.allCases) { mode in
-                    Text(mode.menuTitle).tag(mode)
-                }
-            }
-        } label: {
-            Image(systemName: "gearshape")
-                .font(.system(size: 22, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.86))
-                .frame(width: 42, height: 42)
-                .background(.white.opacity(0.05), in: Circle())
-                .overlay {
-                    Circle().stroke(.white.opacity(0.08), lineWidth: 1)
-                }
+    var body: some View {
+        if !manager.connectionStore.presentation.isConnected,
+           !manager.artworkStore.state.isRestoredSnapshot {
+            ConnectionGuideStoreView(
+                presentation: manager.connectionStore.presentation,
+                onConnect: manager.scanSonyFromMenu
+            )
+        } else {
+            PlayerStoreSections(
+                manager: manager,
+                mode: mode,
+                showFullLyrics: $showFullLyrics
+            )
         }
-        .buttonStyle(PressScaleButtonStyle(pressedScale: 0.96))
-        .accessibilityLabel("设置")
     }
+}
 
-    private var darkTrackInfoSection: some View {
-        HStack(spacing: 27) {
-            albumArtwork(size: 204)
+private struct ConnectionGuideStoreView: View {
+    let presentation: BLEConnectionPresentationState
+    let onConnect: () -> Void
 
-            VStack(alignment: .leading, spacing: 11) {
-                Text(nowPlayingInfo.title)
-                    .font(.system(size: 34, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
+    var body: some View {
+        VStack(spacing: 18) {
+            Image(systemName: icon)
+                .font(.system(size: 46, weight: .semibold))
+                .foregroundStyle(.orange.opacity(0.90))
+                .frame(width: 86, height: 86)
+                .background(.white.opacity(0.06), in: Circle())
+
+            VStack(spacing: 8) {
+                Text(title)
+                    .font(.title2.bold())
+                    .multilineTextAlignment(.center)
+                Text(detail)
+                    .font(.body)
+                    .foregroundStyle(.white.opacity(0.64))
+                    .multilineTextAlignment(.center)
+            }
+
+            Button(action: primaryAction) {
+                Label(buttonTitle, systemImage: isBusy ? "hourglass" : "antenna.radiowaves.left.and.right")
+                    .font(.headline)
+                    .multilineTextAlignment(.center)
                     .lineLimit(2)
-                    .minimumScaleFactor(0.58)
-
-                Text(nowPlayingInfo.artist)
-                    .font(.system(size: 21, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.74))
-                    .lineLimit(1)
-
-                Text("专辑 · \(nowPlayingInfo.album)")
-                    .font(.system(size: 15, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.46))
-                    .lineLimit(1)
-
-                DarkPlaybackStatusBadge(state: uiState.playback)
-                    .padding(.top, 8)
-                    .overlay(alignment: .bottomLeading) {
-                        if bleManager.isShowingLastNowPlayingSnapshot {
-                            Text("上次播放 · 等待同步")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.orange.opacity(0.88))
-                                .fixedSize()
-                                .offset(y: 22)
-                        }
-                    }
+                    .minimumScaleFactor(0.75)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: 280, minHeight: 50)
+                    .background(.white, in: Capsule())
+                    .foregroundStyle(.black)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .buttonStyle(PressScaleButtonStyle(pressedScale: 0.97))
+            .disabled(isPrimaryActionDisabled)
         }
+        .foregroundStyle(.white)
+        .frame(maxWidth: .infinity, minHeight: 430)
+        .padding(.horizontal, 24)
     }
 
-    private var darkLyricsSection: some View {
-        HStack(spacing: 22) {
-            DarkLyricSideDots(color: uiState.playback.accentColor)
-
-            VStack(spacing: 12) {
-                Text(lyricPreviewLine(offset: -1))
-                    .font(.system(size: 16, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.38))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .minimumScaleFactor(0.78)
-                    .frame(maxWidth: .infinity, minHeight: 20, maxHeight: 20)
-
-                KaraokeLyricText(
-                    text: lyricPreviewLine(offset: 0),
-                    progress: currentLyricProgress,
-                    words: lyricPreviewLineModel(offset: 0)?.words ?? [],
-                    positionMs: karaokePositionMs,
-                    highlightColor: uiState.playback.accentColor.opacity(0.92),
-                    normalColor: Color.white.opacity(0.90),
-                    font: .system(size: 27, weight: .semibold, design: .rounded),
-                    lineLimit: 2,
-                    alignment: .center
-                )
-                .minimumScaleFactor(0.76)
-                .truncationMode(.tail)
-                .frame(maxWidth: .infinity, minHeight: 64, maxHeight: 64)
-                .clipped()
-                .id(lyricPreviewIdentity)
-                .transition(.opacity)
-                .animation(.easeInOut(duration: 0.18), value: lyricPreviewIdentity)
-
-                Text(lyricPreviewLine(offset: 1))
-                    .font(.system(size: 16, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.40))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .minimumScaleFactor(0.78)
-                    .frame(maxWidth: .infinity, minHeight: 20, maxHeight: 20)
-
-                GeometryReader { proxy in
-                    DarkLyricRhythmLine(
-                        state: uiState.playback,
-                        trackSeed: "\(nowPlayingInfo.title)|\(nowPlayingInfo.artist)|\(nowPlayingInfo.album)",
-                        lyricProgress: currentLyricProgress,
-                        wordSignature: "\(bleManager.currentWordLineIndex):\(bleManager.currentWordIndex)",
-                        positionMs: karaokePositionMs
-                    )
-                        .frame(width: proxy.size.width * 0.5, height: 36)
-                        .frame(maxWidth: .infinity)
-                }
-                .frame(height: 36)
-            }
-            .frame(maxWidth: .infinity, minHeight: 176, maxHeight: 176)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                if bleManager.fullLyrics.isEmpty {
-                    bleManager.sendGetFullLyrics(force: true)
-                }
-                showFullLyrics = true
-            }
-
-            DarkLyricSideDots(color: uiState.playback.accentColor)
+    private var isBusy: Bool {
+        switch presentation {
+        case .scanning, .connecting, .reconnecting: return true
+        default: return false
         }
-        .accessibilityLabel("当前歌词，点按打开完整歌词")
     }
-
-    private var darkProgressSection: some View {
-        HStack(alignment: .center, spacing: 14) {
-            Text(format(milliseconds: displayedPositionMs))
-                .font(.caption.monospacedDigit().weight(.semibold))
-                .foregroundStyle(.white.opacity(0.72))
-                .frame(width: 46, alignment: .leading)
-
-            Slider(
-                value: Binding(
-                    get: {
-                        Double(
-                            bleManager.isSeeking
-                                ? bleManager.seekPositionMs
-                                : bleManager.displayPositionMs
-                        )
-                    },
-                    set: { value in
-                        bleManager.updateSeekPosition(value)
-                    }
-                ),
-                in: 0...Double(max(bleManager.durationMs, 1)),
-                onEditingChanged: { editing in
-                    if editing {
-                        bleManager.beginSeeking()
-                    } else {
-                        bleManager.finishSeeking()
-                    }
-                }
-            )
-            .tint(uiState.playback.accentColor)
-            .disabled(!isConnected || bleManager.durationMs <= 0)
-
-            Text(format(milliseconds: bleManager.durationMs))
-                .font(.caption.monospacedDigit().weight(.semibold))
-                .foregroundStyle(.white.opacity(0.72))
-                .frame(width: 46, alignment: .trailing)
+    private var isPrimaryActionDisabled: Bool {
+        if isBusy { return true }
+        switch presentation {
+        case .unavailable(.poweredOff), .unavailable(.unsupported), .unavailable(.resetting),
+                .unavailable(.unknown), .unavailable(.available):
+            return true
+        default:
+            return false
         }
-        .animation(
-            bleManager.isSeeking ? nil : .linear(duration: 0.18),
-            value: bleManager.positionMs
-        )
     }
+    private var title: String {
+        let key: String = switch presentation {
+        case .unavailable(.poweredOff): "请打开蓝牙"
+        case .unavailable(.unauthorized): "需要蓝牙权限"
+        case .unavailable(.unsupported): "此设备不支持蓝牙"
+        case .unavailable: "蓝牙暂不可用"
+        case .scanning: "正在查找 Sony"
+        case .connecting: "正在连接 Sony"
+        case .reconnecting: "正在恢复连接"
+        case .failed: "连接没有成功"
+        case .disconnected: "连接你的 Sony 设备"
+        case .connected: "已连接"
+        }
+        return AppLocalization.string(key)
+    }
+    private var detail: String {
+        let key: String = switch presentation {
+        case .unavailable(.poweredOff): "打开系统蓝牙后，应用会自动继续连接。"
+        case .unavailable(.unauthorized): "请在系统设置中允许 Sony Music 使用蓝牙。"
+        case .unavailable(.unsupported): "需要支持低功耗蓝牙的 iPhone。"
+        case .unavailable: "蓝牙正在恢复，请稍后再试。"
+        case .scanning: "请确保 Sony 端已启动并处于可连接状态。"
+        case .connecting, .reconnecting: "正在同步播放状态、歌词和封面。"
+        case .failed: "确认 Sony 端已启动，然后重新扫描。"
+        case .disconnected: "连接后可控制播放，并同步歌词、封面与灵动岛。"
+        case .connected: ""
+        }
+        return AppLocalization.string(key)
+    }
+    private var icon: String {
+        switch presentation {
+        case .unavailable(.poweredOff): return "power"
+        case .unavailable(.unauthorized): return "lock.trianglebadge.exclamationmark"
+        case .failed: return "exclamationmark.triangle.fill"
+        case .scanning, .connecting, .reconnecting: return "antenna.radiowaves.left.and.right"
+        default: return "hifispeaker.2.fill"
+        }
+    }
+    private var buttonTitle: String {
+        let key: String = switch presentation {
+        case .unavailable(.unauthorized): "打开设置"
+        case .unavailable(.poweredOff): "等待蓝牙开启"
+        case .unavailable(.unsupported): "当前设备不支持"
+        case .unavailable: "等待蓝牙恢复"
+        case .scanning: "正在扫描"
+        case .connecting: "正在连接"
+        case .reconnecting: "正在恢复"
+        default: "扫描并连接"
+        }
+        return AppLocalization.string(key)
+    }
+    private func primaryAction() {
+        if case .unavailable(.unauthorized) = presentation,
+           let url = URL(string: UIApplication.openSettingsURLString) {
+            UIApplication.shared.open(url)
+        } else {
+            onConnect()
+        }
+    }
+}
 
-    private var darkControlSection: some View {
-        HStack(spacing: 58) {
-            darkTransportButton(
-                title: "上一首",
-                systemImage: "backward.end.fill",
-                action: bleManager.sendPrevious
-            )
+private struct PlayerStoreSections: View {
+    let manager: BLETestManager
+    let mode: PlayerLayoutMode
+    @Binding var showFullLyrics: Bool
 
-            DarkDynamicPlayButton(
-                state: uiState.playback,
-                isEnabled: isConnected,
-                action: bleManager.sendPlayPause
+    var body: some View {
+        VStack(spacing: mode.isCompact ? 12 : 22) {
+            TrackInfoStoreView(manager: manager, mode: mode)
+            LyricsPreviewStoreView(
+                manager: manager,
+                mode: mode,
+                showFullLyrics: $showFullLyrics
             )
+            PlaybackProgressStoreView(manager: manager)
+            PlaybackControlsStoreView(manager: manager, mode: mode)
+            VolumeControlStoreView(manager: manager)
+        }
+    }
+}
 
-            darkTransportButton(
-                title: "下一首",
-                systemImage: "forward.end.fill",
-                action: bleManager.sendNext
-            )
+private struct TrackInfoStoreView: View {
+    let manager: BLETestManager
+    let mode: PlayerLayoutMode
+
+    var body: some View {
+        Group {
+            if mode == .accessibility {
+                VStack(spacing: 12) {
+                    artwork
+                    metadata.multilineTextAlignment(.center)
+                }
+            } else {
+                HStack(spacing: mode.isCompact ? 16 : 27) {
+                    artwork
+                    metadata
+                }
+            }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private var artworkSize: CGFloat { mode.isCompact ? 140 : 204 }
+    private var artwork: some View {
+        Group {
+            if let image = manager.artworkStore.state.image {
+                Image(uiImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFill()
+            } else {
+                DefaultAlbumArtView()
+            }
+        }
+        .frame(width: artworkSize, height: artworkSize)
+        .clipShape(RoundedRectangle(cornerRadius: mode.isCompact ? 20 : 25, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: mode.isCompact ? 20 : 25)
+                .stroke(.white.opacity(0.12))
+        }
+        .shadow(color: .black.opacity(0.34), radius: 20, y: 12)
+        .accessibilityLabel("当前歌曲封面")
+    }
+    private var metadata: some View {
+        let metadata = manager.playbackStore.metadata
+        return VStack(alignment: mode == .accessibility ? .center : .leading, spacing: mode.isCompact ? 7 : 11) {
+            Text(display(metadata.title, fallback: AppLocalization.string("等待同步")))
+                .font(
+                    mode.isCompact
+                        ? .system(.title2, design: .rounded, weight: .bold)
+                        : .system(.largeTitle, design: .rounded, weight: .bold)
+                )
+                .foregroundStyle(.white)
+                .lineLimit(mode == .accessibility ? 3 : 2)
+                .minimumScaleFactor(0.58)
+            Text(display(metadata.artist, fallback: AppLocalization.string("等待同步")))
+                .font(
+                    mode.isCompact
+                        ? .system(.body, design: .rounded, weight: .medium)
+                        : .system(.title3, design: .rounded, weight: .medium)
+                )
+                .foregroundStyle(.white.opacity(0.74))
+                .lineLimit(2)
+            Text(
+                String(
+                    format: AppLocalization.string("专辑 · %@"),
+                    display(metadata.album, fallback: AppLocalization.string("等待同步"))
+                )
+            )
+                .font(.system(.subheadline, design: .rounded, weight: .medium))
+                .foregroundStyle(.white.opacity(0.48))
+                .lineLimit(2)
+            DarkPlaybackStatusBadge(state: playerVisualState(manager: manager))
+                .overlay(alignment: .bottomLeading) {
+                    if manager.artworkStore.state.isRestoredSnapshot {
+                        Text(AppLocalization.string("上次播放 · 等待同步"))
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.orange)
+                            .fixedSize()
+                            .offset(y: 20)
+                    }
+                }
+        }
+        .frame(maxWidth: .infinity, alignment: mode == .accessibility ? .center : .leading)
+    }
+    private func display(_ value: String, fallback: String) -> String {
+        value == "-" || value.isEmpty ? fallback : value
+    }
+}
+
+private struct LyricsPreviewStoreView: View {
+    let manager: BLETestManager
+    let mode: PlayerLayoutMode
+    @Binding var showFullLyrics: Bool
+    @ObservedObject private var preferences = PreferencesStore.shared
+
+    var body: some View {
+        Button(action: openFullLyrics) {
+            HStack(spacing: mode.isCompact ? 12 : 22) {
+                DarkLyricSideDots(color: visualState.accentColor)
+                VStack(spacing: mode.isCompact ? 7 : 12) {
+                    Text(line(offset: -1))
+                        .font(secondaryLineFont)
+                        .foregroundStyle(.white.opacity(0.38))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.78)
+                    KaraokeLyricText(
+                        text: line(offset: 0),
+                        progress: lineProgress,
+                        words: lineModel(offset: 0)?.words ?? [],
+                        positionMs: karaokePosition,
+                        isPlaying: timeline.isPlaying && !timeline.isSeeking,
+                        highlightColor: visualState.accentColor.opacity(0.92),
+                        normalColor: .white.opacity(0.90),
+                        font: currentLineFont,
+                        lineLimit: mode == .accessibility ? 4 : 2,
+                        alignment: .center
+                    )
+                    .minimumScaleFactor(0.76)
+                    .frame(maxWidth: .infinity, minHeight: mode.isCompact ? 46 : 64)
+                    .clipped()
+                    Text(line(offset: 1))
+                        .font(secondaryLineFont)
+                        .foregroundStyle(.white.opacity(0.40))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.78)
+                    GeometryReader { proxy in
+                        DarkLyricRhythmLine(
+                            state: visualState,
+                            trackSeed: manager.playbackStore.metadata.title + manager.playbackStore.metadata.artist,
+                            lyricProgress: lineProgress,
+                            wordSignature: "\(manager.lyricsStore.live.currentWordLineIndex):\(manager.lyricsStore.live.currentWordIndex)",
+                            positionMs: karaokePosition
+                        )
+                        .frame(width: proxy.size.width * 0.5, height: mode.isCompact ? 24 : 36)
+                        .frame(maxWidth: .infinity)
+                    }
+                    .frame(height: mode.isCompact ? 24 : 36)
+                }
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: mode.isCompact ? 120 : 176,
+                    maxHeight: mode == .regular ? 176 : nil
+                )
+                DarkLyricSideDots(color: visualState.accentColor)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("当前歌词，点按打开完整歌词")
+        .onChange(of: displayedPosition) { _, value in
+            manager.logKaraokeOffset(rawPositionMs: value)
+        }
+    }
+
+    private var timeline: BLEPlaybackTimelineState { manager.playbackStore.timeline }
+    private var document: BLEFullLyricsViewState { manager.lyricsStore.document }
+    private var lines: [LyricLine] { document.isCurrent ? document.lines : [] }
+    private var displayedPosition: Int64 {
+        timeline.isSeeking ? timeline.seekPositionMs : timeline.displayPositionMs
+    }
+    private var karaokePosition: Int64 {
+        manager.karaokePositionMs(rawPositionMs: displayedPosition)
+    }
+    private var currentIndex: Int {
+        LyricTimelineHelper.currentIndex(lines: lines, positionMs: karaokePosition) ?? -1
+    }
+    private var lineProgress: Double {
+        LyricTimelineHelper.lineProgress(
+            lines: lines,
+            index: currentIndex,
+            positionMs: karaokePosition
+        )
+    }
+    private var visualState: DarkPlaybackVisualState { playerVisualState(manager: manager) }
+    private var secondaryLineFont: Font {
+        if mode == .accessibility {
+            return .system(.body, design: .rounded, weight: .medium)
+        }
+        return .system(
+            size: mode.isCompact ? 14 : 16,
+            weight: .medium,
+            design: .rounded
+        )
+    }
+    private var currentLineFont: Font {
+        if mode == .accessibility {
+            return .system(.title2, design: .rounded, weight: .semibold)
+        }
+        return .system(
+            size: mode.isCompact ? 21 : 27,
+            weight: .semibold,
+            design: .rounded
+        )
+    }
+    private func lineModel(offset: Int) -> LyricLine? {
+        let index = currentIndex + offset
+        return lines.indices.contains(index) ? lines[index] : nil
+    }
+    private func line(offset: Int) -> String {
+        if let model = lineModel(offset: offset) {
+            let text = model.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return text.isEmpty ? " " : text
+        }
+        if offset == 0 {
+            let text = manager.lyricsStore.live.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return text.isEmpty ? "暂无歌词" : text
+        }
+        return " "
+    }
+    private func openFullLyrics() {
+        if document.lines.isEmpty { manager.sendGetFullLyrics(force: true) }
+        manager.requestFullLyricsOptionalFieldsIfNeeded(displayMode: preferences.lyricDisplayMode)
+        showFullLyrics = true
+    }
+}
+
+private struct PlaybackProgressStoreView: View {
+    let manager: BLETestManager
+
+    var body: some View {
+        let timeline = manager.playbackStore.timeline
+        HStack(spacing: 12) {
+            Text(format(displayedPosition, duration: timeline.durationMs))
+                .frame(width: 46, alignment: .leading)
+            Slider(
+                value: Binding(
+                    get: { Double(displayedPosition) },
+                    set: manager.updateSeekPosition
+                ),
+                in: 0...Double(max(timeline.durationMs, 1)),
+                onEditingChanged: { editing in
+                    editing ? manager.beginSeeking() : manager.finishSeeking()
+                }
+            )
+            .tint(playerVisualState(manager: manager).accentColor)
+            .disabled(!manager.connectionStore.presentation.isConnected || timeline.durationMs <= 0)
+            .accessibilityLabel("播放进度")
+            .accessibilityValue(
+                "\(format(displayedPosition, duration: timeline.durationMs))，共 \(format(timeline.durationMs, duration: timeline.durationMs))"
+            )
+            Text(format(timeline.durationMs, duration: timeline.durationMs))
+                .frame(width: 46, alignment: .trailing)
+        }
+        .font(.caption.monospacedDigit().weight(.semibold))
+        .foregroundStyle(.white.opacity(0.72))
+    }
+
+    private var displayedPosition: Int64 {
+        let timeline = manager.playbackStore.timeline
+        return timeline.isSeeking ? timeline.seekPositionMs : timeline.displayPositionMs
+    }
+    private func format(_ milliseconds: Int64, duration: Int64) -> String {
+        guard duration > 0 else { return "00:00" }
+        let seconds = max(milliseconds, 0) / 1_000
+        return String(format: "%02lld:%02lld", seconds / 60, seconds % 60)
+    }
+}
+
+private struct PlaybackControlsStoreView: View {
+    let manager: BLETestManager
+    let mode: PlayerLayoutMode
+
+    var body: some View {
+        HStack(spacing: mode.isCompact ? 32 : 58) {
+            transport("上一首", image: "backward.end.fill", action: manager.sendPrevious)
+            DarkDynamicPlayButton(
+                state: playerVisualState(manager: manager),
+                isEnabled: isConnected,
+                action: manager.sendPlayPause
+            )
+            .scaleEffect(mode.isCompact ? 0.84 : 1)
+            transport("下一首", image: "forward.end.fill", action: manager.sendNext)
+        }
+        .frame(maxWidth: .infinity, minHeight: mode.isCompact ? 72 : 88)
         .disabled(!isConnected)
         .opacity(isConnected ? 1 : 0.48)
     }
 
-    private var darkVolumeControl: some View {
+    private var isConnected: Bool { manager.connectionStore.presentation.isConnected }
+    private func transport(_ title: String, image: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: image)
+                .font(.system(size: mode.isCompact ? 26 : 30, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(
+                    width: mode.isCompact ? 52 : 62,
+                    height: mode.isCompact ? 52 : 62
+                )
+                .contentShape(Circle())
+        }
+        .buttonStyle(PressScaleButtonStyle(pressedScale: 0.90))
+        .accessibilityLabel(title)
+    }
+}
+
+private struct VolumeControlStoreView: View {
+    let manager: BLETestManager
+    @State private var feedbackVisible = false
+    @State private var feedbackGeneration = 0
+
+    var body: some View {
+        let volume = manager.playbackStore.volume
         HStack(spacing: 12) {
             Image(systemName: volumeIcon)
                 .font(.system(size: 20, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.92))
                 .frame(width: 24)
+                .accessibilityHidden(true)
 
             GeometryReader { proxy in
                 ZStack(alignment: .leading) {
                     Slider(
-                        value: volumeBinding,
-                        in: 0...Double(max(bleManager.volumeMax, 1)),
+                        value: Binding(
+                            get: { Double(displayedVolume) },
+                            set: manager.updateVolumeSeekValue
+                        ),
+                        in: 0...Double(max(volume.maximum, 1)),
                         step: 1,
-                        onEditingChanged: handleVolumeEditingChanged
+                        onEditingChanged: handleEditing
                     )
-                    .tint(uiState.playback.accentColor)
-                    .disabled(!isVolumeControlAvailable)
+                    .tint(playerVisualState(manager: manager).accentColor)
+                    .disabled(!isAvailable)
+                    .accessibilityLabel("音量")
+                    .accessibilityValue(
+                        volume.maximum > 0 ? "\(displayedVolume)，最大 \(volume.maximum)" : "尚未同步"
+                    )
 
-                    if isVolumeFeedbackVisible, isVolumeControlAvailable {
+                    if feedbackVisible, isAvailable {
                         Text("音量 \(displayedVolume)")
                             .font(.system(size: 11, weight: .semibold, design: .rounded).monospacedDigit())
                             .foregroundStyle(.white.opacity(0.94))
                             .padding(.horizontal, 8)
                             .frame(height: 24)
                             .background(.black.opacity(0.72), in: Capsule())
-                            .overlay {
-                                Capsule().strokeBorder(.white.opacity(0.10), lineWidth: 1)
-                            }
+                            .overlay { Capsule().strokeBorder(.white.opacity(0.10), lineWidth: 1) }
                             .fixedSize()
-                            .position(
-                                x: volumeFeedbackXPosition(in: proxy.size.width),
-                                y: -7
-                            )
+                            .position(x: feedbackXPosition(in: proxy.size.width), y: -7)
                             .transition(.opacity.combined(with: .scale(scale: 0.94)))
                             .allowsHitTesting(false)
                     }
                 }
             }
             .frame(height: 32)
-
         }
         .padding(.horizontal, 14)
         .frame(height: 44)
-        .background(Color.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .strokeBorder(.white.opacity(0.07), lineWidth: 1)
-        }
-        .disabled(!isConnected)
-        .opacity(isConnected ? 1 : 0.48)
-        .animation(.easeInOut(duration: 0.16), value: displayedVolume)
-        .animation(.easeInOut(duration: 0.16), value: isVolumeFeedbackVisible)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("音量")
-        .accessibilityValue(volumeAccessibilityValue)
-    }
-
-    private var volumeBinding: Binding<Double> {
-        Binding(
-            get: { Double(displayedVolume) },
-            set: { bleManager.updateVolumeSeekValue($0) }
-        )
-    }
-
-    private var isVolumeControlAvailable: Bool {
-        isConnected && bleManager.volumeMax > 0
-    }
-
-    private var volumeAccessibilityValue: String {
-        guard bleManager.volumeMax > 0 else { return "尚未同步" }
-        return "\(displayedVolume)，最大 \(bleManager.volumeMax)"
-    }
-
-    private func handleVolumeEditingChanged(_ editing: Bool) {
-        volumeFeedbackGeneration += 1
-        let generation = volumeFeedbackGeneration
-
-        if editing {
-            withAnimation(.easeOut(duration: 0.12)) {
-                isVolumeFeedbackVisible = true
-            }
-            bleManager.beginVolumeSeeking()
-            return
-        }
-
-        bleManager.finishVolumeSeeking()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) {
-            guard generation == volumeFeedbackGeneration else { return }
-            withAnimation(.easeInOut(duration: 0.16)) {
-                isVolumeFeedbackVisible = false
-            }
-        }
-    }
-
-    private func volumeFeedbackXPosition(in width: CGFloat) -> CGFloat {
-        let horizontalInset = CGFloat(18)
-        let usableWidth = max(width - horizontalInset * 2, 0)
-        let progress = CGFloat(CompactVolumePresentation.normalizedProgress(
-            current: displayedVolume,
-            maximum: bleManager.volumeMax
-        ))
-        return min(max(horizontalInset + usableWidth * progress, 30), max(width - 30, 30))
-    }
-
-    private var systemState: DarkControlSystemState {
-        DarkControlSystemState(connection: DarkControlConnectionState(rawValue: bleManager.connectionDisplayState) ?? .disconnected)
-    }
-
-    private var playbackState: DarkControlPlaybackState {
-        DarkControlPlaybackState(
-            isPlaying: bleManager.isPlaying,
-            isLoading: !isConnected && bleManager.connectionDisplayState != "disconnected"
-        )
-    }
-
-    private var uiState: DarkControlUIState {
-        DarkControlUIState(system: systemState, playback: playbackState.visualState(connection: systemState.connection))
-    }
-
-    private func albumArtwork(size: CGFloat) -> some View {
-        ZStack(alignment: .bottomLeading) {
-            if let image = bleManager.albumArtImage {
-                Image(uiImage: image)
-                    .resizable()
-                    .interpolation(.high)
-                    .antialiased(true)
-                    .scaledToFill()
-            } else {
-                DefaultAlbumArtView()
-            }
-        }
-        .frame(width: size, height: size)
-        .clipShape(RoundedRectangle(cornerRadius: 25, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 25, style: .continuous)
-                .stroke(.white.opacity(0.12), lineWidth: 1)
-        }
-        .shadow(color: .black.opacity(0.36), radius: 22, x: 0, y: 14)
-        .accessibilityLabel("当前歌曲封面")
-    }
-
-    private func darkTransportButton(
-        title: String,
-        systemImage: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.system(size: 30, weight: .bold))
-                .foregroundStyle(.white)
-                .frame(width: 62, height: 62)
-                .contentShape(Circle())
-        }
-        .buttonStyle(PressScaleButtonStyle(pressedScale: 0.90))
-        .accessibilityLabel(title)
-    }
-
-    private var nowPlayingSection: some View {
-        VStack(spacing: 9) {
-            albumArtView
-                .id(albumArtIdentity)
-                .transition(.opacity.combined(with: .scale(scale: 0.98)))
-                .animation(.easeInOut(duration: 0.28), value: albumArtIdentity)
-
-            VStack(spacing: 4) {
-                Text(nowPlayingInfo.title)
-                    .font(.system(size: 32, weight: .bold, design: .rounded))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.58)
-
-                Text(nowPlayingInfo.artist)
-                    .font(.system(size: 18, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.72))
-                    .lineLimit(1)
-                    .padding(.top, 4)
-
-                Text(nowPlayingInfo.album)
-                    .font(.system(size: 15, weight: .regular, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.46))
-                    .lineLimit(1)
-            }
-
-            HStack(spacing: 8) {
-                Image(systemName: bleManager.isPlaying ? "music.note" : "pause.fill")
-                Text(bleManager.isPlaying ? "播放中" : "已暂停")
-            }
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(
-                bleManager.isPlaying
-                    ? Color.green.opacity(0.95)
-                    : Color.white.opacity(0.62)
-            )
-            .padding(.horizontal, 11)
-            .padding(.vertical, 6)
-            .background(.white.opacity(0.095), in: Capsule())
-            .overlay {
-                Capsule().stroke(.white.opacity(0.08), lineWidth: 1)
-            }
-            .animation(.spring(response: 0.28, dampingFraction: 0.78), value: bleManager.isPlaying)
-        }
-        .foregroundStyle(.white)
-        .frame(maxWidth: .infinity)
-    }
-
-    private var albumArtView: some View {
-        ZStack {
-            if let image = bleManager.albumArtImage {
-                Image(uiImage: image)
-                    .resizable()
-                    .interpolation(.high)
-                    .antialiased(true)
-                    .scaledToFill()
-            } else {
-                DefaultAlbumArtView()
-            }
-        }
-        .frame(width: albumArtSize, height: albumArtSize)
-        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .stroke(.white.opacity(0.14), lineWidth: 1)
-        }
-        .shadow(color: .black.opacity(0.28), radius: 22, y: 12)
-        .accessibilityLabel("当前歌曲封面")
-    }
-
-    private var lyricCard: some View {
-        VStack(spacing: 8) {
-            Text("当前歌词")
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                .foregroundStyle(.white.opacity(0.46))
-                .textCase(.uppercase)
-                .tracking(1.2)
-
-            if currentTrackFullLyrics.isEmpty {
-                VStack(spacing: 8) {
-                    Text(currentLyricText)
-                        .font(.system(size: 28, weight: .semibold, design: .rounded))
-                        .foregroundStyle(
-                            currentLyricText == "暂无歌词"
-                                ? Color.white.opacity(0.58)
-                                : Color.white.opacity(0.93)
-                        )
-                        .multilineTextAlignment(.center)
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.68)
-                        .frame(maxWidth: .infinity, minHeight: 48)
-
-                    if currentLyricText == "暂无歌词" {
-                        if isDebugMode {
-                            Text("原因：\(bleManager.lyricDiagnostic?.statusTitle ?? "正在确认")")
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(.white.opacity(0.54))
-                                .lineLimit(1)
-
-                            Button {
-                                bleManager.requestLyricDiagnostic(manual: true)
-                                showLyricDiagnostic = true
-                            } label: {
-                                Text("查看原因")
-                                    .font(.caption.weight(.bold))
-                                    .foregroundStyle(.white)
-                                    .padding(.horizontal, 14)
-                                    .frame(height: 30)
-                                    .background(.white.opacity(0.10), in: Capsule())
-                            }
-                            .buttonStyle(.plain)
-                        } else {
-                            Text("提示：可在 Sony QQ音乐打开歌词/桌面歌词后稍等")
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(.white.opacity(0.54))
-                                .multilineTextAlignment(.center)
-                                .lineLimit(2)
-
-                            Button {
-                                bleManager.refreshCurrentLyricFromNowPlayingDiagnostics()
-                            } label: {
-                                Text("刷新歌词")
-                                    .font(.caption.weight(.bold))
-                                    .foregroundStyle(.white)
-                                    .padding(.horizontal, 14)
-                                    .frame(height: 30)
-                                    .background(.white.opacity(0.10), in: Capsule())
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, minHeight: 82)
-            } else {
-                VStack(spacing: 5) {
-                    Text(lyricPreviewLine(offset: -1))
-                        .font(.system(size: 17, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.44))
-                        .lineLimit(1)
-                    KaraokeLyricText(
-                        text: lyricPreviewLine(offset: 0),
-                        progress: currentLyricProgress,
-                        words: lyricPreviewLineModel(offset: 0)?.words ?? [],
-                        positionMs: karaokePositionMs,
-                        highlightColor: Color.green.opacity(0.98),
-                        normalColor: Color.white.opacity(0.48),
-                        font: .system(size: 24, weight: .bold, design: .rounded),
-                        lineLimit: 2,
-                        alignment: .center
-                    )
-                    .minimumScaleFactor(0.72)
-                    if let auxiliary = lyricPreviewAuxiliaryText(offset: 0) {
-                        Text(auxiliary)
-                            .font(.system(size: 14, weight: .medium, design: .rounded))
-                            .foregroundStyle(.white.opacity(0.52))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.72)
-                    }
-                    Text(lyricPreviewLine(offset: 1))
-                        .font(.system(size: 17, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.44))
-                        .lineLimit(1)
-                }
-                .frame(maxWidth: .infinity, minHeight: 82)
-            }
-        }
-        .padding(.horizontal, 4)
-        .padding(.vertical, 4)
-        .id(lyricPreviewIdentity)
-        .transition(.opacity)
-        .animation(.easeInOut(duration: 0.22), value: lyricPreviewIdentity)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            if bleManager.fullLyrics.isEmpty {
-                bleManager.sendGetFullLyrics(force: true)
-            }
-            showFullLyrics = true
-        }
-        .accessibilityLabel("打开完整歌词")
-    }
-
-    private var progressSection: some View {
-        VStack(spacing: 6) {
-            Slider(
-                value: Binding(
-                    get: {
-                        Double(
-                            bleManager.isSeeking
-                                ? bleManager.seekPositionMs
-                                : bleManager.displayPositionMs
-                        )
-                    },
-                    set: { value in
-                        bleManager.updateSeekPosition(value)
-                    }
-                ),
-                in: 0...Double(max(bleManager.durationMs, 1)),
-                onEditingChanged: { editing in
-                    if editing {
-                        bleManager.beginSeeking()
-                    } else {
-                        bleManager.finishSeeking()
-                    }
-                }
-            )
-            .tint(.white.opacity(0.94))
-            .disabled(!isConnected || bleManager.durationMs <= 0)
-
-            HStack {
-                Text(format(milliseconds: displayedPositionMs))
-                Spacer()
-                Text(format(milliseconds: bleManager.durationMs))
-            }
-            .font(.caption2.monospacedDigit().weight(.medium))
-            .foregroundStyle(.white.opacity(0.58))
-        }
-        .padding(.horizontal, 4)
-        .animation(
-            bleManager.isSeeking ? nil : .linear(duration: 0.18),
-            value: bleManager.positionMs
-        )
-    }
-
-    private var playbackControls: some View {
-        HStack(spacing: 26) {
-            playerControlButton(
-                title: "上一首",
-                systemImage: "backward.fill",
-                size: 52,
-                fontSize: 22,
-                action: bleManager.sendPrevious
-            )
-
-            Button(action: bleManager.sendPlayPause) {
-                Image(systemName: bleManager.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: 30, weight: .bold))
-                    .foregroundStyle(.black)
-                    .frame(width: 70, height: 70)
-                    .background(.white, in: Circle())
-                    .shadow(color: .black.opacity(0.18), radius: 12, y: 7)
-                    .scaleEffect(bleManager.isPlaying ? 1.0 : 0.96)
-            }
-            .buttonStyle(PressScaleButtonStyle(pressedScale: 0.92))
-            .accessibilityLabel("播放 / 暂停")
-
-            playerControlButton(
-                title: "下一首",
-                systemImage: "forward.fill",
-                size: 52,
-                fontSize: 22,
-                action: bleManager.sendNext
-            )
-        }
-        .frame(maxWidth: .infinity)
-        .disabled(!isConnected)
-        .opacity(isConnected ? 1 : 0.46)
-        .animation(.spring(response: 0.28, dampingFraction: 0.72), value: bleManager.isPlaying)
-    }
-
-    private var isConnected: Bool {
-        bleManager.connectionDisplayState == "connected"
-    }
-
-    private var isDebugMode: Bool {
-        preferences.appExperienceMode == .debug
-    }
-
-    private var displayedPositionMs: Int64 {
-        bleManager.isSeeking ? bleManager.seekPositionMs : bleManager.displayPositionMs
-    }
-
-    private var karaokePositionMs: Int64 {
-        bleManager.karaokePositionMs(rawPositionMs: displayedPositionMs)
+        .background(.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 20))
+        .overlay { RoundedRectangle(cornerRadius: 20).strokeBorder(.white.opacity(0.07)) }
+        .opacity(isAvailable ? 1 : 0.48)
     }
 
     private var displayedVolume: Int {
-        bleManager.isVolumeSeeking ? bleManager.volumeSeekValue : bleManager.volumeCurrent
+        let volume = manager.playbackStore.volume
+        return volume.isSeeking ? volume.seekValue : volume.current
     }
-
-    private var nowPlayingInfo: NowPlayingInfoProvider {
-        NowPlayingInfoProvider(
-            title: displayText(bleManager.title, fallback: "Sony Music"),
-            artist: displayText(bleManager.artist, fallback: "未知歌手"),
-            album: displayText(bleManager.album, fallback: "未知专辑"),
-            albumArt: bleManager.albumArtImage,
-            positionMs: displayedPositionMs,
-            durationMs: bleManager.durationMs,
-            isPlaying: bleManager.isPlaying
-        )
+    private var isAvailable: Bool {
+        manager.connectionStore.presentation.isConnected && manager.playbackStore.volume.maximum > 0
     }
-
-    private var lyricDisplayMode: LyricDisplayMode {
-        preferences.lyricDisplayMode
-    }
-
-    private func requestOptionalLyricsIfNeeded() {
-        bleManager.requestFullLyricsOptionalFieldsIfNeeded(displayMode: lyricDisplayMode)
-    }
-
-    private var lyricDisplayModeBinding: Binding<LyricDisplayMode> {
-        Binding(
-            get: { lyricDisplayMode },
-            set: { preferences.lyricDisplayMode = $0 }
-        )
-    }
-
-    private var currentLyricText: String {
-        let trimmed = bleManager.lyric.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? "暂无歌词" : trimmed
-    }
-
-    private var currentFullLyricIndex: Int {
-        LyricTimelineHelper.currentIndex(
-            lines: currentTrackFullLyrics,
-            positionMs: karaokePositionMs
-        ) ?? -1
-    }
-
-    private var currentLyricProgress: Double {
-        LyricTimelineHelper.lineProgress(
-            lines: currentTrackFullLyrics,
-            index: currentFullLyricIndex,
-            positionMs: karaokePositionMs
-        )
-    }
-
-    private var lyricPreviewIdentity: String {
-        if currentTrackFullLyrics.isEmpty {
-            return currentLyricText
-        }
-        return "\(bleManager.fullLyricsTrackId)-\(currentFullLyricIndex)"
-    }
-
-    private func lyricPreviewLine(offset: Int) -> String {
-        guard let line = lyricPreviewLineModel(offset: offset) else {
-            return offset == 0 ? currentLyricText : " "
-        }
-        let text = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return text.isEmpty ? " " : text
-    }
-
-    private func lyricPreviewLineModel(offset: Int) -> LyricLine? {
-        let index = currentFullLyricIndex + offset
-        guard currentTrackFullLyrics.indices.contains(index) else {
-            return nil
-        }
-        return currentTrackFullLyrics[index]
-    }
-
-    private func lyricPreviewAuxiliaryText(offset: Int) -> String? {
-        guard let line = lyricPreviewLineModel(offset: offset) else { return nil }
-        if lyricDisplayMode.showsTranslation,
-           let translation = sanitizedSecondaryText(line.translation) {
-            return translation
-        }
-        if lyricDisplayMode.showsRomanization,
-           let romanization = sanitizedSecondaryText(line.romanization) {
-            return romanization
-        }
-        return nil
-    }
-
-    private var currentTrackFullLyrics: [LyricLine] {
-        bleManager.isFullLyricsCurrent ? bleManager.fullLyrics : []
-    }
-
-    private var albumArtIdentity: String {
-        if bleManager.albumArtImage == nil {
-            return "default-\(bleManager.title)-\(bleManager.artist)"
-        }
-        return "art-\(bleManager.title)-\(bleManager.artist)-\(bleManager.album)-\(bleManager.artworkDisplayQuality.label)"
-    }
-
-    private var albumArtSize: CGFloat {
-        preferences.artworkDisplaySize.pointSize
-    }
-
     private var volumeIcon: String {
-        if displayedVolume <= 0 {
-            return "speaker.slash.fill"
-        }
-        if displayedVolume < max(bleManager.volumeMax / 2, 1) {
-            return "speaker.wave.1.fill"
-        }
-        return "speaker.wave.2.fill"
+        if displayedVolume <= 0 { return "speaker.slash.fill" }
+        return displayedVolume < max(manager.playbackStore.volume.maximum / 2, 1)
+            ? "speaker.wave.1.fill"
+            : "speaker.wave.2.fill"
     }
-
-    private func playerControlButton(
-        title: String,
-        systemImage: String,
-        size: CGFloat,
-        fontSize: CGFloat,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.system(size: fontSize, weight: .bold))
-                .foregroundStyle(.white)
-                .frame(width: size, height: size)
-                .background(.white.opacity(0.10), in: Circle())
-                .overlay {
-                    Circle().stroke(.white.opacity(0.10), lineWidth: 1)
-                }
-        }
-        .buttonStyle(PressScaleButtonStyle(pressedScale: 0.92))
-        .accessibilityLabel(title)
-    }
-
-    private func compactButton(
-        title: String,
-        systemImage: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Label(title, systemImage: systemImage)
-                .font(.subheadline.weight(.semibold))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 10)
-        }
-        .buttonStyle(PressScaleButtonStyle(pressedScale: 0.96))
-        .background(.white.opacity(0.10), in: Capsule())
-        .overlay {
-            Capsule().stroke(.white.opacity(0.09), lineWidth: 1)
+    private func handleEditing(_ editing: Bool) {
+        feedbackGeneration += 1
+        let generation = feedbackGeneration
+        if editing {
+            withAnimation(.easeOut(duration: 0.12)) { feedbackVisible = true }
+            manager.beginVolumeSeeking()
+        } else {
+            manager.finishVolumeSeeking()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) {
+                guard generation == feedbackGeneration else { return }
+                withAnimation(.easeInOut(duration: 0.16)) { feedbackVisible = false }
+            }
         }
     }
 
-    private func displayText(_ value: String, fallback: String) -> String {
+    private func feedbackXPosition(in width: CGFloat) -> CGFloat {
+        let horizontalInset: CGFloat = 18
+        let usableWidth = max(width - horizontalInset * 2, 0)
+        let progress = CGFloat(
+            CompactVolumePresentation.normalizedProgress(
+                current: displayedVolume,
+                maximum: manager.playbackStore.volume.maximum
+            )
+        )
+        return min(max(horizontalInset + usableWidth * progress, 30), max(width - 30, 30))
+    }
+}
+
+private struct FullLyricsStoreHost: View {
+    let manager: BLETestManager
+    let onDismiss: () -> Void
+    let onShowDiagnostic: () -> Void
+    @ObservedObject private var preferences = PreferencesStore.shared
+
+    var body: some View {
+        let metadata = manager.playbackStore.metadata
+        let timeline = manager.playbackStore.timeline
+        let document = manager.lyricsStore.document
+        let lines = document.isCurrent ? document.lines : []
+        let rawPosition = timeline.isSeeking ? timeline.seekPositionMs : timeline.displayPositionMs
+        let position = manager.karaokePositionMs(rawPositionMs: rawPosition)
+
+        FullLyricsView(
+            title: display(metadata.title, fallback: "等待同步"),
+            artist: display(metadata.artist, fallback: "等待同步"),
+            albumArtImage: manager.artworkStore.state.image,
+            lyrics: lines,
+            currentIndex: LyricTimelineHelper.currentIndex(lines: lines, positionMs: position) ?? -1,
+            positionMs: position,
+            translationState: document.translationState,
+            romanizationState: document.romanizationState,
+            isPlaying: timeline.isPlaying,
+            isConnected: manager.connectionStore.presentation.isConnected,
+            onDismiss: onDismiss,
+            onPrevious: manager.sendPrevious,
+            onPlayPause: manager.sendPlayPause,
+            onNext: manager.sendNext,
+            onSeekToLine: manager.seekToLyricLine,
+            showDiagnosticButton: preferences.appExperienceMode == .debug,
+            onShowDiagnostic: onShowDiagnostic
+        )
+    }
+
+    private func display(_ value: String, fallback: String) -> String {
         value == "-" || value.isEmpty ? fallback : value
     }
+}
 
-    private func format(milliseconds: Int64) -> String {
-        guard bleManager.durationMs > 0 else { return "00:00" }
-        let totalSeconds = max(milliseconds, 0) / 1_000
-        return String(format: "%02lld:%02lld", totalSeconds / 60, totalSeconds % 60)
-    }
+private func playerVisualState(manager: BLETestManager) -> DarkPlaybackVisualState {
+    let connection = DarkControlConnectionState(
+        rawValue: manager.connectionStore.state.displayState
+    ) ?? .disconnected
+    return DarkControlPlaybackState(
+        isPlaying: manager.playbackStore.timeline.isPlaying,
+        isLoading: !manager.connectionStore.presentation.isConnected
+    ).visualState(connection: connection)
 }
 
 private struct PlayerBackgroundView: View {
@@ -1229,16 +1107,17 @@ enum DarkControlConnectionState: String {
     case disconnected
 
     var compactTitle: String {
-        switch self {
+        let key: String = switch self {
         case .connected:
-            return "Sony"
+            "Sony"
         case .connecting:
-            return "连接中"
+            "连接中"
         case .reconnecting:
-            return "重连中"
+            "重连中"
         case .disconnected:
-            return "连接"
+            "连接"
         }
+        return AppLocalization.string(key)
     }
 
     var showsProgressIndicator: Bool {
@@ -1246,16 +1125,17 @@ enum DarkControlConnectionState: String {
     }
 
     var accessibilityLabel: String {
-        switch self {
+        let key: String = switch self {
         case .connected:
-            return "Sony 已连接"
+            "Sony 已连接"
         case .connecting:
-            return "正在连接 Sony"
+            "正在连接 Sony"
         case .reconnecting:
-            return "正在重新连接 Sony"
+            "正在重新连接 Sony"
         case .disconnected:
-            return "Sony 未连接"
+            "Sony 未连接"
         }
+        return AppLocalization.string(key)
     }
 
     var color: Color {
@@ -1287,33 +1167,35 @@ private enum DarkPlaybackVisualState: Equatable {
     case stopped
 
     var title: String {
-        switch self {
+        let key: String = switch self {
         case .playing:
-            return "正在播放"
+            "正在播放"
         case .paused:
-            return "已暂停"
+            "已暂停"
         case .loading:
-            return "加载中"
+            "加载中"
         case .reconnecting:
-            return "重连中"
+            "重连中"
         case .stopped:
-            return "已停止"
+            "已停止"
         }
+        return AppLocalization.string(key)
     }
 
     var detail: String {
-        switch self {
+        let key: String = switch self {
         case .playing:
-            return "正在播放音乐"
+            "正在播放音乐"
         case .paused:
-            return "音乐暂停状态"
+            "音乐暂停状态"
         case .loading:
-            return "内容加载中"
+            "内容加载中"
         case .reconnecting:
-            return "设备重连中"
+            "设备重连中"
         case .stopped:
-            return "音乐已停止"
+            "音乐已停止"
         }
+        return AppLocalization.string(key)
     }
 
     var accentColor: Color {
@@ -1385,6 +1267,7 @@ private struct DarkDynamicPlayButton: View {
     let action: () -> Void
 
     @State private var isPulsing = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         Button(action: action) {
@@ -1412,7 +1295,7 @@ private struct DarkDynamicPlayButton: View {
                         color: state == .playing ? state.accentColor.opacity(isPulsing ? 0.28 : 0.12) : .clear,
                         radius: state == .playing ? (isPulsing ? 18 : 8) : 0
                     )
-                    .scaleEffect(state == .playing && isPulsing ? 1.018 : 1.0)
+                    .scaleEffect(state == .playing && isPulsing && !reduceMotion ? 1.018 : 1.0)
 
                 if state == .loading || state == .reconnecting {
                     ProgressView()
@@ -1431,15 +1314,15 @@ private struct DarkDynamicPlayButton: View {
         .disabled(!isEnabled || state == .loading || state == .reconnecting)
         .opacity(isEnabled ? 1 : 0.55)
         .onAppear {
-            isPulsing = true
+            isPulsing = !reduceMotion
         }
         .animation(
-            state == .playing
+            state == .playing && !reduceMotion
                 ? .easeInOut(duration: 1.15).repeatForever(autoreverses: true)
-                : .default,
+                : nil,
             value: isPulsing
         )
-        .animation(.spring(response: 0.26, dampingFraction: 0.72), value: state)
+        .animation(reduceMotion ? nil : .spring(response: 0.26, dampingFraction: 0.72), value: state)
         .accessibilityLabel("播放 / 暂停")
     }
 }
@@ -1531,9 +1414,9 @@ private struct DarkLyricRhythmLine: View {
         }
         switch state {
         case .playing:
-            return 1.0 / 20.0
+            return performanceMode == .smooth ? 1.0 / 20.0 : 1.0 / 15.0
         case .loading, .reconnecting:
-            return 1.0 / 10.0
+            return performanceMode == .smooth ? 1.0 / 15.0 : 1.0 / 12.0
         case .paused, .stopped:
             return nil
         }
@@ -1950,46 +1833,284 @@ struct KaraokeLyricText: View {
     let progress: Double
     var words: [LyricWord] = []
     var positionMs: Int64? = nil
+    var isPlaying = false
     let highlightColor: Color
     let normalColor: Color
     let font: Font
     var lineLimit: Int? = nil
     var alignment: TextAlignment = .leading
 
-    private var highlightCount: Int {
-        let characters = Array(text)
-        let count = characters.count
-        guard count > 0 else { return 0 }
-        if let positionMs, !words.isEmpty {
-            let wordCharacterCount = words.reduce(0) { partial, word in
-                guard positionMs >= word.startMs else { return partial }
-                return partial + Array(word.text).count
-            }
-            return min(max(wordCharacterCount, 0), count)
-        }
-        let boundedProgress = min(max(progress, 0), 1)
-        let rawCount = Int((Double(count) * boundedProgress).rounded(.down))
-        return min(max(rawCount, 0), count)
-    }
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var preferences = PreferencesStore.shared
+    @State private var renderedProgress = 0.0
+    @State private var previousTargetProgress: Double?
 
-    private var splitText: (String, String) {
-        guard highlightCount > 0 else { return ("", text) }
-        let characters = Array(text)
-        guard highlightCount < characters.count else { return (text, "") }
-        return (
-            String(characters.prefix(highlightCount)),
-            String(characters.dropFirst(highlightCount))
+    private var rawHighlightResult: KaraokeHighlightResult {
+        KaraokeHighlightResolver.resolve(
+            text: text,
+            words: words,
+            positionMs: positionMs,
+            fallbackProgress: progress
         )
     }
 
+    private var targetHighlightResult: KaraokeHighlightResult {
+        KaraokeHighlightResolver.resolve(
+            text: text,
+            words: words,
+            positionMs: positionMs,
+            fallbackProgress: progress,
+            lookAheadMs: isPlaying && !reduceMotion ? interpolationLookAheadMs : 0
+        )
+    }
+
+    private var targetProgress: Double {
+        targetHighlightResult.normalizedProgress
+    }
+
+    private var interpolationDuration: TimeInterval {
+        KaraokeProgressAnimationPolicy.duration(
+            for: preferences.playbackPerformanceMode,
+            isLowPowerModeEnabled: ProcessInfo.processInfo.isLowPowerModeEnabled
+        )
+    }
+
+    private var interpolationLookAheadMs: Int64 {
+        Int64((interpolationDuration * 1_000).rounded())
+    }
+
     var body: some View {
-        let parts = splitText
-        (Text(parts.0).foregroundColor(highlightColor) +
-            Text(parts.1).foregroundColor(normalColor))
+        ZStack {
+            lyricText(color: normalColor)
+            lyricText(color: highlightColor)
+                .textRenderer(KaraokeProgressTextRenderer(progress: renderedProgress))
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(text)
+        .onAppear(perform: resetProgress)
+        .onChange(of: text) { _, _ in resetProgress() }
+        .onChange(of: targetProgress) { oldValue, newValue in
+            updateRenderedProgress(from: oldValue, to: newValue)
+        }
+        .onChange(of: reduceMotion) { _, _ in resetProgress() }
+        .onChange(of: isPlaying) { _, playing in
+            if !playing { resetProgress() }
+        }
+    }
+
+    private func lyricText(color: Color) -> some View {
+        Text(text)
+            .foregroundStyle(color)
             .font(font)
             .multilineTextAlignment(alignment)
             .lineLimit(lineLimit)
-            .animation(.linear(duration: 0.25), value: highlightCount)
+    }
+
+    private func resetProgress() {
+        let progress = rawHighlightResult.normalizedProgress
+        previousTargetProgress = progress
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) {
+            renderedProgress = progress
+        }
+    }
+
+    private func updateRenderedProgress(from oldValue: Double, to newValue: Double) {
+        let previous = previousTargetProgress ?? oldValue
+        previousTargetProgress = newValue
+        guard KaraokeProgressAnimationPolicy.shouldAnimate(
+            from: previous,
+            to: newValue,
+            isPlaying: isPlaying,
+            reduceMotion: reduceMotion
+        ) else {
+            resetProgress()
+            return
+        }
+        withAnimation(.linear(duration: interpolationDuration)) {
+            renderedProgress = newValue
+        }
+    }
+}
+
+struct KaraokeHighlightResult: Equatable {
+    let highlightedText: String
+    let remainingText: String
+    let highlightedCharacterCount: Int
+    let highlightedCharacterProgress: Double
+    let totalCharacterCount: Int
+
+    var normalizedProgress: Double {
+        guard totalCharacterCount > 0 else { return 0 }
+        return min(max(highlightedCharacterProgress / Double(totalCharacterCount), 0), 1)
+    }
+}
+
+enum KaraokeHighlightResolver {
+    static func resolve(
+        text: String,
+        words: [LyricWord],
+        positionMs: Int64?,
+        fallbackProgress: Double,
+        lookAheadMs: Int64 = 0
+    ) -> KaraokeHighlightResult {
+        let characters = Array(text)
+        let count = characters.count
+        guard count > 0 else {
+            return KaraokeHighlightResult(
+                highlightedText: "",
+                remainingText: "",
+                highlightedCharacterCount: 0,
+                highlightedCharacterProgress: 0,
+                totalCharacterCount: 0
+            )
+        }
+        let highlightProgress: Double
+        if let positionMs, !words.isEmpty {
+            highlightProgress = wordHighlightProgress(
+                textCharacters: characters,
+                words: words,
+                positionMs: positionMs + max(lookAheadMs, 0)
+            )
+        } else {
+            let boundedProgress = min(max(fallbackProgress, 0), 1)
+            highlightProgress = Double(count) * boundedProgress
+        }
+        let boundedHighlightProgress = min(max(highlightProgress, 0), Double(count))
+        let highlightCount = Int(boundedHighlightProgress.rounded(.down))
+        return KaraokeHighlightResult(
+            highlightedText: String(characters.prefix(highlightCount)),
+            remainingText: String(characters.dropFirst(highlightCount)),
+            highlightedCharacterCount: highlightCount,
+            highlightedCharacterProgress: boundedHighlightProgress,
+            totalCharacterCount: count
+        )
+    }
+
+    private static func wordHighlightProgress(
+        textCharacters: [Character],
+        words: [LyricWord],
+        positionMs: Int64
+    ) -> Double {
+        var searchStart = 0
+        var completedEnd = 0
+        for word in words {
+            let wordCharacters = Array(word.text)
+            guard !wordCharacters.isEmpty else { continue }
+            let wordStart = find(
+                wordCharacters,
+                in: textCharacters,
+                startingAt: searchStart
+            ) ?? min(searchStart, textCharacters.count)
+            let wordEnd = min(wordStart + wordCharacters.count, textCharacters.count)
+            guard positionMs >= word.startMs else {
+                return Double(min(completedEnd, textCharacters.count))
+            }
+            let durationMs = max(word.durationMs, 1)
+            let elapsedMs = positionMs - word.startMs
+            if elapsedMs < durationMs {
+                let fraction = min(max(Double(elapsedMs) / Double(durationMs), 0), 1)
+                let partialProgress = Double(wordStart) +
+                    Double(max(wordEnd - wordStart, 0)) * fraction
+                return min(
+                    max(partialProgress, Double(completedEnd)),
+                    Double(textCharacters.count)
+                )
+            }
+            completedEnd = max(completedEnd, wordEnd)
+            searchStart = wordEnd
+        }
+        return Double(textCharacters.count)
+    }
+
+    private static func find(
+        _ needle: [Character],
+        in haystack: [Character],
+        startingAt start: Int
+    ) -> Int? {
+        guard !needle.isEmpty,
+              start < haystack.count,
+              needle.count <= haystack.count else { return nil }
+        let lastStart = haystack.count - needle.count
+        guard start <= lastStart else { return nil }
+        for index in start...lastStart {
+            if haystack[index..<(index + needle.count)].elementsEqual(needle) {
+                return index
+            }
+        }
+        return nil
+    }
+}
+
+struct KaraokeProgressTextRenderer: TextRenderer {
+    var progress: Double
+
+    var animatableData: Double {
+        get { progress }
+        set { progress = newValue }
+    }
+
+    func draw(layout: Text.Layout, in context: inout GraphicsContext) {
+        let boundedProgress = min(max(progress, 0), 1)
+        let totalWidth = layout.reduce(CGFloat.zero) { partialResult, line in
+            partialResult + max(line.typographicBounds.width, 0)
+        }
+        guard totalWidth > 0, boundedProgress > 0 else { return }
+
+        var remainingWidth = totalWidth * boundedProgress
+        for line in layout {
+            let bounds = line.typographicBounds
+            let lineWidth = max(bounds.width, 0)
+            guard lineWidth > 0, remainingWidth > 0 else { continue }
+
+            if remainingWidth >= lineWidth {
+                for run in line { context.draw(run) }
+                remainingWidth -= lineWidth
+                continue
+            }
+
+            var clippedContext = context
+            let isRightToLeft = line.first?.layoutDirection == .rightToLeft
+            let revealWidth = min(max(remainingWidth, 0), lineWidth)
+            let rect = bounds.rect
+            let clipRect = CGRect(
+                x: isRightToLeft ? rect.maxX - revealWidth : rect.minX,
+                y: rect.minY - 1,
+                width: revealWidth,
+                height: rect.height + 2
+            )
+            clippedContext.clip(to: Path(clipRect))
+            for run in line { clippedContext.draw(run) }
+            remainingWidth = 0
+        }
+    }
+}
+
+enum KaraokeProgressAnimationPolicy {
+    static func duration(
+        for mode: PlaybackPerformanceMode,
+        isLowPowerModeEnabled: Bool
+    ) -> TimeInterval {
+        switch mode {
+        case .smooth:
+            return 0.10
+        case .automatic:
+            return isLowPowerModeEnabled ? 0.50 : 0.25
+        case .powerSaving:
+            return 0.50
+        }
+    }
+
+    static func shouldAnimate(
+        from oldProgress: Double,
+        to newProgress: Double,
+        isPlaying: Bool,
+        reduceMotion: Bool
+    ) -> Bool {
+        guard isPlaying, !reduceMotion else { return false }
+        let delta = newProgress - oldProgress
+        return delta >= 0 && delta <= 0.30
     }
 }
 

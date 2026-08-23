@@ -277,7 +277,7 @@ struct NowPlayingDiagnosticView: View {
     private func selfHealingCard(_ snapshot: NowPlayingDiagnosticSnapshot) -> some View {
         DiagnosticCard {
             VStack(alignment: .leading, spacing: 12) {
-                Label("Self-Healing", systemImage: "cross.case")
+                Label("自愈引擎", systemImage: "cross.case")
                     .font(.headline.weight(.bold))
 
                 Text(snapshot.selfHealing.overallStatus)
@@ -308,7 +308,7 @@ struct NowPlayingDiagnosticView: View {
     private func recentIssuesCard(_ snapshot: NowPlayingDiagnosticSnapshot) -> some View {
         DiagnosticCard {
             VStack(alignment: .leading, spacing: 12) {
-                Label("Recent Issues", systemImage: "exclamationmark.triangle")
+                Label("最近问题", systemImage: "exclamationmark.triangle")
                     .font(.headline.weight(.bold))
 
                 VStack(alignment: .leading, spacing: 8) {
@@ -332,7 +332,7 @@ struct NowPlayingDiagnosticView: View {
     private func quickActionsCard(_ snapshot: NowPlayingDiagnosticSnapshot) -> some View {
         DiagnosticCard {
             VStack(alignment: .leading, spacing: 12) {
-                Label("Quick Actions", systemImage: "bolt.fill")
+                Label("快捷操作", systemImage: "bolt.fill")
                     .font(.headline.weight(.bold))
 
                 LazyVGrid(
@@ -431,11 +431,11 @@ struct NowPlayingDiagnosticView: View {
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.78))
                 .lineLimit(2)
-            Text("Recover: \(report.recoveryAction)")
+            Text("恢复：\(report.recoveryAction)")
                 .font(.caption2)
                 .foregroundStyle(.white.opacity(0.54))
                 .lineLimit(3)
-            Text("Verify: \(report.verifySignal)")
+            Text("验证：\(report.verifySignal)")
                 .font(.caption2)
                 .foregroundStyle(.white.opacity(0.54))
                 .lineLimit(3)

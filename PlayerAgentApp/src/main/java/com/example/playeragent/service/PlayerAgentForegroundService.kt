@@ -34,6 +34,7 @@ import com.example.playeragent.media.QrcIncrementalPrebuildManager
 import com.example.playeragent.media.QrcMaintenanceCoordinator
 import com.example.playeragent.media.QrcWatcherStatus
 import com.example.playeragent.media.MaintenanceTaskType
+import com.example.playeragent.media.PlayerAgentExecutionHub
 
 class PlayerAgentForegroundService : Service() {
 
@@ -49,6 +50,7 @@ class PlayerAgentForegroundService : Service() {
     private var playbackHistoryMonitor: PlaybackHistoryMonitor? = null
     private var qrcIncrementalPrebuildManager: QrcIncrementalPrebuildManager? = null
     private var qrcDirectoryWatcher: QrcDirectoryWatcher? = null
+    private var executionHub: PlayerAgentExecutionHub? = null
     @Volatile
     private var serviceStopping = false
     @Volatile
@@ -81,6 +83,7 @@ class PlayerAgentForegroundService : Service() {
         StartupGuard.markServiceOnCreate(::log)
         running = true
         serviceStopping = false
+        executionHub = PlayerAgentExecutionHub("PlayerAgent")
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification("PlayerAgent is running"))
         registerReceiver(
@@ -121,6 +124,8 @@ class PlayerAgentForegroundService : Service() {
         advertiserManager = null
         gattServerManager?.close("service destroyed")
         gattServerManager = null
+        executionHub?.close()
+        executionHub = null
         publishBleHealthSnapshot("service destroyed")
         log("Foreground service stopped")
         flushLogBroadcasts()
@@ -128,6 +133,11 @@ class PlayerAgentForegroundService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onTrimMemory(level: Int) {
+        gattServerManager?.onTrimMemory(level)
+        super.onTrimMemory(level)
+    }
 
     private fun ensureBleStackStarted(reason: String, forceRebuild: Boolean = false) {
         log("[BLE-RECOVERY] ensure start reason=$reason")
@@ -141,7 +151,8 @@ class PlayerAgentForegroundService : Service() {
         }
         playbackHistoryMonitor = PlaybackHistoryMonitor(
             context = this,
-            logger = ::log
+            logger = ::log,
+            executionHub = executionHub
         ).also {
             it.start()
         }
@@ -227,7 +238,10 @@ class PlayerAgentForegroundService : Service() {
                 },
                 onAllClientsDisconnected = ::handleAllClientsDisconnected,
                 onControllerConnectionCountChanged = ::handleControllerConnectionCountChanged,
-                onPlaybackUiState = ::publishPlaybackUiState
+                onPlaybackUiState = ::publishPlaybackUiState,
+                executionHub = executionHub ?: PlayerAgentExecutionHub("PlayerAgent").also {
+                    executionHub = it
+                }
             )
             if (manager.start()) {
                 gattServerManager = manager
@@ -617,14 +631,17 @@ class PlayerAgentForegroundService : Service() {
                         log("[LyricRetry] watcher retry skipped groups=${groups.size}")
                     }
                 }
-            }
+            },
+            executionHub = executionHub
         ).also {
             qrcIncrementalPrebuildManager = it
         }
         val watcher = qrcDirectoryWatcher ?: QrcDirectoryWatcher(
+            context = this,
             incrementalPrebuildManager = manager,
             logger = ::log,
-            statusListener = ::publishQrcWatcherStatus
+            statusListener = ::publishQrcWatcherStatus,
+            executionHub = executionHub
         ).also {
             qrcDirectoryWatcher = it
         }

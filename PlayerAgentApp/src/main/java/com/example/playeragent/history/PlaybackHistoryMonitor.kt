@@ -2,7 +2,9 @@ package com.example.playeragent.history
 
 import android.content.Context
 import android.os.SystemClock
+import com.example.playeragent.media.PlayerAgentExecutionHub
 import com.example.playeragent.media.PlaybackStateReader
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
@@ -11,7 +13,8 @@ import java.util.concurrent.atomic.AtomicReference
 
 class PlaybackHistoryMonitor(
     context: Context,
-    private val logger: (String) -> Unit
+    private val logger: (String) -> Unit,
+    executionHub: PlayerAgentExecutionHub? = null
 ) {
     private val appContext = context.applicationContext
     private val repository = PlaybackHistoryRepository(appContext)
@@ -20,12 +23,14 @@ class PlaybackHistoryMonitor(
         logger = logger,
         includeLyric = false
     )
-    private val executor: ScheduledExecutorService =
-        Executors.newSingleThreadScheduledExecutor { runnable ->
+    private val ownsExecutor = executionHub == null
+    private val scheduler: ScheduledExecutorService =
+        executionHub?.scheduled ?: Executors.newSingleThreadScheduledExecutor { runnable ->
             Thread(runnable, "PlaybackHistoryMonitorThread").apply {
                 isDaemon = true
             }
         }
+    private val worker: ExecutorService = executionHub?.maintenance ?: scheduler
 
     @Volatile
     private var running = false
@@ -43,7 +48,7 @@ class PlaybackHistoryMonitor(
         }
         running = true
         updateStatus()
-        scheduledFuture = executor.schedule({ safeTick() }, 0L, TimeUnit.MILLISECONDS)
+        scheduleTick(0L)
         logger("[History] monitor started")
     }
 
@@ -54,7 +59,7 @@ class PlaybackHistoryMonitor(
         running = false
         scheduledFuture?.cancel(false)
         scheduledFuture = null
-        executor.execute {
+        worker.execute {
             runCatching {
                 endActiveSession(EndReason.SERVICE_STOPPED)
                 updateStatus()
@@ -62,9 +67,20 @@ class PlaybackHistoryMonitor(
                 logger("[History] stop flush failed error=${it.message}")
             }
         }
-        executor.shutdown()
+        if (ownsExecutor) scheduler.shutdown()
         reader.close()
         logger("[History] monitor stopped")
+    }
+
+    private fun scheduleTick(delayMs: Long) {
+        scheduledFuture = scheduler.schedule(
+            {
+                runCatching { worker.execute(::safeTick) }
+                    .onFailure { logger("[History] schedule failed error=${it.message}") }
+            },
+            delayMs,
+            TimeUnit.MILLISECONDS
+        )
     }
 
     private fun safeTick() {
@@ -76,11 +92,7 @@ class PlaybackHistoryMonitor(
             }
         } finally {
             if (running) {
-                scheduledFuture = executor.schedule(
-                    { safeTick() },
-                    nextTickDelayMs,
-                    TimeUnit.MILLISECONDS
-                )
+                scheduleTick(nextTickDelayMs)
             }
         }
     }

@@ -729,7 +729,7 @@ struct SystemHealthSnapshot {
             return "封面传输中断，可点击重试封面。"
         }
         if artwork.status == "图片过大" {
-            return "HQ 图片过大，已使用 fallback 或 preview。"
+            return "高清图片过大，已使用回退图或预览图。"
         }
         if selfHealing.level == .warning || selfHealing.level == .critical {
             return "查看 Self-Healing 报告中的失败或诊断项。"
@@ -741,13 +741,13 @@ struct SystemHealthSnapshot {
     }
 
     private static func cacheSummary(_ cache: ArtworkCacheDiagnostic?) -> String {
-        guard let cache else { return "unknown" }
-        guard cache.exists else { return "missing" }
+        guard let cache else { return "未知" }
+        guard cache.exists else { return "缺失" }
         return "\(cache.pixelWidth)x\(cache.pixelHeight), \(cache.bytes) bytes"
     }
 
     private static func formatTimestamp(_ value: Int64) -> String {
-        guard value > 0 else { return "unknown" }
+        guard value > 0 else { return "未知" }
         return NowPlayingDiagnosticSnapshot.optionalDate(
             Date(timeIntervalSince1970: TimeInterval(value) / 1_000)
         )

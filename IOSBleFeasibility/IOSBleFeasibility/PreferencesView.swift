@@ -56,6 +56,17 @@ struct PreferencesView: View {
 
     private var modeSection: some View {
         PreferencesCard(title: "使用模式", systemImage: "person.crop.circle") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("界面语言")
+                    .font(.subheadline.weight(.semibold))
+                Picker("界面语言", selection: appLanguageBinding) {
+                    ForEach(AppLanguage.allCases) { language in
+                        Text(language.title).tag(language)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+
             Picker("使用模式", selection: appModeBinding) {
                 ForEach(AppExperienceMode.allCases) { mode in
                     Text(mode.title).tag(mode)
@@ -93,7 +104,7 @@ struct PreferencesView: View {
                 .pickerStyle(.segmented)
             }
 
-            Text("默认使用歌词优先样式；其它样式先作为本地设置保留，方便后续扩展。")
+            Text("默认展示封面、标题与歌手；歌词优先突出当前歌词；节奏优先展示播放状态与节奏条。")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.58))
         }
@@ -105,14 +116,24 @@ struct PreferencesView: View {
                 .tint(.green)
 
             preferencesRow("当前连接状态", displayConnectionState)
-            preferencesRow("Health 状态", bleManager.connectionHealthState)
-            preferencesRow(
-                "MTU",
-                bleManager.currentMtuBytesForPreferences > 0
-                    ? "\(bleManager.currentMtuBytesForPreferences)"
-                    : "-"
-            )
-            preferencesRow("最近重连原因", bleManager.connectionHealthLastHardReconnectReason)
+
+            if preferences.appExperienceMode == .debug {
+                Toggle("强制使用 V2 协议", isOn: forceProtocolV2Binding)
+                    .tint(.orange)
+
+                Text("仅用于跨端 A/B 与紧急回退；切换后请重新连接。")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.58))
+
+                preferencesRow("Health 状态", bleManager.connectionHealthState)
+                preferencesRow(
+                    "MTU",
+                    bleManager.currentMtuBytesForPreferences > 0
+                        ? "\(bleManager.currentMtuBytesForPreferences)"
+                        : "-"
+                )
+                preferencesRow("最近重连原因", bleManager.connectionHealthLastHardReconnectReason)
+            }
 
             Text("关闭自动重连后，手动扫描 / 重连仍然可用。")
                 .font(.caption)
@@ -184,11 +205,11 @@ struct PreferencesView: View {
             VStack(spacing: 10) {
                 actionButton("清理增强封面缓存", "trash") {
                     bleManager.clearEnhancedArtworkCache()
-                    actionStatus = "已请求清理增强封面缓存"
+                    actionStatus = AppLocalization.string("已请求清理增强封面缓存")
                 }
                 actionButton("复制最近日志路径", "doc.on.clipboard") {
                     UIPasteboard.general.string = AppLogStore.shared.currentLogURL.path
-                    actionStatus = "已复制日志路径"
+                    actionStatus = AppLocalization.string("已复制日志路径")
                 }
                 if AppLogStore.shared.currentLogFileExists() {
                     ShareLink(item: AppLogStore.shared.currentLogURL) {
@@ -203,7 +224,7 @@ struct PreferencesView: View {
                         nowPlaying: bleManager.makeNowPlayingDiagnosticSnapshot()
                     )
                     UIPasteboard.general.string = snapshot.copyText
-                    actionStatus = "已复制诊断摘要"
+                    actionStatus = AppLocalization.string("已复制诊断摘要")
                 }
             }
 
@@ -223,12 +244,12 @@ struct PreferencesView: View {
 
     private var aboutSection: some View {
         PreferencesCard(title: "关于", systemImage: "info.circle") {
-            preferencesRow("App", "Sony Music BLE Controller")
+            preferencesRow("应用", "Sony 音乐控制器")
             preferencesRow("版本", appVersion)
-            preferencesRow("Build", buildVersion)
+            preferencesRow("构建版本", buildVersion)
             preferencesRow("签名有效期", signingProfileExpireText, valueColor: signingProfileStatusColor)
             preferencesRow("剩余时间", signingProfileRemainingText, valueColor: signingProfileStatusColor)
-            preferencesRow("签名 Team", signingProfile?.teamIdentifier ?? "-")
+            preferencesRow("签名团队", signingProfile?.teamIdentifier ?? "-")
             preferencesRow("当前模式", preferences.appExperienceMode.title)
             preferencesRow("连接设备", bleManager.connectedDeviceName == "-" ? "Sony" : bleManager.connectedDeviceName)
         }
@@ -238,6 +259,13 @@ struct PreferencesView: View {
         Binding(
             get: { preferences.appExperienceMode },
             set: { bleManager.setAppExperienceMode($0) }
+        )
+    }
+
+    private var appLanguageBinding: Binding<AppLanguage> {
+        Binding(
+            get: { preferences.appLanguage },
+            set: { preferences.appLanguage = $0 }
         )
     }
 
@@ -252,6 +280,13 @@ struct PreferencesView: View {
         Binding(
             get: { preferences.playbackPerformanceMode },
             set: { preferences.playbackPerformanceMode = $0 }
+        )
+    }
+
+    private var forceProtocolV2Binding: Binding<Bool> {
+        Binding(
+            get: { preferences.forceProtocolV2 },
+            set: { preferences.forceProtocolV2 = $0 }
         )
     }
 
@@ -302,9 +337,9 @@ struct PreferencesView: View {
 
     private var displayConnectionState: String {
         switch bleManager.connectionDisplayState {
-        case "connected": return "已连接"
-        case "reconnecting": return "正在重连"
-        case "disconnected": return "未连接"
+        case "connected": return AppLocalization.string("已连接")
+        case "reconnecting": return AppLocalization.string("正在重连")
+        case "disconnected": return AppLocalization.string("未连接")
         default: return bleManager.connectionDisplayState
         }
     }
@@ -367,7 +402,7 @@ struct PreferencesView: View {
         valueColor: Color = .white.opacity(0.82)
     ) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text(title)
+            Text(AppLocalization.string(title))
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.white.opacity(0.52))
                 .frame(width: 96, alignment: .leading)
@@ -391,7 +426,7 @@ struct PreferencesView: View {
     }
 
     private func settingsActionLabel(_ title: String, _ systemImage: String) -> some View {
-        Label(title, systemImage: systemImage)
+        Label(AppLocalization.string(title), systemImage: systemImage)
             .font(.subheadline.weight(.semibold))
             .foregroundStyle(.white)
             .frame(maxWidth: .infinity)
@@ -453,7 +488,7 @@ private struct PreferencesCard<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 13) {
-            Label(title, systemImage: systemImage)
+            Label(AppLocalization.string(title), systemImage: systemImage)
                 .font(.headline.weight(.bold))
 
             content

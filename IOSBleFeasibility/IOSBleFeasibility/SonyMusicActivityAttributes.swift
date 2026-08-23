@@ -1,6 +1,39 @@
 import ActivityKit
 import Foundation
 
+enum AppLanguage: String, CaseIterable, Identifiable {
+    case simplifiedChinese = "zh-Hans"
+    case english = "en"
+
+    var id: String { rawValue }
+    var locale: Locale { Locale(identifier: rawValue) }
+    var title: String {
+        switch self {
+        case .simplifiedChinese: return "简体中文"
+        case .english: return "English"
+        }
+    }
+
+    static let userDefaultsKey = "appLanguage"
+    static let defaultLanguage: AppLanguage = .simplifiedChinese
+}
+
+enum AppLocalization {
+    static func string(_ key: String) -> String {
+        let groupDefaults = UserDefaults(
+            suiteName: "group.com.sqz.IOSBleFeasibility.LiveActivity"
+        )
+        let rawLanguage = UserDefaults.standard.string(forKey: AppLanguage.userDefaultsKey) ??
+            groupDefaults?.string(forKey: AppLanguage.userDefaultsKey)
+        let language = rawLanguage.flatMap(AppLanguage.init(rawValue:)) ?? .defaultLanguage
+        guard let path = Bundle.main.path(forResource: language.rawValue, ofType: "lproj"),
+              let localizedBundle = Bundle(path: path) else {
+            return key
+        }
+        return localizedBundle.localizedString(forKey: key, value: key, table: nil)
+    }
+}
+
 enum IslandState: String, Codable, Hashable {
     case playing
     case paused
@@ -29,11 +62,11 @@ enum DynamicIslandStyle: String, Codable, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .compactDefault:
-            return "默认"
+            return AppLocalization.string("默认")
         case .lyricFocused:
-            return "歌词优先"
+            return AppLocalization.string("歌词优先")
         case .waveformFocused:
-            return "节奏优先"
+            return AppLocalization.string("节奏优先")
         }
     }
 
