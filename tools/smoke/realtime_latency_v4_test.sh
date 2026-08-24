@@ -316,8 +316,17 @@ clock_matches = re.findall(
 stage_counts = data.get("stageCounts", {})
 mode = sys.argv[2]
 requested_runs = int(sys.argv[3])
+fast_switch = sys.argv[4].lower() == "true"
+control_attempt_count = len(re.findall(
+    r"\[RealtimeTrace\][^\n]*\bside=sony\b[^\n]*\bstage=commandReceived\b"
+    r"[^\n]*\bcommandType=(?:NEXT|PREVIOUS)\b",
+    sony_text,
+))
+observed_transition_count = stage_counts.get("mediaSessionTrackChanged", 0)
 sample_count = (
-    stage_counts.get("mediaSessionTrackChanged", 0)
+    control_attempt_count
+    if fast_switch
+    else observed_transition_count
     if mode == "auto"
     else stage_counts.get("commandIntent", 0)
 )
@@ -328,7 +337,7 @@ data.update({
     "scenario": {
         "mode": mode,
         "runs": requested_runs,
-        "fastSwitch": sys.argv[4].lower() == "true",
+        "fastSwitch": fast_switch,
     },
     "devices": {"ios": sys.argv[5], "sony": sys.argv[6]},
     "basicInfo": {
@@ -340,6 +349,8 @@ data.update({
         "clockSyncTrusted": data.get("clock", {}).get("crossDeviceTrusted", False),
         "clockSyncSampleCount": int(clock_matches[-1][0]) if clock_matches else 0,
         "sampleCount": sample_count,
+        "controlAttemptCount": control_attempt_count,
+        "observedTransitionCount": observed_transition_count,
         "cacheState": {
             "runtimeHit": data.get("stageCounts", {}).get("runtimeCacheHit", 0),
             "runtimeMiss": data.get("stageCounts", {}).get("runtimeCacheMiss", 0),
@@ -362,6 +373,7 @@ summary_path.write_text(
     + f"- MTU: {basic['mtu']}\n"
     + f"- Clock sync trusted: {basic['clockSyncTrusted']}\n"
     + f"- Samples: {sample_count}/{requested_runs}\n\n"
+    + f"- Observed transitions: {observed_transition_count}\n\n"
     + body,
     encoding="utf-8",
 )

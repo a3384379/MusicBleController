@@ -40,6 +40,7 @@
 9. iOS 在 utility 串行队列原子保存 `Documents/AlbumArtCache/`；增强图保存到 Enhanced 子目录。
 10. 主 UI 使用最终 `albumArtImage`；Live Activity 使用 App Group 小图。加载层明确区分 preview、HQ 和失败，可只重试当前歌曲。
 11. Sony PlayerAgent 本机 UI 在歌曲变化时先进入 LOADING；MediaMetadata/Notification 的 title/artist 与当前身份不匹配时拒绝。通知更新触发精确重读，不增加轮询；同一当前歌曲的临时精确源缺失不会把已经 READY 的图替换为占位图。
+12. V4 第三阶段的预测模型可以记录“已有精确 artwork cache”这一 readiness，但当前 QQ 音乐不暴露高置信下一/上一首 identity，因此没有执行候选图片预编码、跨端 Preview/HQ 预取或猜测式图片晋升。正式封面仍只按当前 trackId/generation 发布。
 
 ## 关键状态
 
@@ -53,6 +54,7 @@
 - 缓存最长可展示 30 天；通知来源 30 分钟后复验，稳定 metadata 来源 24 小时后复验。小于 300px 只触发后台刷新，不清空可用图。
 - Sony preview 目标约 112px、Q40～50、最多 1.8KB/12 包；HQ Q70～80、最多 8KB且保持最低优先级。
 - Sony 已编码 JPEG 使用 40 项、16MB、30 分钟内存 LRU，避免同歌曲重复压缩。
+- Predictive Hot Set 只保存 artworkId/readiness 元数据，不复制 Bitmap/JPEG；当前真机 prefetch bytes/packets 均为 0。
 - iOS 解码缓存 key 包含 `artworkId + quality + targetPixelSize`，避免同一 JPEG 在主界面和历史列表重复全尺寸解码。
 - A1 header 和 quality code 不变；start/end 可带 `transferId`、`generation`、`crc32`，新端支持局部重传，旧端直接忽略新字段。
 

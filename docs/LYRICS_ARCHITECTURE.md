@@ -12,6 +12,7 @@
 - Sony `LyricRecoveryEngine`：当前歌曲无歌词后短期恢复窗口，处理 QQ音乐懒加载歌词缓存。
 - iOS `BLETestManager`：接收 `lyricWindow*`、legacy `fullLyrics*`、A2 zlib full lyrics、`lyricSecondary*` 和歌词诊断。
 - Sony `LyricsTransferCoordinator` / `CompressedLyricsCache`：独立持有歌词重传与最多 16 项/512KB 的 zlib 正文和 CRC，不受封面生命周期影响。
+- Sony `PredictiveMediaCoordinator`：最多两个候选的有界 Hot Set；只在低优先级线程验证现有 QRC parsed cache 和 fingerprint，不复制第二份完整歌词。
 - iOS `FullLyricsView`：显示原文、翻译、罗马音，逐字高亮只作用于原文。
 
 ## 核心文件
@@ -43,6 +44,8 @@
 8. 翻译/罗马音继续通过 `GET_LYRIC_SECONDARY mode=translation|romanization` 独立分片发送。iOS 分别维护开始、分包空闲和总传输超时；临时错误或缺包只重试一次，明确 unavailable 不重试，切歌/断线会取消旧连接代次的请求。
 9. QRC 就绪回调会立即恢复 currentWord 边界调度；暂停时无周期任务，seek/恢复/切歌重新计算，最长 500ms 漂移校正。
 10. iOS 主界面显示等待 QQ QRC、歌词窗口、完整歌词、完成或明确失败；“重试歌词”只清理当前歌曲 cooldown/失败状态，并用 `GET_FULL_LYRICS forceRefresh=true` 触发兼容刷新。
+11. V4 预测候选只有在真实 Track Identity、稳定 mediaId/trackId 和 QRC fingerprint 全部复验后才能晋升；WEAK 历史候选永不晋升，失败立即走步骤 3 的冷路径。
+12. `mediaCacheValidationV1` 启用时，iOS cache v2 附带覆盖原文、逐字 timing、翻译和罗马音的 fingerprint/schema/行数，并在请求前用跨端固定向量算法复算本地正文。精确命中返回 `fullLyricsNotModified`，不重复发送 FullLyrics；任一字段或正文不一致、cache 损坏或旧 cache v1 都回退完整传输。新 descriptor 只随完整正文发布落盘，不能附着到旧正文。
 
 ## 关键状态
 
@@ -54,6 +57,7 @@
 - iOS `LyricLine`：解析 fullLyrics 和 secondary 后合并，secondary 会清洗 `//`、`/`、`暂无翻译` 等占位。
 - iOS `FullLyricsCacheStore`：按精确 trackId 并复核标准化 title+artist，最多 80 首/8MB/30 天；缓存命中只做即时展示，仍请求 Sony 复验，远端主歌词刷新时保留已有翻译/罗马音直到新结果到达。
 - 压缩缓存 key 包含 songKey、fingerprint、generation、格式和逐字行集合；翻译/罗马音、fingerprint、generation 改变时不复用旧正文。
+- `PredictiveHotSet` 最多两个 metadata entry、TTL 2 分钟；大数据继续引用 QRC parsed cache 和 `CompressedLyricsCache`，没有第二份大缓存。
 
 ## 不允许随便修改的点
 

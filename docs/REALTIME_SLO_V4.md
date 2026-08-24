@@ -206,3 +206,9 @@ Sony 同一 `commandSeq + commandType` 的多次 `mediaControlDispatchStart` 计
 ## 17. 下一阶段建议
 
 下一阶段应优先使用预测命中、精确缓存和传输消除处理 MediaSession 身份确认、歌词就绪与封面首帧长尾。若继续做第二阶段微调，仍只处理事件证据指向的 ready→pending、pending→queue、CurrentWord 启动或 Preview/HQ 竞争；每项优化必须保留 stale fence，并用同一场景输出 before/after p95 与正确性计数。
+
+## 18. 第三阶段结果索引
+
+第三阶段实现和数据见 [PREDICTIVE_MEDIA_ENGINE_V4.md](/Volumes/雷电/project/MusicBleController/docs/PREDICTIVE_MEDIA_ENGINE_V4.md)。正式 Prediction Source Audit 采集 239 次转换，但当前 Sony/QQ 音乐的 MediaSession queue available=0、activeQueueItemId available=0，高置信候选覆盖率为 0，所以 Warm Path 全部标记 `NOT APPLICABLE`，跨端 prefetch Gate 跳过。
+
+已落地的可测收益是 `mediaCacheValidationV1`：iOS 与 Sony 精确校验 FullLyrics fingerprint/schema/原文及 secondary 行数，命中时只发轻量 not-modified 并继续 CurrentLine/CurrentWord，不再传 A2/legacy 正文。第一轮 100 个快速控制观察到 31 次传输跳过、估算节省 317,060 bytes；stale accepted、wrong CurrentWord、wrong artwork、visible false positive、duplicate control 和 cold fallback failure 均为 0。该轮 command→Track p95 608.8ms，相对第二阶段同场景 621.8ms 无回退；图片冷路径仍有外部长尾，未宣称 Warm SLO 达标。

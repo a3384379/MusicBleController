@@ -20,6 +20,7 @@
 - Sony BLE GATT：[BleGattServerManager.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/ble/BleGattServerManager.kt)
 - Sony BLE 队列：[BleNotifyQueue.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/ble/BleNotifyQueue.kt)
 - Sony 播放状态：[PlaybackStateReader.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/PlaybackStateReader.kt)
+- Sony 预测热集：[PredictiveMediaCoordinator.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/PredictiveMediaCoordinator.kt)
 - Sony 歌词：[LyricManager.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/LyricManager.kt)、[QrcLyricManager.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/QrcLyricManager.kt)
 - Android Controller 服务：[ControllerConnectionService.kt](/Volumes/雷电/project/MusicBleController/ControllerApp/src/main/java/com/example/controllerapp/service/ControllerConnectionService.kt)
 - Android Controller 协议与状态：[ControllerRepository.kt](/Volumes/雷电/project/MusicBleController/ControllerApp/src/main/java/com/example/controllerapp/ControllerRepository.kt)、[ControllerModels.kt](/Volumes/雷电/project/MusicBleController/ControllerApp/src/main/java/com/example/controllerapp/model/ControllerModels.kt)
@@ -36,6 +37,8 @@
 7. Android `ControllerConnectionService` 使用同一 BLE V2 协议更新 Compose 界面和
    MediaStyle 通知，可与 iPhone 同时在线并保持控制与媒体状态同步。
 8. Sony PlayerAgent 本机播放器封面监听 QQ 音乐通知事件，并在 title/artist 精确匹配当前媒体后发布；切歌后的迟到图片由 generation+songKey 栅栏拒绝。
+9. V4 第三阶段先审计 MediaSession queue；有稳定 queueItemId/mediaId 时 Sony 才允许 CONFIRMED/STRONG 候选晋升。当前真机 QQ 音乐不暴露队列，因此只保留 WEAK 历史候选的本地 QRC 索引预热，不向控制端发送候选。
+10. 协商 `mediaCacheValidationV1` 后，iOS 对当前歌曲的精确 FullLyrics cache 发 fingerprint/schema/行数校验；命中时 Sony 跳过完整正文传输，CurrentLine/CurrentWord 仍正常增量发布。
 
 ## 关键状态
 
@@ -66,6 +69,7 @@
 - Live Activity：`[LiveActivity]`、`[LiveActivityState]`、`[LiveActivityPerf]`。
 - Smoke 报告：`/tmp/music_ble_ios_smoke/<timestamp>/report.json`。
 - V4 实时性 Trace、SLO 与真机基线：[REALTIME_SLO_V4.md](/Volumes/雷电/project/MusicBleController/docs/REALTIME_SLO_V4.md)；自动报告位于 `/tmp/musicble_realtime_v4/<timestamp>/`。
+- V4 预测来源、Hot Set、缓存校验与 Gate 4 跳过依据：[PREDICTIVE_MEDIA_ENGINE_V4.md](/Volumes/雷电/project/MusicBleController/docs/PREDICTIVE_MEDIA_ENGINE_V4.md)。
 
 ## 修改后必须跑哪些 smoke test
 

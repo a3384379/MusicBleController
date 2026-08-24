@@ -60,6 +60,7 @@
 - `albumArtUnavailable`
 - `fullLyricsStart` / `fullLyricsChunk` / `fullLyricsEnd` / `fullLyricsUnavailable`
 - `fullLyricsBinaryStart` / `0xA2` binary chunk / `fullLyricsBinaryEnd`
+- `fullLyricsCacheMetadata` / `fullLyricsNotModified`（仅协商 `mediaCacheValidationV1`）
 - `lyricWindowStart` / `lyricWindowChunk` / `lyricWindowEnd`
 - `clientCapabilitiesAck`、`pong`
 - `lyricSecondaryStart` / `lyricSecondaryPart` / `lyricSecondaryEnd`
@@ -100,7 +101,7 @@
 V3 是逐项可选能力层，不替换 V2。UUID、命令名、A1/A2、legacy 和全部 V2 字段保持不变；任一能力未协商时立即沿用现有 V2/legacy 行为。
 
 - 客户端必须同时发送 `protocolVersion=3` 和 `f3` 才进入 V3 协商。只发送版本号不会启用任何 V3 行为。
-- `f3` bit0=`statusMetaV1`、bit1=`structuredErrorV1`、bit2=`mediaLoadStateV1`。Sony 只回显双方都支持的位；单项不支持时仅关闭该位。
+- `f3` bit0=`statusMetaV1`、bit1=`structuredErrorV1`、bit2=`mediaLoadStateV1`、bit3=`mediaCacheValidationV1`。Sony 只回显双方都支持的位；单项不支持时仅关闭该位。
 - `statusMetaV1` 仅在该设备有效 notify payload 不小于 247 bytes 时启用，小 MTU 会自动清除 bit0，不影响另外两个能力。
 - V3 ACK 使用紧凑格式：`{"type":"clientCapabilitiesAck","protocolVersion":3,"f2":63,"f3":<negotiated>,"sid":"1234abcd"}`。`sid` 是本次 Sony 服务进程的 8 位十六进制会话 ID。
 - `f2` bit0～bit5 依次表示 `albumArtBinary`、`fullLyricsZlib`、`lyricWindow`、`ping`、`clockSyncV1`、`transferRetry`。客户端仍发送原有 V2 boolean，Sony 据此生成 `f2`。
@@ -117,6 +118,10 @@ V3 是逐项可选能力层，不替换 V2。UUID、命令名、A1/A2、legacy �
 `domain` 为 `protocol/lyrics/artwork/history/connection`。错误必须关联原命令 `seq`；ATT 写响应只表示命令已收到，不能冒充业务成功。正常成功状态仍由现有 authoritative status 表示。
 
 协商 `mediaLoadStateV1` 后，Sony 可发送 P1 `mediaLoadState`：`resource=lyrics/artwork`，`stage=waiting/preparing/transferring/ready/unavailable/failed`。状态按设备与 `trackId/resource/stage/reason/generation` 去重，仅转换时发送；`ready` 表示对应传输已经完成。歌词 reason 包含 `qrc_pending/qrc_not_found/qrc_ambiguous/qrc_parse_failed/transfer_preparing/transfer_failed`，封面包含 `source_pending/source_unavailable/encode_failed/transfer_preparing/transfer_failed`。
+
+协商 `mediaCacheValidationV1` 后，iOS 可在原 `GET_FULL_LYRICS` 中携带 `fp/sv/n/tc/rc`（fingerprint、schema、主歌词/翻译/罗马音行数）以及紧凑 `id/p/w/f`。Sony 必须同时验证当前 trackId、generation 和实际内容描述符；命中返回 `fullLyricsNotModified` 并跳过 A2/legacy 正文，未命中返回 `fullLyricsCacheMetadata` 后继续原传输。旧端不声明 bit3，完全保持原行为。A2 header、命令名和 FullLyrics 正文 schema 均不改变。
+
+V4 第三阶段没有实现 `prefetchManifest`、`PREFETCH_MEDIA` 或 purpose=prefetch 的 A1/A2 会话。真机预测来源审计显示 QQ 音乐 queue 与 activeQueueItemId 均不可用，跨端预取 Gate 被关闭；详见 [PREDICTIVE_MEDIA_ENGINE_V4.md](/Volumes/雷电/project/MusicBleController/docs/PREDICTIVE_MEDIA_ENGINE_V4.md)。
 
 ## 自动歌词时钟同步
 
