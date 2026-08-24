@@ -63,6 +63,7 @@
 - 封面：iOS `[AlbumArt]`、`[AlbumArtBinary]`、`[AlbumArt-iOS]`、`[ArtworkDisplay]`；Sony `[AlbumArt-Sony]`。
 - Live Activity：`[LiveActivity]`、`[LiveActivityState]`、`[LiveActivityPerf]`。
 - Smoke 报告：`/tmp/music_ble_ios_smoke/<timestamp>/report.json`。
+- V4 实时性 Trace、SLO 与真机基线：[REALTIME_SLO_V4.md](/Volumes/雷电/project/MusicBleController/docs/REALTIME_SLO_V4.md)；自动报告位于 `/tmp/musicble_realtime_v4/<timestamp>/`。
 
 ## 修改后必须跑哪些 smoke test
 

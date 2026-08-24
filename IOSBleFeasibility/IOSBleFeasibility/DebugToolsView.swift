@@ -9,12 +9,14 @@ struct DebugToolsView: View {
     @State private var showLyricDiagnostic = false
     @State private var showNowPlayingDiagnostic = false
     @State private var showSystemHealthOverview = false
+    @State private var realtimeSummary = RealtimeTraceStore.shared.summary()
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     statusSection
+                    realtimeTraceSection
                     autoReconnectSection
                     artworkEnhancementSection
                     liveActivityControlSection
@@ -41,6 +43,7 @@ struct DebugToolsView: View {
         .presentationDragIndicator(.visible)
         .onAppear {
             bleManager.setUILogStreamingEnabled(true)
+            refreshRealtimeSummary()
         }
         .onDisappear {
             bleManager.setUILogStreamingEnabled(false)
@@ -63,6 +66,33 @@ struct DebugToolsView: View {
                 onDismiss: { showSystemHealthOverview = false }
             )
         }
+    }
+
+    private var realtimeTraceSection: some View {
+        DebugCard {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Label("Real-time SLO", systemImage: "waveform.path.ecg")
+                        .font(.headline)
+                    Spacer()
+                    Button("刷新") { refreshRealtimeSummary() }
+                        .buttonStyle(.bordered)
+                }
+                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
+                    debugRow("Events", "\(realtimeSummary.eventCount)")
+                    debugRow("Missing result", "\(realtimeSummary.missingResultCount)")
+                    debugRow("Latest mono", realtimeSummary.latestMonoMs.map { "\($0)ms" } ?? "-")
+                    debugRow("Stages", "\(realtimeSummary.stageCounts.count)")
+                }
+                Text("仅显示聚合快照；手动刷新，不读取日志正文。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func refreshRealtimeSummary() {
+        realtimeSummary = RealtimeTraceStore.shared.summary()
     }
 
     private var statusSection: some View {

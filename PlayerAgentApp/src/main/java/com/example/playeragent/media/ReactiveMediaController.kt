@@ -1,6 +1,7 @@
 package com.example.playeragent.media
 
 import android.os.SystemClock
+import com.example.playeragent.diagnostics.RealtimeTrace
 
 enum class MediaEventType {
     MEDIA_METADATA_CHANGED,
@@ -113,6 +114,29 @@ class ReactiveMediaController(
                 albumArtReady = false
                 lastCurrentLine = ""
                 lastCurrentWordKey = ""
+                RealtimeTrace.record(
+                    stage = "mediaSessionTrackChanged",
+                    monoMs = now,
+                    trackId = stableTrackId,
+                    generation = generation,
+                    payloadType = "mediaSession",
+                    result = "changed"
+                )
+                RealtimeTrace.record(
+                    stage = "trackIdentityAccepted",
+                    monoMs = now,
+                    trackId = stableTrackId,
+                    generation = generation,
+                    payloadType = "mediaSession",
+                    result = "accepted"
+                )
+                RealtimeTrace.record(
+                    stage = "trackGenerationCreated",
+                    monoMs = now,
+                    trackId = stableTrackId,
+                    generation = generation,
+                    result = "created"
+                )
                 logger(
                     "[Engine] event received type=${MediaEventType.TRACK_CHANGED} " +
                         "trackId=$stableTrackId generation=$generation title=${title.take(48)}"
@@ -157,6 +181,13 @@ class ReactiveMediaController(
             if (shouldScheduleLyrics) {
                 lyricsScheduledGeneration = generation
                 lyricsState = MediaPipelineState.SCHEDULED
+                RealtimeTrace.record(
+                    stage = "lyricRequestQueued",
+                    trackId = stableTrackId,
+                    generation = generation,
+                    payloadType = "lyrics",
+                    result = "scheduled"
+                )
                 logger(
                     "[Engine] task scheduled priority=${MediaTaskPriority.P3_LYRICS_PARSE.wireName} " +
                         "trackId=$stableTrackId generation=$generation reason=metadata_stable"
@@ -197,6 +228,13 @@ class ReactiveMediaController(
             lyricsInFlightTrackId = trackId
             lyricsInFlightGeneration = generation
             lyricsState = MediaPipelineState.RUNNING
+            RealtimeTrace.record(
+                stage = "lyricLoadStart",
+                trackId = trackId,
+                generation = generation,
+                payloadType = "lyrics",
+                result = "started"
+            )
             logger("[Lyrics] parse start trackId=$trackId generation=$generation")
             return true
         }

@@ -336,11 +336,21 @@ final class AlbumArtReceiver {
         updateArtworkEnhancementStatus(message: "ready")
     }
 
+    private func realtimeMonoMs() -> Int64 {
+        Int64(ProcessInfo.processInfo.systemUptime * 1_000)
+    }
+
     func handleOffer(id: String) {
         guard !id.isEmpty else {
             log("[AlbumArt] invalid offer")
             return
         }
+        RealtimeTraceStore.shared.record(
+            stage: "albumArtOfferReceived",
+            trackId: id,
+            payloadType: "albumArtOffer",
+            result: "received"
+        )
         if !authoritativeAlbumArtID.isEmpty,
            id != authoritativeAlbumArtID {
             deferredAlbumArtOfferWorkItem?.cancel()
@@ -409,6 +419,12 @@ final class AlbumArtReceiver {
         if let image = hqValidation.image,
            hqValidation.valid,
            !hqNeedsRefresh {
+            RealtimeTraceStore.shared.record(
+                stage: "artworkCacheHit",
+                trackId: id,
+                payloadType: "hq",
+                result: "hit"
+            )
             cancelAlbumArtFallback()
             cancelHqAlbumArtRequest()
             recordPredictiveHqSkip(id: id, reason: "cache hit", category: .cacheHit)
@@ -423,6 +439,12 @@ final class AlbumArtReceiver {
         } else if let image = previewValidation.image,
                   previewValidation.valid,
                   !previewNeedsRefresh {
+            RealtimeTraceStore.shared.record(
+                stage: "artworkCacheHit",
+                trackId: id,
+                payloadType: "preview",
+                result: "hit"
+            )
             cancelAlbumArtFallback()
             setAlbumArtDisplay(image: image, id: id, quality: .preview, reason: "offer cacheHit")
             delegate?.albumArtPublishLiveArtwork(image: image, key: id, reason: "cacheHit")
@@ -603,6 +625,15 @@ final class AlbumArtReceiver {
         binaryAlbumArtGeneration = generation
         binaryAlbumArtLastPublishedProgressBucket = 0
         startBinaryAlbumArtTransferSession(id: id, quality: quality, size: size, chunks: chunks)
+        RealtimeTraceStore.shared.record(
+            stage: quality == "preview" ? "previewTransferStart" : "hqTransferStart",
+            trackId: id,
+            generation: generation,
+            transferId: transferId,
+            payloadType: quality,
+            chunkCount: chunks,
+            result: "accepted"
+        )
         let message = "[AlbumArtBinary] start chunks=\(chunks)"
         log(message)
         consoleLog(message)
@@ -1012,6 +1043,14 @@ final class AlbumArtReceiver {
 
         let decodeToken = UUID()
         albumArtDecodeToken = decodeToken
+        let decodeStartedMonoMs = realtimeMonoMs()
+        RealtimeTraceStore.shared.record(
+            stage: quality == "preview" ? "previewDecodeStart" : "hqDecodeStart",
+            monoMs: decodeStartedMonoMs,
+            trackId: id,
+            payloadType: quality,
+            result: "started"
+        )
         ArtworkImageCache.shared.decode(
             data: jpegData,
             artworkId: id,
@@ -1029,6 +1068,15 @@ final class AlbumArtReceiver {
                 self.resetAlbumArtTransfer()
                 return
             }
+            let decodeEndedMonoMs = self.realtimeMonoMs()
+            RealtimeTraceStore.shared.record(
+                stage: quality == "preview" ? "previewDecodeEnd" : "hqDecodeEnd",
+                monoMs: decodeEndedMonoMs,
+                trackId: id,
+                payloadType: quality,
+                processingMs: max(decodeEndedMonoMs - decodeStartedMonoMs, 0),
+                result: "success"
+            )
             self.finishDecodedAlbumArt(
                 id: id,
                 quality: quality,
@@ -1095,6 +1143,16 @@ final class AlbumArtReceiver {
         albumArtTransferState = "decoding"
         let decodeToken = UUID()
         albumArtDecodeToken = decodeToken
+        let decodeStartedMonoMs = realtimeMonoMs()
+        RealtimeTraceStore.shared.record(
+            stage: quality == "preview" ? "previewDecodeStart" : "hqDecodeStart",
+            monoMs: decodeStartedMonoMs,
+            trackId: id,
+            generation: binaryAlbumArtGeneration,
+            transferId: binaryAlbumArtTransferID,
+            payloadType: quality,
+            result: "started"
+        )
         ArtworkImageCache.shared.decode(
             data: jpegData,
             artworkId: id,
@@ -1121,6 +1179,17 @@ final class AlbumArtReceiver {
                 )
                 return
             }
+            let decodeEndedMonoMs = self.realtimeMonoMs()
+            RealtimeTraceStore.shared.record(
+                stage: quality == "preview" ? "previewDecodeEnd" : "hqDecodeEnd",
+                monoMs: decodeEndedMonoMs,
+                trackId: id,
+                generation: self.binaryAlbumArtGeneration,
+                transferId: self.binaryAlbumArtTransferID,
+                payloadType: quality,
+                processingMs: max(decodeEndedMonoMs - decodeStartedMonoMs, 0),
+                result: "success"
+            )
             self.binaryAlbumArtRetryCounts.removeValue(
                 forKey: self.binaryAlbumArtTransferID
             )
@@ -1130,6 +1199,15 @@ final class AlbumArtReceiver {
                 data: jpegData,
                 image: image,
                 source: "binary"
+            )
+            RealtimeTraceStore.shared.record(
+                stage: quality == "preview" ? "previewTransferEnd" : "hqTransferEnd",
+                trackId: id,
+                generation: self.binaryAlbumArtGeneration,
+                transferId: self.binaryAlbumArtTransferID,
+                payloadType: quality,
+                chunkCount: self.binaryAlbumArtExpectedChunks,
+                result: "success"
             )
             let message = "[AlbumArtBinary] decode success bytes=\(jpegData.count)"
             self.log(message)
@@ -2178,6 +2256,12 @@ final class AlbumArtReceiver {
         displayedAlbumArtID = id
         artworkDisplayQuality = quality
         currentCachedAlbumArtQuality = quality.label
+        RealtimeTraceStore.shared.record(
+            stage: quality >= .hq ? "hqPublished" : "previewPublished",
+            trackId: id,
+            payloadType: quality.label,
+            result: "published"
+        )
         updateArtworkEnhancementStatus(message: reason)
         if previous != quality {
             log(

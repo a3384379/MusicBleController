@@ -108,6 +108,16 @@ struct ContentView: View {
                     showSystemHealthOverview = false
                 }
             }
+            .onChange(of: manager.title) { oldValue, newValue in
+                guard oldValue != newValue else { return }
+                RealtimeTraceStore.shared.record(
+                    stage: "nowPlayingViewStateChanged",
+                    trackId: manager.realtimeTraceTrackId,
+                    generation: manager.realtimeTraceGeneration,
+                    payloadType: "trackIdentity",
+                    result: "changed"
+                )
+            }
         }
     }
 }

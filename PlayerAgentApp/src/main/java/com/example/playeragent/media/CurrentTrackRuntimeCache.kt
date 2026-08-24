@@ -1,6 +1,7 @@
 package com.example.playeragent.media
 
 import android.os.SystemClock
+import com.example.playeragent.diagnostics.RealtimeTrace
 import com.example.playeragent.logging.LogConfig
 import org.json.JSONObject
 
@@ -285,8 +286,20 @@ object CurrentTrackRuntimeCache {
         synchronized(lock) {
             if (current == null) {
                 cacheMiss += 1
+                RealtimeTrace.record(
+                    stage = "runtimeCacheMiss",
+                    payloadType = "currentTrack",
+                    result = "miss"
+                )
             } else {
                 cacheHit += 1
+                RealtimeTrace.record(
+                    stage = "runtimeCacheHit",
+                    trackId = current?.trackId,
+                    generation = current?.currentTrackGeneration,
+                    payloadType = "currentTrack",
+                    result = "hit"
+                )
             }
             return CurrentTrackRuntimeCacheSnapshot(
                 track = current,

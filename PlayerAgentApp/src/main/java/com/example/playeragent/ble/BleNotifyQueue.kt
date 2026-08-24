@@ -10,6 +10,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
+import com.example.playeragent.diagnostics.RealtimeTrace
 import com.example.playeragent.logging.LogConfig
 import org.json.JSONObject
 import java.util.ArrayDeque
@@ -241,6 +242,15 @@ class BleNotifyQueue(
         }
         val current = activeJob
         val activeJobRemoved = current != null && matches(current)
+        (removedJobs + listOfNotNull(current.takeIf { activeJobRemoved })).forEach { job ->
+            RealtimeTrace.record(
+                stage = "notifyCancelled",
+                payloadType = job.type,
+                queueWaitMs = (SystemClock.elapsedRealtime() - job.enqueuedAtMs).coerceAtLeast(0L),
+                result = "cancelled",
+                reason = reason
+            )
+        }
         if (activeJobRemoved) {
             // Never clear the HandlerThread wholesale here: another device
             // may already have queued an enqueue/callback action. The stale
@@ -302,6 +312,23 @@ class BleNotifyQueue(
             SystemClock.elapsedRealtime() - activeNotifyStartedAtMs
         } else {
             0L
+        }
+        RealtimeTrace.record(
+            stage = "notifyCallback",
+            payloadType = callbackType ?: job.type,
+            processingMs = callbackRttMs,
+            chunkIndex = activePacketIndex,
+            chunkCount = job.packets.size,
+            result = if (status == BluetoothGatt.GATT_SUCCESS) "success" else "failure",
+            reason = if (status == BluetoothGatt.GATT_SUCCESS) null else "callback_failed"
+        )
+        if (callbackType == "albumArtOffer" && status == BluetoothGatt.GATT_SUCCESS) {
+            RealtimeTrace.record(
+                stage = "albumArtOfferSent",
+                payloadType = "albumArtOffer",
+                processingMs = callbackRttMs,
+                result = "success"
+            )
         }
         clearActiveNotifyMetrics()
         if (interleavedPacketInFlight) {
@@ -455,13 +482,29 @@ class BleNotifyQueue(
     @Synchronized
     private fun enqueueJobOnQueue(job: SendJob) {
         if (!job.isLongJob && shouldCoalesceShortType(job.type)) {
-            jobs.removeAll {
+            val coalesced = jobs.filter {
                 !it.isLongJob &&
                     it.type == job.type &&
                     it.device.address == job.device.address
             }
+            jobs.removeAll(coalesced.toSet())
+            coalesced.forEach {
+                RealtimeTrace.record(
+                    stage = "notifyPreempted",
+                    payloadType = it.type,
+                    result = "coalesced",
+                    reason = "latest_value_wins"
+                )
+            }
         }
         jobs.addLast(job)
+        RealtimeTrace.record(
+            stage = "notifyEnqueued",
+            monoMs = job.enqueuedAtMs,
+            payloadType = job.type,
+            chunkCount = job.packets.size,
+            result = "queued"
+        )
         sendNextPacket()
     }
 
@@ -486,6 +529,17 @@ class BleNotifyQueue(
                 ?.takeIf { it > 0L }
                 ?: SystemClock.elapsedRealtime()
             activeJob?.startedAtMs = activeJobStartedAtMs
+            activeJob?.let { selected ->
+                RealtimeTrace.record(
+                    stage = "notifyDequeued",
+                    payloadType = selected.type,
+                    queueWaitMs = (SystemClock.elapsedRealtime() - selected.enqueuedAtMs)
+                        .coerceAtLeast(0L),
+                    chunkIndex = selected.nextPacketIndex,
+                    chunkCount = selected.packets.size,
+                    result = "selected"
+                )
+            }
             activeJob?.takeIf { it.isLongJob }?.let {
                 if (LogConfig.DEBUG_VERBOSE_LOG) {
                     verboseLogger(
@@ -498,6 +552,14 @@ class BleNotifyQueue(
 
         var job = activeJob ?: return
         if (shouldYieldToPendingJob(job)) {
+            RealtimeTrace.record(
+                stage = "notifyPreempted",
+                payloadType = job.type,
+                chunkIndex = activePacketIndex,
+                chunkCount = job.packets.size,
+                result = "yielded",
+                reason = "higher_priority_pending"
+            )
             job.nextPacketIndex = activePacketIndex
             job.packetsSinceYield = 0
             jobs.addFirst(job)
@@ -511,8 +573,23 @@ class BleNotifyQueue(
                 .takeIf { it > 0L }
                 ?: SystemClock.elapsedRealtime()
             job.startedAtMs = activeJobStartedAtMs
+            RealtimeTrace.record(
+                stage = "notifyDequeued",
+                payloadType = job.type,
+                queueWaitMs = (SystemClock.elapsedRealtime() - job.enqueuedAtMs)
+                    .coerceAtLeast(0L),
+                chunkIndex = job.nextPacketIndex,
+                chunkCount = job.packets.size,
+                result = "selected"
+            )
         }
         if (job.shouldCancel?.invoke() == true) {
+            RealtimeTrace.record(
+                stage = "notifyCancelled",
+                payloadType = job.type,
+                result = "cancelled",
+                reason = "stale_generation"
+            )
             failJob(job, "cancelled")
             activeJob = null
             activePacketIndex = 0
@@ -644,6 +721,14 @@ class BleNotifyQueue(
         notificationInFlight = true
         activeRequestType = packet.type
         markNotifyStarted(job.device.address, packet.type)
+        RealtimeTrace.record(
+            stage = "notifySendStart",
+            payloadType = packet.type,
+            queueWaitMs = (SystemClock.elapsedRealtime() - job.enqueuedAtMs).coerceAtLeast(0L),
+            chunkIndex = activePacketIndex,
+            chunkCount = job.packets.size,
+            result = "requested"
+        )
         val requested = notify(server, characteristic, job.device, packet.value)
         if (job.type == "albumArt") {
             logAlbumArtPacketProgress(job, packet)
@@ -718,6 +803,19 @@ class BleNotifyQueue(
                     return@synchronized
                 }
                 val job = activeJob
+                RealtimeTrace.record(
+                    stage = "notifyTimeout",
+                    payloadType = type,
+                    processingMs = if (activeNotifyStartedAtMs > 0L) {
+                        SystemClock.elapsedRealtime() - activeNotifyStartedAtMs
+                    } else {
+                        NOTIFY_CALLBACK_TIMEOUT_MS
+                    },
+                    chunkIndex = activePacketIndex,
+                    chunkCount = job?.packets?.size,
+                    result = "timeout",
+                    reason = "callback_timeout"
+                )
                 logger("[BleNotifyQueue] notify callback timeout type=$type job=${job?.type}")
                 val address = activeNotifyDeviceAddress ?: job?.device?.address.orEmpty()
                 recordAdaptiveFailure(type, address)
@@ -1119,6 +1217,7 @@ class BleNotifyQueue(
         var nextPacketIndex: Int = 0,
         var startedAtMs: Long = 0L,
         var packetsSinceYield: Int = 0,
+        val enqueuedAtMs: Long = SystemClock.elapsedRealtime(),
         val terminalCallbackGate: BleQueueTerminalCallbackGate =
             BleQueueTerminalCallbackGate()
     ) {

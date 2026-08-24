@@ -1827,6 +1827,84 @@ final class PerformanceStabilityTests: XCTestCase {
         }
     }
 
+    func testRealtimeTraceUsesMonotonicClockAndFixedRingCapacity() {
+        var samples: [Int64] = [100, 90, 110, 120]
+        let buffer = RealtimeTraceBuffer(capacity: 3) {
+            samples.removeFirst()
+        }
+
+        buffer.append(stage: "one")
+        buffer.append(stage: "two")
+        buffer.append(stage: "three")
+        buffer.append(stage: "four")
+
+        let snapshot = buffer.snapshot()
+        XCTAssertEqual(snapshot.map(\.stage), ["two", "three", "four"])
+        XCTAssertEqual(snapshot.map(\.monoMs), [100, 110, 120])
+        XCTAssertEqual(snapshot.map(\.sequence), [2, 3, 4])
+    }
+
+    func testRealtimeTraceStableLineAndMissingStageSummary() {
+        var lines: [String] = []
+        let store = RealtimeTraceStore(
+            capacity: 4,
+            enabled: true,
+            clock: { 42 },
+            logSink: { lines.append($0) }
+        )
+        store.record(
+            stage: "playbackStatePublished",
+            trackId: "track 1",
+            generation: 7,
+            result: "ok"
+        )
+        store.record(stage: "currentWordPublished", result: nil)
+
+        XCTAssertEqual(store.summary().eventCount, 2)
+        XCTAssertEqual(store.summary().missingResultCount, 1)
+        XCTAssertEqual(store.summary().stageCounts["currentWordPublished"], 1)
+        XCTAssertEqual(lines.count, 2)
+        XCTAssertTrue(lines[0].contains("trackId=track_1"))
+        XCTAssertTrue(lines[0].contains("payloadType=-"))
+        XCTAssertFalse(lines[0].contains("lyrics="))
+        XCTAssertFalse(lines[0].contains("bytes="))
+    }
+
+    func testRealtimePercentilesAndUntrustedClockPolicy() {
+        let values: [Int64] = [10, 20, 30, 40, 50]
+        let p50 = try? XCTUnwrap(
+            RealtimeTraceStatistics.percentile(values, percentile: 50)
+        )
+        let p95 = try? XCTUnwrap(
+            RealtimeTraceStatistics.percentile(values, percentile: 95)
+        )
+        XCTAssertEqual(p50, 30)
+        XCTAssertEqual(p95 ?? 0, 48, accuracy: 0.001)
+        XCTAssertNil(RealtimeTraceStatistics.percentile([], percentile: 50))
+        XCTAssertNil(
+            RealtimeLatencyPolicy.crossDeviceDuration(
+                startMonoMs: 10,
+                endMonoMs: 30,
+                clockTrusted: false
+            )
+        )
+        XCTAssertEqual(
+            RealtimeLatencyPolicy.crossDeviceDuration(
+                startMonoMs: 10,
+                endMonoMs: 30,
+                clockTrusted: true
+            ),
+            20
+        )
+        XCTAssertNil(
+            RealtimeLatencyPolicy.crossDeviceDuration(
+                startMonoMs: 30,
+                endMonoMs: 10,
+                clockTrusted: true
+            )
+        )
+    }
+
     @MainActor
     private func assertViewRenders(
         _ view: AnyView,

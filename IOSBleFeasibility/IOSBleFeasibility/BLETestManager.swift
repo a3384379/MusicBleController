@@ -457,6 +457,8 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private var firstConnectionReadyAtMs: Int64 = 0
     private var lastKaraokeOffsetLogAtMs: Int64 = 0
     private var currentTrackID = ""
+    var realtimeTraceTrackId: String { currentTrackID }
+    var realtimeTraceGeneration: Int64 { currentTrackGeneration }
     private var currentTrackGeneration: Int64 = 0
     private var currentLiveArtworkKey: String?
     private var currentLiveArtworkRevision = 0
@@ -508,6 +510,8 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     #if DEBUG
     private var trackMatrixV31RunID = ""
     private var trackMatrixV31Active = false
+    private var realtimeV4RunID = ""
+    private var realtimeV4Active = false
     #endif
     private var remoteLogExpectedChunks = 0
     private var remoteLogExpectedLines = 0
@@ -610,6 +614,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         let seq: UInt64
         let cmd: String
         let writeCalledAtMs: Int64
+        let writeCalledMonoMs: Int64
     }
 
     private struct PendingCommandWrite {
@@ -618,6 +623,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         let data: Data
         let payloadText: String
         let enqueuedAtMs: Int64
+        let enqueuedMonoMs: Int64
         let isControl: Bool
         let volumeValue: Int?
         let volumeReason: String?
@@ -1007,6 +1013,21 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         if arguments.contains("--smoke-track-matrix-v31") {
             scheduleTrackMatrixV31SmokeTest()
         }
+        if arguments.contains("--smoke-realtime-v4") {
+            let requestedRuns = arguments.first {
+                $0.hasPrefix("--smoke-realtime-runs=")
+            }
+            .flatMap { Int($0.split(separator: "=").last ?? "") } ?? 30
+            let mode = arguments.first {
+                $0.hasPrefix("--smoke-realtime-mode=")
+            }
+            .map { String($0.split(separator: "=").last ?? "next") } ?? "next"
+            scheduleRealtimeV4SmokeTest(
+                runs: min(max(requestedRuns, 1), 500),
+                mode: mode,
+                fastSwitch: arguments.contains("--smoke-realtime-fast-switch")
+            )
+        }
         #endif
     }
 
@@ -1071,6 +1092,120 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
             legacyLine?.text == "hello" &&
             magicDispatchValid
         log("[ProtocolSelfTest] fullLyricsV2 \(passed ? "PASS" : "FAIL")")
+    }
+
+    private func scheduleRealtimeV4SmokeTest(
+        runs: Int,
+        mode: String,
+        fastSwitch: Bool
+    ) {
+        let runID = "\(currentTimeMs())"
+        realtimeV4RunID = runID
+        realtimeV4Active = true
+        RealtimeTraceStore.shared.buffer.clear()
+        AppLogStore.shared.clear()
+        log(
+            "[RealtimeV4] scheduled runId=\(runID) runs=\(runs) " +
+                "mode=\(mode) fastSwitch=\(fastSwitch)"
+        )
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.runRealtimeV4WhenReady(
+                attempt: 0,
+                runID: runID,
+                runs: runs,
+                mode: mode,
+                fastSwitch: fastSwitch
+            )
+        }
+    }
+
+    private func runRealtimeV4WhenReady(
+        attempt: Int,
+        runID: String,
+        runs: Int,
+        mode: String,
+        fastSwitch: Bool
+    ) {
+        guard realtimeV4Active, realtimeV4RunID == runID else { return }
+        let ready = sonyPeripheral?.state == .connected &&
+            sonyCommandCharacteristic != nil &&
+            sonyStatusCharacteristic != nil &&
+            isConnectionHealthyOrSuspect &&
+            !currentTrackID.isEmpty
+        guard ready else {
+            if attempt >= 40 {
+                log("[RealtimeV4] abort runId=\(runID) reason=not_ready")
+                realtimeV4Active = false
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.runRealtimeV4WhenReady(
+                    attempt: attempt + 1,
+                    runID: runID,
+                    runs: runs,
+                    mode: mode,
+                    fastSwitch: fastSwitch
+                )
+            }
+            return
+        }
+        let maximumWriteLength = sonyPeripheral?.maximumWriteValueLength(for: .withResponse) ?? 0
+        let negotiatedMTU = maximumWriteLength > 0 ? maximumWriteLength + 3 : 0
+        log(
+            "[RealtimeV4] start runId=\(runID) runs=\(runs) " +
+                "mode=\(mode) fastSwitch=\(fastSwitch) " +
+                "protocolVersion=\(serverProtocolVersion) mtu=\(negotiatedMTU)"
+        )
+        if mode == "auto" {
+            log("[RealtimeV4] observing Sony-local track changes runId=\(runID)")
+            realtimeV4Active = false
+            return
+        }
+        runRealtimeV4Command(
+            index: 0,
+            runID: runID,
+            runs: runs,
+            mode: mode,
+            interval: fastSwitch ? 0.65 : 3.0
+        )
+    }
+
+    private func runRealtimeV4Command(
+        index: Int,
+        runID: String,
+        runs: Int,
+        mode: String,
+        interval: TimeInterval
+    ) {
+        guard realtimeV4Active, realtimeV4RunID == runID else { return }
+        guard index < runs else {
+            log("[RealtimeV4] end runId=\(runID) completed=\(runs)")
+            realtimeV4Active = false
+            return
+        }
+        let command: String
+        switch mode {
+        case "previous":
+            command = "PREVIOUS"
+        case "fast":
+            command = index.isMultiple(of: 2) ? "NEXT" : "PREVIOUS"
+        default:
+            command = "NEXT"
+        }
+        log(
+            "[RealtimeV4] command runId=\(runID) index=\(index + 1) " +
+                "cmd=\(command) trackId=\(currentTrackID)"
+        )
+        sendUserCommand(cmd: command)
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval) { [weak self] in
+            self?.runRealtimeV4Command(
+                index: index + 1,
+                runID: runID,
+                runs: runs,
+                mode: mode,
+                interval: interval
+            )
+        }
     }
 
     private static func dataFromHex(_ text: String) -> Data {
@@ -2270,6 +2405,12 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
 
     private func sendUserCommand(cmd: String, extra: [String: Any] = [:]) {
         let seq = nextCommandSeq()
+        RealtimeTraceStore.shared.record(
+            stage: "commandIntent",
+            commandSeq: Int64(seq),
+            commandType: cmd,
+            result: "accepted"
+        )
         ctrlLog("[CTRL-iOS] tap seq=\(seq) cmd=\(cmd) uiTimeMs=\(currentTimeMs())")
         sendCommand(cmd: cmd, extra: extra, seq: seq)
     }
@@ -2338,6 +2479,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
                 data: data,
                 payloadText: text,
                 enqueuedAtMs: startMs,
+                enqueuedMonoMs: monotonicTimeMs(),
                 isControl: isControlCommand(cmd),
                 volumeValue: nil,
                 volumeReason: nil
@@ -2355,6 +2497,13 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         } else {
             pendingCommandWrites.append(request)
         }
+        RealtimeTraceStore.shared.record(
+            stage: "commandEnqueued",
+            commandSeq: Int64(request.seq),
+            commandType: request.cmd,
+            queueWaitMs: 0,
+            result: "queued"
+        )
         if !commandWriteInflight.isEmpty {
             ctrlLog(
                 "[CTRL-iOS] write queued seq=\(request.seq) cmd=\(request.cmd) " +
@@ -2382,12 +2531,22 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
 
         let request = pendingCommandWrites.removeFirst()
         let writeBeginMs = currentTimeMs()
+        let writeBeginMonoMs = monotonicTimeMs()
         commandWriteInflight.append(
             CommandWriteInfo(
                 seq: request.seq,
                 cmd: request.cmd,
-                writeCalledAtMs: writeBeginMs
+                writeCalledAtMs: writeBeginMs,
+                writeCalledMonoMs: writeBeginMonoMs
             )
+        )
+        RealtimeTraceStore.shared.record(
+            stage: "commandWriteStart",
+            monoMs: writeBeginMonoMs,
+            commandSeq: Int64(request.seq),
+            commandType: request.cmd,
+            queueWaitMs: max(writeBeginMonoMs - request.enqueuedMonoMs, 0),
+            result: "started"
         )
         if request.cmd == "SET_VOLUME" {
             volumeWriteInFlightSeq = request.seq
@@ -2448,6 +2607,14 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
                 "[CTRL-iOS] write timeout seq=\(seq) cmd=\(cmd) " +
                     "timeoutMs=\(COMMAND_WRITE_CALLBACK_TIMEOUT_MS) " +
                     "pending=\(self.pendingCommandWrites.count)"
+            )
+            RealtimeTraceStore.shared.record(
+                stage: "commandWriteTimeout",
+                commandSeq: Int64(seq),
+                commandType: cmd,
+                processingMs: COMMAND_WRITE_CALLBACK_TIMEOUT_MS,
+                result: "timeout",
+                reason: "callback_timeout"
             )
             self.handleCommandWriteCallbackTimeout(seq: seq, cmd: cmd)
         }
@@ -2884,6 +3051,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
                 data: data,
                 payloadText: text,
                 enqueuedAtMs: startMs,
+                enqueuedMonoMs: monotonicTimeMs(),
                 isControl: true,
                 volumeValue: value,
                 volumeReason: forceFinal ? "final" : reason
@@ -5084,8 +5252,18 @@ extension BLETestManager: CBPeripheralDelegate {
         commandWriteTimeoutWorkItem = nil
         let completed = commandWriteInflight.isEmpty ? nil : commandWriteInflight.removeFirst()
         let didWriteMs = currentTimeMs()
+        let didWriteMonoMs = monotonicTimeMs()
         if let completed {
             let costMs = didWriteMs - completed.writeCalledAtMs
+            RealtimeTraceStore.shared.record(
+                stage: "commandWriteCallback",
+                monoMs: didWriteMonoMs,
+                commandSeq: Int64(completed.seq),
+                commandType: completed.cmd,
+                processingMs: max(didWriteMonoMs - completed.writeCalledMonoMs, 0),
+                result: error == nil ? "success" : "failure",
+                reason: error == nil ? nil : "core_bluetooth_error"
+            )
             let errorText = error?.localizedDescription ?? "nil"
             ctrlLog(
                 "[CTRL-iOS] didWrite seq=\(completed.seq) cmd=\(completed.cmd) " +
@@ -5303,6 +5481,13 @@ extension BLETestManager: CBPeripheralDelegate {
             log("[Status] empty notify")
             return
         }
+        if data.first != 0xA1, data.first != 0xA2 {
+            RealtimeTraceStore.shared.record(
+                stage: "statusNotifyReceived",
+                payloadType: "statusJSON",
+                result: "received"
+            )
+        }
         let peripheralID = peripheral.identifier
         inboundPipeline.submit { [weak self] in
             guard let self else { return }
@@ -5324,11 +5509,29 @@ extension BLETestManager: CBPeripheralDelegate {
                 }
                 return
             }
+            let decodeStartedMonoMs = self.monotonicTimeMs()
+            RealtimeTraceStore.shared.record(
+                stage: "playbackDecodeStart",
+                monoMs: decodeStartedMonoMs,
+                payloadType: "statusJSON",
+                result: "started"
+            )
             let decodeState = AppPerformanceLog.protocolSignposter.beginInterval("Status JSON Decode")
             let objectBox = BLEProtocolV3Parser.jsonObject(from: data).map(BLEStatusObjectBox.init)
             let type = objectBox?.value["type"] as? String
             let text = String(data: data, encoding: .utf8)
             AppPerformanceLog.protocolSignposter.endInterval("Status JSON Decode", decodeState)
+            let decodeEndedMonoMs = self.monotonicTimeMs()
+            RealtimeTraceStore.shared.record(
+                stage: "playbackDecodeEnd",
+                monoMs: decodeEndedMonoMs,
+                trackId: objectBox?.value["trackId"] as? String,
+                generation: Self.optionalInt64Value(objectBox?.value["generation"]),
+                payloadType: type ?? "invalidJSON",
+                processingMs: max(decodeEndedMonoMs - decodeStartedMonoMs, 0),
+                result: objectBox == nil ? "failure" : "success",
+                reason: objectBox == nil ? "json_decode_failed" : nil
+            )
             DispatchQueue.main.async { [weak self] in
                 guard let self,
                       self.sonyPeripheral?.identifier == peripheralID else { return }
@@ -5527,6 +5730,23 @@ extension BLETestManager: CBPeripheralDelegate {
                     self.updateLiveActivity(force: false, reason: "playbackState")
                 }
                 self.scheduleLastNowPlayingSnapshotSave(reason: "playbackState")
+                RealtimeTraceStore.shared.record(
+                    stage: "playbackStatePublished",
+                    trackId: self.currentTrackID,
+                    generation: self.currentTrackGeneration,
+                    payloadType: type,
+                    result: "published",
+                    reason: "\(self.isPlaying ? "playing" : "paused")_\(self.appLifecycleState)"
+                )
+                if oldLyric != self.lyric {
+                    RealtimeTraceStore.shared.record(
+                        stage: "currentLyricPublished",
+                        trackId: self.currentTrackID,
+                        generation: self.currentTrackGeneration,
+                        payloadType: type,
+                        result: "published"
+                    )
+                }
 
             case "currentWord":
                 self.handleCurrentWord(object)
@@ -6231,6 +6451,13 @@ extension BLETestManager: CBPeripheralDelegate {
         if !trackID.isEmpty {
             currentTrackID = trackID
             currentTrackGeneration = generation
+            RealtimeTraceStore.shared.record(
+                stage: "trackIdentityAccepted",
+                trackId: trackID,
+                generation: generation,
+                payloadType: "trackInfo",
+                result: trackChanged ? "changed" : "refreshed"
+            )
             isShowingLastNowPlayingSnapshot = false
             if trackChanged {
                 restoreFullLyricsCacheIfAvailable(
@@ -6696,6 +6923,15 @@ extension BLETestManager: CBPeripheralDelegate {
             generation: Self.int64Value(object["generation"]),
             expectedCount: count
         )
+        RealtimeTraceStore.shared.record(
+            stage: "lyricWindowStartReceived",
+            trackId: trackID,
+            generation: Self.optionalInt64Value(object["generation"]),
+            transferId: transferID,
+            payloadType: "lyricWindow",
+            chunkCount: count,
+            result: "accepted"
+        )
     }
 
     private func handleLyricWindowChunk(_ object: [String: Any]) {
@@ -6738,6 +6974,23 @@ extension BLETestManager: CBPeripheralDelegate {
             lines: Array(transfer.chunks.values),
             trackID: transfer.trackId,
             isFinal: false
+        )
+        RealtimeTraceStore.shared.record(
+            stage: "lyricWindowEndReceived",
+            trackId: transfer.trackId,
+            generation: transfer.generation,
+            transferId: transfer.transferId,
+            payloadType: "lyricWindow",
+            chunkCount: transfer.expectedCount,
+            result: "success"
+        )
+        RealtimeTraceStore.shared.record(
+            stage: "lyricWindowPublished",
+            trackId: transfer.trackId,
+            generation: transfer.generation,
+            transferId: transfer.transferId,
+            payloadType: "lyricWindow",
+            result: "published"
         )
         mediaLoadingState.lyric = .windowReady(lineCount: transfer.chunks.count)
         log("[LyricWindow-iOS] published lines=\(transfer.chunks.count)")
@@ -6785,6 +7038,15 @@ extension BLETestManager: CBPeripheralDelegate {
             expectedChunks: chunks,
             expectedLineCount: count,
             expectedCRC32: crc
+        )
+        RealtimeTraceStore.shared.record(
+            stage: "fullLyricsStartReceived",
+            trackId: trackID,
+            generation: Self.optionalInt64Value(object["generation"] ?? object["g"]),
+            transferId: transferID,
+            payloadType: "fullLyricsBinary",
+            chunkCount: chunks,
+            result: "accepted"
         )
         isFullLyricsReceiving = true
         mediaLoadingState.lyric = .fullLyrics(
@@ -6866,6 +7128,15 @@ extension BLETestManager: CBPeripheralDelegate {
                         lines: lines,
                         trackID: transfer.trackId,
                         isFinal: true
+                    )
+                    RealtimeTraceStore.shared.record(
+                        stage: "fullLyricsEndReceived",
+                        trackId: transfer.trackId,
+                        generation: transfer.generation,
+                        transferId: transfer.transferId,
+                        payloadType: "fullLyricsBinary",
+                        chunkCount: transfer.expectedChunks,
+                        result: "success"
                     )
                     self.fullLyricsUnavailableTrackIDs.remove(transfer.trackId)
                     self.log(
@@ -7571,6 +7842,13 @@ extension BLETestManager: CBPeripheralDelegate {
         fullLyrics = sortedLines
         fullLyricsTrackId = trackID
         isFullLyricsCurrent = true
+        RealtimeTraceStore.shared.record(
+            stage: "fullLyricsPublished",
+            trackId: trackID,
+            generation: currentTrackGeneration,
+            payloadType: isFinal ? "fullLyricsFinal" : "fullLyricsPartial",
+            result: "published"
+        )
         let nowMs = currentTimeMs()
         var traceDetail =
             "[LyricTrace-iOS] id=\(trackID) stage=uiPublished " +
@@ -7844,6 +8122,13 @@ extension BLETestManager: CBPeripheralDelegate {
 
     private func handleCurrentWord(_ object: [String: Any]) {
         let trackID = object["trackId"] as? String ?? ""
+        RealtimeTraceStore.shared.record(
+            stage: "currentWordReceived",
+            trackId: trackID,
+            generation: Self.optionalInt64Value(object["generation"]),
+            payloadType: "currentWord",
+            result: "received"
+        )
         let sameTrack = isSameTrackId(incoming: trackID, current: currentTrackID)
         guard !trackID.isEmpty, sameTrack else {
             currentWordDropCount += 1
@@ -7896,6 +8181,13 @@ extension BLETestManager: CBPeripheralDelegate {
             )
             return
         }
+        RealtimeTraceStore.shared.record(
+            stage: "currentWordAccepted",
+            trackId: trackID,
+            generation: generation,
+            payloadType: "currentWord",
+            result: "accepted"
+        )
 
         let anchorResolution = resolveRemotePlaybackAnchor(
             object: object,
@@ -7931,6 +8223,13 @@ extension BLETestManager: CBPeripheralDelegate {
 
         currentWordLineIndex = effectiveLineIndex
         currentWordIndex = effectiveWordIndex
+        RealtimeTraceStore.shared.record(
+            stage: "currentWordPublished",
+            trackId: trackID,
+            generation: generation,
+            payloadType: "currentWord",
+            result: "published"
+        )
         currentWordPushCount += 1
         if lastCurrentWordReceivedAtMs > 0 {
             currentWordIntervalTotalMs += max(nowMs - lastCurrentWordReceivedAtMs, 0)

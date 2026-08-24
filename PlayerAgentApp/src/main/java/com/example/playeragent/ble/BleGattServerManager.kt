@@ -12,6 +12,7 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.content.ComponentCallbacks2
+import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.os.Handler
 import android.os.HandlerThread
@@ -22,6 +23,7 @@ import com.example.playeragent.history.HistorySessionRow
 import com.example.playeragent.history.PlaybackHistoryRepository
 import com.example.playeragent.history.PlaybackStatsSummary
 import com.example.playeragent.history.StatsRange
+import com.example.playeragent.diagnostics.RealtimeTrace
 import com.example.playeragent.media.AlbumArtPlaceholderPolicy
 import com.example.playeragent.media.AlbumArtTestManager
 import com.example.playeragent.logging.LogConfig
@@ -67,6 +69,13 @@ class BleGattServerManager(
     private val onPlaybackUiState: (JSONObject) -> Unit = {},
     private val executionHub: PlayerAgentExecutionHub
 ) {
+
+    init {
+        RealtimeTrace.configure(
+            logger = logger,
+            enabled = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+        )
+    }
 
     private val appContext = context.applicationContext
     private val connectedDeviceAddresses = Collections.newSetFromMap(
@@ -416,6 +425,24 @@ class BleGattServerManager(
 
             val command = request.optString("cmd")
             val seq = request.optString("seq").ifBlank { "unknown" }
+            val commandSeq = seq.toLongOrNull()
+            RealtimeTrace.record(
+                stage = "commandReceived",
+                monoMs = receiveElapsedMs,
+                commandSeq = commandSeq,
+                commandType = command,
+                processingMs = (SystemClock.elapsedRealtime() - receiveElapsedMs)
+                    .coerceAtLeast(0L),
+                result = "received"
+            )
+            RealtimeTrace.record(
+                stage = "commandValidated",
+                commandSeq = commandSeq,
+                commandType = command,
+                processingMs = (SystemClock.elapsedRealtime() - parseStartedAtMs)
+                    .coerceAtLeast(0L),
+                result = "valid"
+            )
             logger(
                 "[CTRL-Sony] command parsed seq=$seq cmd=$command " +
                     "parseCostMs=${SystemClock.elapsedRealtime() - parseStartedAtMs}"
@@ -464,6 +491,14 @@ class BleGattServerManager(
                     return@execute
                 }
                 val handleStartedAtMs = SystemClock.elapsedRealtime()
+                RealtimeTrace.record(
+                    stage = "mediaControlDispatchStart",
+                    monoMs = handleStartedAtMs,
+                    commandSeq = commandSeq,
+                    commandType = command,
+                    queueWaitMs = (handleStartedAtMs - receiveElapsedMs).coerceAtLeast(0L),
+                    result = "started"
+                )
                 logger(
                     "[CTRL-Sony] handle async begin seq=$seq cmd=$command " +
                         "queueSnapshot=${controlQueueSnapshot()}"
@@ -473,13 +508,25 @@ class BleGattServerManager(
                     logger("[CTRL-Sony] command dropped reason=unknown source seq=$seq cmd=$command")
                     return@execute
                 }
-                runCatching { handleCommand(sourceDevice, command, request, seq) }
+                val dispatchResult = runCatching {
+                    handleCommand(sourceDevice, command, request, seq)
+                }
                     .onFailure { exception ->
                         logger(
                             "[CTRL-Sony] handle async failed seq=$seq cmd=$command " +
                                 "error=${exception.message}"
                         )
                     }
+                val handleEndedAtMs = SystemClock.elapsedRealtime()
+                RealtimeTrace.record(
+                    stage = "mediaControlDispatchEnd",
+                    monoMs = handleEndedAtMs,
+                    commandSeq = commandSeq,
+                    commandType = command,
+                    processingMs = (handleEndedAtMs - handleStartedAtMs).coerceAtLeast(0L),
+                    result = if (dispatchResult.isSuccess) "success" else "failure",
+                    reason = if (dispatchResult.isSuccess) null else "handler_exception"
+                )
                 logger(
                     "[CTRL-Sony] handle async end seq=$seq cmd=$command " +
                         "costMs=${SystemClock.elapsedRealtime() - handleStartedAtMs}"
@@ -2062,6 +2109,14 @@ class BleGattServerManager(
     private fun scheduleCurrentWordPush(delayMs: Long) {
         val executor = currentWordExecutor ?: return
         currentWordPushTask?.cancel(false)
+        RealtimeTrace.record(
+            stage = "currentWordScheduleCreated",
+            trackId = CurrentTrackRuntimeCache.trackSnapshot()?.trackId,
+            generation = CurrentTrackRuntimeCache.currentGeneration(),
+            payloadType = "currentWord",
+            processingMs = delayMs.coerceAtLeast(0L),
+            result = "scheduled"
+        )
         currentWordPushTask = executor.schedule(
             {
                 if (subscribedDevices.isEmpty()) {
@@ -2398,6 +2453,13 @@ class BleGattServerManager(
             logger = logger
         )
         TrackCapabilityTracker.onAlbumArtLoadStart(protocolId)
+        RealtimeTrace.record(
+                stage = "albumArtDetected",
+            trackId = protocolId,
+            generation = CurrentTrackRuntimeCache.currentGeneration(),
+            payloadType = "albumArt",
+            result = "detected"
+        )
 
         val pending = PendingAlbumArt(
             cacheKey = cacheKey,
@@ -2407,6 +2469,13 @@ class BleGattServerManager(
         logger("[AlbumArtFastPath] track_changed start id=$protocolId")
         val cached = albumArtCacheEntry(protocolId, cacheKey)
         if (cached != null) {
+            RealtimeTrace.record(
+                stage = "albumArtCacheHit",
+                trackId = protocolId,
+                generation = CurrentTrackRuntimeCache.currentGeneration(),
+                payloadType = "albumArt",
+                result = "hit"
+            )
             logger("[AlbumArt] cache hit id=$protocolId source=${cached.source}")
             logger(
                 "[AlbumArtFastPath] cache hit id=$protocolId source=${cached.source} " +
@@ -2557,6 +2626,13 @@ class BleGattServerManager(
             }
             logger("[AlbumArt] offer id=$protocolId device=${device.address}")
             logger("[AlbumArtDebug] offer sent id=$protocolId device=${device.address}")
+            RealtimeTrace.record(
+                stage = "albumArtOfferEnqueued",
+                trackId = protocolId,
+                generation = CurrentTrackRuntimeCache.currentGeneration(),
+                payloadType = "albumArtOffer",
+                result = "queued"
+            )
             notifyQueue.enqueueShort(
                 device = device,
                 type = "albumArtOffer",
@@ -3138,12 +3214,32 @@ class BleGattServerManager(
         } else {
             minOf(albumArtMaximumPayloadFor(device), MAX_ALBUM_JSON_BYTES)
         }
+        val encodeStartedAtMs = SystemClock.elapsedRealtime()
+        RealtimeTrace.record(
+            stage = "previewEncodeStart",
+            monoMs = encodeStartedAtMs,
+            trackId = protocolId,
+            generation = CurrentTrackRuntimeCache.currentGeneration(),
+            payloadType = quality.wireValue,
+            result = "started"
+        )
         val preparation = prepareAlbumArt(
             bitmap = bitmap,
             deviceMaximumPayload = maximumPayload,
             protocolId = protocolId,
             quality = quality,
             binaryTransport = useBinaryAlbumArt
+        )
+        val encodeEndedAtMs = SystemClock.elapsedRealtime()
+        RealtimeTrace.record(
+            stage = "previewEncodeEnd",
+            monoMs = encodeEndedAtMs,
+            trackId = protocolId,
+            generation = CurrentTrackRuntimeCache.currentGeneration(),
+            payloadType = quality.wireValue,
+            processingMs = (encodeEndedAtMs - encodeStartedAtMs).coerceAtLeast(0L),
+            result = if (preparation.prepared != null) "success" else "failure",
+            reason = if (preparation.prepared != null) null else "encode_failed"
         )
         val preparedAlbumArt = preparation.prepared
         if (preparedAlbumArt == null) {
@@ -3214,6 +3310,19 @@ class BleGattServerManager(
         }
 
         val startAt = SystemClock.elapsedRealtime()
+        RealtimeTrace.record(
+            stage = if (quality == AlbumArtQuality.HQ) {
+                "hqSendStart"
+            } else {
+                "previewSendStart"
+            },
+            monoMs = startAt,
+            trackId = protocolId,
+            generation = CurrentTrackRuntimeCache.currentGeneration(),
+            payloadType = quality.wireValue,
+            chunkCount = totalChunks,
+            result = "started"
+        )
         if (quality == AlbumArtQuality.HQ) {
             logger("[AlbumArtHQ] send start chunks=$totalChunks")
         } else if (useBinaryAlbumArt) {
@@ -3251,6 +3360,19 @@ class BleGattServerManager(
                 albumArtRequestsInFlight.remove(requestKey)
                 albumArtRequestCompletedAtMs[requestKey] = SystemClock.elapsedRealtime()
                 val costMs = SystemClock.elapsedRealtime() - startAt
+                RealtimeTrace.record(
+                    stage = if (quality == AlbumArtQuality.HQ) {
+                        "hqSendEnd"
+                    } else {
+                        "previewSendEnd"
+                    },
+                    trackId = protocolId,
+                    generation = artworkGeneration,
+                    payloadType = quality.wireValue,
+                    processingMs = costMs.coerceAtLeast(0L),
+                    chunkCount = totalChunks,
+                    result = "success"
+                )
                 if (quality == AlbumArtQuality.HQ) {
                     logger("[AlbumArtHQ] send end costMs=$costMs")
                 } else if (useBinaryAlbumArt) {
@@ -4693,6 +4815,15 @@ class BleGattServerManager(
         val runtimeGeneration = runtimeSnapshot.track?.currentTrackGeneration ?: 0L
         val readyGate = playbackStateReader.lyricsReadyGateSnapshot()
         val allLines = playbackStateReader.runtimeLyricLinesSnapshot()
+        if (runtimeLineCount > 0) {
+            RealtimeTrace.record(
+                stage = "lyricCacheHit",
+                trackId = traceId,
+                generation = runtimeGeneration,
+                payloadType = "fullLyrics",
+                result = "hit"
+            )
+        }
         val candidateLines = allLines
             .filter { it.text.isNotBlank() }
             .take(MAX_FULL_LYRICS_LINES)
@@ -5029,6 +5160,23 @@ class BleGattServerManager(
             generation = readyGate.generation,
             extra = mapOf("lines" to lines.size.toString())
         )
+        RealtimeTrace.record(
+            stage = "fullLyricsEnqueued",
+            monoMs = sendStartedAtMs,
+            trackId = traceId,
+            generation = readyGate.generation,
+            payloadType = "fullLyricsJson",
+            chunkCount = packets.size,
+            result = "queued"
+        )
+        RealtimeTrace.record(
+            stage = "fullLyricsSendStart",
+            monoMs = sendStartedAtMs,
+            trackId = traceId,
+            generation = readyGate.generation,
+            payloadType = "fullLyricsJson",
+            result = "started"
+        )
         notifyQueue.enqueueLongJob(
             type = FULL_LYRICS_JOB_TYPE,
             device = device,
@@ -5036,6 +5184,16 @@ class BleGattServerManager(
             maxSendDurationMs = FULL_LYRICS_MAX_SEND_MS,
             shouldCancel = { !isLyricsTransferCurrent(trackId, readyGate.generation) },
             onComplete = {
+                val sendEndedAtMs = SystemClock.elapsedRealtime()
+                RealtimeTrace.record(
+                    stage = "fullLyricsSendEnd",
+                    monoMs = sendEndedAtMs,
+                    trackId = traceId,
+                    generation = readyGate.generation,
+                    payloadType = "fullLyricsJson",
+                    processingMs = (sendEndedAtMs - sendStartedAtMs).coerceAtLeast(0L),
+                    result = "success"
+                )
                 logger(
                     "[FullLyricsPerf] send end costMs=" +
                         "${SystemClock.elapsedRealtime() - sendStartedAtMs}"
@@ -5301,6 +5459,25 @@ class BleGattServerManager(
                 "chunks" to binaryChunks.size.toString()
             )
         )
+        RealtimeTrace.record(
+            stage = "fullLyricsEnqueued",
+            monoMs = sendStartedAtMs,
+            trackId = traceId,
+            generation = generation,
+            transferId = transferId,
+            payloadType = "fullLyricsBinary",
+            chunkCount = packets.size,
+            result = "queued"
+        )
+        RealtimeTrace.record(
+            stage = "fullLyricsSendStart",
+            monoMs = sendStartedAtMs,
+            trackId = traceId,
+            generation = generation,
+            transferId = transferId,
+            payloadType = "fullLyricsBinary",
+            result = "started"
+        )
         notifyQueue.enqueueLongJob(
             type = FULL_LYRICS_JOB_TYPE,
             device = device,
@@ -5309,6 +5486,17 @@ class BleGattServerManager(
             maxSendDurationMs = FULL_LYRICS_MAX_SEND_MS,
             shouldCancel = { !isLyricsTransferCurrent(trackId, generation) },
             onComplete = {
+                val sendEndedAtMs = SystemClock.elapsedRealtime()
+                RealtimeTrace.record(
+                    stage = "fullLyricsSendEnd",
+                    monoMs = sendEndedAtMs,
+                    trackId = traceId,
+                    generation = generation,
+                    transferId = transferId,
+                    payloadType = "fullLyricsBinary",
+                    processingMs = (sendEndedAtMs - sendStartedAtMs).coerceAtLeast(0L),
+                    result = "success"
+                )
                 sendMediaLoadState(
                     device, "lyrics", "ready", "transfer_complete", false,
                     trackId, generation
@@ -5408,6 +5596,14 @@ class BleGattServerManager(
                     "generation=${pendingLyricWindowRequests[device.address]?.generation} " +
                     "device=${device.address} reason=$reason"
             )
+            RealtimeTrace.record(
+                stage = "lyricWindowPendingQueued",
+                trackId = requestedTrackId.ifBlank { trackId },
+                generation = gate.generation,
+                payloadType = "lyricWindow",
+                result = "queued",
+                reason = reason
+            )
             return
         }
         pendingLyricWindowRequests.remove(device.address)
@@ -5467,12 +5663,39 @@ class BleGattServerManager(
             end,
             FULL_LYRICS_JSON_NOTIFICATION_DELAY_MS
         )
+        RealtimeTrace.record(
+            stage = "lyricWindowEnqueued",
+            trackId = trackId,
+            generation = gate.generation,
+            transferId = transferId,
+            payloadType = "lyricWindow",
+            chunkCount = packets.size,
+            result = "queued"
+        )
+        RealtimeTrace.record(
+            stage = "lyricWindowSendStart",
+            trackId = trackId,
+            generation = gate.generation,
+            transferId = transferId,
+            payloadType = "lyricWindow",
+            result = "started"
+        )
         notifyQueue.enqueueLongJob(
             type = LYRIC_WINDOW_JOB_TYPE,
             device = device,
             packets = packets,
             priority = BleNotifyQueue.Priority.P1_INTERACTIVE,
-            shouldCancel = { !isLyricsTransferCurrent(trackId, gate.generation) }
+            shouldCancel = { !isLyricsTransferCurrent(trackId, gate.generation) },
+            onComplete = {
+                RealtimeTrace.record(
+                    stage = "lyricWindowSendEnd",
+                    trackId = trackId,
+                    generation = gate.generation,
+                    transferId = transferId,
+                    payloadType = "lyricWindow",
+                    result = "success"
+                )
+            }
         )
         logger("[LyricWindow] send trackId=$trackId first=$first count=${window.size}")
     }
@@ -6052,6 +6275,14 @@ class BleGattServerManager(
                 "requested=$requestedTrackId generation=$generation " +
                 "state=${readyGate.state} reason=$reason"
         )
+        RealtimeTrace.record(
+            stage = "pendingQueued",
+            trackId = requestedTrackId.ifBlank { protocolTrackId },
+            generation = generation,
+            payloadType = "fullLyrics",
+            result = "queued",
+            reason = reason
+        )
         lyricTrace(
             stage = "pendingQueued",
             trackId = requestedTrackId.ifBlank { protocolTrackId },
@@ -6107,6 +6338,14 @@ class BleGattServerManager(
     }
 
     private fun handleLyricsReady(snapshot: LyricsReadyGateSnapshot) {
+        RealtimeTrace.record(
+            stage = "lyricReady",
+            trackId = snapshot.trackId,
+            generation = snapshot.generation,
+            payloadType = "lyrics",
+            result = if (snapshot.lyricsReady) "ready" else "not_ready",
+            reason = snapshot.reason
+        )
         schedulePlaybackUiRefresh("lyrics_ready")
         flushPendingLyricWindow(snapshot)
         if (!snapshot.lyricsReady) {
@@ -6151,6 +6390,15 @@ class BleGattServerManager(
                     "[LyricsState] pending request flushed trackId=${pending.protocolTrackId} " +
                         "device=$ownerAddress lines=${snapshot.lineCount} " +
                         "waitMs=${SystemClock.elapsedRealtime() - pending.createdAtMs}"
+                )
+                RealtimeTrace.record(
+                    stage = "pendingFlush",
+                    trackId = pending.requestedTrackId.ifBlank { pending.protocolTrackId },
+                    generation = snapshot.generation,
+                    payloadType = "fullLyrics",
+                    processingMs = (SystemClock.elapsedRealtime() - pending.createdAtMs)
+                        .coerceAtLeast(0L),
+                    result = "flushed"
                 )
                 lyricTrace(
                     stage = "pendingFlush",
@@ -6208,6 +6456,15 @@ class BleGattServerManager(
                     "[LyricWindow] pending flushed trackId=${pending.protocolTrackId} " +
                         "device=$ownerAddress lines=${snapshot.lineCount} " +
                         "waitMs=${SystemClock.elapsedRealtime() - pending.createdAtMs}"
+                )
+                RealtimeTrace.record(
+                    stage = "lyricWindowPendingFlush",
+                    trackId = pending.requestedTrackId.ifBlank { pending.protocolTrackId },
+                    generation = snapshot.generation,
+                    payloadType = "lyricWindow",
+                    processingMs = (SystemClock.elapsedRealtime() - pending.createdAtMs)
+                        .coerceAtLeast(0L),
+                    result = "flushed"
                 )
                 sendLyricWindow(device, JSONObject(pending.request.toString()))
             }

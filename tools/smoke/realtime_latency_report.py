@@ -1,0 +1,752 @@
+#!/usr/bin/env python3
+"""Build the V4 realtime latency report from privacy-safe trace lines."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import statistics
+import sys
+from collections import Counter, defaultdict
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Callable, Iterable, Optional
+
+
+TRACE_MARKER = "[RealtimeTrace] "
+METRIC_NAMES = (
+    "commandToSonyReceiveMs",
+    "commandToTrackPublishMs",
+    "trackToCurrentLyricMs",
+    "trackToCurrentWordMs",
+    "trackToPreviewArtMs",
+    "trackToHqArtMs",
+    "lyricReadyToPendingFlushMs",
+    "pendingFlushToSendStartMs",
+    "fullLyricsSendDurationMs",
+    "lyricReadyToFullLyricsPublishMs",
+    "previewSendDurationMs",
+    "notifyQueueWaitMs",
+    "iOSDecodeDurationMs",
+    "iOSPublishDurationMs",
+)
+
+
+@dataclass(frozen=True)
+class Event:
+    side: str
+    stage: str
+    mono_ms: int
+    command_seq: Optional[int] = None
+    command_type: Optional[str] = None
+    track_id: Optional[str] = None
+    generation: Optional[int] = None
+    transfer_id: Optional[str] = None
+    payload_type: Optional[str] = None
+    queue_wait_ms: Optional[int] = None
+    processing_ms: Optional[int] = None
+    chunk_index: Optional[int] = None
+    chunk_count: Optional[int] = None
+    result: Optional[str] = None
+    reason: Optional[str] = None
+    source_line: int = 0
+
+    def as_dict(self) -> dict:
+        return {
+            "side": self.side,
+            "stage": self.stage,
+            "monoMs": self.mono_ms,
+            "commandSeq": self.command_seq,
+            "commandType": self.command_type,
+            "trackId": self.track_id,
+            "generation": self.generation,
+            "transferId": self.transfer_id,
+            "payloadType": self.payload_type,
+            "queueWaitMs": self.queue_wait_ms,
+            "processingMs": self.processing_ms,
+            "chunkIndex": self.chunk_index,
+            "chunkCount": self.chunk_count,
+            "result": self.result,
+            "reason": self.reason,
+            "sourceLine": self.source_line,
+        }
+
+
+def _optional_text(value: Optional[str]) -> Optional[str]:
+    return None if value in (None, "", "-") else value
+
+
+def _optional_int(value: Optional[str]) -> Optional[int]:
+    value = _optional_text(value)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def parse_trace_line(line: str, source_line: int = 0) -> Optional[Event]:
+    marker_index = line.find(TRACE_MARKER)
+    if marker_index < 0:
+        return None
+    fields = {}
+    for token in line[marker_index + len(TRACE_MARKER):].strip().split():
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        fields[key] = value
+    side = _optional_text(fields.get("side"))
+    stage = _optional_text(fields.get("stage"))
+    mono_ms = _optional_int(fields.get("monoMs"))
+    if side is None or stage is None or mono_ms is None:
+        return None
+    return Event(
+        side=side,
+        stage=stage,
+        mono_ms=mono_ms,
+        command_seq=_optional_int(fields.get("commandSeq")),
+        command_type=_optional_text(fields.get("commandType")),
+        track_id=_optional_text(fields.get("trackId")),
+        generation=_optional_int(fields.get("generation")),
+        transfer_id=_optional_text(fields.get("transferId")),
+        payload_type=_optional_text(fields.get("payloadType")),
+        queue_wait_ms=_optional_int(fields.get("queueWaitMs")),
+        processing_ms=_optional_int(fields.get("processingMs")),
+        chunk_index=_optional_int(fields.get("chunkIndex")),
+        chunk_count=_optional_int(fields.get("chunkCount")),
+        result=_optional_text(fields.get("result")),
+        reason=_optional_text(fields.get("reason")),
+        source_line=source_line,
+    )
+
+
+def load_events(paths: Iterable[Path]) -> tuple[list[Event], int]:
+    events = []
+    malformed = 0
+    source_line = 0
+    for path in paths:
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            source_line += 1
+            if TRACE_MARKER not in line:
+                continue
+            event = parse_trace_line(line, source_line)
+            if event is None:
+                malformed += 1
+            else:
+                events.append(event)
+    return events, malformed
+
+
+def discover_clock_sync(paths: Iterable[Path]) -> tuple[bool, Optional[int]]:
+    pattern = re.compile(
+        r"\[ClockSync\]\s+pong\b.*\boffsetMs=(-?\d+)\b.*\bconfident=(true|false)\b",
+        re.IGNORECASE,
+    )
+    latest = None
+    for path in paths:
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = pattern.search(line)
+            if match:
+                latest = (match.group(2).lower() == "true", int(match.group(1)))
+    return latest or (False, None)
+
+
+def percentile(values: list[int], value: float) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = min(max(value, 0.0), 100.0) / 100.0 * (len(ordered) - 1)
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return float(ordered[lower])
+    fraction = rank - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def summarize(values: list[int], missing: int) -> dict:
+    return {
+        "count": len(values),
+        "min": min(values) if values else None,
+        "avg": statistics.fmean(values) if values else None,
+        "p50": percentile(values, 50),
+        "p95": percentile(values, 95),
+        "p99": percentile(values, 99),
+        "max": max(values) if values else None,
+        "missing": missing,
+        "missingCount": missing,
+    }
+
+
+def _track_key(event: Event) -> Optional[tuple]:
+    if not event.track_id:
+        return None
+    return (event.track_id[:12], event.generation)
+
+
+def _track_id_key(event: Event) -> Optional[tuple]:
+    return (event.track_id[:12],) if event.track_id else None
+
+
+def _ready_track_key(event: Event) -> Optional[tuple]:
+    if event.stage == "lyricReady" and event.result != "ready":
+        return None
+    return _track_key(event)
+
+
+def _command_key(event: Event) -> Optional[tuple]:
+    if event.command_seq is None:
+        return None
+    return (event.command_seq, event.command_type)
+
+
+def _control_command_key(event: Event) -> Optional[tuple]:
+    if event.command_type not in {"NEXT", "PREVIOUS"}:
+        return None
+    return _command_key(event)
+
+
+def _transfer_key(event: Event) -> Optional[tuple]:
+    if event.transfer_id:
+        return (event.transfer_id, event.generation)
+    return _track_key(event)
+
+
+def _same_track(left: tuple, right: tuple) -> bool:
+    left_id, left_generation = left
+    right_id, right_generation = right
+    return left_id == right_id and (
+        left_generation is None
+        or right_generation is None
+        or left_generation == right_generation
+    )
+
+
+def paired_durations(
+    events: list[Event],
+    start_side: str,
+    start_stage: str,
+    end_side: str,
+    end_stage: str,
+    key: Callable[[Event], Optional[tuple]],
+    categories: Counter,
+    cross_device: bool = False,
+    clock_trusted: bool = False,
+    sony_to_ios_offset_ms: Optional[int] = None,
+) -> tuple[list[int], int]:
+    starts = [
+        event for event in events
+        if event.side == start_side
+        and event.stage == start_stage
+        and key(event) is not None
+    ]
+    ends = [
+        event for event in events
+        if event.side == end_side
+        and event.stage == end_stage
+        and key(event) is not None
+    ]
+    if cross_device and (not clock_trusted or sony_to_ios_offset_ms is None):
+        if starts or ends:
+            categories["untrusted_clock"] += max(len(starts), len(ends))
+        return [], max(len(starts), len(ends))
+
+    ends_by_key = defaultdict(list)
+    for event in ends:
+        event_key = key(event)
+        if event_key is not None:
+            ends_by_key[event_key].append(event)
+    for grouped in ends_by_key.values():
+        grouped.sort(key=lambda event: event.mono_ms)
+
+    values = []
+    used_end_lines = set()
+    missing = 0
+    for start in sorted(starts, key=lambda event: event.mono_ms):
+        event_key = key(start)
+        start_ms = start.mono_ms
+        if cross_device and start.side == "sony":
+            start_ms += sony_to_ios_offset_ms or 0
+        candidates = ends_by_key.get(event_key, [])
+        eligible = []
+        for end in candidates:
+            end_ms = end.mono_ms
+            if cross_device and end.side == "sony":
+                end_ms += sony_to_ios_offset_ms or 0
+            minimum_end_ms = start_ms - 75 if cross_device else start_ms
+            if end.source_line not in used_end_lines and end_ms >= minimum_end_ms:
+                eligible.append((end_ms, end))
+        if not eligible:
+            if candidates:
+                categories["out_of_order"] += 1
+            missing += 1
+            continue
+        end_ms, end = eligible[0]
+        used_end_lines.add(end.source_line)
+        duration = end_ms - start_ms
+        if duration < 0:
+            categories["clock_uncertainty_clamped"] += 1
+            duration = 0
+        if duration > 120_000:
+            categories["extreme"] += 1
+        values.append(duration)
+    # Additional or standalone end events are legitimate for streaming and
+    # cache-hit stages. A closure is incomplete only when a measured start has
+    # no matching end.
+    return values, missing
+
+
+def derive_track_t0(
+    events: list[Event],
+    categories: Counter,
+    clock_trusted: bool,
+    sony_to_ios_offset_ms: Optional[int],
+) -> tuple[list[Event], list[int], int]:
+    """Correlate each visible iOS track with its scenario-specific T0.
+
+    Manual NEXT/PREVIOUS uses the iOS command intent. Sony-local/automatic
+    changes use the Sony MediaSession identity mapped onto the iOS monotonic
+    clock only when clockSyncV1 is trusted.
+    """
+    identities = sorted(
+        (
+            event for event in events
+            if event.side == "ios"
+            and event.stage == "trackIdentityAccepted"
+            and event.result == "changed"
+        ),
+        key=lambda event: event.mono_ms,
+    )
+    controls = sorted(
+        (
+            event for event in events
+            if event.side == "ios"
+            and event.stage == "commandIntent"
+            and event.command_type in {"NEXT", "PREVIOUS"}
+        ),
+        key=lambda event: event.mono_ms,
+    )
+    t0_events = []
+    track_publish_values = []
+    missing = 0
+
+    if controls:
+        used_identity_lines = set()
+        for index, control in enumerate(controls):
+            next_control_ms = (
+                controls[index + 1].mono_ms
+                if index + 1 < len(controls)
+                else None
+            )
+            candidates = [
+                identity for identity in identities
+                if identity.source_line not in used_identity_lines
+                and identity.mono_ms >= control.mono_ms
+                and (
+                    next_control_ms is None
+                    or identity.mono_ms < next_control_ms
+                )
+            ]
+            if not candidates:
+                missing += 1
+                continue
+            identity = candidates[0]
+            used_identity_lines.add(identity.source_line)
+            duration = identity.mono_ms - control.mono_ms
+            if duration > 120_000:
+                categories["extreme"] += 1
+            track_publish_values.append(duration)
+            t0_events.append(
+                Event(
+                    side="t0",
+                    stage="trackT0",
+                    mono_ms=control.mono_ms,
+                    command_seq=control.command_seq,
+                    command_type=control.command_type,
+                    track_id=identity.track_id,
+                    generation=identity.generation,
+                    result="manual",
+                    source_line=-(index + 1),
+                )
+            )
+        return t0_events, track_publish_values, missing
+
+    sony_identities = sorted(
+        (
+            event for event in events
+            if event.side == "sony" and event.stage == "trackIdentityAccepted"
+        ),
+        key=lambda event: event.mono_ms,
+    )
+    if sony_identities or identities:
+        if not clock_trusted or sony_to_ios_offset_ms is None:
+            categories["untrusted_clock"] += max(len(sony_identities), len(identities))
+            return [], [], max(len(sony_identities), len(identities))
+
+    identities_by_key = defaultdict(list)
+    for identity in identities:
+        identity_key = _track_key(identity)
+        if identity_key is not None:
+            identities_by_key[identity_key].append(identity)
+    used_identity_lines = set()
+    for index, sony_identity in enumerate(sony_identities):
+        identity_key = _track_key(sony_identity)
+        mapped_t0_ms = sony_identity.mono_ms + sony_to_ios_offset_ms
+        candidates = [
+            identity for identity in identities_by_key.get(identity_key, [])
+            if identity.source_line not in used_identity_lines
+            and identity.mono_ms >= mapped_t0_ms
+        ]
+        if not candidates:
+            missing += 1
+            continue
+        identity = candidates[0]
+        used_identity_lines.add(identity.source_line)
+        duration = identity.mono_ms - mapped_t0_ms
+        if duration > 120_000:
+            categories["extreme"] += 1
+        track_publish_values.append(duration)
+        t0_events.append(
+            Event(
+                side="t0",
+                stage="trackT0",
+                mono_ms=mapped_t0_ms,
+                track_id=identity.track_id,
+                generation=identity.generation,
+                result="automatic",
+                source_line=-(index + 1),
+            )
+        )
+    if sony_identities:
+        first_mapped_t0 = sony_identities[0].mono_ms + sony_to_ios_offset_ms
+        missing += sum(
+            1 for identity in identities
+            if identity.source_line not in used_identity_lines
+            and identity.mono_ms >= first_mapped_t0
+        )
+    return t0_events, track_publish_values, missing
+
+
+def analyze(
+    events: list[Event],
+    malformed: int = 0,
+    clock_trusted: bool = False,
+    sony_to_ios_offset_ms: Optional[int] = None,
+) -> dict:
+    categories = Counter()
+    categories["malformed"] = malformed
+    if not events:
+        categories["empty"] += 1
+
+    identity_counts = Counter(
+        (
+            event.side,
+            event.stage,
+            event.mono_ms,
+            event.command_seq,
+            event.track_id,
+            event.generation,
+            event.transfer_id,
+        )
+        for event in events
+    )
+    categories["duplicate"] = sum(count - 1 for count in identity_counts.values() if count > 1)
+
+    accepted_generation_stages = {
+        "trackIdentityAccepted",
+        "playbackStatePublished",
+        "currentLyricPublished",
+        "currentWordAccepted",
+        "currentWordPublished",
+        "lyricWindowPublished",
+        "fullLyricsPublished",
+        "previewPublished",
+        "hqPublished",
+    }
+    latest_generation = {}
+    for event in sorted(events, key=lambda item: (item.side, item.mono_ms, item.source_line)):
+        if event.stage not in accepted_generation_stages or event.generation is None:
+            continue
+        previous = latest_generation.get(event.side)
+        if previous is not None and event.generation < previous:
+            categories["stale_generation"] += 1
+        latest_generation[event.side] = max(previous or event.generation, event.generation)
+
+    current_ios_track: Optional[tuple] = None
+    for event in sorted(
+        (event for event in events if event.side == "ios"),
+        key=lambda item: (item.mono_ms, item.source_line),
+    ):
+        if event.stage == "trackIdentityAccepted":
+            current_ios_track = _track_key(event)
+            continue
+        event_track = _track_key(event)
+        if current_ios_track is None or event_track is None:
+            continue
+        if event.stage in {"currentWordAccepted", "currentWordPublished"}:
+            if not _same_track(event_track, current_ios_track):
+                categories["wrong_current_word"] += 1
+        elif event.stage in {"previewPublished", "hqPublished"}:
+            if not _same_track(event_track, current_ios_track):
+                categories["wrong_artwork"] += 1
+        elif event.stage in {"lyricWindowPublished", "fullLyricsPublished"}:
+            if not _same_track(event_track, current_ios_track):
+                categories["wrong_lyrics"] += 1
+
+    dispatch_counts = Counter(
+        (event.command_seq, event.command_type)
+        for event in events
+        if event.side == "sony"
+        and event.stage == "mediaControlDispatchStart"
+        and _control_command_key(event) is not None
+    )
+    receive_counts = Counter(
+        (event.command_seq, event.command_type)
+        for event in events
+        if event.side == "sony"
+        and event.stage == "commandReceived"
+        and _control_command_key(event) is not None
+    )
+    categories["duplicate_control"] = sum(
+        count - 1 for count in dispatch_counts.values() if count > 1
+    )
+    categories["control_reconnect_resend"] = sum(
+        count - 1 for count in receive_counts.values() if count > 1
+    )
+
+    metrics = {}
+    metric_samples = {}
+
+    track_t0_events, track_publish_values, track_publish_missing = derive_track_t0(
+        events,
+        categories,
+        clock_trusted,
+        sony_to_ios_offset_ms,
+    )
+    metric_samples["commandToTrackPublishMs"] = track_publish_values
+    metrics["commandToTrackPublishMs"] = summarize(
+        track_publish_values,
+        track_publish_missing,
+    )
+
+    usable_artwork_events = [
+        replace(event, stage="usableArtworkPublished")
+        for event in events
+        if event.side == "ios" and event.stage in {"previewPublished", "hqPublished"}
+    ]
+    t0_pair_specs = (
+        ("trackToCurrentLyricMs", "currentLyricPublished", _track_key),
+        ("trackToCurrentWordMs", "currentWordPublished", _track_key),
+        ("trackToPreviewArtMs", "usableArtworkPublished", _track_id_key),
+        ("trackToHqArtMs", "hqPublished", _track_id_key),
+    )
+    t0_analysis_events = [*events, *usable_artwork_events, *track_t0_events]
+    for name, end_stage, key in t0_pair_specs:
+        values, missing = paired_durations(
+            t0_analysis_events,
+            "t0",
+            "trackT0",
+            "ios",
+            end_stage,
+            key,
+            categories,
+        )
+        metric_samples[name] = values
+        metrics[name] = summarize(values, missing)
+
+    pair_specs = (
+        ("commandToSonyReceiveMs", "ios", "commandIntent", "sony", "commandReceived", _control_command_key, True),
+        ("lyricReadyToPendingFlushMs", "sony", "lyricReady", "sony", "pendingFlush", _ready_track_key, False),
+        ("pendingFlushToSendStartMs", "sony", "pendingFlush", "sony", "fullLyricsSendStart", _track_key, False),
+        ("fullLyricsSendDurationMs", "sony", "fullLyricsSendStart", "sony", "fullLyricsSendEnd", _transfer_key, False),
+        ("lyricReadyToFullLyricsPublishMs", "sony", "lyricReady", "ios", "fullLyricsPublished", _ready_track_key, True),
+        ("previewSendDurationMs", "sony", "previewSendStart", "sony", "previewSendEnd", _track_key, False),
+        (
+            "iOSPublishDurationMs",
+            "ios",
+            "playbackDecodeEnd",
+            "ios",
+            "playbackStatePublished",
+            lambda event: ("playbackState",)
+            if event.payload_type == "playbackState"
+            else None,
+            False,
+        ),
+    )
+    pending_track_keys = {
+        _track_key(event)
+        for event in events
+        if event.side == "sony" and event.stage == "pendingQueued"
+    }
+    for name, start_side, start_stage, end_side, end_stage, key, cross in pair_specs:
+        analysis_events = events
+        if name == "lyricReadyToPendingFlushMs":
+            analysis_events = [
+                event for event in events
+                if event.stage != "lyricReady" or _track_key(event) in pending_track_keys
+            ]
+        values, missing = paired_durations(
+            analysis_events,
+            start_side,
+            start_stage,
+            end_side,
+            end_stage,
+            key,
+            categories,
+            cross_device=cross,
+            clock_trusted=clock_trusted,
+            sony_to_ios_offset_ms=sony_to_ios_offset_ms,
+        )
+        metric_samples[name] = values
+        metrics[name] = summarize(values, missing)
+
+    direct_specs = {
+        "notifyQueueWaitMs": ("sony", {"notifyDequeued"}, "queue_wait_ms"),
+        "iOSDecodeDurationMs": ("ios", {"playbackDecodeEnd"}, "processing_ms"),
+    }
+    for name, (side, stages, attribute) in direct_specs.items():
+        candidates = [e for e in events if e.side == side and e.stage in stages]
+        values = [getattr(e, attribute) for e in candidates if getattr(e, attribute) is not None]
+        metric_samples[name] = values
+        metrics[name] = summarize(values, len(candidates) - len(values))
+
+    for name in METRIC_NAMES:
+        metrics.setdefault(name, summarize([], 0))
+
+    delay_thresholds = {
+        "COMMAND_DELAY": ("commandToSonyReceiveMs", 200),
+        "TRACK_IDENTITY_DELAY": ("commandToTrackPublishMs", 300),
+        "LYRIC_READY_DELAY": ("trackToCurrentLyricMs", 500),
+        "PENDING_FLUSH_DELAY": ("lyricReadyToPendingFlushMs", 100),
+        "SEND_QUEUE_DELAY": ("notifyQueueWaitMs", 200),
+        "CURRENT_WORD_DELAY": ("trackToCurrentWordMs", 500),
+        "ARTWORK_DELAY": ("trackToPreviewArtMs", 800),
+        "IOS_DECODE_DELAY": ("iOSDecodeDurationMs", 50),
+        "IOS_PUBLISH_DELAY": ("iOSPublishDurationMs", 100),
+    }
+    classifications = {
+        category: sum(1 for value in metric_samples.get(metric, []) if value > threshold)
+        for category, (metric, threshold) in delay_thresholds.items()
+    }
+    classifications["CLOCK_SYNC_UNTRUSTED"] = categories["untrusted_clock"]
+    classifications["TRACE_INCOMPLETE"] = (
+        malformed
+        + categories["empty"]
+        + categories["out_of_order"]
+        + sum(metric["missing"] for metric in metrics.values())
+    )
+    classifications["STALE_CONTENT"] = (
+        categories["stale_generation"]
+        + categories["wrong_current_word"]
+        + categories["wrong_artwork"]
+        + categories["wrong_lyrics"]
+    )
+    slow_samples = sorted(
+        (
+            {
+                "traceId": f"{name}-{index + 1}",
+                "trackIdSummary": None,
+                "slowestStage": name,
+                "durationMs": value,
+                "cacheHit": None,
+                "longTaskCompetition": None,
+                "currentWordPreempted": None,
+                "retry": None,
+            }
+            for name, samples in metric_samples.items()
+            for index, value in enumerate(samples)
+        ),
+        key=lambda sample: sample["durationMs"],
+        reverse=True,
+    )[:10]
+
+    return {
+        "schemaVersion": 1,
+        "clock": {
+            "crossDeviceTrusted": clock_trusted and sony_to_ios_offset_ms is not None,
+            "sonyToIosOffsetMs": sony_to_ios_offset_ms,
+        },
+        "eventCount": len(events),
+        "sideCounts": dict(Counter(event.side for event in events)),
+        "stageCounts": dict(Counter(event.stage for event in events)),
+        "metrics": metrics,
+        "categories": classifications,
+        "diagnostics": dict(sorted(categories.items())),
+        "slowSamples": slow_samples,
+    }
+
+
+def render_summary(report: dict) -> str:
+    lines = [
+        "# MusicBleController V4 Real-time SLO Summary",
+        "",
+        f"Events: {report['eventCount']}",
+        f"Cross-device clock trusted: {report['clock']['crossDeviceTrusted']}",
+        "",
+        "| Metric | Count | P50 | P95 | P99 | Max | Missing |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for name in METRIC_NAMES:
+        metric = report["metrics"][name]
+        value = lambda key: "-" if metric[key] is None else f"{metric[key]:.1f}"
+        lines.append(
+            f"| {name} | {metric['count']} | {value('p50')} | {value('p95')} | "
+            f"{value('p99')} | {value('max')} | {metric['missing']} |"
+        )
+    lines.extend(("", "## Diagnostic categories", ""))
+    if report["categories"]:
+        lines.extend(f"- {key}: {value}" for key, value in report["categories"].items())
+    else:
+        lines.append("- none")
+    return "\n".join(lines) + "\n"
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sony-trace", type=Path, action="append", default=[])
+    parser.add_argument("--ios-trace", type=Path, action="append", default=[])
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--clock-trusted", action="store_true")
+    parser.add_argument("--sony-to-ios-offset-ms", type=int)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    trace_paths = [*args.sony_trace, *args.ios_trace]
+    events, malformed = load_events(trace_paths)
+    discovered_trusted, discovered_offset = discover_clock_sync(args.ios_trace)
+    clock_trusted = args.clock_trusted or discovered_trusted
+    sony_to_ios_offset_ms = (
+        args.sony_to_ios_offset_ms
+        if args.sony_to_ios_offset_ms is not None
+        else discovered_offset
+    )
+    report = analyze(
+        events,
+        malformed=malformed,
+        clock_trusted=clock_trusted,
+        sony_to_ios_offset_ms=sony_to_ios_offset_ms,
+    )
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    (args.output_dir / "report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (args.output_dir / "summary.md").write_text(render_summary(report), encoding="utf-8")
+    with (args.output_dir / "raw_events.jsonl").open("w", encoding="utf-8") as handle:
+        for event in events:
+            handle.write(json.dumps(event.as_dict(), ensure_ascii=False) + "\n")
+    if args.json:
+        json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -80,3 +80,5 @@
 - iOS UserDefaults 歌词显示模式/偏移：full smoke。
 - Sony QRC/Recovery/Cache：Android build `./gradlew :PlayerAgentApp:assembleDebug`，真机播放有/无歌词、懒加载、翻译/罗马音歌曲。
 - docs-only：`git diff --check`。
+
+V4 实时性观测使用 `trackId + generation` 关联 `lyricRequestQueued`、`lyricReady`、pending、LyricWindow、FullLyrics 和 CurrentWord 阶段。Trace 不读取歌词正文，也不改变 QRC 加载、pending flush、队列优先级或 stale fence；指标定义见 [REALTIME_SLO_V4.md](/Volumes/雷电/project/MusicBleController/docs/REALTIME_SLO_V4.md)。

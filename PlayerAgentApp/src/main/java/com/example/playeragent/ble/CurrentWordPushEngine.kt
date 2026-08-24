@@ -1,6 +1,7 @@
 package com.example.playeragent.ble
 
 import android.os.SystemClock
+import com.example.playeragent.diagnostics.RealtimeTrace
 import com.example.playeragent.media.CurrentTrackRuntimeCache
 import com.example.playeragent.media.CurrentWordState
 import com.example.playeragent.media.TrackCapabilityTracker
@@ -45,6 +46,13 @@ class CurrentWordPushEngine(
         force: Boolean = false
     ): CurrentWordState? {
         val startedAt = elapsedRealtime()
+        RealtimeTrace.record(
+            stage = "currentWordEnqueued",
+            monoMs = startedAt,
+            payloadType = "currentWord",
+            result = "running",
+            reason = reason
+        )
         val state = currentWordState() ?: run {
             recordSkip("missing")
             return null
@@ -147,7 +155,28 @@ class CurrentWordPushEngine(
             payload.put("sampleMono", state.sampleElapsedMs)
         }
 
+        val sendStartedAt = elapsedRealtime()
+        RealtimeTrace.record(
+            stage = "currentWordSendStart",
+            monoMs = sendStartedAt,
+            trackId = outgoingTrackId,
+            generation = state.trackGeneration,
+            payloadType = "currentWord",
+            result = "started",
+            reason = reason
+        )
         val sent = sendStatusMessage(payload.toString())
+        val sendEndedAt = elapsedRealtime()
+        RealtimeTrace.record(
+            stage = "currentWordSendEnd",
+            monoMs = sendEndedAt,
+            trackId = outgoingTrackId,
+            generation = state.trackGeneration,
+            payloadType = "currentWord",
+            processingMs = (sendEndedAt - sendStartedAt).coerceAtLeast(0L),
+            result = if (sent) "success" else "failure",
+            reason = if (sent) reason else "send_failed"
+        )
         synchronized(lock) {
             if (!sent) {
                 recordSkipLocked("send failed", elapsedRealtime(), state, key)
@@ -248,6 +277,19 @@ class CurrentWordPushEngine(
         extra: String = ""
     ) {
         skipCount += 1
+        RealtimeTrace.record(
+            stage = if (reason == "same word" || reason == "rate limited") {
+                "currentWordCoalesced"
+            } else {
+                "currentWordDropped"
+            },
+            monoMs = now,
+            trackId = state?.trackId,
+            generation = state?.trackGeneration,
+            payloadType = "currentWord",
+            result = "skipped",
+            reason = reason.replace(' ', '_')
+        )
         if (now - lastSkipLogAtMs >= SKIP_LOG_INTERVAL_MS) {
             lastSkipLogAtMs = now
             val detail = if (state != null) {

@@ -113,3 +113,5 @@ CoreBluetooth 使用 `com.musicblecontroller.sony.central.v1` 做状态恢复，
 - 覆盖率测试包含主播放器 regular/compact、设置、调试、诊断、完整歌词四种显示模式、历史统计等真实 SwiftUI 渲染，以及诊断 reducer、自愈状态机、歌词/封面/历史/日志/快照持久化。不得通过排除生产源码或把无断言执行计入测试来维持门槛。
 
 工程暂时使用 Swift 5 + targeted strict concurrency；升级 Swift 6 前必须先保持 clean build 无源代码 warning。Debug/诊断构建可启用主线程 heartbeat，生产性能以 signpost 和 MetricKit 为准。
+
+V4 Debug/Smoke 构建通过 `RealtimeTraceStore` 记录命令、协议接收、解码、Track/歌词/CurrentWord/封面 publish 和主播放器消费事件。事件只进入 2048 条 Ring Buffer 与现有异步 `AppLogStore`，不成为业务状态源；完整口径和真机命令见 [REALTIME_SLO_V4.md](/Volumes/雷电/project/MusicBleController/docs/REALTIME_SLO_V4.md)。

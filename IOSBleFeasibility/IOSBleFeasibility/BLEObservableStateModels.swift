@@ -1,4 +1,5 @@
 import Combine
+import Foundation
 import Observation
 import UIKit
 
@@ -712,5 +713,261 @@ struct CurrentWordOrderingFence {
         generation = -1
         sequence = -1
         positionMs = -1
+    }
+}
+
+// MARK: - V4 realtime latency trace
+
+struct RealtimeTraceEvent: Equatable {
+    let sequence: UInt64
+    let side: String
+    let stage: String
+    let monoMs: Int64
+    let commandSeq: Int64?
+    let commandType: String?
+    let trackId: String?
+    let generation: Int64?
+    let transferId: String?
+    let payloadType: String?
+    let queueWaitMs: Int64?
+    let processingMs: Int64?
+    let chunkIndex: Int?
+    let chunkCount: Int?
+    let result: String?
+    let reason: String?
+
+    var logLine: String {
+        let fields: [(String, String)] = [
+            ("side", side),
+            ("stage", stage),
+            ("monoMs", String(monoMs)),
+            ("commandSeq", commandSeq.map(String.init) ?? "-"),
+            ("commandType", commandType ?? "-"),
+            ("trackId", trackId ?? "-"),
+            ("generation", generation.map(String.init) ?? "-"),
+            ("transferId", transferId ?? "-"),
+            ("payloadType", payloadType ?? "-"),
+            ("queueWaitMs", queueWaitMs.map(String.init) ?? "-"),
+            ("processingMs", processingMs.map(String.init) ?? "-"),
+            ("chunkIndex", chunkIndex.map(String.init) ?? "-"),
+            ("chunkCount", chunkCount.map(String.init) ?? "-"),
+            ("result", result ?? "-"),
+            ("reason", reason ?? "-")
+        ]
+        return "[RealtimeTrace] " + fields
+            .map { "\($0.0)=\(Self.safe($0.1))" }
+            .joined(separator: " ")
+    }
+
+    private static func safe(_ value: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(
+            CharacterSet(charactersIn: "-_.:/")
+        )
+        return String(
+            value.unicodeScalars.prefix(96).map { scalar in
+                allowed.contains(scalar) ? Character(String(scalar)) : "_"
+            }
+        )
+    }
+}
+
+final class RealtimeTraceBuffer {
+    typealias MonotonicClock = () -> Int64
+
+    let capacity: Int
+    private let clock: MonotonicClock
+    private let lock = NSLock()
+    private var storage: [RealtimeTraceEvent?]
+    private var nextIndex = 0
+    private var storedCount = 0
+    private var nextSequence: UInt64 = 0
+    private var lastMonoMs: Int64 = 0
+
+    init(
+        capacity: Int = 2_048,
+        clock: @escaping MonotonicClock = {
+            Int64(ProcessInfo.processInfo.systemUptime * 1_000)
+        }
+    ) {
+        self.capacity = max(capacity, 1)
+        self.clock = clock
+        storage = Array(repeating: nil, count: max(capacity, 1))
+    }
+
+    @discardableResult
+    func append(
+        side: String = "ios",
+        stage: String,
+        monoMs suppliedMonoMs: Int64? = nil,
+        commandSeq: Int64? = nil,
+        commandType: String? = nil,
+        trackId: String? = nil,
+        generation: Int64? = nil,
+        transferId: String? = nil,
+        payloadType: String? = nil,
+        queueWaitMs: Int64? = nil,
+        processingMs: Int64? = nil,
+        chunkIndex: Int? = nil,
+        chunkCount: Int? = nil,
+        result: String? = nil,
+        reason: String? = nil
+    ) -> RealtimeTraceEvent {
+        lock.lock()
+        defer { lock.unlock() }
+        let sampled = suppliedMonoMs ?? clock()
+        let monoMs = max(sampled, lastMonoMs)
+        lastMonoMs = monoMs
+        nextSequence &+= 1
+        let event = RealtimeTraceEvent(
+            sequence: nextSequence,
+            side: side,
+            stage: stage,
+            monoMs: monoMs,
+            commandSeq: commandSeq,
+            commandType: commandType,
+            trackId: trackId,
+            generation: generation,
+            transferId: transferId,
+            payloadType: payloadType,
+            queueWaitMs: queueWaitMs,
+            processingMs: processingMs,
+            chunkIndex: chunkIndex,
+            chunkCount: chunkCount,
+            result: result,
+            reason: reason
+        )
+        storage[nextIndex] = event
+        nextIndex = (nextIndex + 1) % capacity
+        storedCount = min(storedCount + 1, capacity)
+        return event
+    }
+
+    func snapshot() -> [RealtimeTraceEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard storedCount > 0 else { return [] }
+        let start = storedCount == capacity ? nextIndex : 0
+        return (0..<storedCount).compactMap { offset in
+            storage[(start + offset) % capacity]
+        }
+    }
+
+    func clear() {
+        lock.lock()
+        storage = Array(repeating: nil, count: capacity)
+        nextIndex = 0
+        storedCount = 0
+        lastMonoMs = 0
+        lock.unlock()
+    }
+}
+
+final class RealtimeTraceStore {
+    static let shared = RealtimeTraceStore()
+
+    let buffer: RealtimeTraceBuffer
+    var enabled: Bool
+    private let logSink: (String) -> Void
+
+    init(
+        capacity: Int = 2_048,
+        enabled: Bool = {
+#if DEBUG
+            true
+#else
+            false
+#endif
+        }(),
+        clock: @escaping RealtimeTraceBuffer.MonotonicClock = {
+            Int64(ProcessInfo.processInfo.systemUptime * 1_000)
+        },
+        logSink: @escaping (String) -> Void = { AppLogStore.shared.append($0) }
+    ) {
+        buffer = RealtimeTraceBuffer(capacity: capacity, clock: clock)
+        self.enabled = enabled
+        self.logSink = logSink
+    }
+
+    @discardableResult
+    func record(
+        stage: String,
+        monoMs: Int64? = nil,
+        commandSeq: Int64? = nil,
+        commandType: String? = nil,
+        trackId: String? = nil,
+        generation: Int64? = nil,
+        transferId: String? = nil,
+        payloadType: String? = nil,
+        queueWaitMs: Int64? = nil,
+        processingMs: Int64? = nil,
+        chunkIndex: Int? = nil,
+        chunkCount: Int? = nil,
+        result: String? = nil,
+        reason: String? = nil
+    ) -> RealtimeTraceEvent? {
+        guard enabled else { return nil }
+        let event = buffer.append(
+            stage: stage,
+            monoMs: monoMs,
+            commandSeq: commandSeq,
+            commandType: commandType,
+            trackId: trackId,
+            generation: generation,
+            transferId: transferId,
+            payloadType: payloadType,
+            queueWaitMs: queueWaitMs,
+            processingMs: processingMs,
+            chunkIndex: chunkIndex,
+            chunkCount: chunkCount,
+            result: result,
+            reason: reason
+        )
+        logSink(event.logLine)
+        return event
+    }
+
+    func summary() -> RealtimeTraceSummary {
+        RealtimeTraceSummary(events: buffer.snapshot())
+    }
+}
+
+enum RealtimeTraceStatistics {
+    static func percentile(_ values: [Int64], percentile: Double) -> Double? {
+        guard !values.isEmpty else { return nil }
+        let sorted = values.sorted()
+        let clamped = min(max(percentile, 0), 100)
+        let rank = clamped / 100 * Double(sorted.count - 1)
+        let lower = Int(rank.rounded(.down))
+        let upper = Int(rank.rounded(.up))
+        guard lower != upper else { return Double(sorted[lower]) }
+        let fraction = rank - Double(lower)
+        return Double(sorted[lower]) +
+            (Double(sorted[upper] - sorted[lower]) * fraction)
+    }
+}
+
+enum RealtimeLatencyPolicy {
+    static func crossDeviceDuration(
+        startMonoMs: Int64,
+        endMonoMs: Int64,
+        clockTrusted: Bool
+    ) -> Int64? {
+        guard clockTrusted, endMonoMs >= startMonoMs else { return nil }
+        return endMonoMs - startMonoMs
+    }
+}
+
+struct RealtimeTraceSummary: Equatable {
+    let eventCount: Int
+    let missingResultCount: Int
+    let latestMonoMs: Int64?
+    let stageCounts: [String: Int]
+
+    init(events: [RealtimeTraceEvent]) {
+        eventCount = events.count
+        missingResultCount = events.filter { $0.result == nil }.count
+        latestMonoMs = events.last?.monoMs
+        stageCounts = Dictionary(grouping: events, by: \.stage)
+            .mapValues(\.count)
     }
 }

@@ -9,6 +9,7 @@ import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.Bundle
 import android.os.SystemClock
+import com.example.playeragent.diagnostics.RealtimeTrace
 import com.example.playeragent.history.FastPlaybackSnapshot
 import com.example.playeragent.logging.LogConfig
 import com.example.playeragent.service.PlayerNotificationListenerService
@@ -64,6 +65,12 @@ class PlaybackStateReader(
 
     fun readPlaybackState(): JSONObject {
         val startedAtMs = SystemClock.elapsedRealtime()
+        RealtimeTrace.record(
+            stage = "playbackStateReadStart",
+            monoMs = startedAtMs,
+            payloadType = "playbackState",
+            result = "started"
+        )
         verbose("[PlaybackState] GET_PLAYBACK_STATE received")
 
         if (mediaSessionManager == null) {
@@ -308,7 +315,7 @@ class PlaybackStateReader(
             .put("lyricStatus", lyricStatus)
             .put("lyricReason", lyricReason)
             .put("lyricSuggestion", diagnostic.suggestion)
-        CurrentTrackRuntimeCache.updatePlaybackState(
+        val runtimeTrack = CurrentTrackRuntimeCache.updatePlaybackState(
             trackId = lastTrackId,
             songKey = songKey,
             title = title,
@@ -335,6 +342,17 @@ class PlaybackStateReader(
                 )
             }
         }
+        val readyAtMs = SystemClock.elapsedRealtime()
+        RealtimeTrace.record(
+            stage = "playbackStateReady",
+            monoMs = readyAtMs,
+            trackId = runtimeTrack.trackId,
+            generation = runtimeTrack.currentTrackGeneration,
+            payloadType = "playbackState",
+            processingMs = (readyAtMs - startedAtMs).coerceAtLeast(0L),
+            result = "ready",
+            reason = if (runtimeTrack.isPlaying) "playing" else "paused"
+        )
         return response
     }
 

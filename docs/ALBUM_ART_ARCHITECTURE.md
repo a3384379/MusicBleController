@@ -86,3 +86,5 @@
 - 必须查看 `report.json` 的 `albumArtFlow`，Sony 不在线时允许 Optional WARN/SKIPPED；若真实在线应看到 PASS。
 - 改 Xcode target 或新增 Swift 文件：full smoke。
 - 改 Sony 发送压缩或 binary 协议：Android build + iPhone 真机封面链路。
+
+V4 实时性观测按 `trackId + generation + transferId` 记录 offer、cache hit、Preview/HQ 编码、队列、传输、iOS 解码与 publish。Trace 不包含图片正文，不改变 A1、CRC、质量、超时或调度策略；指标定义见 [REALTIME_SLO_V4.md](/Volumes/雷电/project/MusicBleController/docs/REALTIME_SLO_V4.md)。
