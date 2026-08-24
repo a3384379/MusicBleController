@@ -130,9 +130,45 @@ Notify queue p95 为 79.6ms，单次 iOS decode/publish 远低于 SLO，因此�
 
 ## 12. 修改后数据与实际优化
 
-Gate 1 只增加观测能力。Gate 2 是否产生 `perf: reduce first-frame media latency` 提交，必须由第 11 节基线证明；若所有主要指标达标，则明确记录“已满足目标，不做无意义优化”。
+Gate 1 只增加观测能力。Gate 2 使用同一台 iPhone、同一台 Sony 和相同的 100 次 650ms 快速交替切歌复测。两轮 Clock Sync 都不可信，因此跨设备命令接收继续标记为不可用，不用墙上时间填充。
 
-本节将在连接展示与 Sony artwork identity fence 修复后，用相同真机场景补充 before/after。基线已证明允许修改的范围仅限：写回调异常时的连接展示稳定、stale generation 拒绝、以及事件触发的精确封面刷新；不调整 BLE delay、全局 priority、Timer、chunk size 或图片编码质量。
+修改后报告保存在本机 `/tmp/musicble_phase2_after_fix2_fast100/`，原始设备日志不提交仓库。
+
+| metric | count | p50 | p95 | p99 | max | missing |
+|---|---:|---:|---:|---:|---:|---:|
+| commandToSonyReceiveMs | 0 | — | — | — | — | 100 |
+| commandToTrackPublishMs | 46 | 359.5 | 621.8 | 628.1 | 629 | 54 |
+| trackToCurrentLyricMs | 25 | 410 | 1230.8 | 5945.2 | 7414 | 21 |
+| trackToCurrentWordMs | 1 | 1836 | 1836 | 1836 | 1836 | 45 |
+| trackToPreviewArtMs | 46 | 387 | 650 | 655.7 | 657 | 0 |
+| trackToHqArtMs | 30 | 394 | 652.2 | 656.1 | 657 | 16 |
+| lyricReadyToPendingFlushMs | 0 | — | — | — | — | 0 |
+| pendingFlushToSendStartMs | 0 | — | — | — | — | 0 |
+| fullLyricsSendDurationMs | 37 | 177 | 319.2 | 381.9 | 392 | 6 |
+| iOSDecodeDurationMs | 1119 | 0 | 1 | 1 | 2 | 0 |
+| iOSPublishDurationMs | 144 | 1 | 20.9 | 23 | 26 | 0 |
+
+同场景 p95 对比：
+
+| metric | before p95 | after p95 | change | 结论 |
+|---|---:|---:|---:|---|
+| command → Track publish | 631.1ms | 621.8ms | -1.5% | 无明显回退，仍高于 300ms SLO |
+| Track → current lyric | 635.5ms | 1230.8ms | +93.7% | 25 个样本含 1 个 7414ms 外部歌词就绪长尾；未宣称优化 |
+| Track → CurrentWord | 1196.4ms | 1836ms | 样本 3→1 | 样本不足，不作性能结论 |
+| Track → Preview | 663.1ms | 650ms | -2.0% | 保持在 800ms SLO 内 |
+| Track → HQ | 631.3ms | 652.2ms | +3.3% | 保持在 2500ms SLO 内 |
+| FullLyrics send | 337.4ms | 319.2ms | -5.4% | 无协议或队列参数改动 |
+| Notify queue | 124ms | 143ms | +15.3% | 最大值由 887ms 降至 591ms；p95 仍是待优化项 |
+| iOS decode | 1ms | 1ms | 0% | 已满足目标 |
+| iOS publish | 18ms | 20.9ms | +15.8% | 绝对值仍远低于 100ms |
+
+实际优化严格限于证据指向的正确性和产品状态：
+
+1. CoreBluetooth 已连接且最近仍收到 notify 时，连续两次写回调超时仍执行必要的传输自愈，但在 8 秒保护窗内保持“已连接”展示；只有同步失败或保护窗到期才显示重连。修复前压力轮次出现 3 次可见假重连，修复后一次同类内部自愈期间可见假重连为 0，4.38 秒后恢复同步。
+2. iOS 对同一 Sony session 的 Track Identity 增加 generation 回退和同 generation 冲突栅栏；新 session 与 legacy generation=0 保持兼容。复测拒绝 2 个迟到身份事件，`STALE_CONTENT=0`。
+3. Sony PlayerAgent UI 改为监听既有 QQ 音乐通知事件，并按当前 title/artist 精确验证 MediaMetadata/Notification 后才晋升封面。轨道变化先进入 LOADING，迟到任务受 generation+songKey 栅栏约束；临时精确源缺失只保留同一当前歌曲已经 READY 的图。复测最后一次歌曲身份变化后约 85ms 显示匹配封面。
+
+本轮没有修改 BLE delay、全局 priority、Timer、chunk size、图片编码质量或协议。验收采用“找到真实外部瓶颈并有可重复证据”：剩余 Track/歌词长尾位于 MediaSession/媒体源身份与歌词就绪，不在 iOS decode/publish；盲目调低 BLE delay 无法解决。
 
 ## 13. 正确性与 stale fence
 
@@ -140,14 +176,19 @@ Gate 1 只增加观测能力。Gate 2 是否产生 `perf: reduce first-frame med
 
 Sony 同一 `commandSeq + commandType` 的多次 `mediaControlDispatchStart` 计作重复执行；同一控制命令多次 `commandReceived` 单列为可能的重连补发。既有 generation、transferId、CRC 和顺序栅栏保持不变。
 
+100 次复测结果：stale accepted 0、wrong currentWord 0、wrong artwork 0、wrong lyrics 0、duplicate control 0、control reconnect resend 0。快速切歌中被 iOS generation 栅栏拒绝的旧身份事件单独记为 `trackIdentityRejected=2`，不算 accepted。
+
 ## 14. CPU、内存、电量和日志
 
 - 两端各 2048 条固定 Ring Buffer，目标常驻增量小于 2 MB。
 - iOS 复用 `AppLogStore` 串行异步缓冲与 2 MB 文件上限；Sony 使用单线程 daemon 日志执行器。
 - Debug/Smoke 才启用完整事件流；Release 不产生完整事件流。
 - 普通模式 BLE notify 数量不增加，Timer 不增加。
+- 连接展示保护只复用命令超时和既有连接健康事件；没有新增轮询或 Timer。
+- Sony 封面刷新复用 `PlayerNotificationListenerService` 已存在的通知回调和单线程 UI media executor；没有新增周期扫描，精确源不匹配时不解码或发布图片。
 - Trace 不做 JSON pretty print，不做主线程同步 I/O，不解码图片，不参与重连。
 - 诊断 UI 只读已有 Snapshot 并手动刷新，不绘制实时图表。
+- Android lint 在起始 commit 实测为 PlayerAgent 20 errors / 34 warnings，修改后为 20 errors / 33 warnings；Controller 修改前后均为 0 errors / 30 warnings。本阶段没有新增 lint，新增 `AlbumArtIdentityPolicy` 文件为 0 issue。PlayerAgent lint 仍因历史 20 errors 以非零退出，未用 baseline 或 suppress 隐藏。
 
 ## 15. BLE 协议审计
 
@@ -158,8 +199,10 @@ Sony 同一 `commandSeq + commandType` 的多次 `mediaControlDispatchStart` 计
 - Clock Sync 样本不足时端到端跨设备指标不可用，这是可信度保护，不是 0 ms。
 - 快速切歌可能被播放器或 MediaSession 合并；无法关联的样本记为 missing，不选择最好一次。
 - QRC 解密/解析若重新成为 Top 3，将拆为 Phase 2.1，不在本阶段顺手重写。
-- 真实设备基线与前后台恢复结果完成前，本节不声明产品性能达标。
+- 常规 NEXT 的 Track、歌词、CurrentWord、Preview/HQ 仍未全部达到目标；第二阶段完成的是 CI、可重复 Trace/SLO、正确性栅栏和基于证据的首轮修复，不宣称所有端到端 SLO 已达标。
+- 快速场景 CurrentWord 可关联样本只有 1 个，不能据此判断改善或回退。
+- 双控制器真机未执行，必须保持 SKIPPED。
 
 ## 17. 下一阶段建议
 
-基线完成后只处理事件证据指向的最大区间：ready→pending、pending→queue、重复 PlaybackState、CurrentWord 启动、Preview/HQ 竞争或 iOS decode/publish。每项优化必须保留 stale fence，并用同一场景输出 before/after p95 与正确性计数。
+下一阶段应优先使用预测命中、精确缓存和传输消除处理 MediaSession 身份确认、歌词就绪与封面首帧长尾。若继续做第二阶段微调，仍只处理事件证据指向的 ready→pending、pending→queue、CurrentWord 启动或 Preview/HQ 竞争；每项优化必须保留 stale fence，并用同一场景输出 before/after p95 与正确性计数。

@@ -1048,6 +1048,7 @@ final class PerformanceStabilityTests: XCTestCase {
             CommandWriteTimeoutPolicy.action(
                 appIsActive: false,
                 transportReady: true,
+                linkRecentlyActive: true,
                 timeoutCountAfterIncrement: 1,
                 reconnectThreshold: 2
             ),
@@ -1057,6 +1058,7 @@ final class PerformanceStabilityTests: XCTestCase {
             CommandWriteTimeoutPolicy.action(
                 appIsActive: true,
                 transportReady: true,
+                linkRecentlyActive: true,
                 timeoutCountAfterIncrement: 1,
                 reconnectThreshold: 2
             ),
@@ -1066,6 +1068,17 @@ final class PerformanceStabilityTests: XCTestCase {
             CommandWriteTimeoutPolicy.action(
                 appIsActive: true,
                 transportReady: true,
+                linkRecentlyActive: true,
+                timeoutCountAfterIncrement: 2,
+                reconnectThreshold: 2
+            ),
+            .reconnectPreservingPresentation
+        )
+        XCTAssertEqual(
+            CommandWriteTimeoutPolicy.action(
+                appIsActive: true,
+                transportReady: true,
+                linkRecentlyActive: false,
                 timeoutCountAfterIncrement: 2,
                 reconnectThreshold: 2
             ),
@@ -1075,6 +1088,7 @@ final class PerformanceStabilityTests: XCTestCase {
             CommandWriteTimeoutPolicy.action(
                 appIsActive: true,
                 transportReady: false,
+                linkRecentlyActive: false,
                 timeoutCountAfterIncrement: 1,
                 reconnectThreshold: 2
             ),
@@ -1690,6 +1704,56 @@ final class PerformanceStabilityTests: XCTestCase {
         XCTAssertEqual(
             diagnostics.observe(BLEStatusMetadata(sessionId: "s2", eventSequence: 1)),
             .newSession
+        )
+    }
+
+    func testTrackIdentityGenerationPolicyRejectsRollbackAndConflict() {
+        XCTAssertEqual(
+            TrackIdentityGenerationPolicy.decision(
+                currentTrackId: "track-new",
+                currentGeneration: 41,
+                currentSessionId: "session-1",
+                incomingTrackId: "track-old",
+                incomingGeneration: 40,
+                incomingSessionId: "session-1"
+            ),
+            .rejectStale
+        )
+        XCTAssertEqual(
+            TrackIdentityGenerationPolicy.decision(
+                currentTrackId: "track-a",
+                currentGeneration: 41,
+                currentSessionId: "session-1",
+                incomingTrackId: "track-b",
+                incomingGeneration: 41,
+                incomingSessionId: "session-1"
+            ),
+            .rejectConflict
+        )
+    }
+
+    func testTrackIdentityGenerationPolicyAllowsNewSessionAndLegacyPayload() {
+        XCTAssertEqual(
+            TrackIdentityGenerationPolicy.decision(
+                currentTrackId: "track-a",
+                currentGeneration: 41,
+                currentSessionId: "session-1",
+                incomingTrackId: "track-b",
+                incomingGeneration: 1,
+                incomingSessionId: "session-2"
+            ),
+            .acceptSessionReset
+        )
+        XCTAssertEqual(
+            TrackIdentityGenerationPolicy.decision(
+                currentTrackId: "legacy-a",
+                currentGeneration: 0,
+                currentSessionId: "",
+                incomingTrackId: "legacy-b",
+                incomingGeneration: 0,
+                incomingSessionId: ""
+            ),
+            .accept
         )
     }
 

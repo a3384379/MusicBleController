@@ -4,7 +4,8 @@
 
 ## 模块职责
 
-- Sony `AlbumArtTestManager`：从 MediaMetadata 和通知 largeIcon 中探测当前可用封面。当前真实链路常见来源是 QQMusic notification largeIcon。
+- Sony `AlbumArtTestManager`：从 MediaMetadata 和通知 largeIcon 中探测当前可用封面。PlayerAgent UI 请求当前封面时必须用当前 title/artist 验证来源身份；当前真实链路常见来源是 QQMusic notification largeIcon。
+- Sony `MainActivity`：监听既有 QQ 音乐通知事件，事件到达后在后台执行精确身份读取；用 generation+songKey 防止迟到结果覆盖当前歌曲。
 - Sony `BleGattServerManager`：处理 `ALBUM_ART_REQUEST`，压缩 preview/HQ/fallback，发送 `albumArtOffer` 和 binary chunk；短期重传记录由独立 `AlbumArtTransferCoordinator` 持有。
 - Sony `BleNotifyQueue`：发送 `albumArt` 长任务，控制 chunk 进度、超时和短状态让路。
 - iOS `AlbumArtReceiver`：接收 offer、请求 preview/HQ、处理 binary start/chunk/end、超时恢复、缓存、displayQuality、enhanced、诊断 snapshot。
@@ -38,6 +39,7 @@
 8. 解码完成回主线程前再次校验 `transferId + artworkId`；切歌后的旧任务不能覆盖新封面。
 9. iOS 在 utility 串行队列原子保存 `Documents/AlbumArtCache/`；增强图保存到 Enhanced 子目录。
 10. 主 UI 使用最终 `albumArtImage`；Live Activity 使用 App Group 小图。加载层明确区分 preview、HQ 和失败，可只重试当前歌曲。
+11. Sony PlayerAgent 本机 UI 在歌曲变化时先进入 LOADING；MediaMetadata/Notification 的 title/artist 与当前身份不匹配时拒绝。通知更新触发精确重读，不增加轮询；同一当前歌曲的临时精确源缺失不会把已经 READY 的图替换为占位图。
 
 ## 关键状态
 
@@ -77,6 +79,9 @@
   - `[AlbumArt-Sony]`
   - `[AlbumArt][BLE] failed`
   - `[BleNotifyQueue] job start type=albumArt`
+  - `[PlayerUI] artwork source event=...`
+  - `[AlbumArtSource] metadata rejected reason=identity_mismatch`
+  - `[PlayerUI] album art retained reason=transient_exact_source_miss`
 - 自动验收：
   `./tools/ios-smoke-tests/ios_album_art_flow_test.sh <ios_ble.log>`
 

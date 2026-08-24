@@ -79,6 +79,19 @@ class RealtimeLatencyReportTests(unittest.TestCase):
         self.assertGreaterEqual(report["diagnostics"]["stale_generation"], 1)
         self.assertGreaterEqual(report["diagnostics"]["extreme"], 1)
 
+    def test_unknown_generation_zero_is_not_reported_as_stale(self):
+        report = REPORT.analyze([
+            event(
+                "ios", "trackIdentityAccepted", 100,
+                track_id="t", generation=1, source_line=1,
+            ),
+            event(
+                "ios", "playbackStatePublished", 110,
+                track_id="t", generation=0, source_line=2,
+            ),
+        ])
+        self.assertEqual(report["diagnostics"].get("stale_generation", 0), 0)
+
     def test_cross_device_requires_trusted_clock(self):
         events = [
             event("ios", "commandIntent", 100, command_seq=7, command_type="NEXT", source_line=1),

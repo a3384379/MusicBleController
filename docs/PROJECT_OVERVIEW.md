@@ -35,6 +35,7 @@
 6. Live Activity Extension 只读取 `ContentState` 和 App Group 缩略图，不访问 BLE。
 7. Android `ControllerConnectionService` 使用同一 BLE V2 协议更新 Compose 界面和
    MediaStyle 通知，可与 iPhone 同时在线并保持控制与媒体状态同步。
+8. Sony PlayerAgent 本机播放器封面监听 QQ 音乐通知事件，并在 title/artist 精确匹配当前媒体后发布；切歌后的迟到图片由 generation+songKey 栅栏拒绝。
 
 ## 关键状态
 
@@ -43,6 +44,7 @@
 - iPhone 是同步、缓存和展示端。
 - Android Controller 是与 iPhone 对等的同步、缓存和展示端，不包含 Live Activity。
 - iOS `BLETestManager` 仍是连接/协议分发中心，但设置已拆到 `PreferencesStore`，封面接收已拆到 `AlbumArtReceiver`。
+- iOS 写通道自愈不会把最近仍有 notify 的健康连接立即展示成“正在连接”；同步失败或保护窗到期时仍回到真实重连状态。
 - Live Activity 状态必须保持轻量，`ContentState` 不允许放图片、完整歌词、大数组或 Base64。
 - iOS 日志落盘在 App 容器 `Documents/Logs/ios_ble.log`。
 

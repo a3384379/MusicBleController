@@ -299,6 +299,50 @@ struct BLEEventSequenceDiagnostics: Sendable {
     }
 }
 
+enum TrackIdentityGenerationDecision: Equatable, Sendable {
+    case accept
+    case acceptSessionReset
+    case rejectStale
+    case rejectConflict
+}
+
+enum TrackIdentityGenerationPolicy {
+    static func decision(
+        currentTrackId: String,
+        currentGeneration: Int64,
+        currentSessionId: String,
+        incomingTrackId: String,
+        incomingGeneration: Int64,
+        incomingSessionId: String
+    ) -> TrackIdentityGenerationDecision {
+        guard currentGeneration > 0, incomingGeneration > 0 else {
+            return .accept
+        }
+        let currentSession = normalizedSessionId(currentSessionId)
+        let incomingSession = normalizedSessionId(incomingSessionId)
+        if !currentSession.isEmpty,
+           !incomingSession.isEmpty,
+           currentSession != incomingSession {
+            return .acceptSessionReset
+        }
+        if incomingGeneration < currentGeneration {
+            return .rejectStale
+        }
+        if incomingGeneration == currentGeneration,
+           !currentTrackId.isEmpty,
+           !incomingTrackId.isEmpty,
+           currentTrackId != incomingTrackId {
+            return .rejectConflict
+        }
+        return .accept
+    }
+
+    private static func normalizedSessionId(_ value: String) -> String {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized == "-" ? "" : normalized
+    }
+}
+
 struct LiveActivityArtworkRevisionFence: Sendable {
     private(set) var current: UInt64 = 0
 

@@ -472,7 +472,11 @@ def analyze(
     }
     latest_generation = {}
     for event in sorted(events, key=lambda item: (item.side, item.mono_ms, item.source_line)):
-        if event.stage not in accepted_generation_stages or event.generation is None:
+        if (
+            event.stage not in accepted_generation_stages
+            or event.generation is None
+            or event.generation <= 0
+        ):
             continue
         previous = latest_generation.get(event.side)
         if previous is not None and event.generation < previous:

@@ -65,6 +65,8 @@
 
 CoreBluetooth 使用 `com.musicblecontroller.sony.central.v1` 做状态恢复，并在 iOS 17+ 连接选项中启用系统自动重连。系统报告 `isReconnecting=true` 时，自建 scan/reconnect 暂停；回到前台且系统重连超过连接超时后才由现有主动扫描接管。恢复到已连接且特征有效的 Sony 时直接复用 characteristic/notify；恢复确认前，前台生命周期检查不得把 `disconnected` 初值误判为真实断链。只有恢复状态无效时才回到 scan/reconnect。
 
+命令写回调连续超时仍会触发真实传输自愈。若 CoreBluetooth transport 尚连接且最近 notify 证明链路活跃，自愈期间最多 8 秒保持已连接展示；正式同步完成后结束保护，连接失败或保护窗到期则恢复真实重连状态。该策略只稳定产品展示，不跳过重连，也不把超时命令补发。
+
 ## 关键状态
 
 - 连接：`connectionStatus`、`connectionDisplayState`、`connectionHealthState`、`autoReconnectState`。
@@ -98,6 +100,7 @@ CoreBluetooth 使用 `com.musicblecontroller.sony.central.v1` 做状态恢复，
 
 - 自动连接慢：查 `[BLE-Reconnect] foreground strategy=scanFirst`、retrieve fast timeout、didDiscover、didConnect。
 - 假连接：查 `[BLE-Health] suspect/probe/hard reconnect` 和 `connectionHealthState`。
+- 频繁切歌时误显示重连：查 `[CTRL-iOS] write path recovery keeps connected presentation` 与 `[BLE-UIState] silent transport recovery started/finished`；保护窗内不应出现 `display reconnecting`。
 - 恢复后立即重连：查 `[BLE-Restore]`、`foreground restore skipped`，恢复完成前不应出现 `foreground unhealthy ... hard reconnect`。
 - 设置未持久化：查 `[Preferences] loaded`、`[Preferences] changed`、smoke `[SmokeTest] preferences persisted`。
 - 诊断页数据不对：查 `makeNowPlayingDiagnosticSnapshot()` 和 `SystemHealthSnapshot(nowPlaying:)`。

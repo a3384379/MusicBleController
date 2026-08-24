@@ -31,6 +31,7 @@ private let CONNECTION_SUBSCRIBE_NOTIFY_TIMEOUT_MS: Int64 = 5_000
 private let CORE_BLUETOOTH_RESTORE_TIMEOUT_MS: Int64 = 5_000
 private let CONNECTION_DISPLAY_CONNECTED_MIN_HOLD_MS: Int64 = 5_000
 private let CONNECTION_DISPLAY_DISCONNECTED_CONFIRM_MS: Int64 = 1_000
+private let CONNECTION_RECOVERY_PRESENTATION_GRACE_MS: Int64 = 8_000
 private let COMMAND_WRITE_CALLBACK_TIMEOUT_MS: Int64 = 2_500
 private let COMMAND_WRITE_RECENT_NOTIFY_GRACE_MS: Int64 = 3_000
 private let COMMAND_WRITE_TIMEOUTS_BEFORE_RECONNECT = 2
@@ -53,6 +54,7 @@ private let CLOCK_SYNC_PROBE_TTL_MS: Int64 = 5_000
 enum CommandWriteTimeoutAction: Equatable {
     case suspendUntilForeground
     case extendWithoutAdvancingQueue
+    case reconnectPreservingPresentation
     case reconnect
 }
 
@@ -60,14 +62,16 @@ enum CommandWriteTimeoutPolicy {
     static func action(
         appIsActive: Bool,
         transportReady: Bool,
+        linkRecentlyActive: Bool,
         timeoutCountAfterIncrement: Int,
         reconnectThreshold: Int
     ) -> CommandWriteTimeoutAction {
         guard appIsActive else { return .suspendUntilForeground }
         guard transportReady else { return .reconnect }
-        return timeoutCountAfterIncrement < reconnectThreshold
-            ? .extendWithoutAdvancingQueue
-            : .reconnect
+        if timeoutCountAfterIncrement < reconnectThreshold {
+            return .extendWithoutAdvancingQueue
+        }
+        return linkRecentlyActive ? .reconnectPreservingPresentation : .reconnect
     }
 }
 
@@ -460,6 +464,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     var realtimeTraceTrackId: String { currentTrackID }
     var realtimeTraceGeneration: Int64 { currentTrackGeneration }
     private var currentTrackGeneration: Int64 = 0
+    private var currentTrackGenerationSessionId = ""
     private var currentLiveArtworkKey: String?
     private var currentLiveArtworkRevision = 0
     private var liveArtworkRevisionFence = LiveActivityArtworkRevisionFence()
@@ -609,6 +614,8 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private var lastHardReconnectAt: Date?
     private var connectionDisplayStateChangedAt = Date()
     private var connectionDisplayWorkItem: DispatchWorkItem?
+    private var connectionRecoveryPresentationWorkItem: DispatchWorkItem?
+    private var preservesConnectedPresentationDuringRecovery = false
 
     private struct CommandWriteInfo {
         let seq: UInt64
@@ -1694,7 +1701,11 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         syncAfterReconnect(reason: "device detail manual resync")
     }
 
-    private func performHardReconnect(reason: String, manual: Bool) {
+    private func performHardReconnect(
+        reason: String,
+        manual: Bool,
+        preserveConnectedPresentation: Bool = false
+    ) {
         let now = Date()
         if !manual,
            let lastHardReconnectAt,
@@ -1702,6 +1713,14 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
             log("[BLE-Health] hard reconnect skipped reason=rate limited trigger=\(reason)")
             setConnectionHealth(.stale, reason: "hard reconnect rate limited")
             return
+        }
+        if preserveConnectedPresentation {
+            beginConnectedRecoveryPresentation(reason: reason)
+        } else {
+            finishConnectedRecoveryPresentation(
+                reason: "visible hard reconnect",
+                refresh: false
+            )
         }
         lastHardReconnectAt = now
         systemAutoReconnectInProgress = false
@@ -1730,7 +1749,9 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         }
         clearConnectionTransports(reason: "force reconnect")
         sonyPeripheral = nil
-        connectedDeviceName = "-"
+        if !preservesConnectedPresentationDuringRecovery {
+            connectedDeviceName = "-"
+        }
         setConnectionHealth(.disconnected, reason: reason)
         setStatus("正在重新连接")
         refreshConnectionDisplayState(reason: "hard reconnect \(reason)")
@@ -2632,10 +2653,16 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         } ?? Int64.max
         let transportReady = sonyPeripheral?.state == .connected &&
             sonyCommandCharacteristic != nil
+        let recentLinkThresholdMs = isPlaying
+            ? CONNECTION_HEALTH_PLAYING_SUSPECT_MS
+            : CONNECTION_HEALTH_PAUSED_SUSPECT_MS
+        let linkRecentlyActive = transportReady &&
+            recentNotifyAgeMs <= recentLinkThresholdMs
         let nextTimeoutCount = consecutiveCommandWriteTimeouts + 1
         let action = CommandWriteTimeoutPolicy.action(
             appIsActive: appLifecycleState == "active",
             transportReady: transportReady,
+            linkRecentlyActive: linkRecentlyActive,
             timeoutCountAfterIncrement: nextTimeoutCount,
             reconnectThreshold: COMMAND_WRITE_TIMEOUTS_BEFORE_RECONNECT
         )
@@ -2660,6 +2687,17 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
                     "recentNotify=\(recentNotifyAgeMs <= COMMAND_WRITE_RECENT_NOTIFY_GRACE_MS)"
             )
             scheduleCommandWriteTimeout(seq: seq, cmd: cmd)
+        case .reconnectPreservingPresentation:
+            consecutiveCommandWriteTimeouts = nextTimeoutCount
+            ctrlLog(
+                "[CTRL-iOS] write path recovery keeps connected presentation " +
+                    "seq=\(seq) cmd=\(cmd) recentNotifyAgeMs=\(recentNotifyAgeMs)"
+            )
+            performHardReconnect(
+                reason: "command write callback timeout x\(nextTimeoutCount) cmd=\(cmd) seq=\(seq)",
+                manual: false,
+                preserveConnectedPresentation: true
+            )
         case .reconnect:
             consecutiveCommandWriteTimeouts = nextTimeoutCount
             performHardReconnect(
@@ -3591,7 +3629,10 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
 
     private func refreshConnectionDisplayState(reason: String, explicitDisconnect: Bool = false) {
         let desired: ConnectionDisplayState
-        if connectionHealthState == ConnectionHealthState.stale.rawValue || isReconnectInProgress {
+        if preservesConnectedPresentationDuringRecovery,
+           connectionDisplayState == ConnectionDisplayState.connected.rawValue {
+            desired = .connected
+        } else if connectionHealthState == ConnectionHealthState.stale.rawValue || isReconnectInProgress {
             desired = .reconnecting
         } else if connectionStatus == "已连接",
                   connectionHealthState == ConnectionHealthState.healthy.rawValue ||
@@ -3609,6 +3650,43 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
             desired = .disconnected
         }
         setConnectionDisplayState(desired, reason: reason, explicitDisconnect: explicitDisconnect)
+    }
+
+    private func beginConnectedRecoveryPresentation(reason: String) {
+        guard connectionDisplayState == ConnectionDisplayState.connected.rawValue else {
+            return
+        }
+        preservesConnectedPresentationDuringRecovery = true
+        connectionRecoveryPresentationWorkItem?.cancel()
+        log("[BLE-UIState] silent transport recovery started reason=\(reason)")
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.preservesConnectedPresentationDuringRecovery else { return }
+            self.preservesConnectedPresentationDuringRecovery = false
+            self.connectionRecoveryPresentationWorkItem = nil
+            self.log("[BLE-UIState] silent transport recovery grace expired")
+            self.refreshConnectionDisplayState(reason: "transport recovery grace expired")
+        }
+        connectionRecoveryPresentationWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() +
+                Double(CONNECTION_RECOVERY_PRESENTATION_GRACE_MS) / 1_000.0,
+            execute: item
+        )
+    }
+
+    private func finishConnectedRecoveryPresentation(
+        reason: String,
+        refresh: Bool = true
+    ) {
+        connectionRecoveryPresentationWorkItem?.cancel()
+        connectionRecoveryPresentationWorkItem = nil
+        guard preservesConnectedPresentationDuringRecovery else { return }
+        preservesConnectedPresentationDuringRecovery = false
+        log("[BLE-UIState] silent transport recovery finished reason=\(reason)")
+        if refresh {
+            refreshConnectionDisplayState(reason: reason)
+        }
     }
 
     private func setConnectionDisplayState(
@@ -3884,6 +3962,12 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
 
     private func setAutoReconnectState(_ state: AutoReconnectState) {
         autoReconnectState = state.rawValue
+        if state == .connected {
+            finishConnectedRecoveryPresentation(
+                reason: "transport recovery synchronized",
+                refresh: false
+            )
+        }
         if state == .reconnectScheduled {
             if reconnectScheduledAt == nil {
                 reconnectScheduledAt = Date()
@@ -5070,6 +5154,7 @@ extension BLETestManager: CBCentralManagerDelegate {
             log("[BLE-Reconnect] ignore stale didFailToConnect id=\(peripheral.identifier.uuidString)")
             return
         }
+        finishConnectedRecoveryPresentation(reason: "transport recovery connect failed")
         systemAutoReconnectInProgress = false
         systemAutoReconnectStartedAt = nil
         isConnectingToSony = false
@@ -5340,6 +5425,7 @@ extension BLETestManager: CBPeripheralDelegate {
         coreBluetoothRestoreTimeoutWorkItem = nil
 
         if let error {
+            finishConnectedRecoveryPresentation(reason: "notify subscribe failed")
             setStatus("未连接")
             log("[BLE] status notify subscription failed: \(error.localizedDescription)")
             log("[BLE-Reconnect] failed reason=notify subscribe error=\(error.localizedDescription)")
@@ -6405,6 +6491,36 @@ extension BLETestManager: CBPeripheralDelegate {
             return
         }
 
+        let generationDecision = TrackIdentityGenerationPolicy.decision(
+            currentTrackId: currentTrackID,
+            currentGeneration: currentTrackGeneration,
+            currentSessionId: currentTrackGenerationSessionId,
+            incomingTrackId: trackID,
+            incomingGeneration: generation,
+            incomingSessionId: serverSessionId
+        )
+        switch generationDecision {
+        case .rejectStale, .rejectConflict:
+            let reason = generationDecision == .rejectStale
+                ? "stale_generation"
+                : "generation_track_conflict"
+            RealtimeTraceStore.shared.record(
+                stage: "trackIdentityRejected",
+                trackId: trackID,
+                generation: generation,
+                payloadType: "trackInfo",
+                result: "rejected",
+                reason: reason
+            )
+            log(
+                "[TrackInfo] rejected reason=\(reason) " +
+                    "incomingGeneration=\(generation) currentGeneration=\(currentTrackGeneration)"
+            )
+            return
+        case .accept, .acceptSessionReset:
+            break
+        }
+
         let trackChanged = newTitle != title ||
             newArtist != artist ||
             newAlbum != album ||
@@ -6451,6 +6567,9 @@ extension BLETestManager: CBPeripheralDelegate {
         if !trackID.isEmpty {
             currentTrackID = trackID
             currentTrackGeneration = generation
+            if !serverSessionId.isEmpty, serverSessionId != "-" {
+                currentTrackGenerationSessionId = serverSessionId
+            }
             RealtimeTraceStore.shared.record(
                 stage: "trackIdentityAccepted",
                 trackId: trackID,
@@ -6528,6 +6647,7 @@ extension BLETestManager: CBPeripheralDelegate {
 
         currentTrackID = ""
         currentTrackGeneration = 0
+        currentTrackGenerationSessionId = ""
         title = "-"
         artist = "-"
         album = "-"

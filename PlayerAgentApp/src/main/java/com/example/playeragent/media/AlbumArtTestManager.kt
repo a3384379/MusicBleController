@@ -39,7 +39,7 @@ class AlbumArtTestManager(
     ): NotificationAlbumArt? {
         val selectedNotification = currentNotification(expectedTitle, expectedArtist)
         val notificationFingerprint = selectedNotification?.let {
-            notificationFingerprint(it, expectedTitle)
+            notificationFingerprint(it, expectedTitle, expectedArtist)
         }
         synchronized(sharedArtworkReadLock) {
             val now = android.os.SystemClock.elapsedRealtime()
@@ -54,7 +54,7 @@ class AlbumArtTestManager(
             }
 
             val candidates = mutableListOf<AlbumArtCandidate>()
-            candidates += readMediaMetadataCandidates()
+            candidates += readMediaMetadataCandidates(expectedTitle, expectedArtist)
             candidates += readNotificationCandidates(selectedNotification)
             logger("[AlbumArtSource] candidates count=${candidates.size}")
             if (candidates.isEmpty()) {
@@ -173,7 +173,10 @@ class AlbumArtTestManager(
         )
     }
 
-    private fun readMediaMetadataCandidates(): List<AlbumArtCandidate> {
+    private fun readMediaMetadataCandidates(
+        expectedTitle: String,
+        expectedArtist: String
+    ): List<AlbumArtCandidate> {
         val manager = mediaSessionManager ?: run {
             logger("[AlbumArtSource] metadata unavailable reason=MediaSessionManager")
             return emptyList()
@@ -193,6 +196,27 @@ class AlbumArtTestManager(
         }
         val controller = selectQqMusicController(controllers)
         val metadata = controller?.metadata
+        val metadataTitle = metadataString(
+            metadata,
+            MediaMetadata.METADATA_KEY_TITLE,
+            MediaMetadata.METADATA_KEY_DISPLAY_TITLE
+        )
+        val metadataArtist = metadataString(
+            metadata,
+            MediaMetadata.METADATA_KEY_ARTIST,
+            MediaMetadata.METADATA_KEY_ALBUM_ARTIST,
+            MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE
+        )
+        if (!AlbumArtIdentityPolicy.matches(
+                expectedTitle = expectedTitle,
+                expectedArtist = expectedArtist,
+                actualTitle = metadataTitle,
+                actualArtist = metadataArtist
+            )
+        ) {
+            logger("[AlbumArtSource] metadata rejected reason=identity_mismatch")
+            return emptyList()
+        }
         return listOfNotNull(
             albumArtCandidate(
                 source = "metadataAlbumArt",
@@ -257,14 +281,14 @@ class AlbumArtTestManager(
 
     private fun notificationFingerprint(
         notification: StatusBarNotification,
-        expectedTitle: String
+        expectedTitle: String,
+        expectedArtist: String
     ): String {
         val extras = notification.notification.extras
         val title = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
         val artist = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
-        // A title-less notification is accepted by the legacy matcher, but it
-        // must not share artwork across two different expected tracks.
-        val expectedScope = if (title.isBlank()) expectedTitle.trim().lowercase() else ""
+        val expectedScope =
+            "${expectedTitle.trim().lowercase()}|${expectedArtist.trim().lowercase()}"
         return "${notification.key}|${notification.postTime}|$title|$artist|$expectedScope"
     }
 
@@ -335,11 +359,23 @@ class AlbumArtTestManager(
             val extras = notification.notification.extras
             val title = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
             val artist = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
-            title.isBlank() ||
-                (title.equals(expectedTitle, ignoreCase = true) &&
-                    (expectedArtist.isBlank() || artist.isBlank() ||
-                        artist.contains(expectedArtist, ignoreCase = true)))
+            AlbumArtIdentityPolicy.matches(
+                expectedTitle = expectedTitle,
+                expectedArtist = expectedArtist,
+                actualTitle = title,
+                actualArtist = artist
+            )
         }
+    }
+
+    private fun metadataString(metadata: MediaMetadata?, vararg keys: String): String {
+        keys.forEach { key ->
+            val value = metadata?.getString(key)
+            if (!value.isNullOrBlank()) {
+                return value
+            }
+        }
+        return ""
     }
 
     private fun selectQqMusicController(

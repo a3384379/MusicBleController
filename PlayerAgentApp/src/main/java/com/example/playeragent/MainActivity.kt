@@ -57,6 +57,7 @@ import com.example.playeragent.media.QrcV2RebuildProgress
 import com.example.playeragent.media.QrcV2RebuildStatus
 import com.example.playeragent.media.QrcWatcherStatus
 import com.example.playeragent.service.PlayerAgentForegroundService
+import com.example.playeragent.service.PlayerNotificationListenerService
 import com.example.playeragent.service.QQMusicLyricAccessibilityService
 import com.example.playeragent.ui.SonyPlayerUiState
 import com.example.playeragent.ui.PlayerLogAdapter
@@ -127,6 +128,26 @@ class MainActivity : Activity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val uiMediaExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "PlayerAgent-UiMediaIO")
+    }
+    private val qqMusicArtworkListener: (String) -> Unit = { event ->
+        mainHandler.post {
+            if (!::currentAlbumArtImageView.isInitialized) {
+                return@post
+            }
+            val playback = lastSonyPlayerUiState.playback
+            if (lastPlayerUiSongKey.isBlank() ||
+                playback.title.isBlank() ||
+                playback.title == "-"
+            ) {
+                return@post
+            }
+            appendLog("[PlayerUI] artwork source event=$event")
+            refreshCurrentAlbumArtForSong(
+                songKey = lastPlayerUiSongKey,
+                expectedTitle = playback.title,
+                expectedArtist = playback.artist.takeUnless { it == "-" }.orEmpty()
+            )
+        }
     }
     @Volatile private var debugStatsLoading = false
     @Volatile private var lastDebugStatsLoadAt = 0L
@@ -236,6 +257,12 @@ class MainActivity : Activity() {
         } else {
             registerReceiver(logReceiver, filter)
         }
+        PlayerNotificationListenerService.removeQqMusicArtworkListener(
+            qqMusicArtworkListener
+        )
+        PlayerNotificationListenerService.addQqMusicArtworkListener(
+            qqMusicArtworkListener
+        )
         refreshControlServiceStatus()
     }
 
@@ -253,6 +280,9 @@ class MainActivity : Activity() {
     override fun onStop() {
         super.onStop()
         stopControlServiceStatusRefresh()
+        PlayerNotificationListenerService.removeQqMusicArtworkListener(
+            qqMusicArtworkListener
+        )
         unregisterReceiver(logReceiver)
     }
 
@@ -1086,39 +1116,32 @@ class MainActivity : Activity() {
                 null
             }
 
-            val albumArt = try {
-                AlbumArtTestManager(
-                    context = this,
-                    logger = ::appendThreadSafeLog
-                ).readCurrentNotificationAlbumArt()
-            } catch (_: Exception) {
-                null
-            }
-
             runOnUiThread {
                 if (state != null) {
+                    val title = state.optString("title")
+                    val artist = state.optString("artist")
+                    val album = state.optString("album")
+                    val songKey = playerUiSongKey(title, artist, album)
+                    val songChanged = songKey != lastPlayerUiSongKey
                     renderPlayerUiState(
-                        title = state.optString("title"),
-                        artist = state.optString("artist"),
-                        album = state.optString("album"),
+                        title = title,
+                        artist = artist,
+                        album = album,
                         lyric = state.optString("lyric"),
                         positionMs = state.optLong("position"),
                         durationMs = state.optLong("duration"),
                         allowAlbumArtRefresh = false
                     )
-                }
-
-                if (albumArt != null) {
-                    lastPlayerUiAlbumArtStatus =
-                        "READY ${albumArt.bitmap.width}x${albumArt.bitmap.height}"
-                    currentAlbumArtImageView.setImageBitmap(albumArt.bitmap)
-                    currentAlbumArtTextView.text =
-                        "封面：${albumArt.bitmap.width} x ${albumArt.bitmap.height}"
-                } else {
-                    lastPlayerUiAlbumArtStatus = "SOURCE_NOT_PROVIDED"
-                    currentAlbumArtImageView
-                        .setImageResource(android.R.drawable.ic_media_play)
-                    currentAlbumArtTextView.text = "封面：未找到"
+                    if (songChanged) {
+                        showAlbumArtLoading()
+                    }
+                    if (title.isNotBlank()) {
+                        refreshCurrentAlbumArtForSong(
+                            songKey = songKey,
+                            expectedTitle = title,
+                            expectedArtist = artist
+                        )
+                    }
                 }
                 refreshMaintenanceUiState()
             }
@@ -1163,7 +1186,7 @@ class MainActivity : Activity() {
         val safeTitle = title.ifBlank { "-" }
         val safeArtist = artist.ifBlank { "-" }
         val safeAlbum = album.ifBlank { "-" }
-        val songKey = "$safeTitle|$safeArtist|$safeAlbum"
+        val songKey = playerUiSongKey(title, artist, album)
         val songChanged = songKey != lastPlayerUiSongKey
         val lyricText = lyric.ifBlank { "暂无歌词" }
         val rawStatus = lyricStatus.ifBlank { "unknown" }
@@ -1185,10 +1208,14 @@ class MainActivity : Activity() {
                     "artist=$safeArtist album=$safeAlbum"
             )
             if (allowAlbumArtRefresh) {
-                lastPlayerUiAlbumArtStatus = "LOADING"
-                currentAlbumArtImageView.setImageResource(android.R.drawable.ic_media_play)
-                    currentAlbumArtTextView.text = "封面：加载中..."
-                refreshCurrentAlbumArtForSong(songKey)
+                showAlbumArtLoading()
+                if (title.isNotBlank()) {
+                    refreshCurrentAlbumArtForSong(
+                        songKey = songKey,
+                        expectedTitle = title,
+                        expectedArtist = artist
+                    )
+                }
             }
         }
 
@@ -1224,14 +1251,31 @@ class MainActivity : Activity() {
         if (songChanged) refreshMaintenanceUiState()
     }
 
-    private fun refreshCurrentAlbumArtForSong(songKey: String) {
+    private fun playerUiSongKey(title: String, artist: String, album: String): String {
+        return "${title.ifBlank { "-" }}|${artist.ifBlank { "-" }}|${album.ifBlank { "-" }}"
+    }
+
+    private fun showAlbumArtLoading() {
+        lastPlayerUiAlbumArtStatus = "LOADING"
+        currentAlbumArtImageView.setImageResource(android.R.drawable.ic_media_play)
+        currentAlbumArtTextView.text = "封面：加载中..."
+    }
+
+    private fun refreshCurrentAlbumArtForSong(
+        songKey: String,
+        expectedTitle: String,
+        expectedArtist: String
+    ) {
         val generation = ++albumArtRefreshGeneration
         uiMediaExecutor.execute {
             val albumArt = try {
                 AlbumArtTestManager(
                     context = this,
                     logger = ::appendThreadSafeLog
-                ).readCurrentNotificationAlbumArt()
+                ).readCurrentNotificationAlbumArt(
+                    expectedTitle = expectedTitle,
+                    expectedArtist = expectedArtist
+                )
             } catch (exception: Exception) {
                 appendThreadSafeLog(
                     "[PlayerUI] album art refresh failed=${exception.message}"
@@ -1253,9 +1297,15 @@ class MainActivity : Activity() {
                     appendLog(
                         "[PlayerUI] album art changed exists=true " +
                             "width=${albumArt.bitmap.width} " +
-                            "height=${albumArt.bitmap.height}"
+                        "height=${albumArt.bitmap.height}"
                     )
                 } else {
+                    if (lastPlayerUiAlbumArtStatus.startsWith("READY")) {
+                        appendLog(
+                            "[PlayerUI] album art retained reason=transient_exact_source_miss"
+                        )
+                        return@runOnUiThread
+                    }
                     lastPlayerUiAlbumArtStatus = "SOURCE_NOT_PROVIDED"
                     currentAlbumArtImageView
                         .setImageResource(android.R.drawable.ic_media_play)
@@ -1510,7 +1560,10 @@ class MainActivity : Activity() {
                 val albumArt = AlbumArtTestManager(
                     this,
                     ::appendThreadSafeLog
-                ).readCurrentNotificationAlbumArt()
+                ).readCurrentNotificationAlbumArt(
+                    expectedTitle = title,
+                    expectedArtist = artist
+                )
                 if (albumArt == null) {
                     appendThreadSafeLog("[ArtworkDiscovery] skipped reason=no notification artwork")
                     return@Thread
