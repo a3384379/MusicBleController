@@ -1043,6 +1043,143 @@ final class PerformanceStabilityTests: XCTestCase {
         )
     }
 
+    func testFullLyricsCacheValidationRequiresExactContentAndGeneration() {
+        let lines = [
+            FullLyricsCacheEntry.Line(
+                index: 0,
+                timeMs: 0,
+                durationMs: 1_000,
+                text: "line",
+                translation: "translation",
+                romanization: nil,
+                words: []
+            )
+        ]
+        let fingerprint = FullLyricsCacheValidationDescriptor.contentFingerprint(
+            title: "Song",
+            artist: "Artist",
+            lines: lines
+        )
+        XCTAssertEqual(fingerprint, "3e1c8ce388901c3763a5b1c3")
+        let descriptor = FullLyricsCacheValidationDescriptor(
+            fingerprint: fingerprint,
+            schemaVersion: 1,
+            lineCount: 1,
+            translationLineCount: 1,
+            romanizationLineCount: 0
+        )
+        let entry = FullLyricsCacheEntry(
+            version: FullLyricsCacheEntry.version,
+            trackId: "track-1",
+            title: "Song",
+            artist: "Artist",
+            album: "Album",
+            lines: lines,
+            savedAt: Date(),
+            fingerprint: descriptor.fingerprint,
+            schemaVersion: descriptor.schemaVersion,
+            expectedLineCount: descriptor.lineCount,
+            expectedTranslationLineCount: descriptor.translationLineCount,
+            expectedRomanizationLineCount: descriptor.romanizationLineCount
+        )
+        XCTAssertEqual(entry.validationDescriptor, descriptor)
+        XCTAssertEqual(descriptor.requestFields["n"] as? Int, 1)
+
+        let tamperedEntry = FullLyricsCacheEntry(
+            version: FullLyricsCacheEntry.version,
+            trackId: "track-1",
+            title: "Song",
+            artist: "Artist",
+            album: "Album",
+            lines: lines.map {
+                .init(
+                    index: $0.index,
+                    timeMs: $0.timeMs,
+                    durationMs: $0.durationMs,
+                    text: "tampered",
+                    translation: $0.translation,
+                    romanization: $0.romanization,
+                    words: $0.words
+                )
+            },
+            savedAt: Date(),
+            fingerprint: descriptor.fingerprint,
+            schemaVersion: descriptor.schemaVersion,
+            expectedLineCount: descriptor.lineCount,
+            expectedTranslationLineCount: descriptor.translationLineCount,
+            expectedRomanizationLineCount: descriptor.romanizationLineCount
+        )
+        XCTAssertNil(tamperedEntry.validationDescriptor)
+
+        let payload: [String: Any] = [
+            "id": "track-1",
+            "g": 7,
+            "fp": descriptor.fingerprint,
+            "sv": 1,
+            "n": 1,
+            "tc": 1,
+            "rc": 0
+        ]
+        XCTAssertEqual(
+            FullLyricsCacheValidationDescriptor(
+                object: payload,
+                trackId: "track-1",
+                currentTrackId: "track-1",
+                generation: 7,
+                currentGeneration: 7
+            ),
+            descriptor
+        )
+        XCTAssertNil(
+            FullLyricsCacheValidationDescriptor(
+                object: payload,
+                trackId: "track-1",
+                currentTrackId: "track-1",
+                generation: 7,
+                currentGeneration: 8
+            )
+        )
+
+        let incompleteEntry = FullLyricsCacheEntry(
+            version: FullLyricsCacheEntry.version,
+            trackId: "track-1",
+            title: "Song",
+            artist: "Artist",
+            album: "Album",
+            lines: lines.map {
+                .init(
+                    index: $0.index,
+                    timeMs: $0.timeMs,
+                    durationMs: $0.durationMs,
+                    text: $0.text,
+                    translation: nil,
+                    romanization: nil,
+                    words: $0.words
+                )
+            },
+            savedAt: Date(),
+            fingerprint: descriptor.fingerprint,
+            schemaVersion: descriptor.schemaVersion,
+            expectedLineCount: descriptor.lineCount,
+            expectedTranslationLineCount: descriptor.translationLineCount,
+            expectedRomanizationLineCount: descriptor.romanizationLineCount
+        )
+        XCTAssertNil(incompleteEntry.validationDescriptor)
+
+        var compactRequest: [String: Any] = [
+            "cmd": "GET_FULL_LYRICS",
+            "seq": 9,
+            "id": "0123456789abcdef01234567",
+            "p": 123_456,
+            "w": true,
+            "f": "z"
+        ]
+        descriptor.requestFields.forEach { compactRequest[$0.key] = $0.value }
+        let encodedRequest = try? JSONSerialization.data(withJSONObject: compactRequest)
+        XCTAssertNotNil(encodedRequest)
+        XCTAssertLessThanOrEqual(encodedRequest?.count ?? .max, 182)
+    }
+
     func testWriteTimeoutDoesNotAdvanceQueueAndSuspendsInBackground() {
         XCTAssertEqual(
             CommandWriteTimeoutPolicy.action(
@@ -1624,8 +1761,16 @@ final class PerformanceStabilityTests: XCTestCase {
         XCTAssertTrue(v3.v3Features.contains(.statusMetaV1))
         XCTAssertTrue(v3.v3Features.contains(.structuredErrorV1))
         XCTAssertTrue(v3.v3Features.contains(.mediaLoadStateV1))
+        XCTAssertFalse(v3.v3Features.contains(.mediaCacheValidationV1))
         XCTAssertEqual(v3.sessionId, "sony-session-1")
         XCTAssertEqual(v3.v3Features.intersection(.all).rawValue, 7)
+
+        let cacheValidation = BLEProtocolV3Parser.capabilitiesAck(from: [
+            "protocolVersion": 3,
+            "f2": 0,
+            "f3": 1 << 3
+        ])
+        XCTAssertTrue(cacheValidation.v3Features.contains(.mediaCacheValidationV1))
     }
 
     func testProtocolRejectsMalformedAndOversizedJSON() {

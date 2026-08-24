@@ -9,7 +9,9 @@ internal object BleV3Features {
     const val STATUS_META_V1 = 1 shl 0
     const val STRUCTURED_ERROR_V1 = 1 shl 1
     const val MEDIA_LOAD_STATE_V1 = 1 shl 2
-    const val ALL = STATUS_META_V1 or STRUCTURED_ERROR_V1 or MEDIA_LOAD_STATE_V1
+    const val MEDIA_CACHE_VALIDATION_V1 = 1 shl 3
+    const val ALL = STATUS_META_V1 or STRUCTURED_ERROR_V1 or MEDIA_LOAD_STATE_V1 or
+        MEDIA_CACHE_VALIDATION_V1
     const val STATUS_META_MIN_NOTIFY_PAYLOAD = 247
 }
 

@@ -478,6 +478,9 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private var requestedFullLyricsTrackIDs: Set<String> = []
     private var lastSnapshotQueuedAtMs: Int64 = 0
     private var completedFullLyricsTrackIDs: Set<String> = []
+    private var currentFullLyricsCacheEntry: FullLyricsCacheEntry?
+    private var currentFullLyricsCacheDescriptor: FullLyricsCacheValidationDescriptor?
+    private var fullLyricsCacheValidationRetryTrackIDs: Set<String> = []
     private var fullLyricsUnavailableTrackIDs: Set<String> = []
     private var fullLyricsDelayedRetryTrackIDs: Set<String> = []
     private var fullLyricsOptionalRefreshTrackIDs: Set<String> = []
@@ -2448,7 +2451,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         // Capability payloads sit close to the common 182-byte ATT limit.
         // Their wall-clock field was never consumed by Sony, so omit it to
         // leave room for additive capability flags without fragmenting writes.
-        if cmd != "CLIENT_CAPABILITIES" {
+        if cmd != "CLIENT_CAPABILITIES" && cmd != "GET_FULL_LYRICS" {
             payload["time"] = startMs
         }
         payload["seq"] = seq
@@ -5880,6 +5883,12 @@ extension BLETestManager: CBPeripheralDelegate {
             case "fullLyricsUnavailable":
                 self.handleFullLyricsUnavailable(object)
 
+            case "fullLyricsCacheMetadata":
+                self.handleFullLyricsCacheMetadata(object)
+
+            case "fullLyricsNotModified":
+                self.handleFullLyricsNotModified(object)
+
             case "fullLyricsBinaryStart":
                 self.handleFullLyricsBinaryStart(object)
 
@@ -6533,6 +6542,9 @@ extension BLETestManager: CBPeripheralDelegate {
             isFullLyricsCurrent = false
             requestedFullLyricsTrackIDs.removeAll()
             completedFullLyricsTrackIDs.removeAll()
+            currentFullLyricsCacheEntry = nil
+            currentFullLyricsCacheDescriptor = nil
+            fullLyricsCacheValidationRetryTrackIDs.removeAll()
             fullLyricsBinaryFallbackTrackIDs.removeAll()
             fullLyricsBinaryRetryCounts.removeAll()
             fullLyricsBinaryTransfer = nil
@@ -6620,6 +6632,9 @@ extension BLETestManager: CBPeripheralDelegate {
         resetFullLyricsTransfer()
         requestedFullLyricsTrackIDs.removeAll()
         completedFullLyricsTrackIDs.removeAll()
+        currentFullLyricsCacheEntry = nil
+        currentFullLyricsCacheDescriptor = nil
+        fullLyricsCacheValidationRetryTrackIDs.removeAll()
         fullLyricsBinaryFallbackTrackIDs.removeAll()
         fullLyricsBinaryRetryCounts.removeAll()
         fullLyricsBinaryTransfer = nil
@@ -6934,14 +6949,48 @@ extension BLETestManager: CBPeripheralDelegate {
             }
             self.log(detail)
             self.log("[LyricsPerf] request fullLyrics trackId=\(trackID)")
-            var extra: [String: Any] = [
-                "trackId": trackID,
-                "positionMs": self.displayPositionMs,
-                "includeWordsAroundCurrent": true
-            ]
-            if self.serverSupportsFullLyricsZlib,
-               !self.fullLyricsBinaryFallbackTrackIDs.contains(trackID) {
-                extra["format"] = "zlib-json-v1"
+            let validationDescriptor: FullLyricsCacheValidationDescriptor?
+            if !force,
+               let entry = self.currentFullLyricsCacheEntry,
+               entry.trackId == trackID,
+               self.negotiatedV3Features.contains(.mediaCacheValidationV1) {
+                validationDescriptor = entry.validationDescriptor
+            } else {
+                validationDescriptor = nil
+            }
+            var extra: [String: Any]
+            if let descriptor = validationDescriptor {
+                extra = [
+                    "id": trackID,
+                    "p": self.displayPositionMs,
+                    "w": true
+                ]
+                descriptor.requestFields.forEach { extra[$0.key] = $0.value }
+                if self.serverSupportsFullLyricsZlib,
+                   !self.fullLyricsBinaryFallbackTrackIDs.contains(trackID) {
+                    extra["f"] = "z"
+                }
+                RealtimeTraceStore.shared.record(
+                    stage: "cacheValidationRequest",
+                    trackId: trackID,
+                    generation: self.currentTrackGeneration,
+                    payloadType: "fullLyrics",
+                    result: "sent"
+                )
+                self.log(
+                    "[FullLyricsCacheValidation] request trackId=\(trackID) " +
+                        "lines=\(descriptor.lineCount)"
+                )
+            } else {
+                extra = [
+                    "trackId": trackID,
+                    "positionMs": self.displayPositionMs,
+                    "includeWordsAroundCurrent": true
+                ]
+                if self.serverSupportsFullLyricsZlib,
+                   !self.fullLyricsBinaryFallbackTrackIDs.contains(trackID) {
+                    extra["format"] = "zlib-json-v1"
+                }
             }
             self.sendCommand(
                 cmd: "GET_FULL_LYRICS",
@@ -7631,6 +7680,127 @@ extension BLETestManager: CBPeripheralDelegate {
         }
     }
 
+    private func handleFullLyricsCacheMetadata(_ object: [String: Any]) {
+        let trackID = object["trackId"] as? String ?? object["id"] as? String ?? ""
+        let generation = Self.int64Value(object["generation"] ?? object["g"])
+        guard trackID == currentTrackID,
+              generation == currentTrackGeneration,
+              let descriptor = FullLyricsCacheValidationDescriptor(
+                object: object,
+                trackId: trackID,
+                currentTrackId: currentTrackID,
+                generation: generation,
+                currentGeneration: currentTrackGeneration
+              ) else {
+            log(
+                "[FullLyricsCacheValidation] metadata rejected trackId=\(trackID) " +
+                    "generation=\(generation)"
+            )
+            return
+        }
+        currentFullLyricsCacheDescriptor = descriptor
+        log(
+            "[FullLyricsCacheValidation] metadata accepted trackId=\(trackID) " +
+                "lines=\(descriptor.lineCount) pendingFullTransfer=true"
+        )
+    }
+
+    private func handleFullLyricsNotModified(_ object: [String: Any]) {
+        let trackID = object["trackId"] as? String ?? object["id"] as? String ?? ""
+        let generation = Self.int64Value(object["generation"] ?? object["g"])
+        guard trackID == currentTrackID,
+              generation == currentTrackGeneration else {
+            RealtimeTraceStore.shared.record(
+                stage: "cacheValidationMiss",
+                trackId: trackID,
+                generation: generation,
+                payloadType: "fullLyrics",
+                result: "rejected",
+                reason: "stale_identity_or_generation"
+            )
+            log(
+                "[FullLyricsCacheValidation] stale not-modified ignored " +
+                    "trackId=\(trackID) generation=\(generation)"
+            )
+            return
+        }
+        guard let descriptor = FullLyricsCacheValidationDescriptor(
+                object: object,
+                trackId: trackID,
+                currentTrackId: currentTrackID,
+                generation: generation,
+                currentGeneration: currentTrackGeneration
+              ),
+              let entry = currentFullLyricsCacheEntry,
+              entry.trackId == trackID,
+              entry.validationDescriptor == descriptor,
+              fullLyricsTrackId == trackID,
+              !fullLyrics.isEmpty else {
+            rejectFullLyricsCacheValidation(trackID: trackID, reason: "local_cache_mismatch")
+            return
+        }
+
+        currentFullLyricsCacheDescriptor = descriptor
+        fullLyricsRequestStartTimeouts.removeValue(forKey: trackID)?.cancel()
+        fullLyricsRequestStartRetryCounts.removeValue(forKey: trackID)
+        requestedFullLyricsTrackIDs.remove(trackID)
+        completedFullLyricsTrackIDs.insert(trackID)
+        fullLyricsUnavailableTrackIDs.remove(trackID)
+        mediaLoadingState.lyric = .ready(lineCount: fullLyrics.count)
+        RealtimeTraceStore.shared.record(
+            stage: "cacheValidationHit",
+            trackId: trackID,
+            generation: generation,
+            payloadType: "fullLyrics",
+            result: "hit"
+        )
+        RealtimeTraceStore.shared.record(
+            stage: "cachedLyricsPublished",
+            trackId: trackID,
+            generation: generation,
+            payloadType: "fullLyrics",
+            result: "published"
+        )
+        RealtimeTraceStore.shared.record(
+            stage: "fullLyricsTransferSkipped",
+            trackId: trackID,
+            generation: generation,
+            payloadType: "fullLyrics",
+            result: "skipped",
+            reason: "cache_validation_hit"
+        )
+        scheduleLastNowPlayingSnapshotSave(reason: "fullLyrics cache validated", force: true)
+        log(
+            "[FullLyricsCacheValidation] hit published trackId=\(trackID) " +
+                "lines=\(fullLyrics.count)"
+        )
+    }
+
+    private func rejectFullLyricsCacheValidation(trackID: String, reason: String) {
+        RealtimeTraceStore.shared.record(
+            stage: "cacheValidationMiss",
+            trackId: trackID,
+            generation: currentTrackGeneration,
+            payloadType: "fullLyrics",
+            result: "rejected",
+            reason: reason
+        )
+        fullLyricsRequestStartTimeouts.removeValue(forKey: trackID)?.cancel()
+        requestedFullLyricsTrackIDs.remove(trackID)
+        currentFullLyricsCacheEntry = nil
+        FullLyricsCacheStore.shared.remove(trackId: trackID)
+        guard !fullLyricsCacheValidationRetryTrackIDs.contains(trackID) else {
+            log(
+                "[FullLyricsCacheValidation] fallback suppressed reason=retry_limit " +
+                    "trackId=\(trackID)"
+            )
+            return
+        }
+        fullLyricsCacheValidationRetryTrackIDs.insert(trackID)
+        log("[FullLyricsCacheValidation] rejected reason=\(reason) trackId=\(trackID)")
+        requestFullLyricsIfNeeded(force: true, after: 0.1)
+    }
+
     private func handleFullLyricsUnavailable(_ object: [String: Any]) {
         let trackID = object["trackId"] as? String ?? ""
         guard trackID == currentTrackID else { return }
@@ -8040,6 +8210,7 @@ extension BLETestManager: CBPeripheralDelegate {
             }
             let lines = entry.lines.map(Self.lyricLine(from:))
             guard !lines.isEmpty else { return }
+            self.currentFullLyricsCacheEntry = entry
             self.fullLyrics = lines.sorted { $0.index < $1.index }
             self.fullLyricsTrackId = trackID
             self.isFullLyricsCurrent = true
@@ -8054,6 +8225,13 @@ extension BLETestManager: CBPeripheralDelegate {
                 "[FullLyricsCache] hit trackId=\(trackID) lines=\(lines.count) " +
                     "ageMs=\(Int64(Date().timeIntervalSince(entry.savedAt) * 1_000))"
             )
+            RealtimeTraceStore.shared.record(
+                stage: "cachedLyricsPublished",
+                trackId: trackID,
+                generation: self.currentTrackGeneration,
+                payloadType: "fullLyrics",
+                result: "published"
+            )
         }
     }
 
@@ -8064,15 +8242,27 @@ extension BLETestManager: CBPeripheralDelegate {
               !isShowingLastNowPlayingSnapshot else {
             return
         }
+        let cachedLines = fullLyrics.map(Self.cacheLine(from:))
+        let descriptor = currentFullLyricsCacheDescriptor?.matchesCachedContent(
+            title: title,
+            artist: artist,
+            lines: cachedLines
+        ) == true ? currentFullLyricsCacheDescriptor : nil
         let entry = FullLyricsCacheEntry(
             version: FullLyricsCacheEntry.version,
             trackId: currentTrackID,
             title: title,
             artist: artist,
             album: album,
-            lines: fullLyrics.map(Self.cacheLine(from:)),
-            savedAt: Date()
+            lines: cachedLines,
+            savedAt: Date(),
+            fingerprint: descriptor?.fingerprint,
+            schemaVersion: descriptor?.schemaVersion,
+            expectedLineCount: descriptor?.lineCount,
+            expectedTranslationLineCount: descriptor?.translationLineCount,
+            expectedRomanizationLineCount: descriptor?.romanizationLineCount
         )
+        currentFullLyricsCacheEntry = entry
         FullLyricsCacheStore.shared.save(entry)
         log(
             "[FullLyricsCache] save queued reason=\(reason) " +

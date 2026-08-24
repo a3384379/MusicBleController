@@ -1242,6 +1242,8 @@ class BleGattServerManager(
                 }
                 if (command == "NEXT") {
                     playbackStateReader.notifyManualNextHint(seq)
+                } else if (command == "PREVIOUS") {
+                    playbackStateReader.notifyManualPreviousHint(seq)
                 }
                 mediaCommandExecutor.execute(command, seq)
                 if (command in MULTI_CONTROLLER_DEDUP_COMMANDS) {
@@ -1689,9 +1691,12 @@ class BleGattServerManager(
             "[PredictiveLyrics] metrics candidates=${predictiveMetrics.candidateCount} " +
                 "queueCandidates=${predictiveMetrics.mediaSessionQueueCandidateCount} " +
                 "manualNextHints=${predictiveMetrics.manualNextHintCount} " +
+                "manualPreviousHints=${predictiveMetrics.manualPreviousHintCount} " +
                 "historyCandidates=${predictiveMetrics.historyTransitionCandidateCount} " +
                 "selected=${predictiveMetrics.selectedCount} " +
                 "rejected=${predictiveMetrics.rejectedCount} " +
+                "expired=${predictiveMetrics.expiredCount} " +
+                "invalidated=${predictiveMetrics.invalidatedCount} " +
                 "preloadStart=${predictiveMetrics.preloadStartCount} " +
                 "preloadHit=${predictiveMetrics.preloadHitCount} " +
                 "preloadMiss=${predictiveMetrics.preloadMissCount} " +
@@ -4772,6 +4777,7 @@ class BleGattServerManager(
         }
         if (!subscribedDevices.containsKey(device.address)) {
             val requestedTrackId = request.optString("trackId")
+                .ifBlank { request.optString("id") }
             if (requestedTrackId.isNotBlank()) {
                 lyricTrace(
                     stage = "fullLyricsSendSkip",
@@ -4785,6 +4791,7 @@ class BleGattServerManager(
         }
         val buildStartedAtMs = SystemClock.elapsedRealtime()
         val requestedTrackId = request.optString("trackId")
+            .ifBlank { request.optString("id") }
         if (notifyQueue.hasJobTypeActiveOrQueued(FULL_LYRICS_JOB_TYPE, device.address)) {
             logger(
                 "[FullLyrics] request skipped reason=transfer_in_progress " +
@@ -4801,7 +4808,12 @@ class BleGattServerManager(
             lyricTrace(
                 stage = "fullLyricsRequest",
                 trackId = requestedTrackId,
-                extra = mapOf("positionMs" to request.optLong("positionMs", 0L).toString())
+                extra = mapOf(
+                    "positionMs" to request.optLong(
+                        "positionMs",
+                        request.optLong("p", 0L)
+                    ).toString()
+                )
             )
         }
         val source = playbackSourceForRequestedTrack(requestedTrackId)
@@ -4855,11 +4867,13 @@ class BleGattServerManager(
                 "runtimeGeneration" to runtimeGeneration.toString()
             )
         )
-        val includeWordsAroundCurrent =
-            request.optBoolean("includeWordsAroundCurrent", false)
+        val includeWordsAroundCurrent = request.optBoolean(
+            "includeWordsAroundCurrent",
+            request.optBoolean("w", false)
+        )
         val requestedPositionMs = request.optLong(
             "positionMs",
-            source.optLong("position", 0L)
+            request.optLong("p", source.optLong("position", 0L))
         )
         val currentLineIndex = if (includeWordsAroundCurrent) {
             findCurrentLyricIndex(lines, requestedPositionMs)
@@ -5011,6 +5025,88 @@ class BleGattServerManager(
             TrackCapabilityTracker.onFullLyricsSent(traceId, trackId, 0)
             return
         }
+        clearMatchingPendingFullLyrics(
+            device.address,
+            requestedTrackId,
+            trackId,
+            runtimeGeneration
+        )
+
+        val maximumPayload = maximumPayloadFor(device)
+        val requestedFormat = request.optString("format").ifBlank {
+            if (request.optString("f") == "z") FULL_LYRICS_ZLIB_FORMAT else ""
+        }
+        val negotiatedCapabilities = connectionCommandCoordinator.capabilities(device.address)
+        val cacheDescriptor = FullLyricsCacheValidation.describe(title, artist, lines)
+        val cacheValidationRequest = parseFullLyricsCacheValidationRequest(request)
+        val cacheValidationDecision = if (request.optBoolean("forceRefresh", false)) {
+            FullLyricsCacheValidationDecision.REQUEST_MISSING
+        } else {
+            FullLyricsCacheValidation.decide(
+                capabilityEnabled = negotiatedCapabilities.mediaCacheValidationV1,
+                request = cacheValidationRequest,
+                actual = cacheDescriptor
+            )
+        }
+        if (cacheValidationDecision == FullLyricsCacheValidationDecision.HIT &&
+            sendFullLyricsCacheStatus(
+                device = device,
+                type = "fullLyricsNotModified",
+                trackId = trackId,
+                generation = readyGate.generation,
+                descriptor = cacheDescriptor
+            )
+        ) {
+            val bytesSaved = FullLyricsCacheValidation.estimatedPayloadBytes(lines)
+            sendMediaLoadState(
+                device, "lyrics", "ready", "cache_validation_hit", false,
+                trackId, readyGate.generation
+            )
+            RealtimeTrace.record(
+                stage = "cacheValidationHit",
+                trackId = traceId,
+                generation = readyGate.generation,
+                payloadType = "fullLyrics",
+                processingMs = SystemClock.elapsedRealtime() - buildStartedAtMs,
+                result = "hit"
+            )
+            RealtimeTrace.record(
+                stage = "fullLyricsTransferSkipped",
+                trackId = traceId,
+                generation = readyGate.generation,
+                payloadType = "fullLyrics",
+                result = "skipped",
+                reason = "cache_validation_hit bytesSaved=$bytesSaved"
+            )
+            logger(
+                "[FullLyricsCacheValidation] hit trackId=$trackId " +
+                    "lines=${lines.size} bytesSaved=$bytesSaved"
+            )
+            return
+        }
+        if (cacheValidationRequest != null) {
+            RealtimeTrace.record(
+                stage = "cacheValidationMiss",
+                trackId = traceId,
+                generation = readyGate.generation,
+                payloadType = "fullLyrics",
+                result = "miss",
+                reason = cacheValidationDecision.name.lowercase()
+            )
+            logger(
+                "[FullLyricsCacheValidation] miss trackId=$trackId " +
+                    "reason=${cacheValidationDecision.name.lowercase()}"
+            )
+        }
+        if (negotiatedCapabilities.mediaCacheValidationV1) {
+            sendFullLyricsCacheStatus(
+                device = device,
+                type = "fullLyricsCacheMetadata",
+                trackId = trackId,
+                generation = readyGate.generation,
+                descriptor = cacheDescriptor
+            )
+        }
         sendMediaLoadState(
             device = device,
             resource = "lyrics",
@@ -5020,16 +5116,6 @@ class BleGattServerManager(
             trackId = trackId,
             generation = runtimeGeneration
         )
-        clearMatchingPendingFullLyrics(
-            device.address,
-            requestedTrackId,
-            trackId,
-            runtimeGeneration
-        )
-
-        val maximumPayload = maximumPayloadFor(device)
-        val requestedFormat = request.optString("format")
-        val negotiatedCapabilities = connectionCommandCoordinator.capabilities(device.address)
         if (requestedFormat == FULL_LYRICS_ZLIB_FORMAT &&
             negotiatedCapabilities.negotiated &&
             negotiatedCapabilities.protocolVersion >= SERVER_PROTOCOL_VERSION &&
@@ -5544,6 +5630,8 @@ class BleGattServerManager(
             mix(line.timeMs)
             mix(line.durationMs)
             mix(line.text.hashCode().toLong())
+            mix(line.translation.orEmpty().hashCode().toLong())
+            mix(line.romanization.orEmpty().hashCode().toLong())
             mix(line.words.size.toLong())
             line.words.forEach { word ->
                 mix(word.startMs)
@@ -5552,6 +5640,69 @@ class BleGattServerManager(
             }
         }
         return hash
+    }
+
+    private fun parseFullLyricsCacheValidationRequest(
+        request: JSONObject
+    ): FullLyricsCacheValidationRequest? {
+        val fingerprint = request.optString("knownFingerprint")
+            .ifBlank { request.optString("fp") }
+            .trim()
+        if (fingerprint.isBlank() ||
+            (!request.has("knownSchemaVersion") && !request.has("sv")) ||
+            (!request.has("knownLineCount") && !request.has("n")) ||
+            (!request.has("knownTranslationLineCount") && !request.has("tc")) ||
+            (!request.has("knownRomanizationLineCount") && !request.has("rc"))
+        ) {
+            return null
+        }
+        return FullLyricsCacheValidationRequest(
+            fingerprint = fingerprint,
+            schemaVersion = if (request.has("knownSchemaVersion")) {
+                request.optInt("knownSchemaVersion", -1)
+            } else {
+                request.optInt("sv", -1)
+            },
+            lineCount = if (request.has("knownLineCount")) {
+                request.optInt("knownLineCount", -1)
+            } else {
+                request.optInt("n", -1)
+            },
+            translationLineCount = if (request.has("knownTranslationLineCount")) {
+                request.optInt("knownTranslationLineCount", -1)
+            } else {
+                request.optInt("tc", -1)
+            },
+            romanizationLineCount = if (request.has("knownRomanizationLineCount")) {
+                request.optInt("knownRomanizationLineCount", -1)
+            } else {
+                request.optInt("rc", -1)
+            }
+        )
+    }
+
+    private fun sendFullLyricsCacheStatus(
+        device: BluetoothDevice,
+        type: String,
+        trackId: String,
+        generation: Long,
+        descriptor: FullLyricsCacheDescriptor
+    ): Boolean {
+        val value = JSONObject()
+            .put("type", type)
+            .put("id", trackId)
+            .put("g", generation)
+            .put("fp", descriptor.fingerprint)
+            .put("sv", descriptor.schemaVersion)
+            .put("n", descriptor.lineCount)
+            .put("tc", descriptor.translationLineCount)
+            .put("rc", descriptor.romanizationLineCount)
+        if (value.toString().toByteArray(Charsets.UTF_8).size > maximumPayloadFor(device)) {
+            logger("[FullLyricsCacheValidation] status skipped type=$type reason=metadata_exceeds_mtu")
+            return false
+        }
+        sendShortJsonIfFits(device, type, value)
+        return true
     }
 
     private fun sendLyricWindow(device: BluetoothDevice, request: JSONObject) {

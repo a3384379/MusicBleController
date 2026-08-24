@@ -2,7 +2,8 @@ import CryptoKit
 import Foundation
 
 struct FullLyricsCacheEntry: Codable, Equatable {
-    static let version = 1
+    static let version = 2
+    static let legacyVersion = 1
     static let maximumAge: TimeInterval = 30 * 24 * 60 * 60
 
     struct Word: Codable, Equatable {
@@ -29,9 +30,42 @@ struct FullLyricsCacheEntry: Codable, Equatable {
     let album: String
     let lines: [Line]
     let savedAt: Date
+    let fingerprint: String?
+    let schemaVersion: Int?
+    let expectedLineCount: Int?
+    let expectedTranslationLineCount: Int?
+    let expectedRomanizationLineCount: Int?
+
+    init(
+        version: Int,
+        trackId: String,
+        title: String,
+        artist: String,
+        album: String,
+        lines: [Line],
+        savedAt: Date,
+        fingerprint: String? = nil,
+        schemaVersion: Int? = nil,
+        expectedLineCount: Int? = nil,
+        expectedTranslationLineCount: Int? = nil,
+        expectedRomanizationLineCount: Int? = nil
+    ) {
+        self.version = version
+        self.trackId = trackId
+        self.title = title
+        self.artist = artist
+        self.album = album
+        self.lines = lines
+        self.savedAt = savedAt
+        self.fingerprint = fingerprint
+        self.schemaVersion = schemaVersion
+        self.expectedLineCount = expectedLineCount
+        self.expectedTranslationLineCount = expectedTranslationLineCount
+        self.expectedRomanizationLineCount = expectedRomanizationLineCount
+    }
 
     var isValid: Bool {
-        version == Self.version &&
+        (version == Self.version || version == Self.legacyVersion) &&
             !trackId.isEmpty &&
             !normalized(title).isEmpty &&
             !lines.isEmpty &&
@@ -43,8 +77,186 @@ struct FullLyricsCacheEntry: Codable, Equatable {
             normalized(self.artist) == normalized(artist)
     }
 
+    var validationDescriptor: FullLyricsCacheValidationDescriptor? {
+        guard version == Self.version,
+              let fingerprint,
+              !fingerprint.isEmpty,
+              let schemaVersion,
+              let expectedLineCount,
+              let expectedTranslationLineCount,
+              let expectedRomanizationLineCount else {
+            return nil
+        }
+        let descriptor = FullLyricsCacheValidationDescriptor(
+            fingerprint: fingerprint,
+            schemaVersion: schemaVersion,
+            lineCount: expectedLineCount,
+            translationLineCount: expectedTranslationLineCount,
+            romanizationLineCount: expectedRomanizationLineCount
+        )
+        return descriptor.matchesCachedContent(
+            title: title,
+            artist: artist,
+            lines: lines
+        ) ? descriptor : nil
+    }
+
     private func normalized(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+}
+
+struct FullLyricsCacheValidationDescriptor: Codable, Equatable, Sendable {
+    let fingerprint: String
+    let schemaVersion: Int
+    let lineCount: Int
+    let translationLineCount: Int
+    let romanizationLineCount: Int
+
+    init?(
+        object: [String: Any],
+        trackId: String,
+        currentTrackId: String,
+        generation: Int64,
+        currentGeneration: Int64
+    ) {
+        let incomingTrackId = object["trackId"] as? String ?? object["id"] as? String ?? ""
+        let incomingGeneration = FullLyricsCacheValidationDescriptor.int64Value(
+            object["generation"] ?? object["g"]
+        )
+        let fingerprint = object["fingerprint"] as? String ?? object["fp"] as? String ?? ""
+        let schemaVersion = FullLyricsCacheValidationDescriptor.intValue(
+            object["schemaVersion"] ?? object["sv"]
+        )
+        let lineCount = FullLyricsCacheValidationDescriptor.intValue(
+            object["lineCount"] ?? object["n"]
+        )
+        let translationLineCount = FullLyricsCacheValidationDescriptor.intValue(
+            object["translationLineCount"] ?? object["tc"]
+        )
+        let romanizationLineCount = FullLyricsCacheValidationDescriptor.intValue(
+            object["romanizationLineCount"] ?? object["rc"]
+        )
+        guard !trackId.isEmpty,
+              incomingTrackId == trackId,
+              incomingTrackId == currentTrackId,
+              generation > 0,
+              incomingGeneration == generation,
+              incomingGeneration == currentGeneration,
+              fingerprint.count == 24,
+              fingerprint.allSatisfy({ $0.isHexDigit }),
+              schemaVersion > 0,
+              lineCount > 0,
+              translationLineCount >= 0,
+              romanizationLineCount >= 0,
+              translationLineCount <= lineCount,
+              romanizationLineCount <= lineCount else {
+            return nil
+        }
+        self.fingerprint = fingerprint.lowercased()
+        self.schemaVersion = schemaVersion
+        self.lineCount = lineCount
+        self.translationLineCount = translationLineCount
+        self.romanizationLineCount = romanizationLineCount
+    }
+
+    init(
+        fingerprint: String,
+        schemaVersion: Int,
+        lineCount: Int,
+        translationLineCount: Int,
+        romanizationLineCount: Int
+    ) {
+        self.fingerprint = fingerprint.lowercased()
+        self.schemaVersion = schemaVersion
+        self.lineCount = lineCount
+        self.translationLineCount = translationLineCount
+        self.romanizationLineCount = romanizationLineCount
+    }
+
+    func matchesCachedLines(_ lines: [FullLyricsCacheEntry.Line]) -> Bool {
+        guard lines.count == lineCount else { return false }
+        let cachedTranslationCount = lines.filter {
+            Self.hasUsableSecondaryText($0.translation)
+        }.count
+        let cachedRomanizationCount = lines.filter {
+            Self.hasUsableSecondaryText($0.romanization)
+        }.count
+        return cachedTranslationCount == translationLineCount &&
+            cachedRomanizationCount == romanizationLineCount
+    }
+
+    func matchesCachedContent(
+        title: String,
+        artist: String,
+        lines: [FullLyricsCacheEntry.Line]
+    ) -> Bool {
+        matchesCachedLines(lines) &&
+            Self.contentFingerprint(title: title, artist: artist, lines: lines) == fingerprint
+    }
+
+    static func contentFingerprint(
+        title: String,
+        artist: String,
+        lines: [FullLyricsCacheEntry.Line]
+    ) -> String {
+        var digest = SHA256()
+        updateField(title.trimmingCharacters(in: .whitespacesAndNewlines), digest: &digest)
+        updateField(artist.trimmingCharacters(in: .whitespacesAndNewlines), digest: &digest)
+        for (index, line) in lines.enumerated() {
+            updateField(String(index), digest: &digest)
+            updateField(String(line.timeMs), digest: &digest)
+            updateField(String(line.durationMs), digest: &digest)
+            updateField(line.text, digest: &digest)
+            updateField(line.translation ?? "", digest: &digest)
+            updateField(line.romanization ?? "", digest: &digest)
+            updateField(String(line.words.count), digest: &digest)
+            for word in line.words {
+                updateField(String(word.startMs), digest: &digest)
+                updateField(String(word.durationMs), digest: &digest)
+                updateField(word.text, digest: &digest)
+            }
+        }
+        return digest.finalize().prefix(12).map { String(format: "%02x", $0) }.joined()
+    }
+
+    var requestFields: [String: Any] {
+        [
+            "fp": fingerprint,
+            "sv": schemaVersion,
+            "n": lineCount,
+            "tc": translationLineCount,
+            "rc": romanizationLineCount
+        ]
+    }
+
+    private static func hasUsableSecondaryText(_ value: String?) -> Bool {
+        guard let value else { return false }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !normalized.isEmpty && normalized != "null" && normalized != "undefined"
+    }
+
+    private static func updateField(_ value: String, digest: inout SHA256) {
+        let valueData = Data(value.utf8)
+        var length = UInt32(valueData.count).bigEndian
+        withUnsafeBytes(of: &length) { digest.update(bufferPointer: $0) }
+        digest.update(data: valueData)
+    }
+
+    private static func intValue(_ value: Any?) -> Int {
+        if let value = value as? Int { return value }
+        if let value = value as? Int64 { return Int(value) }
+        if let value = value as? NSNumber { return value.intValue }
+        if let value = value as? String { return Int(value) ?? 0 }
+        return 0
+    }
+
+    private static func int64Value(_ value: Any?) -> Int64 {
+        if let value = value as? Int64 { return value }
+        if let value = value as? Int { return Int64(value) }
+        if let value = value as? NSNumber { return value.int64Value }
+        if let value = value as? String { return Int64(value) ?? 0 }
+        return 0
     }
 }
 

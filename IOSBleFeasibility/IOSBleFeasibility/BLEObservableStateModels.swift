@@ -237,7 +237,13 @@ struct BLEProtocolV3Features: OptionSet, Equatable, Sendable {
     static let statusMetaV1 = Self(rawValue: 1 << 0)
     static let structuredErrorV1 = Self(rawValue: 1 << 1)
     static let mediaLoadStateV1 = Self(rawValue: 1 << 2)
-    static let all: Self = [.statusMetaV1, .structuredErrorV1, .mediaLoadStateV1]
+    static let mediaCacheValidationV1 = Self(rawValue: 1 << 3)
+    static let all: Self = [
+        .statusMetaV1,
+        .structuredErrorV1,
+        .mediaLoadStateV1,
+        .mediaCacheValidationV1
+    ]
 }
 
 struct BLEProtocolV2Features: OptionSet, Equatable, Sendable {

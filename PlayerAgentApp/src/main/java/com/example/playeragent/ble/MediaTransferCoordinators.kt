@@ -104,6 +104,8 @@ internal class ConnectionCommandCoordinator {
         val statusMetaV1: Boolean get() = f3 and BleV3Features.STATUS_META_V1 != 0
         val structuredErrorV1: Boolean get() = f3 and BleV3Features.STRUCTURED_ERROR_V1 != 0
         val mediaLoadStateV1: Boolean get() = f3 and BleV3Features.MEDIA_LOAD_STATE_V1 != 0
+        val mediaCacheValidationV1: Boolean
+            get() = f3 and BleV3Features.MEDIA_CACHE_VALIDATION_V1 != 0
         val v3: Boolean get() = protocolVersion >= 3 && f3 != 0
     }
 

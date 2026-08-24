@@ -15,7 +15,9 @@ class BleV3SessionCoordinatorTest {
             BleV3CapabilityPolicy.negotiateF3(3, BleV3Features.ALL, 247)
         )
         assertEquals(
-            BleV3Features.STRUCTURED_ERROR_V1 or BleV3Features.MEDIA_LOAD_STATE_V1,
+            BleV3Features.STRUCTURED_ERROR_V1 or
+                BleV3Features.MEDIA_LOAD_STATE_V1 or
+                BleV3Features.MEDIA_CACHE_VALIDATION_V1,
             BleV3CapabilityPolicy.negotiateF3(3, BleV3Features.ALL, 246)
         )
         assertEquals(0, BleV3CapabilityPolicy.negotiateF3(2, BleV3Features.ALL, 512))
