@@ -88,7 +88,14 @@ if (( DURATION_MINUTES > 0 )); then
 else
   run_round "$OUTPUT_DIR/realtime" "$RUNS"
   REALTIME_REPORT="$OUTPUT_DIR/realtime/report.json"
-  EXPECTED_TRANSITIONS="$RUNS"
+  # Fast-switch is a control-pressure test: Android must receive every command,
+  # while the player is allowed to coalesce rapid commands into fewer track changes.
+  # The separate source audit remains responsible for collecting 100 real transitions.
+  if [[ "$FAST_SWITCH" == true ]]; then
+    EXPECTED_TRANSITIONS=1
+  else
+    EXPECTED_TRANSITIONS="$RUNS"
+  fi
 fi
 
 SOURCE_AUDIT_DIR="$OUTPUT_DIR/source_audit"
