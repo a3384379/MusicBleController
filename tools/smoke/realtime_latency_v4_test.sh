@@ -20,7 +20,7 @@ Options:
   --runs <count>          Number of samples. Default: 30.
   --fast-switch           Alternate NEXT/PREVIOUS at 650 ms intervals.
   --previous              Use PREVIOUS for the normal scenario.
-  --auto                  Equivalent automatic scenario via Sony media key events.
+  --auto                  Equivalent automatic scenario via Sony MediaSession events.
   --ios-device <id>       iPhone devicectl identifier.
   --android-device <id>   Sony adb serial.
   --output <dir>          Output directory.
@@ -134,7 +134,9 @@ ids = []
 pattern = re.compile(r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
 for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
     match = pattern.search(line)
-    if match and "iphone" in line.lower() and "connected" in line.lower():
+    lowered = line.lower()
+    usable = re.search(r"\b(?:connected|available)\b", lowered) is not None
+    if match and "iphone" in lowered and usable:
         ids.append(match.group(0))
 if len(ids) == 1:
     print(ids[0])
@@ -171,14 +173,28 @@ copy_ios_log() {
   local destination="$1"
   local current_log="${destination}.current"
   local old_log="${destination}.old"
+  local copied=false
+  local attempt
   rm -f "$current_log" "$old_log"
-  xcrun devicectl --timeout 12 device copy from \
-    --device "$IOS_DEVICE_ID" \
-    --domain-type appDataContainer \
-    --domain-identifier "$BUNDLE_ID" \
-    --source Documents/Logs/ios_ble.log \
-    --destination "$current_log" \
-    >"$OUT_DIR/devicectl_copy.out" 2>"$OUT_DIR/devicectl_copy.err"
+  : >"$OUT_DIR/devicectl_copy.out"
+  : >"$OUT_DIR/devicectl_copy.err"
+  for attempt in 1 2 3; do
+    rm -f "$current_log"
+    if xcrun devicectl --timeout 20 device copy from \
+      --device "$IOS_DEVICE_ID" \
+      --domain-type appDataContainer \
+      --domain-identifier "$BUNDLE_ID" \
+      --source Documents/Logs/ios_ble.log \
+      --destination "$current_log" \
+      >>"$OUT_DIR/devicectl_copy.out" 2>>"$OUT_DIR/devicectl_copy.err"; then
+      copied=true
+      break
+    fi
+    sleep 1
+  done
+  if [[ "$copied" != true || ! -s "$current_log" ]]; then
+    return 1
+  fi
   xcrun devicectl --timeout 12 device copy from \
     --device "$IOS_DEVICE_ID" \
     --domain-type appDataContainer \
@@ -256,9 +272,14 @@ fi
 if [[ "$MODE" == "auto" ]]; then
   "$ADB_BIN" -s "$ANDROID_DEVICE_ID" shell log -t RealtimeV4 \
     "measurement_start mode=auto" >/dev/null 2>&1 || true
-  log "running automatic-equivalent Sony media events"
+  log "running automatic-equivalent Sony MediaSession events"
   for _ in $(seq 1 "$RUNS"); do
-    "$ADB_BIN" -s "$ANDROID_DEVICE_ID" shell input keyevent 87
+    # `input keyevent 87` is routed through the foreground input target on some
+    # Sony builds and can be silently dropped after the first event. The public
+    # media_session shell command dispatches the same standard NEXT action to
+    # the active MediaSession and is stable for repeatable automatic-equivalent
+    # measurements. This does not call a QQ Music private API.
+    "$ADB_BIN" -s "$ANDROID_DEVICE_ID" shell cmd media_session dispatch next
     sleep 3
   done
   sleep 12
