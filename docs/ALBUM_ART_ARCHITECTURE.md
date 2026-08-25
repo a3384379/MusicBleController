@@ -41,6 +41,8 @@
 10. 主 UI 使用最终 `albumArtImage`；Live Activity 使用 App Group 小图。加载层明确区分 preview、HQ 和失败，可只重试当前歌曲。
 11. Sony PlayerAgent 本机 UI 在歌曲变化时先进入 LOADING；MediaMetadata/Notification 的 title/artist 与当前身份不匹配时拒绝。通知更新触发精确重读，不增加轮询；同一当前歌曲的临时精确源缺失不会把已经 READY 的图替换为占位图。
 12. V4 第三阶段的预测模型可以记录“已有精确 artwork cache”这一 readiness，但当前 QQ 音乐不暴露高置信下一/上一首 identity，因此没有执行候选图片预编码、跨端 Preview/HQ 预取或猜测式图片晋升。正式封面仍只按当前 trackId/generation 发布。
+13. TrackInfo、PlaybackState、Preview/HQ A1 和 CurrentWord 使用同一个经过 identity 复核的 wire generation；Sony 捕获一次传输 generation 后贯穿 Start/Chunk/End，迟到旧 generation 不能覆盖 iOS 或 Sony PlayerAgent 当前封面。
+14. Android notify callback 不能等同 L2CAP 已排空。封面 binary 使用 15ms 最小 pacing；command write 到达时同步预留 response quiet window，避免频繁切歌与 HQ 并发时写响应被 L2CAP hold queue 挤掉。该节流不作用于 JSON、歌词或 CurrentWord。
 
 ## 关键状态
 
@@ -57,6 +59,7 @@
 - Predictive Hot Set 只保存 artworkId/readiness 元数据，不复制 Bitmap/JPEG；当前真机 prefetch bytes/packets 均为 0。
 - iOS 解码缓存 key 包含 `artworkId + quality + targetPixelSize`，避免同一 JPEG 在主界面和历史列表重复全尺寸解码。
 - A1 header 和 quality code 不变；start/end 可带 `transferId`、`generation`、`crc32`，新端支持局部重传，旧端直接忽略新字段。
+- 真机 100 次快速切歌中 command write callback 313/313，response failed、write timeout、L2CAP congestion 均为 0；Preview/HQ p95 707.2ms。
 
 ## 不允许随便修改的点
 

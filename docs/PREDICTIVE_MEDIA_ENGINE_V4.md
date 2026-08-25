@@ -58,7 +58,7 @@ V3 `f3` bit3 定义 `mediaCacheValidationV1`。只有双方 ACK 后，iOS 才在
 
 Sony 对实际歌词生成 SHA-256 截断 fingerprint，覆盖 title、artist、每行时长/正文、translation、romanization 和逐字 timing；并精确比较 schema、主歌词行数、翻译行数和罗马音行数。完全相同时返回轻量 `fullLyricsNotModified` 并跳过 A2/legacy 正文；不匹配时返回 `fullLyricsCacheMetadata` 后执行原完整传输。
 
-iOS cache v2 保存上述描述符，并用与 Sony 相同的固定向量算法重新计算本地正文 fingerprint；只有本地正文、逐字和 secondary 内容也完全一致时才发送校验请求。legacy v1 仍可即时显示，但不能抑制传输。缓存损坏、descriptor 不完整或 not-modified 与本地内容不一致时删除该条并只强制刷新一次；新 descriptor 只在完整正文实际发布后落盘，不能覆盖到旧正文。negative cache 不参与校验。CurrentLine、LyricWindow、CurrentWord、position anchor 和 generation 始终继续实时发送。
+iOS cache v3 将 Sony QRC 远端 fingerprint 与 iOS 已落盘正文的 local fingerprint 分开保存。远端 fingerprint 用于 `fullLyricsNotModified` 协商；local fingerprint 由 iOS 对实际收到并持久化的主歌词、逐字和 secondary 内容独立计算，用于发现本地损坏。两者不能互相替代，因为 Sony QRC fingerprint 可以覆盖未包含在当前 FullLyrics 正文中的完整逐字数据。只有远端 descriptor 完整、local fingerprint 精确复算一致时才发送校验请求。legacy v1/v2 仍可即时显示，但不能抑制一次完整传输；成功冷取后迁移到 v3。缓存损坏、descriptor 不完整或 not-modified 与本地内容不一致时删除该条并只强制刷新一次；新 descriptor 只在完整正文实际发布后落盘，不能覆盖到旧正文。negative cache 不参与校验。CurrentLine、LyricWindow、CurrentWord、position anchor 和 generation 始终继续实时发送。
 
 ## 8. Capability、协议与兼容
 
@@ -67,6 +67,8 @@ iOS cache v2 保存上述描述符，并用与 Sony 相同的固定向量算法�
 - 新 Sony + 旧 iOS/Android Controller：旧端不声明 bit3，不收到 not-modified/metadata。
 - A1/A2 固定 header、UUID、command/status characteristic、已有命令名和 payload 均不变。
 - capability 和歌词传输状态继续按控制器地址隔离；没有共享 prefetch session。
+- `sid/es` 只在该设备实际协商 `statusMetaV1` 后附加；MTU 185 等小 payload 会关闭 bit0，不能把未协商元数据挤进 `mediaLoadState` 或错误状态。
+- 当前媒体的 TrackInfo、PlaybackState、歌词、CurrentWord 与 A1 封面统一通过 `MediaWireGenerationPolicy` 解析 wire generation；只有精确 identity 匹配的 runtime generation 才可复用，身份不匹配立即走正式冷路径 generation。
 
 跨端 `prefetchManifest`、`PREFETCH_MEDIA` 和 purpose=prefetch A1/A2 会话均未实现。原因是高置信候选覆盖率为 0，保留它们只会增加无收益协议和 BLE 流量。
 
@@ -74,31 +76,35 @@ iOS cache v2 保存上述描述符，并用与 Sony 相同的固定向量算法�
 
 本阶段预取 BLE packets/bytes 为 0。P0 控制/PlaybackState/CurrentWord、P1 LyricWindow/正式 Preview、P2 正式 FullLyrics/Secondary、P3 HQ/History/Diagnostics 的既有优先级不变。FullLyrics 校验命中反而消除 P2 传输，不占用 CurrentWord 队列。
 
+真机压力还确认 Android 的 notify callback 可能早于 L2CAP 实际排空。封面 chunk 因此使用独立的 15ms 最小 pacing，歌词和实时 JSON 不受影响；收到 command write 时同步预留 response quiet window，让 GATT write response 先于后台图片继续入队。最终 100 次快速切歌中 313/313 次 command write 收到 callback，write timeout、response failed 和 L2CAP congestion 均为 0。
+
 ## 10. Trace 与指标
 
 Sony 输出 `predictionCandidateCreated/Updated`、`predictionPrewarmQueued/Start`、`predictionLyricsReady`、`predictionArtworkReady`、`predictionReady`、`predictionPromotionAttempt/Promoted/Rejected/Invalidated/Expired`、`cacheValidationHit/Miss` 和 `fullLyricsTransferSkipped`。iOS 输出 `cacheValidationRequest/Hit/Miss`、`cachedLyricsPublished` 和 `fullLyricsTransferSkipped`。
 
 关联字段只包含 candidateId、identityDigest、trackId、generation、transferId、confidence、source、monoMs、result 和 reason；不记录标题、歌词或图片。
 
-第一轮真机快速压力数据（100 个 NEXT/PREVIOUS 控制，83 个实际身份转换）观察到：FullLyrics 校验命中/跳过 31 次、节省估算正文 317,060 bytes、Preview cache hit 68；prefetch bytes=0。正确性计数 stale accepted、wrong CurrentWord、wrong artwork、visible false positive、duplicate control、cold fallback failure 均为 0。该轮在最终去重修复前采集，只用于缓存收益和端到端基线，不用于最终预热次数结论。
+最终真机快速压力数据（100 个 NEXT/PREVIOUS 控制，68 个 eligible transition）观察到：FullLyrics 校验命中/跳过 30 次、节省估算正文 538,028 bytes、Preview cache hit 62；prefetch bytes=0。预测候选 37 个且均为 WEAK，本地预热 queued=4、ready=3、promoted=0，符合不得晋升弱候选的屏障。正确性计数 stale accepted、wrong CurrentWord、wrong artwork、visible false positive、duplicate control、cold fallback failure 均为 0。
+
+缓存协议另有一次冷迁移和一次热命中真机证据：热命中请求包含 `fp/sv/n/tc/rc`，Sony 返回 `fullLyricsNotModified`，iOS 从 v3 cache 发布 59 行且没有 A2 正文。封面链路同一歌曲的 TrackInfo、PlaybackState、Preview/HQ A1 和 CurrentWord 全部使用 generation 1，未出现 generation mismatch 拒绝或旧图回写。
 
 ## 11. 性能结果与 SLO
 
 高置信候选为 0，因此 Warm Path 的全部指标为 `NOT APPLICABLE`，不得宣称 ≤150/250/350/300ms 已完成。
 
-第一轮 Phase3 快速压力的可比指标如下；正式报告保存在本机 `/tmp/musicble_phase3_predictive_fast100/`：
+最终 Phase3 快速压力的可比指标如下；正式报告保存在本机 `/tmp/musicble_phase3_control_headroom_15ms_final100/`：
 
 | metric | Phase2 p95 | Phase3 p95 | change | result |
 |---|---:|---:|---:|---|
-| command → Track publish | 621.8ms | 608.8ms | -2.1% | 无回退 |
-| Track → current lyric | 1230.8ms | 1005.3ms | -18.3% | 无回退 |
-| Track → CurrentWord | 样本不足 | 无可关联样本 | N/A | 不作结论 |
-| Track → Preview | 650ms | 1543.6ms | +137.5% | 单轮图片长尾，需结合最终复测；正确性为 0 |
-| Track → HQ | 652.2ms | 3530.8ms | +441.3% | 样本/缓存状态不同，不宣称达标 |
+| command → Track publish | 621.8ms | 632.6ms | +1.7% | PASS，回退 <10% |
+| Track → current lyric | 1230.8ms | 1210.1ms | -1.7% | PASS，无回退 |
+| Track → CurrentWord | 样本不足 | 362ms（1 个样本） | N/A | 样本不足，不作回退结论 |
+| Track → Preview | 650ms | 707.2ms | +8.8% | PASS，回退 <10% 且 ≤800ms |
+| Track → HQ | 652.2ms | 707.2ms | +8.4% | PASS，回退 <10% 且 ≤2500ms |
 | iOS decode | 1ms | 1ms | 0% | PASS |
-| iOS publish | 20.9ms | 21ms | +0.5% | PASS |
+| iOS publish | 20.9ms | 18.5ms | -11.5% | PASS |
 
-第三阶段不以跨端预取掩盖图片冷路径长尾。Preview/HQ 的现有正式传输和 Sony/iOS 精确封面栅栏保持原样；Warm artwork 因无预测来源为 N/A。
+Preview/HQ 的正式传输继续使用 Sony/iOS 精确封面栅栏；15ms 封面 pacing 保住了 100 次压力下的控制响应窗口，同时最终 Preview/HQ p95 仍处于 Cold SLO。Warm artwork 因无预测来源为 N/A。
 
 ## 12. 资源开销
 
@@ -129,6 +135,8 @@ Sony 输出 `predictionCandidateCreated/Updated`、`predictionPrewarmQueued/Star
 - FullLyrics cache miss/corrupt/schema/secondary mismatch：完整传输；iOS 强刷最多一次。
 - capability timeout/旧客户端/metadata 超 MTU：V2/legacy 完整传输。
 - 连接 suspect/stale：没有跨端预取需要取消，正式任务保持既有优先级。
+- 小 MTU 未协商 `statusMetaV1`：不附加 `sid/es`，避免 notify payload 超限；其他 V3 capability 保持独立。
+- 高频切歌与封面并发：command write 到达时先预留响应窗口，图片以 15ms 最小间隔继续；若真实连接仍无 callback，iOS 仍按既有两阶段 suspect/reconnect 规则处理。
 
 ## 15. 未实现能力
 

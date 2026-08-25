@@ -141,10 +141,10 @@ internal class BleLinkProfile(initialMtu: Int) {
     companion object {
         private const val JSON_INITIAL_DELAY_MS = 5L
         private const val BINARY_INITIAL_DELAY_MS = 2L
-        private const val ARTWORK_INITIAL_DELAY_MS = 3L
+        private const val ARTWORK_INITIAL_DELAY_MS = 15L
         private const val JSON_MIN_DELAY_MS = 2L
         private const val BINARY_MIN_DELAY_MS = 1L
-        private const val ARTWORK_MIN_DELAY_MS = 1L
+        private const val ARTWORK_MIN_DELAY_MS = 15L
         private const val FAILURE_STEP_MS = 5L
         private const val MAX_DELAY_MS = 30L
         private const val SUCCESS_WINDOW = 20

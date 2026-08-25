@@ -211,4 +211,8 @@ Sony 同一 `commandSeq + commandType` 的多次 `mediaControlDispatchStart` 计
 
 第三阶段实现和数据见 [PREDICTIVE_MEDIA_ENGINE_V4.md](/Volumes/雷电/project/MusicBleController/docs/PREDICTIVE_MEDIA_ENGINE_V4.md)。正式 Prediction Source Audit 采集 239 次转换，但当前 Sony/QQ 音乐的 MediaSession queue available=0、activeQueueItemId available=0，高置信候选覆盖率为 0，所以 Warm Path 全部标记 `NOT APPLICABLE`，跨端 prefetch Gate 跳过。
 
-已落地的可测收益是 `mediaCacheValidationV1`：iOS 与 Sony 精确校验 FullLyrics fingerprint/schema/原文及 secondary 行数，命中时只发轻量 not-modified 并继续 CurrentLine/CurrentWord，不再传 A2/legacy 正文。第一轮 100 个快速控制观察到 31 次传输跳过、估算节省 317,060 bytes；stale accepted、wrong CurrentWord、wrong artwork、visible false positive、duplicate control 和 cold fallback failure 均为 0。该轮 command→Track p95 608.8ms，相对第二阶段同场景 621.8ms 无回退；图片冷路径仍有外部长尾，未宣称 Warm SLO 达标。
+已落地的可测收益是 `mediaCacheValidationV1`：iOS cache v3 分离 Sony 远端 QRC fingerprint 与本地持久化正文 fingerprint，精确校验 schema/原文及 secondary 行数；命中时只发轻量 not-modified 并继续 CurrentLine/CurrentWord，不再传 A2/legacy 正文。最终 100 个快速控制观察到 30 次传输跳过、估算节省 538,028 bytes、Preview cache hit 62；stale accepted、wrong CurrentWord、wrong artwork、visible false positive、duplicate control 和 cold fallback failure 均为 0。
+
+最终压力还统一了 TrackInfo、PlaybackState、歌词、CurrentWord 和 A1 封面的 wire generation，并为 command write response 预留 radio window。封面 binary 使用 15ms 最小 pacing 后，313/313 次 command write 获得 callback，write timeout、response failed 和 L2CAP congestion 均为 0；切歌期间没有虚假“正在连接”，也没有 Sony/iOS 新旧封面 generation 分叉。
+
+Cold Path 最终 p95：command→Track 632.6ms（相对 621.8ms +1.7%）、Track→current lyric 1210.1ms（-1.7%）、Track→Preview 707.2ms（+8.8%）、Track→HQ 707.2ms（+8.4%）、iOS decode 1ms、publish 18.5ms。可比项均未超过第二阶段 10% 回退边界，Preview/HQ 仍满足 Cold SLO；CurrentWord 只有 1 个 362ms 可关联样本，不据此宣称统计改善。

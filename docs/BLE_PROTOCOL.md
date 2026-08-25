@@ -107,7 +107,7 @@ V3 是逐项可选能力层，不替换 V2。UUID、命令名、A1/A2、legacy �
 - `f2` bit0～bit5 依次表示 `albumArtBinary`、`fullLyricsZlib`、`lyricWindow`、`ping`、`clockSyncV1`、`transferRetry`。客户端仍发送原有 V2 boolean，Sony 据此生成 `f2`。
 - V1/V2 客户端继续收到原有 verbose ACK（`protocolVersion=2` 加六个 boolean）；旧端不会收到 `f2`、`f3`、`sid` 或 `es`。
 
-协商 `statusMetaV1` 后，Sony 可为该设备的 JSON 状态附加 `sid` 和 `es`。`es` 是每设备 UInt64 enqueue 序号，只用于发现 notify 缺口或重复；不同优先级可能交错，接收端不得按 `es` 全局丢弃状态。媒体正确性仍以 `trackId + generation + transferId` 为准。
+协商 `statusMetaV1` 后，Sony 可为该设备的 JSON 状态附加 `sid` 和 `es`。未协商时任何状态（包括 `mediaLoadState` 和 structured error）都不得附加这两个字段，避免小 MTU payload 超限。`es` 是每设备 UInt64 enqueue 序号，只用于发现 notify 缺口或重复；不同优先级可能交错，接收端不得按 `es` 全局丢弃状态。媒体正确性仍以 `trackId + generation + transferId` 为准。
 
 协商 `structuredErrorV1` 后，Sony 可发送：
 
@@ -137,8 +137,9 @@ V4 第三阶段没有实现 `prefetchManifest`、`PREFETCH_MEDIA` 或 purpose=pr
 ## 自适应发送
 
 - 每次连接创建独立 `BleLinkProfile`，记录设备、连接代次、MTU、EWMA notify RTT、失败率和 JSON/二进制间隔；重连或 MTU 改变时重置。
-- JSON 初始 5ms、范围 2～30ms；binary 初始 2ms、范围 1～30ms。
+- JSON 初始 5ms、范围 2～30ms；歌词 binary 初始 2ms、范围 1～30ms；封面 binary 初始/最小均为 15ms、最大 30ms。
 - notify 失败或 callback RTT 超过 120ms 时增加 5ms；连续 20 次成功且 EWMA RTT 小于 60ms 时减少 1ms。
+- Android notify callback 可能早于 L2CAP 实际排空，封面不能因快速 callback 下降到 15ms 以下。command characteristic 收到 write 时同步预留响应 quiet window，GATT write response 优先于后台封面继续入队。
 - `GET_LYRIC_WINDOW` 与完整歌词走独立歌词命令执行器，不被较慢的播放状态读取 FIFO 阻塞。
 - 压缩歌词缓存最多 16 项/512KB，保存 zlib 正文与 CRC，按当前 MTU 重新分包；fingerprint、generation、格式或逐字行集合变化时失效。
 - Sony 执行器只分实时、前台媒体 I/O、后台维护和 BLE 发送四类；历史、索引、日志与诊断不得占用实时线程。
@@ -147,6 +148,7 @@ V4 第三阶段没有实现 `prefetchManifest`、`PREFETCH_MEDIA` 或 purpose=pr
 
 - iOS 进入 inactive/background 时暂停健康探测、订阅超时、写回调超时和时钟同步调度；回到前台先用 `PING`（旧协议用 `GET_PLAYBACK_STATE`）验证链路，收到任意有效 notify 后才同步播放状态、音量和歌词。
 - CoreBluetooth 偶发漏掉单次 `didWrite` 时，第一次超时只标记 suspect 并延长等待，不弹出 in-flight 请求、不推进下一条写，避免迟到回调串到下一条命令；连续两次超时才 hard reconnect。
+- 频繁切歌只要 notify 与 write callback 仍健康，就不得把 UI 连接状态降为“正在连接”；媒体 generation 变化不等于 BLE connection generation 变化。
 - Sony 端 45 秒无业务流量只会按设备发送 `{"type":"link"}` 小探针，不再重建共享 GATT。探针的真实 notify 失败累计到阈值后，仅隔离失败地址，其他控制器继续工作。
 - 恢复连接的 smoke 参数通过一次性 App 容器标记传递，避免 CoreBluetooth 后台恢复抢先启动导致测试序列丢失。
 

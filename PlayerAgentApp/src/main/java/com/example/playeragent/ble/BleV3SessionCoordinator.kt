@@ -102,6 +102,10 @@ internal class BleV3SessionCoordinator(
             .put("es", sequence)
     }
 
+    fun decorateIfEnabled(address: String, value: JSONObject, enabled: Boolean): JSONObject {
+        return if (enabled) decorate(address, value) else value
+    }
+
     fun shouldSendMediaLoadState(
         address: String,
         resource: String,

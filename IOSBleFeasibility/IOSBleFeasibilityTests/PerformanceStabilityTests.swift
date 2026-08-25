@@ -1062,7 +1062,9 @@ final class PerformanceStabilityTests: XCTestCase {
         )
         XCTAssertEqual(fingerprint, "3e1c8ce388901c3763a5b1c3")
         let descriptor = FullLyricsCacheValidationDescriptor(
-            fingerprint: fingerprint,
+            // The remote QRC descriptor may cover word timing omitted from the
+            // compact iOS cache, so it is intentionally independent here.
+            fingerprint: "ab" + String(repeating: "01", count: 11),
             schemaVersion: 1,
             lineCount: 1,
             translationLineCount: 1,
@@ -1077,11 +1079,13 @@ final class PerformanceStabilityTests: XCTestCase {
             lines: lines,
             savedAt: Date(),
             fingerprint: descriptor.fingerprint,
+            localContentFingerprint: fingerprint,
             schemaVersion: descriptor.schemaVersion,
             expectedLineCount: descriptor.lineCount,
             expectedTranslationLineCount: descriptor.translationLineCount,
             expectedRomanizationLineCount: descriptor.romanizationLineCount
         )
+        XCTAssertNotEqual(descriptor.fingerprint, fingerprint)
         XCTAssertEqual(entry.validationDescriptor, descriptor)
         XCTAssertEqual(descriptor.requestFields["n"] as? Int, 1)
 
@@ -1104,6 +1108,7 @@ final class PerformanceStabilityTests: XCTestCase {
             },
             savedAt: Date(),
             fingerprint: descriptor.fingerprint,
+            localContentFingerprint: fingerprint,
             schemaVersion: descriptor.schemaVersion,
             expectedLineCount: descriptor.lineCount,
             expectedTranslationLineCount: descriptor.translationLineCount,
@@ -1159,6 +1164,7 @@ final class PerformanceStabilityTests: XCTestCase {
             },
             savedAt: Date(),
             fingerprint: descriptor.fingerprint,
+            localContentFingerprint: fingerprint,
             schemaVersion: descriptor.schemaVersion,
             expectedLineCount: descriptor.lineCount,
             expectedTranslationLineCount: descriptor.translationLineCount,

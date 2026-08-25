@@ -77,6 +77,20 @@ class BleV3SessionCoordinatorTest {
     }
 
     @Test
+    fun statusMetadataIsOnlyAddedWhenNegotiated() {
+        val coordinator = BleV3SessionCoordinator("1234abcd")
+        val value = JSONObject().put("type", "mediaLoadState")
+
+        val withoutMetadata = coordinator.decorateIfEnabled("A", value, enabled = false)
+        assertFalse(withoutMetadata.has("sid"))
+        assertFalse(withoutMetadata.has("es"))
+
+        val withMetadata = coordinator.decorateIfEnabled("A", value, enabled = true)
+        assertEquals("1234abcd", withMetadata.getString("sid"))
+        assertEquals(1L, withMetadata.getLong("es"))
+    }
+
+    @Test
     fun commandErrorKeepsOriginalSequence() {
         val error = BleV3PayloadFactory.commandError(
             seq = "42",

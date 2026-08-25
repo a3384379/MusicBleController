@@ -123,15 +123,24 @@ class BleNotifyQueue(
      * Older Sony Bluetooth stacks can otherwise acknowledge sendResponse() locally while the
      * iOS client never receives its write callback during a dense album-art transfer.
      */
+    @Synchronized
+    fun onCommandWriteReceived() {
+        reserveCommandResponseWindow(SystemClock.elapsedRealtime())
+    }
+
     fun onCommandResponseSent() {
         runOnQueueThread { onCommandResponseSentOnQueue() }
     }
 
     @Synchronized
     private fun onCommandResponseSentOnQueue() {
+        reserveCommandResponseWindow(SystemClock.elapsedRealtime())
+    }
+
+    private fun reserveCommandResponseWindow(nowMs: Long) {
         commandResponseQuietUntilMs = maxOf(
             commandResponseQuietUntilMs,
-            SystemClock.elapsedRealtime() + COMMAND_RESPONSE_QUIET_MS
+            nowMs + COMMAND_RESPONSE_QUIET_MS
         )
         if (!notificationInFlight && !drainingCancelledCallback) {
             handler.postDelayed({ sendNextPacket() }, COMMAND_RESPONSE_QUIET_MS)

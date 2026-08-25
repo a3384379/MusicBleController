@@ -459,6 +459,11 @@ class BleGattServerManager(
                 )
             }
             if (responseNeeded) {
+                // Stop issuing new notify packets before the ATT response. A dense
+                // artwork transfer can otherwise fill Sony's L2CAP hold queue and
+                // make sendResponse() look successful locally while iOS never gets
+                // its write callback.
+                notifyQueue.onCommandWriteReceived()
                 val responseStartMs = SystemClock.elapsedRealtime()
                 logger(
                     "[CTRL-Sony] sendResponse begin seq=$seq cmd=$command " +
@@ -1914,7 +1919,12 @@ class BleGattServerManager(
         value: JSONObject,
         priority: BleNotifyQueue.Priority
     ) {
-        val decorated = v3SessionCoordinator.decorate(device.address, value)
+        val capabilities = connectionCommandCoordinator.capabilities(device.address)
+        val decorated = v3SessionCoordinator.decorateIfEnabled(
+            address = device.address,
+            value = value,
+            enabled = capabilities.statusMetaV1
+        )
         val bytes = decorated.toString().toByteArray(Charsets.UTF_8)
         if (bytes.size > maximumPayloadFor(device)) {
             logger("[BLE-V3] skipped type=$type reason=payload too large bytes=${bytes.size}")
@@ -2328,7 +2338,7 @@ class BleGattServerManager(
         val artist = source.optString("artist")
         val album = source.optString("album")
         val trackId = buildAlbumArtProtocolId(source)
-        val generation = reactiveMediaController.generation()
+        val generation = mediaWireGeneration(trackId)
         val candidates = listOf(
             TrackInfoLimit(30, 30, 20, includeAlbum = true),
             TrackInfoLimit(30, 30, 0, includeAlbum = false),
@@ -3219,12 +3229,16 @@ class BleGattServerManager(
         } else {
             minOf(albumArtMaximumPayloadFor(device), MAX_ALBUM_JSON_BYTES)
         }
+        // Capture one authoritative wire generation for the entire transfer.
+        // ReactiveMediaController's generation remains an internal task fence
+        // and can have a different offset after a service restart.
+        val artworkGeneration = mediaWireGeneration(protocolId)
         val encodeStartedAtMs = SystemClock.elapsedRealtime()
         RealtimeTrace.record(
             stage = "previewEncodeStart",
             monoMs = encodeStartedAtMs,
             trackId = protocolId,
-            generation = CurrentTrackRuntimeCache.currentGeneration(),
+            generation = artworkGeneration,
             payloadType = quality.wireValue,
             result = "started"
         )
@@ -3233,14 +3247,15 @@ class BleGattServerManager(
             deviceMaximumPayload = maximumPayload,
             protocolId = protocolId,
             quality = quality,
-            binaryTransport = useBinaryAlbumArt
+            binaryTransport = useBinaryAlbumArt,
+            wireGeneration = artworkGeneration
         )
         val encodeEndedAtMs = SystemClock.elapsedRealtime()
         RealtimeTrace.record(
             stage = "previewEncodeEnd",
             monoMs = encodeEndedAtMs,
             trackId = protocolId,
-            generation = CurrentTrackRuntimeCache.currentGeneration(),
+            generation = artworkGeneration,
             payloadType = quality.wireValue,
             processingMs = (encodeEndedAtMs - encodeStartedAtMs).coerceAtLeast(0L),
             result = if (preparation.prepared != null) "success" else "failure",
@@ -3323,7 +3338,7 @@ class BleGattServerManager(
             },
             monoMs = startAt,
             trackId = protocolId,
-            generation = CurrentTrackRuntimeCache.currentGeneration(),
+            generation = artworkGeneration,
             payloadType = quality.wireValue,
             chunkCount = totalChunks,
             result = "started"
@@ -3338,8 +3353,6 @@ class BleGattServerManager(
                     "quality=${quality.wireValue} chunks=$totalChunks"
             )
         }
-        val artworkGeneration = playbackStateReader.runtimeCacheSnapshot()
-            .track?.currentTrackGeneration ?: 0L
         sendMediaLoadState(
             device, "artwork", "transferring", "transfer_preparing", false,
             protocolId, artworkGeneration
@@ -3433,7 +3446,8 @@ class BleGattServerManager(
         deviceMaximumPayload: Int,
         protocolId: String,
         quality: AlbumArtQuality,
-        binaryTransport: Boolean
+        binaryTransport: Boolean,
+        wireGeneration: Long
     ): AlbumArtPreparation {
         val encodedCacheKey = listOf(
             protocolId,
@@ -3450,7 +3464,8 @@ class BleGattServerManager(
                 protocolId = protocolId,
                 quality = quality,
                 binaryTransport = binaryTransport,
-                encodedCacheKey = encodedCacheKey
+                encodedCacheKey = encodedCacheKey,
+                wireGeneration = wireGeneration
             )
         }
     }
@@ -3461,7 +3476,8 @@ class BleGattServerManager(
         protocolId: String,
         quality: AlbumArtQuality,
         binaryTransport: Boolean,
-        encodedCacheKey: String
+        encodedCacheKey: String,
+        wireGeneration: Long
     ): AlbumArtPreparation {
         getEncodedAlbumArt(encodedCacheKey)?.let { cached ->
             val cachedPackets = if (binaryTransport) {
@@ -3470,6 +3486,7 @@ class BleGattServerManager(
                     protocolId,
                     quality,
                     cached.bytes,
+                    wireGeneration,
                     when (quality) {
                         AlbumArtQuality.PREVIEW -> ALBUM_ART_PREVIEW_MAX_CHUNKS
                         AlbumArtQuality.HQ -> ALBUM_ART_HQ_MAX_CHUNKS
@@ -3573,6 +3590,7 @@ class BleGattServerManager(
                     protocolId = protocolId,
                     quality = quality,
                     bytes = compressed.bytes,
+                    wireGeneration = wireGeneration,
                     maximumChunks = maximumChunks
                 )
             } else {
@@ -3929,6 +3947,7 @@ class BleGattServerManager(
         protocolId: String,
         quality: AlbumArtQuality,
         bytes: ByteArray,
+        wireGeneration: Long,
         maximumChunks: Int
     ): AlbumArtPackets? {
         val maxPayload = deviceMaximumPayload
@@ -3946,14 +3965,13 @@ class BleGattServerManager(
         }
         val transferId = UUID.randomUUID().toString().replace("-", "").take(12)
         val crc32 = BleTransferCodec.crc32Hex(bytes)
-        val generation = reactiveMediaController.generation()
         val start = JSONObject()
             .put("type", "albumArtBinaryStart")
             .put("id", protocolId)
             .put("quality", quality.wireValue)
             .put("transferId", transferId)
             .put("crc32", crc32)
-            .put("generation", generation)
+            .put("generation", wireGeneration)
             .put("size", bytes.size)
             .put("chunks", totalChunks)
             .put("format", "jpg")
@@ -3965,7 +3983,7 @@ class BleGattServerManager(
             .put("quality", quality.wireValue)
             .put("transferId", transferId)
             .put("crc32", crc32)
-            .put("generation", generation)
+            .put("generation", wireGeneration)
             .toString()
             .toByteArray(Charsets.UTF_8)
         if (start.size > maxPayload || end.size > maxPayload) {
@@ -4156,6 +4174,16 @@ class BleGattServerManager(
             return trimmed
         }
         return trimmed.take(ALBUM_ART_ID_HASH_BYTES)
+    }
+
+    private fun mediaWireGeneration(protocolTrackId: String): Long {
+        val runtimeTrack = playbackStateReader.runtimeCacheSnapshot().track
+        return MediaWireGenerationPolicy.resolve(
+            protocolTrackId = protocolTrackId,
+            runtimeTrackId = runtimeTrack?.trackId,
+            runtimeGeneration = runtimeTrack?.currentTrackGeneration,
+            fallbackGeneration = reactiveMediaController.generation()
+        )
     }
 
     private fun sha256(bytes: ByteArray): String {

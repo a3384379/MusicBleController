@@ -45,7 +45,7 @@
 9. QRC 就绪回调会立即恢复 currentWord 边界调度；暂停时无周期任务，seek/恢复/切歌重新计算，最长 500ms 漂移校正。
 10. iOS 主界面显示等待 QQ QRC、歌词窗口、完整歌词、完成或明确失败；“重试歌词”只清理当前歌曲 cooldown/失败状态，并用 `GET_FULL_LYRICS forceRefresh=true` 触发兼容刷新。
 11. V4 预测候选只有在真实 Track Identity、稳定 mediaId/trackId 和 QRC fingerprint 全部复验后才能晋升；WEAK 历史候选永不晋升，失败立即走步骤 3 的冷路径。
-12. `mediaCacheValidationV1` 启用时，iOS cache v2 附带覆盖原文、逐字 timing、翻译和罗马音的 fingerprint/schema/行数，并在请求前用跨端固定向量算法复算本地正文。精确命中返回 `fullLyricsNotModified`，不重复发送 FullLyrics；任一字段或正文不一致、cache 损坏或旧 cache v1 都回退完整传输。新 descriptor 只随完整正文发布落盘，不能附着到旧正文。
+12. `mediaCacheValidationV1` 启用时，iOS cache v3 分别保存 Sony QRC 远端 fingerprint 与 iOS 实际落盘正文的 local fingerprint，并附带 schema/主歌词、翻译和罗马音行数。远端 fingerprint 用于 not-modified 协商，local fingerprint 用于精确检测本地损坏；二者不能互相替代。精确命中返回 `fullLyricsNotModified`，不重复发送 FullLyrics；任一字段或正文不一致、cache 损坏或旧 cache v1/v2 都回退一次完整传输并迁移。新 descriptor 只随完整正文发布落盘，不能附着到旧正文。
 
 ## 关键状态
 

@@ -39,6 +39,8 @@
 8. Sony PlayerAgent 本机播放器封面监听 QQ 音乐通知事件，并在 title/artist 精确匹配当前媒体后发布；切歌后的迟到图片由 generation+songKey 栅栏拒绝。
 9. V4 第三阶段先审计 MediaSession queue；有稳定 queueItemId/mediaId 时 Sony 才允许 CONFIRMED/STRONG 候选晋升。当前真机 QQ 音乐不暴露队列，因此只保留 WEAK 历史候选的本地 QRC 索引预热，不向控制端发送候选。
 10. 协商 `mediaCacheValidationV1` 后，iOS 对当前歌曲的精确 FullLyrics cache 发 fingerprint/schema/行数校验；命中时 Sony 跳过完整正文传输，CurrentLine/CurrentWord 仍正常增量发布。
+11. iOS cache v3 分离远端 QRC fingerprint 与本地持久化正文 fingerprint；媒体 TrackInfo、PlaybackState、歌词、CurrentWord、Preview/HQ 统一使用经过 identity 复核的 wire generation。
+12. 高频切歌与封面传输并发时，Sony 优先保留 command write response 窗口，并将封面 binary 最小 pacing 固定为 15ms；健康链路不会仅因歌曲 generation 变化显示“正在连接”。
 
 ## 关键状态
 

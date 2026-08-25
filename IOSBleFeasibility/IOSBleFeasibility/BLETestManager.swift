@@ -6590,7 +6590,11 @@ extension BLETestManager: CBPeripheralDelegate {
                 result: trackChanged ? "changed" : "refreshed"
             )
             isShowingLastNowPlayingSnapshot = false
-            if trackChanged {
+            // A restored LastNowPlayingSnapshot can make the first authoritative
+            // trackInfo look like a same-track refresh. The snapshot contains
+            // display lyrics but not the cache-validation descriptor, so load
+            // the exact cache entry whenever that descriptor source is absent.
+            if trackChanged || currentFullLyricsCacheEntry?.trackId != trackID {
                 restoreFullLyricsCacheIfAvailable(
                     trackID: trackID,
                     title: newTitle,
@@ -8243,11 +8247,20 @@ extension BLETestManager: CBPeripheralDelegate {
             return
         }
         let cachedLines = fullLyrics.map(Self.cacheLine(from:))
-        let descriptor = currentFullLyricsCacheDescriptor?.matchesCachedContent(
-            title: title,
-            artist: artist,
-            lines: cachedLines
-        ) == true ? currentFullLyricsCacheDescriptor : nil
+        // The remote QRC fingerprint covers Sony's complete word-timing model,
+        // while this transfer intentionally carries words only around the
+        // current line. Validate the transmitted shape here and persist a
+        // separate local checksum for corruption detection.
+        let descriptor = currentFullLyricsCacheDescriptor?.matchesCachedLines(cachedLines) == true
+            ? currentFullLyricsCacheDescriptor
+            : nil
+        let localContentFingerprint = descriptor.map { _ in
+            FullLyricsCacheEntry.localContentFingerprint(
+                title: title,
+                artist: artist,
+                lines: cachedLines
+            )
+        }
         let entry = FullLyricsCacheEntry(
             version: FullLyricsCacheEntry.version,
             trackId: currentTrackID,
@@ -8257,6 +8270,7 @@ extension BLETestManager: CBPeripheralDelegate {
             lines: cachedLines,
             savedAt: Date(),
             fingerprint: descriptor?.fingerprint,
+            localContentFingerprint: localContentFingerprint,
             schemaVersion: descriptor?.schemaVersion,
             expectedLineCount: descriptor?.lineCount,
             expectedTranslationLineCount: descriptor?.translationLineCount,

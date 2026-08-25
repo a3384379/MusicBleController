@@ -2,7 +2,8 @@ import CryptoKit
 import Foundation
 
 struct FullLyricsCacheEntry: Codable, Equatable {
-    static let version = 2
+    static let version = 3
+    static let validationMetadataVersion = 2
     static let legacyVersion = 1
     static let maximumAge: TimeInterval = 30 * 24 * 60 * 60
 
@@ -30,7 +31,12 @@ struct FullLyricsCacheEntry: Codable, Equatable {
     let album: String
     let lines: [Line]
     let savedAt: Date
+    /// Sony's stable QRC descriptor. It can cover word timing that is not part
+    /// of the bandwidth-limited iOS payload.
     let fingerprint: String?
+    /// Digest of the exact lines persisted on iOS, used only for local file
+    /// integrity. It must not be sent to Sony as the QRC fingerprint.
+    let localContentFingerprint: String?
     let schemaVersion: Int?
     let expectedLineCount: Int?
     let expectedTranslationLineCount: Int?
@@ -45,6 +51,7 @@ struct FullLyricsCacheEntry: Codable, Equatable {
         lines: [Line],
         savedAt: Date,
         fingerprint: String? = nil,
+        localContentFingerprint: String? = nil,
         schemaVersion: Int? = nil,
         expectedLineCount: Int? = nil,
         expectedTranslationLineCount: Int? = nil,
@@ -58,6 +65,7 @@ struct FullLyricsCacheEntry: Codable, Equatable {
         self.lines = lines
         self.savedAt = savedAt
         self.fingerprint = fingerprint
+        self.localContentFingerprint = localContentFingerprint
         self.schemaVersion = schemaVersion
         self.expectedLineCount = expectedLineCount
         self.expectedTranslationLineCount = expectedTranslationLineCount
@@ -65,7 +73,9 @@ struct FullLyricsCacheEntry: Codable, Equatable {
     }
 
     var isValid: Bool {
-        (version == Self.version || version == Self.legacyVersion) &&
+        (version == Self.version ||
+            version == Self.validationMetadataVersion ||
+            version == Self.legacyVersion) &&
             !trackId.isEmpty &&
             !normalized(title).isEmpty &&
             !lines.isEmpty &&
@@ -81,6 +91,8 @@ struct FullLyricsCacheEntry: Codable, Equatable {
         guard version == Self.version,
               let fingerprint,
               !fingerprint.isEmpty,
+              let localContentFingerprint,
+              !localContentFingerprint.isEmpty,
               let schemaVersion,
               let expectedLineCount,
               let expectedTranslationLineCount,
@@ -94,11 +106,27 @@ struct FullLyricsCacheEntry: Codable, Equatable {
             translationLineCount: expectedTranslationLineCount,
             romanizationLineCount: expectedRomanizationLineCount
         )
-        return descriptor.matchesCachedContent(
+        guard descriptor.matchesCachedLines(lines),
+              Self.localContentFingerprint(
+                title: title,
+                artist: artist,
+                lines: lines
+              ) == localContentFingerprint else {
+            return nil
+        }
+        return descriptor
+    }
+
+    static func localContentFingerprint(
+        title: String,
+        artist: String,
+        lines: [Line]
+    ) -> String {
+        FullLyricsCacheValidationDescriptor.contentFingerprint(
             title: title,
             artist: artist,
             lines: lines
-        ) ? descriptor : nil
+        )
     }
 
     private func normalized(_ value: String) -> String {
