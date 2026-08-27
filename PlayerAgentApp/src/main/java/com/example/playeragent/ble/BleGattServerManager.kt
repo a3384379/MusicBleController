@@ -463,7 +463,7 @@ class BleGattServerManager(
                 // artwork transfer can otherwise fill Sony's L2CAP hold queue and
                 // make sendResponse() look successful locally while iOS never gets
                 // its write callback.
-                notifyQueue.onCommandWriteReceived()
+                notifyQueue.onCommandWriteReceived(device?.address.orEmpty())
                 val responseStartMs = SystemClock.elapsedRealtime()
                 logger(
                     "[CTRL-Sony] sendResponse begin seq=$seq cmd=$command " +
@@ -481,7 +481,7 @@ class BleGattServerManager(
                         "costMs=${SystemClock.elapsedRealtime() - responseStartMs} ok=$ok"
                 )
                 if (ok) {
-                    notifyQueue.onCommandResponseSent()
+                    notifyQueue.onCommandResponseSent(device?.address.orEmpty())
                     recordCommandSuccess(command, device?.address)
                 }
             }
@@ -2176,6 +2176,7 @@ class BleGattServerManager(
         if (songChanged) {
             val oldSongKey = lastAutoPushSongKey.orEmpty()
             lastAutoPushSongKey = songKey
+            notifyQueue.onMediaGenerationChanged()
             currentWordPushEngine.reset()
             notifyQueue.cancelJobTypes(setOf("currentWord"), "track changed")
             logger("[SongChange] detected title=$title")

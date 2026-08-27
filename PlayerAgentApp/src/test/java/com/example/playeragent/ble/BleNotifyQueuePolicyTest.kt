@@ -99,6 +99,75 @@ class BleNotifyQueuePolicyTest {
     }
 
     @Test
+    fun commandResponseQuietWindowIsPerDeviceAndDoesNotExtendActiveBurst() {
+        val windows = CommandResponseQuietWindows(25L)
+
+        assertEquals(1_025L, windows.reserve("ios", 1_000L))
+        assertEquals(1_025L, windows.reserve("ios", 1_010L))
+        assertEquals(
+            15L,
+            windows.remainingDelayMs("ios", "albumArtBinaryChunk", 1_010L)
+        )
+        assertEquals(
+            0L,
+            windows.remainingDelayMs("android", "albumArtBinaryChunk", 1_010L)
+        )
+        assertEquals(1_050L, windows.reserve("ios", 1_025L))
+    }
+
+    @Test
+    fun commandResponseQuietWindowNeverDelaysRealtimeState() {
+        val windows = CommandResponseQuietWindows(25L)
+        windows.reserve("ios", 1_000L)
+
+        listOf(
+            "trackInfo",
+            "trackInfoChunk",
+            "playbackState",
+            "currentWord",
+            "lyricWindowChunk"
+        ).forEach {
+            assertEquals(0L, windows.remainingDelayMs("ios", it, 1_010L))
+        }
+        listOf(
+            "albumArtBinaryChunk",
+            "albumArtChunk",
+            "fullLyricsBinaryChunk",
+            "fullLyricsChunk",
+            "lyricSecondaryPart",
+            "logChunk",
+            "mediaFieldDumpChunk",
+            "historyPayloadChunk"
+        ).forEach {
+            assertTrue(BleNotifyQueue.isCommandResponseSensitivePacket(it))
+            assertEquals(15L, windows.remainingDelayMs("ios", it, 1_010L))
+        }
+    }
+
+    @Test
+    fun commandResponseQuietWindowClearsPerDeviceAndGlobally() {
+        val windows = CommandResponseQuietWindows(25L)
+        windows.reserve("ios", 1_000L)
+        windows.reserve("android", 1_000L)
+
+        windows.remove("ios")
+        assertEquals(
+            0L,
+            windows.remainingDelayMs("ios", "albumArtBinaryChunk", 1_010L)
+        )
+        assertEquals(
+            15L,
+            windows.remainingDelayMs("android", "albumArtBinaryChunk", 1_010L)
+        )
+
+        windows.clear()
+        assertEquals(
+            0L,
+            windows.remainingDelayMs("android", "albumArtBinaryChunk", 1_010L)
+        )
+    }
+
+    @Test
     fun everyLongTransferChecksRealtimePacketsAfterEachChunk() {
         listOf(
             "albumArt",

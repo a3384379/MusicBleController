@@ -34,6 +34,48 @@ internal class BleQueueTerminalCallbackGate {
     }
 }
 
+internal class CommandResponseQuietWindows(
+    private val quietWindowMs: Long
+) {
+    private val quietUntilMsByAddress = LinkedHashMap<String, Long>()
+
+    /** Keep the first deadline so a command burst cannot extend the window forever. */
+    fun reserve(deviceAddress: String, nowMs: Long): Long {
+        if (deviceAddress.isBlank()) return 0L
+        val existing = quietUntilMsByAddress[deviceAddress]
+        if (existing != null && existing > nowMs) {
+            return existing
+        }
+        return (nowMs + quietWindowMs).also {
+            quietUntilMsByAddress[deviceAddress] = it
+        }
+    }
+
+    fun remainingDelayMs(
+        deviceAddress: String,
+        packetType: String,
+        nowMs: Long
+    ): Long {
+        if (!BleNotifyQueue.isCommandResponseSensitivePacket(packetType)) {
+            return 0L
+        }
+        val quietUntilMs = quietUntilMsByAddress[deviceAddress] ?: return 0L
+        if (quietUntilMs <= nowMs) {
+            quietUntilMsByAddress.remove(deviceAddress)
+            return 0L
+        }
+        return quietUntilMs - nowMs
+    }
+
+    fun remove(deviceAddress: String) {
+        quietUntilMsByAddress.remove(deviceAddress)
+    }
+
+    fun clear() {
+        quietUntilMsByAddress.clear()
+    }
+}
+
 class BleNotifyQueue(
     private val serverProvider: () -> BluetoothGattServer?,
     private val characteristicProvider: () -> BluetoothGattCharacteristic?,
@@ -69,7 +111,8 @@ class BleNotifyQueue(
     private var notifyTimeoutRunnable: Runnable? = null
     private var drainingCancelledCallback = false
     private var cancelledCallbackDrainRunnable: Runnable? = null
-    private var commandResponseQuietUntilMs = 0L
+    private val commandResponseQuietWindows =
+        CommandResponseQuietWindows(COMMAND_RESPONSE_QUIET_MS)
     private var activeNotifyStartedAtMs = 0L
     private var activeNotifyDeviceAddress: String? = null
     private var activeNotifyPacketType: String? = null
@@ -81,6 +124,7 @@ class BleNotifyQueue(
     @Synchronized
     private fun resetLinkProfileOnQueue(address: String, mtu: Int) {
         if (address.isBlank()) return
+        commandResponseQuietWindows.remove(address)
         linkProfiles[address] = BleLinkProfile(mtu)
         localOnlyLogger("[BleLink] reset device=$address mtu=$mtu")
     }
@@ -124,27 +168,30 @@ class BleNotifyQueue(
      * iOS client never receives its write callback during a dense album-art transfer.
      */
     @Synchronized
-    fun onCommandWriteReceived() {
-        reserveCommandResponseWindow(SystemClock.elapsedRealtime())
-    }
-
-    fun onCommandResponseSent() {
-        runOnQueueThread { onCommandResponseSentOnQueue() }
+    fun onCommandWriteReceived(deviceAddress: String) {
+        reserveCommandResponseWindow(deviceAddress, SystemClock.elapsedRealtime())
     }
 
     @Synchronized
-    private fun onCommandResponseSentOnQueue() {
-        reserveCommandResponseWindow(SystemClock.elapsedRealtime())
+    fun onCommandResponseSent(deviceAddress: String) {
+        reserveCommandResponseWindow(deviceAddress, SystemClock.elapsedRealtime())
     }
 
-    private fun reserveCommandResponseWindow(nowMs: Long) {
-        commandResponseQuietUntilMs = maxOf(
-            commandResponseQuietUntilMs,
-            nowMs + COMMAND_RESPONSE_QUIET_MS
-        )
+    private fun reserveCommandResponseWindow(deviceAddress: String, nowMs: Long) {
+        if (deviceAddress.isBlank()) return
+        val quietUntilMs = commandResponseQuietWindows.reserve(deviceAddress, nowMs)
         if (!notificationInFlight && !drainingCancelledCallback) {
-            handler.postDelayed({ sendNextPacket() }, COMMAND_RESPONSE_QUIET_MS)
+            handler.postDelayed(
+                { sendNextPacket() },
+                (quietUntilMs - nowMs).coerceAtLeast(0L)
+            )
         }
+    }
+
+    @Synchronized
+    fun onMediaGenerationChanged() {
+        commandResponseQuietWindows.clear()
+        handler.post { sendNextPacket() }
     }
 
     fun enqueueLongJob(
@@ -390,6 +437,7 @@ class BleNotifyQueue(
         val removedJobs = jobs.filter { it.device.address == address }
         jobs.removeAll { it.device.address == address }
         latestInterleavedPackets.entries.removeAll { it.value.device.address == address }
+        commandResponseQuietWindows.remove(address)
         linkProfiles.remove(address)
         lastServedDeviceByPriority.entries.removeAll { it.value == address }
         val activeDeviceRemoved = activeJob?.device?.address == address ||
@@ -436,7 +484,7 @@ class BleNotifyQueue(
         activePacketIndex = 0
         activeJobStartedAtMs = 0L
         notificationInFlight = false
-        commandResponseQuietUntilMs = 0L
+        commandResponseQuietWindows.clear()
         activeRequestType = null
         activeRequestId += 1
         clearActiveNotifyMetrics()
@@ -464,7 +512,7 @@ class BleNotifyQueue(
         activeJob = null
         activePacketIndex = 0
         notificationInFlight = false
-        commandResponseQuietUntilMs = 0L
+        commandResponseQuietWindows.clear()
         activeRequestType = null
         activeRequestId += 1
         clearActiveNotifyMetrics()
@@ -522,41 +570,9 @@ class BleNotifyQueue(
         if (notificationInFlight || drainingCancelledCallback) {
             return
         }
-        val quietDelayMs = remainingQuietDelayMs(
-            commandResponseQuietUntilMs,
-            SystemClock.elapsedRealtime()
-        )
-        if (quietDelayMs > 0L) {
-            handler.postDelayed({ sendNextPacket() }, quietDelayMs)
-            return
-        }
 
         if (activeJob == null) {
-            activeJob = pollNextJob() ?: return
-            activePacketIndex = activeJob?.nextPacketIndex ?: 0
-            activeJobStartedAtMs = activeJob?.startedAtMs
-                ?.takeIf { it > 0L }
-                ?: SystemClock.elapsedRealtime()
-            activeJob?.startedAtMs = activeJobStartedAtMs
-            activeJob?.let { selected ->
-                RealtimeTrace.record(
-                    stage = "notifyDequeued",
-                    payloadType = selected.type,
-                    queueWaitMs = (SystemClock.elapsedRealtime() - selected.enqueuedAtMs)
-                        .coerceAtLeast(0L),
-                    chunkIndex = selected.nextPacketIndex,
-                    chunkCount = selected.packets.size,
-                    result = "selected"
-                )
-            }
-            activeJob?.takeIf { it.isLongJob }?.let {
-                if (LogConfig.DEBUG_VERBOSE_LOG) {
-                    verboseLogger(
-                        "[BleNotifyQueue] job start " +
-                            "type=${it.type} chunks=${it.chunkCount}"
-                    )
-                }
-            }
+            activateJob(pollNextJob() ?: return)
         }
 
         var job = activeJob ?: return
@@ -575,22 +591,8 @@ class BleNotifyQueue(
             activeJob = null
             activePacketIndex = 0
             activeJobStartedAtMs = 0L
-            activeJob = pollNextJob() ?: return
+            activateJob(pollNextJob() ?: return)
             job = activeJob ?: return
-            activePacketIndex = job.nextPacketIndex
-            activeJobStartedAtMs = job.startedAtMs
-                .takeIf { it > 0L }
-                ?: SystemClock.elapsedRealtime()
-            job.startedAtMs = activeJobStartedAtMs
-            RealtimeTrace.record(
-                stage = "notifyDequeued",
-                payloadType = job.type,
-                queueWaitMs = (SystemClock.elapsedRealtime() - job.enqueuedAtMs)
-                    .coerceAtLeast(0L),
-                chunkIndex = job.nextPacketIndex,
-                chunkCount = job.packets.size,
-                result = "selected"
-            )
         }
         if (job.shouldCancel?.invoke() == true) {
             RealtimeTrace.record(
@@ -715,6 +717,37 @@ class BleNotifyQueue(
         }
 
         val packet = job.packets[activePacketIndex]
+        val nowMs = SystemClock.elapsedRealtime()
+        val quietDelayMs = commandResponseQuietWindows.remainingDelayMs(
+            deviceAddress = job.device.address,
+            packetType = packet.type,
+            nowMs = nowMs
+        )
+        if (quietDelayMs > 0L) {
+            // Keep this packet queued, but continue draining realtime state or
+            // another controller whose response window is unrelated.
+            job.nextPacketIndex = activePacketIndex
+            jobs.addFirst(job)
+            activeJob = null
+            activePacketIndex = 0
+            activeJobStartedAtMs = 0L
+            val runnable = pollNextJob { candidate ->
+                val candidatePacket = candidate.packets.getOrNull(candidate.nextPacketIndex)
+                candidatePacket == null ||
+                    commandResponseQuietWindows.remainingDelayMs(
+                        deviceAddress = candidate.device.address,
+                        packetType = candidatePacket.type,
+                        nowMs = nowMs
+                    ) == 0L
+            }
+            if (runnable != null) {
+                activateJob(runnable)
+                handler.post { sendNextPacket() }
+            } else {
+                handler.postDelayed({ sendNextPacket() }, quietDelayMs)
+            }
+            return
+        }
         val server = serverProvider()
         val characteristic = characteristicProvider()
         if (server == null || characteristic == null) {
@@ -1002,13 +1035,40 @@ class BleNotifyQueue(
         handler.post { onNotifyFailure(deviceAddress, type, status, reason) }
     }
 
-    private fun pollNextJob(): SendJob? {
-        val priority = jobs.minOfOrNull { it.priority.rank } ?: return null
+    private fun activateJob(selected: SendJob) {
+        activeJob = selected
+        activePacketIndex = selected.nextPacketIndex
+        activeJobStartedAtMs = selected.startedAtMs
+            .takeIf { it > 0L }
+            ?: SystemClock.elapsedRealtime()
+        selected.startedAtMs = activeJobStartedAtMs
+        RealtimeTrace.record(
+            stage = "notifyDequeued",
+            payloadType = selected.type,
+            queueWaitMs = (SystemClock.elapsedRealtime() - selected.enqueuedAtMs)
+                .coerceAtLeast(0L),
+            chunkIndex = selected.nextPacketIndex,
+            chunkCount = selected.packets.size,
+            result = "selected"
+        )
+        if (selected.isLongJob && LogConfig.DEBUG_VERBOSE_LOG) {
+            verboseLogger(
+                "[BleNotifyQueue] job start " +
+                    "type=${selected.type} chunks=${selected.chunkCount}"
+            )
+        }
+    }
+
+    private fun pollNextJob(
+        eligible: (SendJob) -> Boolean = { true }
+    ): SendJob? {
+        val candidates = jobs.filter(eligible)
+        val priority = candidates.minOfOrNull { it.priority.rank } ?: return null
         val priorityValue = Priority.entries.first { it.rank == priority }
         val previousAddress = lastServedDeviceByPriority[priorityValue]
-        val selected = jobs.firstOrNull {
+        val selected = candidates.firstOrNull {
             it.priority.rank == priority && it.device.address != previousAddress
-        } ?: jobs.firstOrNull { it.priority.rank == priority } ?: return null
+        } ?: candidates.firstOrNull { it.priority.rank == priority } ?: return null
         jobs.remove(selected)
         lastServedDeviceByPriority[priorityValue] = selected.device.address
         return selected
@@ -1290,6 +1350,16 @@ class BleNotifyQueue(
             "volumeState",
             "albumArtOffer"
         )
+        private val COMMAND_RESPONSE_SENSITIVE_PACKET_TYPES = setOf(
+            "albumArtBinaryChunk",
+            "albumArtChunk",
+            "fullLyricsBinaryChunk",
+            "fullLyricsChunk",
+            "lyricSecondaryPart",
+            "logChunk",
+            "mediaFieldDumpChunk",
+            "historyPayloadChunk"
+        )
 
         fun priorityFor(type: String): Priority {
             return when (type) {
@@ -1322,6 +1392,10 @@ class BleNotifyQueue(
 
         internal fun remainingQuietDelayMs(quietUntilMs: Long, nowMs: Long): Long {
             return (quietUntilMs - nowMs).coerceAtLeast(0L)
+        }
+
+        internal fun isCommandResponseSensitivePacket(type: String): Boolean {
+            return type in COMMAND_RESPONSE_SENSITIVE_PACKET_TYPES
         }
 
         internal fun realtimeInterleaveIntervalFor(jobType: String): Int {
