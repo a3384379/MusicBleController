@@ -357,19 +357,6 @@ stage_counts = data.get("stageCounts", {})
 mode = sys.argv[2]
 requested_runs = int(sys.argv[3])
 fast_switch = sys.argv[4].lower() == "true"
-control_attempt_count = len(re.findall(
-    r"\[RealtimeTrace\][^\n]*\bside=sony\b[^\n]*\bstage=commandReceived\b"
-    r"[^\n]*\bcommandType=(?:NEXT|PREVIOUS)\b",
-    sony_text,
-))
-observed_transition_count = stage_counts.get("mediaSessionTrackChanged", 0)
-sample_count = (
-    control_attempt_count
-    if fast_switch
-    else observed_transition_count
-    if mode == "auto"
-    else stage_counts.get("commandIntent", 0)
-)
 trigger_override = {
     "auto": "SONY_MEDIA_SESSION_NEXT",
     "natural": "NATURAL_AUTOPLAY",
@@ -377,6 +364,32 @@ trigger_override = {
 if trigger_override:
     for sample in data.get("samples", []):
         sample["triggerType"] = trigger_override
+control_attempt_count = len(re.findall(
+    r"\[RealtimeTrace\][^\n]*\bside=sony\b[^\n]*\bstage=commandReceived\b"
+    r"[^\n]*\bcommandType=(?:NEXT|PREVIOUS)\b",
+    sony_text,
+))
+observed_transition_count = stage_counts.get("mediaSessionTrackChanged", 0)
+expected_triggers = {
+    "next": {"IOS_NEXT"},
+    "previous": {"IOS_PREVIOUS"},
+    "fast": {"IOS_NEXT", "IOS_PREVIOUS"},
+    "auto": {"SONY_MEDIA_SESSION_NEXT"},
+    "natural": {"NATURAL_AUTOPLAY"},
+}.get(mode, set())
+eligible_samples = [
+    sample for sample in data.get("samples", [])
+    if sample.get("triggerType") in expected_triggers
+]
+sample_count = sum(
+    "COMPLETE" in sample.get("classifications", [])
+    for sample in eligible_samples
+)
+track_change_count = sum(
+    "NO_TRACK_CHANGE" not in sample.get("classifications", [])
+    and "COMMAND_ONLY" not in sample.get("classifications", [])
+    for sample in eligible_samples
+)
 complete = data.get("eventCount", 0) > 0 and sample_count >= requested_runs
 data.update({
     "result": "PASS" if complete else "FAIL",
@@ -396,6 +409,7 @@ data.update({
         "clockSyncTrusted": data.get("clock", {}).get("crossDeviceTrusted", False),
         "clockSyncSampleCount": int(clock_matches[-1][0]) if clock_matches else 0,
         "sampleCount": sample_count,
+        "trackChangeSampleCount": track_change_count,
         "controlAttemptCount": control_attempt_count,
         "observedTransitionCount": observed_transition_count,
         "cacheState": {
