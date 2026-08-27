@@ -2085,6 +2085,64 @@ final class PerformanceStabilityTests: XCTestCase {
         XCTAssertFalse(lines[0].contains("bytes="))
     }
 
+    func testRealtimeHandoffCorrelatesCommandAndTrackWithoutProtocolFields() {
+        var correlation = RealtimeHandoffCorrelation()
+        let command = correlation.registerCommand(
+            sequence: 9,
+            command: "NEXT",
+            monoMs: 100
+        )
+        let accepted = correlation.acceptTrack(
+            trackId: "track-a",
+            generation: 4,
+            monoMs: 140
+        )
+
+        XCTAssertEqual(command?.handoffId, "command-9")
+        XCTAssertEqual(accepted.handoffId, "command-9")
+        XCTAssertEqual(accepted.triggerType, .iosNext)
+        XCTAssertEqual(correlation.context(for: "track-a"), accepted)
+        XCTAssertNil(correlation.context(for: "track-b"))
+    }
+
+    func testRealtimeHandoffExpiresPendingCommand() {
+        var correlation = RealtimeHandoffCorrelation()
+        _ = correlation.registerCommand(sequence: 2, command: "PREVIOUS", monoMs: 10)
+
+        let accepted = correlation.acceptTrack(
+            trackId: "track-b",
+            generation: 5,
+            monoMs: 20_000
+        )
+
+        XCTAssertEqual(accepted.triggerType, .unknown)
+        XCTAssertNotEqual(accepted.handoffId, "command-2")
+    }
+
+    func testCurrentWordOrderingDecisionClassifiesRejectReasons() {
+        var fence = CurrentWordOrderingFence()
+        XCTAssertEqual(
+            fence.decision(generation: 2, sequence: 2, positionMs: 2_000),
+            .accept
+        )
+        XCTAssertEqual(
+            fence.decision(generation: 2, sequence: 2, positionMs: 2_000),
+            .duplicate
+        )
+        XCTAssertEqual(
+            fence.decision(generation: 1, sequence: 3, positionMs: 2_100),
+            .generationMismatch
+        )
+        XCTAssertEqual(
+            fence.decision(generation: 2, sequence: 1, positionMs: 2_100),
+            .sequenceOld
+        )
+        XCTAssertEqual(
+            fence.decision(generation: 2, sequence: 3, positionMs: 1_900),
+            .positionStale
+        )
+    }
+
     func testRealtimePercentilesAndUntrustedClockPolicy() {
         let values: [Int64] = [10, 20, 30, 40, 50]
         let p50 = try? XCTUnwrap(

@@ -3,6 +3,9 @@ package com.example.playeragent.media
 import android.content.Context
 import android.os.Environment
 import android.os.PowerManager
+import android.os.SystemClock
+import com.example.playeragent.diagnostics.RealtimeTrace
+import com.example.playeragent.diagnostics.TrackHandoffTraceCoordinator
 import com.example.playeragent.logging.LogConfig
 import java.io.File
 import java.nio.charset.Charset
@@ -273,6 +276,13 @@ class LyricManager(
         reason: String = "playback state"
     ) {
         val key = lyricKey(title, artist, album)
+        realtimeLyricTrace(
+            stage = "lyricLookupRequested",
+            trackId = trackId,
+            result = "requested",
+            positionAnchorMs = positionMs,
+            cacheSource = "UNRESOLVED"
+        )
         if (trackId.isNotBlank()) {
             TrackCapabilityTracker.onLyricLookupStart(key, trackId)
         }
@@ -289,6 +299,13 @@ class LyricManager(
             if (positionMs > 0L) {
                 activePositionMs = positionMs
             }
+            realtimeLyricTrace(
+                stage = "lyricRuntimeCacheHit",
+                trackId = trackId.ifBlank { activeTrackId },
+                result = "hit",
+                positionAnchorMs = positionMs,
+                cacheSource = "RUNTIME"
+            )
             return
         }
         if (!force &&
@@ -408,6 +425,20 @@ class LyricManager(
         )
         lastAttemptAtMs = System.currentTimeMillis()
         lyricsReadyState = LyricsReadyState.PARSING
+        realtimeLyricTrace(
+            stage = "lyricLookupStart",
+            trackId = pendingRequest?.trackId.orEmpty(),
+            result = "started",
+            positionAnchorMs = pendingRequest?.positionMs,
+            cacheSource = "UNRESOLVED"
+        )
+        realtimeLyricTrace(
+            stage = "lyricLoadStart",
+            trackId = pendingRequest?.trackId.orEmpty(),
+            result = "started",
+            positionAnchorMs = pendingRequest?.positionMs,
+            cacheSource = "UNRESOLVED"
+        )
         logger("[LyricAsync] scheduled songKey=$key reason=$reason force=$force")
             logger("[LyricsFastPath] lookup start songKey=$key reason=$reason")
             TrackCapabilityTracker.onLyricLookupStart(key, trackId)
@@ -995,6 +1026,18 @@ class LyricManager(
                 lyricSource = result.source.name,
                 logger = logger
             )
+            realtimeLyricTrace(
+                stage = "lyricReady",
+                trackId = request.trackId.ifBlank { activeTrackId },
+                result = "ready",
+                positionAnchorMs = request.positionMs,
+                wordTimingStatus = if (result.lines.any { it.words.isNotEmpty() }) {
+                    "AVAILABLE"
+                } else {
+                    "LINE_ONLY"
+                },
+                cacheSource = result.source.name
+            )
             trace(
                 request.traceId,
                 "runtimeApplyEnd",
@@ -1072,6 +1115,14 @@ class LyricManager(
                     "reason=$retryableFailureReason state=${lyricsReadyState.name}"
             )
             onLyricsReady(lyricsReadyGateSnapshotLocked())
+            realtimeLyricTrace(
+                stage = "lyricReady",
+                trackId = request.trackId.ifBlank { activeTrackId },
+                result = "not_ready",
+                positionAnchorMs = request.positionMs,
+                cacheSource = result.source.name,
+                failureReason = classifyLyricFailure(retryableFailureReason)
+            )
         } else {
             lyricsReadyState = LyricsReadyState.FAILED
             finalEmptySongKey = request.key
@@ -1101,6 +1152,14 @@ class LyricManager(
                     "reason=$finalEmptyReason state=${lyricsReadyState.name}"
             )
             onLyricsReady(lyricsReadyGateSnapshotLocked())
+            realtimeLyricTrace(
+                stage = "lyricReady",
+                trackId = request.trackId.ifBlank { activeTrackId },
+                result = "not_ready",
+                positionAnchorMs = request.positionMs,
+                cacheSource = result.source.name,
+                failureReason = classifyLyricFailure(finalEmptyReason)
+            )
         }
         lastLoggedLine = null
     }
@@ -1139,6 +1198,18 @@ class LyricManager(
                 )
             }
             val costMs = System.currentTimeMillis() - parsedCacheStartedAt
+            realtimeLyricTrace(
+                stage = "lyricParsedCacheHit",
+                trackId = request.trackId,
+                result = "hit",
+                positionAnchorMs = request.positionMs,
+                wordTimingStatus = if (qrcLines.any { it.words.isNotEmpty() }) {
+                    "AVAILABLE"
+                } else {
+                    "LINE_ONLY"
+                },
+                cacheSource = "QRC_PARSED_DISK"
+            )
             trace(
                 request.traceId,
                 "parseOptimizationCacheHit",
@@ -1189,6 +1260,14 @@ class LyricManager(
             request.traceId,
             "parseOptimizationCacheMiss",
             "source=qrc_parsed_fast costMs=${System.currentTimeMillis() - parsedCacheStartedAt}"
+        )
+        realtimeLyricTrace(
+            stage = "lyricParsedCacheMiss",
+            trackId = request.trackId,
+            result = "miss",
+            positionAnchorMs = request.positionMs,
+            cacheSource = "QRC_PARSED_DISK",
+            failureReason = "EXACT_CACHE_MISS"
         )
         val lrcStartedAt = System.currentTimeMillis()
         if (applyScannedCacheIfAvailable(title, artist)) {
@@ -1369,6 +1448,14 @@ class LyricManager(
         }
         parsedCacheGet(request)?.let { cached ->
             val costMs = System.currentTimeMillis() - totalStartedAt
+            realtimeLyricTrace(
+                stage = "lyricParsedCacheHit",
+                trackId = request.trackId,
+                result = "hit",
+                positionAnchorMs = request.positionMs,
+                wordTimingStatus = if (cached.hasWordTiming) "AVAILABLE" else "LINE_ONLY",
+                cacheSource = "PARSED"
+            )
             trace(
                 request.traceId,
                 "parsedCache",
@@ -1438,6 +1525,14 @@ class LyricManager(
             return cached.result
         }
         trace(request.traceId, "parsedCache", "result=miss")
+        realtimeLyricTrace(
+            stage = "lyricParsedCacheMiss",
+            trackId = request.trackId,
+            result = "miss",
+            positionAnchorMs = request.positionMs,
+            cacheSource = "PARSED",
+            failureReason = "EXACT_CACHE_MISS"
+        )
 
         val lookupStartedAt = System.currentTimeMillis()
         logger("[LyricsState] parse start trackId=${request.trackId} songKey=${request.key}")
@@ -1673,6 +1768,55 @@ class LyricManager(
         LyricTraceLogger.legacy(id, stage, detail, logger)
     }
 
+    private fun realtimeLyricTrace(
+        stage: String,
+        trackId: String,
+        result: String,
+        positionAnchorMs: Long? = null,
+        lineIndex: Int? = null,
+        wordTimingStatus: String? = null,
+        cacheSource: String? = null,
+        failureReason: String? = null
+    ) {
+        val safeTrackId = trackId.ifBlank { activeTrackId }
+        val identity = CurrentTrackRuntimeCache.traceIdentitySnapshot()
+        val generation = identity
+            ?.takeIf { it.first == safeTrackId }
+            ?.second
+        val handoff = TrackHandoffTraceCoordinator.contextFor(safeTrackId)
+        RealtimeTrace.record(
+            stage = stage,
+            monoMs = SystemClock.elapsedRealtime(),
+            trackId = safeTrackId.takeIf { it.isNotBlank() },
+            generation = generation,
+            payloadType = "lyrics",
+            result = result,
+            reason = failureReason,
+            handoffId = handoff?.handoffId,
+            triggerType = handoff?.triggerType?.name,
+            positionAnchorMs = positionAnchorMs,
+            lineIndex = lineIndex,
+            wordTimingStatus = wordTimingStatus,
+            cacheSource = cacheSource,
+            failureReason = failureReason
+        )
+    }
+
+    private fun classifyLyricFailure(reason: String): String {
+        val normalized = reason.lowercase(Locale.ROOT)
+        return when {
+            normalized.contains("waiting qqmusic") -> "WAITING_QQMUSIC_CACHE"
+            normalized.contains("identity") -> "TRACK_IDENTITY_INCOMPLETE"
+            normalized.contains("parsed") && normalized.contains("invalid") ->
+                "PARSED_CACHE_INVALID"
+            normalized.contains("generation") -> "GENERATION_MISMATCH"
+            normalized.contains("track") && normalized.contains("mismatch") -> "TRACK_MISMATCH"
+            normalized.contains("stale") -> "STALE_PACKET"
+            normalized.contains("qrc") || normalized.contains("lyric") -> "NO_QRC_FILE"
+            else -> "UNKNOWN"
+        }
+    }
+
     private fun staleLyricResult(): LyricLoadResult {
         return LyricLoadResult(
             lines = emptyList(),
@@ -1758,6 +1902,21 @@ class LyricManager(
             }
             if (currentLine.isNotBlank()) {
                 logger("[LyricAsync] current lyric updated")
+                realtimeLyricTrace(
+                    stage = "lyricCurrentLineSelected",
+                    trackId = activeTrackId,
+                    result = "selected",
+                    positionAnchorMs = safePosition,
+                    lineIndex = currentIndex,
+                    wordTimingStatus = if (
+                        lines.getOrNull(currentIndex)?.words?.isNotEmpty() == true
+                    ) {
+                        "AVAILABLE"
+                    } else {
+                        "LINE_ONLY"
+                    },
+                    cacheSource = lastSource.name
+                )
             }
             lastLoggedLine = currentLine
         }
@@ -1990,7 +2149,16 @@ class LyricManager(
             songKey = activeKey,
             generation = CurrentTrackRuntimeCache.currentGeneration(),
             lineCount = if (linesReady) cachedLines.size else 0,
-            reason = if (linesReady) "" else currentUnavailableReason()
+            reason = if (linesReady) "" else currentUnavailableReason(),
+            wordTimingStatus = when {
+                !linesReady -> "NOT_READY"
+                cachedLines.any { it.words.isNotEmpty() } -> "AVAILABLE"
+                else -> "LINE_ONLY"
+            },
+            cacheSource = lastSource.name,
+            failureReason = if (linesReady) "" else {
+                classifyLyricFailure(currentUnavailableReason())
+            }
         )
     }
 

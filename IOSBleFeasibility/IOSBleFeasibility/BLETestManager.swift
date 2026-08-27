@@ -430,6 +430,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private var sonyCommandCharacteristic: CBCharacteristic?
     private var sonyStatusCharacteristic: CBCharacteristic?
     private var commandSeq: UInt64 = 0
+    private var realtimeHandoffCorrelation = RealtimeHandoffCorrelation()
     private var commandWriteInflight: [CommandWriteInfo] = []
     private var pendingCommandWrites: [PendingCommandWrite] = []
     private var commandWriteTimeoutWorkItem: DispatchWorkItem?
@@ -1166,7 +1167,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
                 "mode=\(mode) fastSwitch=\(fastSwitch) " +
                 "protocolVersion=\(serverProtocolVersion) mtu=\(negotiatedMTU)"
         )
-        if mode == "auto" {
+        if mode == "auto" || mode == "natural" {
             log("[RealtimeV4] observing Sony-local track changes runId=\(runID)")
             realtimeV4Active = false
             return
@@ -1176,7 +1177,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
             runID: runID,
             runs: runs,
             mode: mode,
-            interval: fastSwitch ? 0.65 : 3.0
+            interval: fastSwitch ? 0.65 : 4.0
         )
     }
 
@@ -2429,11 +2430,20 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
 
     private func sendUserCommand(cmd: String, extra: [String: Any] = [:]) {
         let seq = nextCommandSeq()
+        let intentMonoMs = monotonicTimeMs()
+        let handoff = realtimeHandoffCorrelation.registerCommand(
+            sequence: Int64(seq),
+            command: cmd,
+            monoMs: intentMonoMs
+        )
         RealtimeTraceStore.shared.record(
             stage: "commandIntent",
+            monoMs: intentMonoMs,
             commandSeq: Int64(seq),
             commandType: cmd,
-            result: "accepted"
+            result: "accepted",
+            handoffId: handoff?.handoffId,
+            triggerType: handoff?.triggerType.rawValue
         )
         ctrlLog("[CTRL-iOS] tap seq=\(seq) cmd=\(cmd) uiTimeMs=\(currentTimeMs())")
         sendCommand(cmd: cmd, extra: extra, seq: seq)
@@ -2521,12 +2531,15 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         } else {
             pendingCommandWrites.append(request)
         }
+        let handoff = realtimeHandoffCorrelation.commandContext(sequence: Int64(request.seq))
         RealtimeTraceStore.shared.record(
             stage: "commandEnqueued",
             commandSeq: Int64(request.seq),
             commandType: request.cmd,
             queueWaitMs: 0,
-            result: "queued"
+            result: "queued",
+            handoffId: handoff?.handoffId,
+            triggerType: handoff?.triggerType.rawValue
         )
         if !commandWriteInflight.isEmpty {
             ctrlLog(
@@ -2564,13 +2577,16 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
                 writeCalledMonoMs: writeBeginMonoMs
             )
         )
+        let handoff = realtimeHandoffCorrelation.commandContext(sequence: Int64(request.seq))
         RealtimeTraceStore.shared.record(
             stage: "commandWriteStart",
             monoMs: writeBeginMonoMs,
             commandSeq: Int64(request.seq),
             commandType: request.cmd,
             queueWaitMs: max(writeBeginMonoMs - request.enqueuedMonoMs, 0),
-            result: "started"
+            result: "started",
+            handoffId: handoff?.handoffId,
+            triggerType: handoff?.triggerType.rawValue
         )
         if request.cmd == "SET_VOLUME" {
             volumeWriteInFlightSeq = request.seq
@@ -4229,6 +4245,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         coreBluetoothRestoreInProgress = false
         commandWriteInflight.removeAll()
         pendingCommandWrites.removeAll()
+        realtimeHandoffCorrelation.reset()
         liveActivityControlInFlightSeq = nil
         liveActivityControlWriteStartedAtMs = 0
         clearPendingVolume()
@@ -5343,6 +5360,9 @@ extension BLETestManager: CBPeripheralDelegate {
         let didWriteMonoMs = monotonicTimeMs()
         if let completed {
             let costMs = didWriteMs - completed.writeCalledAtMs
+            let handoff = realtimeHandoffCorrelation.commandContext(
+                sequence: Int64(completed.seq)
+            )
             RealtimeTraceStore.shared.record(
                 stage: "commandWriteCallback",
                 monoMs: didWriteMonoMs,
@@ -5350,7 +5370,9 @@ extension BLETestManager: CBPeripheralDelegate {
                 commandType: completed.cmd,
                 processingMs: max(didWriteMonoMs - completed.writeCalledMonoMs, 0),
                 result: error == nil ? "success" : "failure",
-                reason: error == nil ? nil : "core_bluetooth_error"
+                reason: error == nil ? nil : "core_bluetooth_error",
+                handoffId: handoff?.handoffId,
+                triggerType: handoff?.triggerType.rawValue
             )
             let errorText = error?.localizedDescription ?? "nil"
             ctrlLog(
@@ -5570,6 +5592,10 @@ extension BLETestManager: CBPeripheralDelegate {
             log("[Status] empty notify")
             return
         }
+        let notifyReceivedMonoMs = monotonicTimeMs()
+        let pendingHandoff = realtimeHandoffCorrelation.contextForInbound(
+            monoMs: notifyReceivedMonoMs
+        )
         if data.first != 0xA1, data.first != 0xA2 {
             RealtimeTraceStore.shared.record(
                 stage: "statusNotifyReceived",
@@ -5611,6 +5637,18 @@ extension BLETestManager: CBPeripheralDelegate {
             let text = String(data: data, encoding: .utf8)
             AppPerformanceLog.protocolSignposter.endInterval("Status JSON Decode", decodeState)
             let decodeEndedMonoMs = self.monotonicTimeMs()
+            if type == "playbackState" {
+                RealtimeTraceStore.shared.record(
+                    stage: "playbackNotifyReceived",
+                    monoMs: notifyReceivedMonoMs,
+                    trackId: pendingHandoff?.trackId,
+                    generation: pendingHandoff?.generation,
+                    payloadType: "playbackState",
+                    result: "received",
+                    handoffId: pendingHandoff?.handoffId,
+                    triggerType: pendingHandoff?.triggerType.rawValue
+                )
+            }
             RealtimeTraceStore.shared.record(
                 stage: "playbackDecodeEnd",
                 monoMs: decodeEndedMonoMs,
@@ -5619,7 +5657,9 @@ extension BLETestManager: CBPeripheralDelegate {
                 payloadType: type ?? "invalidJSON",
                 processingMs: max(decodeEndedMonoMs - decodeStartedMonoMs, 0),
                 result: objectBox == nil ? "failure" : "success",
-                reason: objectBox == nil ? "json_decode_failed" : nil
+                reason: objectBox == nil ? "json_decode_failed" : nil,
+                handoffId: pendingHandoff?.handoffId,
+                triggerType: pendingHandoff?.triggerType.rawValue
             )
             DispatchQueue.main.async { [weak self] in
                 guard let self,
@@ -5728,8 +5768,38 @@ extension BLETestManager: CBPeripheralDelegate {
                 self.updateProgressTimerState()
                 self.updateLightweightLyricDiagnostic(from: object)
                 if let lyric = object["lyric"] as? String {
+                    let lyricHandoff = self.realtimeHandoffCorrelation.context(
+                        for: self.currentTrackID
+                    )
+                    RealtimeTraceStore.shared.record(
+                        stage: "lyricCurrentLineReceived",
+                        trackId: self.currentTrackID,
+                        generation: self.currentTrackGeneration,
+                        payloadType: type,
+                        result: lyric.trimmingCharacters(
+                            in: .whitespacesAndNewlines
+                        ).isEmpty ? "empty" : "received",
+                        handoffId: lyricHandoff?.handoffId,
+                        triggerType: lyricHandoff?.triggerType.rawValue,
+                        positionAnchorMs: Self.optionalInt64Value(object["sampleMono"]),
+                        failureReason: lyric.trimmingCharacters(
+                            in: .whitespacesAndNewlines
+                        ).isEmpty ? "NO_LINE_AT_POSITION" : nil
+                    )
                     self.lyric = lyric
                     let lyricEmpty = lyric.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    if !lyricEmpty {
+                        RealtimeTraceStore.shared.record(
+                            stage: "lyricCurrentLineAccepted",
+                            trackId: self.currentTrackID,
+                            generation: self.currentTrackGeneration,
+                            payloadType: type,
+                            result: "accepted",
+                            handoffId: lyricHandoff?.handoffId,
+                            triggerType: lyricHandoff?.triggerType.rawValue,
+                            positionAnchorMs: Self.optionalInt64Value(object["sampleMono"])
+                        )
+                    }
                     if !self.currentTrackID.isEmpty {
                         let nowMs = self.currentTimeMs()
                         var details =
@@ -5819,13 +5889,19 @@ extension BLETestManager: CBPeripheralDelegate {
                     self.updateLiveActivity(force: false, reason: "playbackState")
                 }
                 self.scheduleLastNowPlayingSnapshotSave(reason: "playbackState")
+                let playbackHandoff = self.realtimeHandoffCorrelation.context(
+                    for: self.currentTrackID
+                )
                 RealtimeTraceStore.shared.record(
                     stage: "playbackStatePublished",
                     trackId: self.currentTrackID,
                     generation: self.currentTrackGeneration,
                     payloadType: type,
                     result: "published",
-                    reason: "\(self.isPlaying ? "playing" : "paused")_\(self.appLifecycleState)"
+                    reason: "\(self.isPlaying ? "playing" : "paused")_\(self.appLifecycleState)",
+                    handoffId: playbackHandoff?.handoffId,
+                    triggerType: playbackHandoff?.triggerType.rawValue,
+                    positionAnchorMs: Self.optionalInt64Value(object["sampleMono"])
                 )
                 if oldLyric != self.lyric {
                     RealtimeTraceStore.shared.record(
@@ -5834,6 +5910,21 @@ extension BLETestManager: CBPeripheralDelegate {
                         generation: self.currentTrackGeneration,
                         payloadType: type,
                         result: "published"
+                    )
+                    RealtimeTraceStore.shared.record(
+                        stage: "lyricCurrentLinePublished",
+                        trackId: self.currentTrackID,
+                        generation: self.currentTrackGeneration,
+                        payloadType: type,
+                        result: self.lyric.trimmingCharacters(
+                            in: .whitespacesAndNewlines
+                        ).isEmpty ? "empty" : "published",
+                        handoffId: playbackHandoff?.handoffId,
+                        triggerType: playbackHandoff?.triggerType.rawValue,
+                        positionAnchorMs: Self.optionalInt64Value(object["sampleMono"]),
+                        failureReason: self.lyric.trimmingCharacters(
+                            in: .whitespacesAndNewlines
+                        ).isEmpty ? "NO_LINE_AT_POSITION" : nil
                     )
                 }
 
@@ -6582,12 +6673,23 @@ extension BLETestManager: CBPeripheralDelegate {
             if !serverSessionId.isEmpty, serverSessionId != "-" {
                 currentTrackGenerationSessionId = serverSessionId
             }
+            let acceptedMonoMs = monotonicTimeMs()
+            let handoff = trackChanged
+                ? realtimeHandoffCorrelation.acceptTrack(
+                    trackId: trackID,
+                    generation: generation,
+                    monoMs: acceptedMonoMs
+                )
+                : realtimeHandoffCorrelation.context(for: trackID)
             RealtimeTraceStore.shared.record(
                 stage: "trackIdentityAccepted",
+                monoMs: acceptedMonoMs,
                 trackId: trackID,
                 generation: generation,
                 payloadType: "trackInfo",
-                result: trackChanged ? "changed" : "refreshed"
+                result: trackChanged ? "changed" : "refreshed",
+                handoffId: handoff?.handoffId,
+                triggerType: handoff?.triggerType.rawValue
             )
             isShowingLastNowPlayingSnapshot = false
             // A restored LastNowPlayingSnapshot can make the first authoritative
@@ -8446,16 +8548,42 @@ extension BLETestManager: CBPeripheralDelegate {
 
     private func handleCurrentWord(_ object: [String: Any]) {
         let trackID = object["trackId"] as? String ?? ""
+        let lineIndex = Self.intValue(object["line"])
+        let wordIndex = Self.intValue(object["word"])
+        let remotePositionMs = Self.int64Value(object["position"])
+        let timestampMs = Self.int64Value(object["timestamp"])
+        let generation = Self.int64Value(object["generation"])
+        let sequence = Self.int64Value(object["seq"])
+        let handoff = realtimeHandoffCorrelation.context(for: trackID)
         RealtimeTraceStore.shared.record(
             stage: "currentWordReceived",
             trackId: trackID,
-            generation: Self.optionalInt64Value(object["generation"]),
+            generation: generation,
             payloadType: "currentWord",
-            result: "received"
+            result: "received",
+            handoffId: handoff?.handoffId,
+            triggerType: handoff?.triggerType.rawValue,
+            positionAnchorMs: Self.optionalInt64Value(object["sampleMono"]),
+            lineIndex: lineIndex,
+            wordTimingStatus: wordIndex >= 0 ? "AVAILABLE" : "LINE_ONLY"
         )
         let sameTrack = isSameTrackId(incoming: trackID, current: currentTrackID)
         guard !trackID.isEmpty, sameTrack else {
             currentWordDropCount += 1
+            RealtimeTraceStore.shared.record(
+                stage: "currentWordRejected",
+                trackId: trackID,
+                generation: generation,
+                payloadType: "currentWord",
+                result: "rejected",
+                reason: "TRACK_MISMATCH",
+                handoffId: handoff?.handoffId,
+                triggerType: handoff?.triggerType.rawValue,
+                positionAnchorMs: Self.optionalInt64Value(object["sampleMono"]),
+                lineIndex: lineIndex,
+                wordTimingStatus: wordIndex >= 0 ? "AVAILABLE" : "LINE_ONLY",
+                failureReason: "TRACK_MISMATCH"
+            )
             log(
                 "[Lyrics-iOS] currentWord discarded stale trackId=\(trackID) " +
                     "current=\(currentTrackID)"
@@ -8479,23 +8607,52 @@ extension BLETestManager: CBPeripheralDelegate {
             )
         }
 
-        let lineIndex = Self.intValue(object["line"])
-        let wordIndex = Self.intValue(object["word"])
-        let remotePositionMs = Self.int64Value(object["position"])
-        let timestampMs = Self.int64Value(object["timestamp"])
-        let generation = Self.int64Value(object["generation"])
-        let sequence = Self.int64Value(object["seq"])
+        guard generation <= 0 || currentTrackGeneration <= 0 ||
+                generation == currentTrackGeneration else {
+            currentWordDropCount += 1
+            RealtimeTraceStore.shared.record(
+                stage: "currentWordRejected",
+                trackId: trackID,
+                generation: generation,
+                payloadType: "currentWord",
+                result: "rejected",
+                reason: "GENERATION_MISMATCH",
+                handoffId: handoff?.handoffId,
+                triggerType: handoff?.triggerType.rawValue,
+                positionAnchorMs: Self.optionalInt64Value(object["sampleMono"]),
+                lineIndex: lineIndex,
+                wordTimingStatus: wordIndex >= 0 ? "AVAILABLE" : "LINE_ONLY",
+                failureReason: "GENERATION_MISMATCH"
+            )
+            return
+        }
+
         let nowMs = currentTimeMs()
 
         let previousGeneration = currentWordFence.generation
         let previousSequence = currentWordFence.sequence
         let previousPositionMs = currentWordFence.positionMs
-        guard currentWordFence.shouldAccept(
+        let orderingDecision = currentWordFence.decision(
             generation: generation,
             sequence: sequence,
             positionMs: remotePositionMs
-        ) else {
+        )
+        guard orderingDecision == .accept else {
             currentWordDropCount += 1
+            RealtimeTraceStore.shared.record(
+                stage: "currentWordRejected",
+                trackId: trackID,
+                generation: generation,
+                payloadType: "currentWord",
+                result: "rejected",
+                reason: orderingDecision.rawValue,
+                handoffId: handoff?.handoffId,
+                triggerType: handoff?.triggerType.rawValue,
+                positionAnchorMs: Self.optionalInt64Value(object["sampleMono"]),
+                lineIndex: lineIndex,
+                wordTimingStatus: wordIndex >= 0 ? "AVAILABLE" : "LINE_ONLY",
+                failureReason: orderingDecision.rawValue
+            )
             log(
                 "[CurrentWordFence] ordered discard trackId=\(trackID) " +
                     "generation=\(generation) seq=\(sequence) " +
@@ -8510,7 +8667,12 @@ extension BLETestManager: CBPeripheralDelegate {
             trackId: trackID,
             generation: generation,
             payloadType: "currentWord",
-            result: "accepted"
+            result: "accepted",
+            handoffId: handoff?.handoffId,
+            triggerType: handoff?.triggerType.rawValue,
+            positionAnchorMs: Self.optionalInt64Value(object["sampleMono"]),
+            lineIndex: lineIndex,
+            wordTimingStatus: wordIndex >= 0 ? "AVAILABLE" : "LINE_ONLY"
         )
 
         let anchorResolution = resolveRemotePlaybackAnchor(
@@ -8525,6 +8687,20 @@ extension BLETestManager: CBPeripheralDelegate {
             source: "currentWord"
         ) else {
             currentWordDropCount += 1
+            RealtimeTraceStore.shared.record(
+                stage: "currentWordRejected",
+                trackId: trackID,
+                generation: generation,
+                payloadType: "currentWord",
+                result: "rejected",
+                reason: "ANCHOR_STALE",
+                handoffId: handoff?.handoffId,
+                triggerType: handoff?.triggerType.rawValue,
+                positionAnchorMs: Self.optionalInt64Value(object["sampleMono"]),
+                lineIndex: lineIndex,
+                wordTimingStatus: wordIndex >= 0 ? "AVAILABLE" : "LINE_ONLY",
+                failureReason: "ANCHOR_STALE"
+            )
             return
         }
         let transportAgeMs: Int64
@@ -8552,7 +8728,12 @@ extension BLETestManager: CBPeripheralDelegate {
             trackId: trackID,
             generation: generation,
             payloadType: "currentWord",
-            result: "published"
+            result: "published",
+            handoffId: handoff?.handoffId,
+            triggerType: handoff?.triggerType.rawValue,
+            positionAnchorMs: Self.optionalInt64Value(object["sampleMono"]),
+            lineIndex: effectiveLineIndex,
+            wordTimingStatus: effectiveWordIndex >= 0 ? "AVAILABLE" : "LINE_ONLY"
         )
         currentWordPushCount += 1
         if lastCurrentWordReceivedAtMs > 0 {

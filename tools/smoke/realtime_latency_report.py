@@ -17,6 +17,35 @@ from typing import Callable, Iterable, Optional
 
 TRACE_MARKER = "[RealtimeTrace] "
 METRIC_NAMES = (
+    "commandIntentToWriteStartMs",
+    "writeStartToCallbackMs",
+    "commandCallbackToSonyReceiveMs",
+    "sonyReceiveToDispatchEndMs",
+    "dispatchEndToMetadataObservedMs",
+    "metadataObservedToTrackAcceptedMs",
+    "trackAcceptedToPlaybackReadyMs",
+    "playbackReadyToQueueStartMs",
+    "playbackReadyToNotifyStartMs",
+    "playbackQueueWaitMs",
+    "playbackNotifyStartToCallbackMs",
+    "notifyCallbackToIosReceiveMs",
+    "iosReceiveToDecodeMs",
+    "iosDecodeToPublishMs",
+    "publishToUiConsumeMs",
+    "totalCommandToTrackPublishMs",
+    "trackAcceptedToLyricReadyMs",
+    "lyricReadyToCurrentLineEnqueueMs",
+    "currentLineEnqueueToPublishMs",
+    "trackAcceptedToWordEligibleMs",
+    "lyricReadyToWordEligibleMs",
+    "wordEligibleToSchedulerCreatedMs",
+    "schedulerCreatedToFirstEnqueueMs",
+    "firstEnqueueToSendMs",
+    "sendToReceiveMs",
+    "receiveToAcceptMs",
+    "acceptToPublishMs",
+    "wordEligibleToPublishMs",
+    "trackAcceptedToFirstWordMs",
     "commandToSonyReceiveMs",
     "commandToTrackPublishMs",
     "trackToCurrentLyricMs",
@@ -51,6 +80,13 @@ class Event:
     chunk_count: Optional[int] = None
     result: Optional[str] = None
     reason: Optional[str] = None
+    handoff_id: Optional[str] = None
+    trigger_type: Optional[str] = None
+    position_anchor_ms: Optional[int] = None
+    line_index: Optional[int] = None
+    word_timing_status: Optional[str] = None
+    cache_source: Optional[str] = None
+    failure_reason: Optional[str] = None
     source_line: int = 0
 
     def as_dict(self) -> dict:
@@ -70,6 +106,13 @@ class Event:
             "chunkCount": self.chunk_count,
             "result": self.result,
             "reason": self.reason,
+            "handoffId": self.handoff_id,
+            "triggerType": self.trigger_type,
+            "positionAnchorMs": self.position_anchor_ms,
+            "lineIndex": self.line_index,
+            "wordTimingStatus": self.word_timing_status,
+            "cacheSource": self.cache_source,
+            "failureReason": self.failure_reason,
             "sourceLine": self.source_line,
         }
 
@@ -119,6 +162,13 @@ def parse_trace_line(line: str, source_line: int = 0) -> Optional[Event]:
         chunk_count=_optional_int(fields.get("chunkCount")),
         result=_optional_text(fields.get("result")),
         reason=_optional_text(fields.get("reason")),
+        handoff_id=_optional_text(fields.get("handoffId")),
+        trigger_type=_optional_text(fields.get("triggerType")),
+        position_anchor_ms=_optional_int(fields.get("positionAnchorMs")),
+        line_index=_optional_int(fields.get("lineIndex")),
+        word_timing_status=_optional_text(fields.get("wordTimingStatus")),
+        cache_source=_optional_text(fields.get("cacheSource")),
+        failure_reason=_optional_text(fields.get("failureReason")),
         source_line=source_line,
     )
 
@@ -217,6 +267,68 @@ def _transfer_key(event: Event) -> Optional[tuple]:
     if event.transfer_id:
         return (event.transfer_id, event.generation)
     return _track_key(event)
+
+
+def _command_or_handoff_key(event: Event) -> Optional[tuple]:
+    if event.handoff_id:
+        return ("handoff", event.handoff_id)
+    command = _command_key(event)
+    return ("command", *command) if command is not None else None
+
+
+def _media_key(event: Event) -> Optional[tuple]:
+    track = _track_key(event)
+    if track is not None:
+        return ("track", *track)
+    if event.handoff_id:
+        return ("handoff", event.handoff_id)
+    return None
+
+
+def first_correlated_events(
+    events: list[Event],
+    side: str,
+    stages: set[str],
+    canonical_stage: str,
+    key: Callable[[Event], Optional[tuple]],
+) -> list[Event]:
+    first_by_key = {}
+    for event in sorted(events, key=lambda item: (item.mono_ms, item.source_line)):
+        if event.side != side or event.stage not in stages:
+            continue
+        event_key = key(event)
+        if event_key is None or event_key in first_by_key:
+            continue
+        first_by_key[event_key] = replace(event, stage=canonical_stage)
+    return list(first_by_key.values())
+
+
+def first_events_after(
+    events: list[Event],
+    starts: list[Event],
+    side: str,
+    stages: set[str],
+    canonical_stage: str,
+    key: Callable[[Event], Optional[tuple]],
+) -> list[Event]:
+    selected = []
+    for start in starts:
+        start_key = key(start)
+        if start_key is None:
+            continue
+        candidates = [
+            event for event in events
+            if event.side == side
+            and event.stage in stages
+            and key(event) == start_key
+            and event.mono_ms >= start.mono_ms
+        ]
+        if candidates:
+            selected.append(replace(
+                min(candidates, key=lambda item: (item.mono_ms, item.source_line)),
+                stage=canonical_stage,
+            ))
+    return selected
 
 
 def _same_track(left: tuple, right: tuple) -> bool:
@@ -434,6 +546,148 @@ def derive_track_t0(
     return t0_events, track_publish_values, missing
 
 
+def classify_transition_samples(events: list[Event], clock_trusted: bool) -> tuple[list[dict], list[dict]]:
+    anchors = [
+        event for event in events
+        if (
+            event.side == "ios"
+            and event.stage == "commandIntent"
+            and event.command_type in {"NEXT", "PREVIOUS"}
+        ) or (
+            event.side == "sony"
+            and event.stage == "mediaSessionMetadataObserved"
+        )
+    ]
+    samples = []
+    missing_events = []
+    seen = set()
+    for index, anchor in enumerate(sorted(anchors, key=lambda item: item.mono_ms)):
+        anchor_identity = anchor.handoff_id or (
+            f"command-{anchor.command_seq}" if anchor.command_seq is not None
+            else f"track-{anchor.track_id}-{anchor.generation}"
+        )
+        if anchor_identity in seen:
+            continue
+        seen.add(anchor_identity)
+        upper_bound = anchor.mono_ms + 15_000
+        grouped = []
+        for candidate in events:
+            if candidate.side == anchor.side and (
+                candidate.mono_ms < anchor.mono_ms - 100
+                or candidate.mono_ms > upper_bound
+            ):
+                continue
+            same_handoff = bool(
+                anchor.handoff_id
+                and candidate.handoff_id == anchor.handoff_id
+            )
+            same_command = bool(
+                anchor.command_seq is not None
+                and candidate.command_seq == anchor.command_seq
+            )
+            same_track = bool(
+                anchor.track_id
+                and candidate.track_id == anchor.track_id
+                and (
+                    anchor.generation is None
+                    or candidate.generation is None
+                    or anchor.generation == candidate.generation
+                )
+            )
+            if same_handoff or same_command or same_track:
+                grouped.append(candidate)
+        stages = {event.stage for event in grouped}
+        is_command = anchor.stage == "commandIntent"
+        required = {
+            "commandIntent", "commandEnqueued", "commandWriteStart", "commandWriteCallback",
+            "commandReceived", "commandValidated", "mediaControlDispatchStart",
+            "mediaControlDispatchEnd", "mediaSessionMetadataObserved",
+            "notificationMetadataObserved", "trackIdentityCandidate",
+            "trackIdentityAccepted", "mediaGenerationCreated",
+            "playbackReadStart", "playbackReady", "playbackEnqueued",
+            "playbackDequeued", "playbackNotifyStart", "playbackNotifyCallback",
+            "playbackNotifyReceived", "playbackDecodeEnd", "playbackStatePublished",
+            "nowPlayingStateConsumed",
+        }
+        if not is_command:
+            required -= {
+                "commandIntent", "commandEnqueued", "commandWriteStart",
+                "commandWriteCallback", "commandReceived", "commandValidated",
+                "mediaControlDispatchStart", "mediaControlDispatchEnd",
+            }
+        absent = sorted(required - stages)
+        classifications = []
+        ios_track_changed = any(
+            event.side == "ios"
+            and event.stage == "trackIdentityAccepted"
+            and event.result == "changed"
+            for event in grouped
+        )
+        if is_command and not ios_track_changed:
+            classifications.append("NO_TRACK_CHANGE")
+            if not any(event.side == "sony" for event in grouped):
+                classifications.append("COMMAND_ONLY")
+        lyric_ready = [event for event in grouped if event.stage == "lyricReady"]
+        if lyric_ready and not any(event.result == "ready" for event in lyric_ready):
+            classifications.append("NO_LYRICS")
+        if any(event.word_timing_status == "LINE_ONLY" for event in grouped):
+            classifications.append("LINE_ONLY_LYRICS")
+        if any(event.word_timing_status == "AVAILABLE" for event in grouped):
+            classifications.append("WORD_TIMING_AVAILABLE")
+        if any(
+            event.stage == "currentWordNotEligible" and event.reason == "INTRO_WAIT"
+            for event in grouped
+        ):
+            classifications.append("INTRO_WAIT")
+        if any(event.stage in {"lyricRuntimeCacheHit", "lyricParsedCacheHit"} for event in grouped):
+            classifications.append("LYRIC_CACHE_HIT")
+        if any(event.stage == "lyricParsedCacheMiss" for event in grouped):
+            classifications.append("LYRIC_CACHE_MISS")
+        if any(event.stage in {"albumArtCacheHit", "prefetchLocalCacheHit"} for event in grouped):
+            classifications.append("PREVIEW_CACHE_HIT")
+        if any(event.stage in {"previewSendStart", "previewPublished"} for event in grouped):
+            classifications.append("PREVIEW_TRANSFER")
+        if not clock_trusted:
+            classifications.append("CLOCK_SYNC_UNTRUSTED")
+        if any(
+            event.stage in {"trackIdentityRejected", "currentWordRejected"}
+            and (event.reason or "").upper() in {
+                "STALE_PACKET", "GENERATION_MISMATCH", "SEQUENCE_OLD",
+                "POSITION_STALE", "TRACK_MISMATCH",
+            }
+            for event in grouped
+        ):
+            classifications.append("STALE_REJECTED")
+        if any(event.result in {"failure", "failed"} for event in grouped):
+            classifications.append("FAILED")
+        if absent:
+            classifications.append("TRACE_INCOMPLETE")
+        elif ios_track_changed or not is_command:
+            classifications.append("COMPLETE")
+        sample_id = anchor.handoff_id or f"sample-{index + 1}"
+        sample = {
+            "sampleId": sample_id,
+            "handoffId": anchor.handoff_id,
+            "triggerType": anchor.trigger_type or (
+                "IOS_NEXT" if anchor.command_type == "NEXT"
+                else "IOS_PREVIOUS" if anchor.command_type == "PREVIOUS"
+                else "UNKNOWN"
+            ),
+            "trackIdSummary": anchor.track_id[:12] if anchor.track_id else None,
+            "generation": anchor.generation,
+            "eventCount": len(grouped),
+            "classifications": sorted(set(classifications)),
+            "missingEvents": absent,
+        }
+        samples.append(sample)
+        if absent:
+            missing_events.append({
+                "sampleId": sample_id,
+                "missingEvents": absent,
+            })
+    return samples, missing_events
+
+
 def analyze(
     events: list[Event],
     malformed: int = 0,
@@ -527,6 +781,144 @@ def analyze(
 
     metrics = {}
     metric_samples = {}
+
+    phase4_events = list(events)
+    phase4_events.extend(first_correlated_events(
+        events,
+        "sony",
+        {"mediaSessionMetadataObserved", "notificationMetadataObserved"},
+        "metadataObserved",
+        _command_or_handoff_key,
+    ))
+    first_stage_specs = (
+        ("sony", {"trackIdentityAccepted"}, "firstSonyTrackAccepted", _media_key),
+        ("sony", {"playbackReady", "playbackStateReady"}, "firstPlaybackReady", _media_key),
+        ("sony", {"playbackEnqueued"}, "firstPlaybackEnqueued", _media_key),
+        ("sony", {"playbackNotifyStart"}, "firstPlaybackNotifyStart", _media_key),
+        ("sony", {"playbackNotifyCallback"}, "firstPlaybackNotifyCallback", _media_key),
+        ("ios", {"playbackNotifyReceived"}, "firstPlaybackNotifyReceived", _media_key),
+        ("ios", {"playbackDecodeEnd"}, "firstPlaybackDecodeEnd", _media_key),
+        ("ios", {"playbackStatePublished"}, "firstPlaybackPublished", _media_key),
+        ("ios", {"nowPlayingStateConsumed"}, "firstUiConsumed", _media_key),
+        ("sony", {"lyricReady"}, "firstLyricReady", _media_key),
+        ("sony", {"lyricCurrentLineEnqueued"}, "firstLineEnqueued", _media_key),
+        ("ios", {"lyricCurrentLinePublished", "currentLyricPublished"}, "firstLinePublished", _media_key),
+        ("sony", {"currentWordEligible"}, "firstWordEligible", _media_key),
+        ("ios", {"trackIdentityAccepted"}, "firstIosTrackAccepted", _media_key),
+    )
+    for side, stages, canonical, key_function in first_stage_specs:
+        phase4_events.extend(first_correlated_events(
+            events, side, stages, canonical, key_function,
+        ))
+    eligible_events = [
+        event for event in phase4_events if event.stage == "firstWordEligible"
+    ]
+    scheduler_events = first_events_after(
+        events,
+        eligible_events,
+        "sony",
+        {"currentWordSchedulerCreated"},
+        "wordSchedulerCreated",
+        _media_key,
+    )
+    enqueue_events = first_events_after(
+        events,
+        scheduler_events,
+        "sony",
+        {"currentWordImmediateSnapshotEnqueued", "currentWordBoundaryEnqueued"},
+        "wordEnqueued",
+        _media_key,
+    )
+    send_events = first_events_after(
+        events,
+        enqueue_events,
+        "sony",
+        {"currentWordSendStart"},
+        "wordSendStart",
+        _media_key,
+    )
+    phase4_events.extend(scheduler_events)
+    phase4_events.extend(enqueue_events)
+    phase4_events.extend(send_events)
+    for side, stages, canonical in (
+        ("ios", {"currentWordReceived"}, "wordReceived"),
+        ("ios", {"currentWordAccepted"}, "wordAccepted"),
+        ("ios", {"currentWordPublished"}, "wordPublished"),
+    ):
+        phase4_events.extend(first_correlated_events(
+            events, side, stages, canonical, _media_key,
+        ))
+
+    def add_phase4_pair(
+        name: str,
+        start_side: str,
+        start_stage: str,
+        end_side: str,
+        end_stage: str,
+        key: Callable[[Event], Optional[tuple]],
+        cross_device: bool = False,
+    ) -> None:
+        values, missing = paired_durations(
+            phase4_events,
+            start_side,
+            start_stage,
+            end_side,
+            end_stage,
+            key,
+            categories,
+            cross_device=cross_device,
+            clock_trusted=clock_trusted,
+            sony_to_ios_offset_ms=sony_to_ios_offset_ms,
+        )
+        metric_samples[name] = values
+        metrics[name] = summarize(values, missing)
+
+    phase4_pair_specs = (
+        ("commandIntentToWriteStartMs", "ios", "commandIntent", "ios", "commandWriteStart", _command_or_handoff_key, False),
+        ("writeStartToCallbackMs", "ios", "commandWriteStart", "ios", "commandWriteCallback", _command_or_handoff_key, False),
+        ("commandCallbackToSonyReceiveMs", "ios", "commandWriteCallback", "sony", "commandReceived", _command_or_handoff_key, True),
+        ("sonyReceiveToDispatchEndMs", "sony", "commandReceived", "sony", "mediaControlDispatchEnd", _command_or_handoff_key, False),
+        ("dispatchEndToMetadataObservedMs", "sony", "mediaControlDispatchEnd", "sony", "metadataObserved", _command_or_handoff_key, False),
+        ("metadataObservedToTrackAcceptedMs", "sony", "mediaSessionMetadataObserved", "sony", "firstSonyTrackAccepted", _media_key, False),
+        ("trackAcceptedToPlaybackReadyMs", "sony", "firstSonyTrackAccepted", "sony", "firstPlaybackReady", _media_key, False),
+        ("playbackReadyToQueueStartMs", "sony", "firstPlaybackReady", "sony", "firstPlaybackEnqueued", _media_key, False),
+        ("playbackReadyToNotifyStartMs", "sony", "firstPlaybackReady", "sony", "firstPlaybackNotifyStart", _media_key, False),
+        ("playbackNotifyStartToCallbackMs", "sony", "firstPlaybackNotifyStart", "sony", "firstPlaybackNotifyCallback", _media_key, False),
+        ("notifyCallbackToIosReceiveMs", "sony", "firstPlaybackNotifyCallback", "ios", "firstPlaybackNotifyReceived", _media_key, True),
+        ("iosReceiveToDecodeMs", "ios", "firstPlaybackNotifyReceived", "ios", "firstPlaybackDecodeEnd", _media_key, False),
+        ("iosDecodeToPublishMs", "ios", "firstPlaybackDecodeEnd", "ios", "firstPlaybackPublished", _media_key, False),
+        ("publishToUiConsumeMs", "ios", "firstPlaybackPublished", "ios", "firstUiConsumed", _media_key, False),
+        ("totalCommandToTrackPublishMs", "ios", "commandIntent", "ios", "firstIosTrackAccepted", _command_or_handoff_key, False),
+        ("trackAcceptedToLyricReadyMs", "sony", "firstSonyTrackAccepted", "sony", "firstLyricReady", _media_key, False),
+        ("lyricReadyToCurrentLineEnqueueMs", "sony", "firstLyricReady", "sony", "firstLineEnqueued", _media_key, False),
+        ("currentLineEnqueueToPublishMs", "sony", "firstLineEnqueued", "ios", "firstLinePublished", _media_key, True),
+        ("trackAcceptedToWordEligibleMs", "sony", "firstSonyTrackAccepted", "sony", "firstWordEligible", _media_key, False),
+        ("lyricReadyToWordEligibleMs", "sony", "firstLyricReady", "sony", "firstWordEligible", _media_key, False),
+        ("wordEligibleToSchedulerCreatedMs", "sony", "firstWordEligible", "sony", "wordSchedulerCreated", _media_key, False),
+        ("schedulerCreatedToFirstEnqueueMs", "sony", "wordSchedulerCreated", "sony", "wordEnqueued", _media_key, False),
+        ("firstEnqueueToSendMs", "sony", "wordEnqueued", "sony", "wordSendStart", _media_key, False),
+        ("sendToReceiveMs", "sony", "wordSendStart", "ios", "wordReceived", _media_key, True),
+        ("receiveToAcceptMs", "ios", "wordReceived", "ios", "wordAccepted", _media_key, False),
+        ("acceptToPublishMs", "ios", "wordAccepted", "ios", "wordPublished", _media_key, False),
+        ("wordEligibleToPublishMs", "sony", "firstWordEligible", "ios", "wordPublished", _media_key, True),
+        ("trackAcceptedToFirstWordMs", "ios", "firstIosTrackAccepted", "ios", "wordPublished", _media_key, False),
+    )
+    for pair_spec in phase4_pair_specs:
+        add_phase4_pair(*pair_spec)
+
+    playback_dequeues = [
+        event for event in events
+        if event.side == "sony" and event.stage == "playbackDequeued"
+    ]
+    playback_queue_values = [
+        event.queue_wait_ms for event in playback_dequeues
+        if event.queue_wait_ms is not None
+    ]
+    metric_samples["playbackQueueWaitMs"] = playback_queue_values
+    metrics["playbackQueueWaitMs"] = summarize(
+        playback_queue_values,
+        len(playback_dequeues) - len(playback_queue_values),
+    )
 
     track_t0_events, track_publish_values, track_publish_missing = derive_track_t0(
         events,
@@ -625,6 +1017,15 @@ def analyze(
         metrics.setdefault(name, summarize([], 0))
 
     delay_thresholds = {
+        "IOS_WRITE_DELAY": ("writeStartToCallbackMs", 120),
+        "SONY_COMMAND_DELAY": ("sonyReceiveToDispatchEndMs", 120),
+        "MEDIASESSION_SWITCH_DELAY": ("dispatchEndToMetadataObservedMs", 300),
+        "METADATA_OBSERVATION_DELAY": ("metadataObservedToTrackAcceptedMs", 100),
+        "TRACK_ACCEPTANCE_DELAY": ("trackAcceptedToPlaybackReadyMs", 100),
+        "PLAYBACK_READ_DELAY": ("trackAcceptedToPlaybackReadyMs", 150),
+        "NOTIFY_QUEUE_DELAY": ("playbackQueueWaitMs", 100),
+        "BLE_NOTIFY_DELAY": ("playbackNotifyStartToCallbackMs", 100),
+        "IOS_PUBLISH_DELAY": ("iosDecodeToPublishMs", 100),
         "COMMAND_DELAY": ("commandToSonyReceiveMs", 200),
         "TRACK_IDENTITY_DELAY": ("commandToTrackPublishMs", 300),
         "LYRIC_READY_DELAY": ("trackToCurrentLyricMs", 500),
@@ -633,13 +1034,12 @@ def analyze(
         "CURRENT_WORD_DELAY": ("trackToCurrentWordMs", 500),
         "ARTWORK_DELAY": ("trackToPreviewArtMs", 800),
         "IOS_DECODE_DELAY": ("iOSDecodeDurationMs", 50),
-        "IOS_PUBLISH_DELAY": ("iOSPublishDurationMs", 100),
     }
     classifications = {
         category: sum(1 for value in metric_samples.get(metric, []) if value > threshold)
         for category, (metric, threshold) in delay_thresholds.items()
     }
-    classifications["CLOCK_SYNC_UNTRUSTED"] = categories["untrusted_clock"]
+    classifications["CLOCK_SYNC_UNTRUSTED"] = 1 if categories["untrusted_clock"] else 0
     classifications["TRACE_INCOMPLETE"] = (
         malformed
         + categories["empty"]
@@ -671,8 +1071,13 @@ def analyze(
         reverse=True,
     )[:10]
 
+    samples, missing_events = classify_transition_samples(
+        events,
+        clock_trusted and sony_to_ios_offset_ms is not None,
+    )
+
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "clock": {
             "crossDeviceTrusted": clock_trusted and sony_to_ios_offset_ms is not None,
             "sonyToIosOffsetMs": sony_to_ios_offset_ms,
@@ -684,6 +1089,8 @@ def analyze(
         "categories": classifications,
         "diagnostics": dict(sorted(categories.items())),
         "slowSamples": slow_samples,
+        "samples": samples,
+        "missingEvents": missing_events,
     }
 
 
@@ -712,6 +1119,20 @@ def render_summary(report: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def write_combined_trace(paths: list[Path], destination: Path) -> None:
+    """Preserve the report bundle contract even when a trace source is empty."""
+    contents = [
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in paths
+        if path.exists()
+    ]
+    with destination.open("w", encoding="utf-8") as output:
+        for content in contents:
+            output.write(content)
+            if content and not content.endswith("\n"):
+                output.write("\n")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sony-trace", type=Path, action="append", default=[])
@@ -738,11 +1159,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         sony_to_ios_offset_ms=sony_to_ios_offset_ms,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    write_combined_trace(args.sony_trace, args.output_dir / "sony_trace.log")
+    write_combined_trace(args.ios_trace, args.output_dir / "ios_trace.log")
     (args.output_dir / "report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     (args.output_dir / "summary.md").write_text(render_summary(report), encoding="utf-8")
+    (args.output_dir / "sample_classification.json").write_text(
+        json.dumps(report.get("samples", []), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (args.output_dir / "missing_events.json").write_text(
+        json.dumps(report.get("missingEvents", []), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     with (args.output_dir / "raw_events.jsonl").open("w", encoding="utf-8") as handle:
         for event in events:
             handle.write(json.dumps(event.as_dict(), ensure_ascii=False) + "\n")

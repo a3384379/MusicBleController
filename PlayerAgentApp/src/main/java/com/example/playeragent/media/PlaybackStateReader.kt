@@ -10,6 +10,7 @@ import android.media.session.PlaybackState
 import android.os.Bundle
 import android.os.SystemClock
 import com.example.playeragent.diagnostics.RealtimeTrace
+import com.example.playeragent.diagnostics.TrackHandoffTraceCoordinator
 import com.example.playeragent.history.FastPlaybackSnapshot
 import com.example.playeragent.logging.LogConfig
 import com.example.playeragent.service.PlayerNotificationListenerService
@@ -66,11 +67,16 @@ class PlaybackStateReader(
 
     fun readPlaybackState(): JSONObject {
         val startedAtMs = SystemClock.elapsedRealtime()
+        val pendingHandoff = TrackHandoffTraceCoordinator.pendingContext(startedAtMs)
         RealtimeTrace.record(
-            stage = "playbackStateReadStart",
+            stage = "playbackReadStart",
             monoMs = startedAtMs,
             payloadType = "playbackState",
-            result = "started"
+            result = "started",
+            commandSeq = pendingHandoff?.commandSeq,
+            commandType = pendingHandoff?.commandType,
+            handoffId = pendingHandoff?.handoffId,
+            triggerType = pendingHandoff?.triggerType?.name
         )
         verbose("[PlaybackState] GET_PLAYBACK_STATE received")
 
@@ -144,6 +150,22 @@ class PlaybackStateReader(
             durationMs = duration,
             mediaId = mediaId
         )
+        val observedHandoff = TrackHandoffTraceCoordinator.observeMediaSessionMetadata(
+            trackId = currentTrack.trackId,
+            positionAnchorMs = positionSampleElapsedMs
+        )
+        if (observedHandoff != null && pendingHandoff == null) {
+            RealtimeTrace.record(
+                stage = "playbackReadStart",
+                monoMs = startedAtMs,
+                trackId = currentTrack.trackId,
+                payloadType = "playbackState",
+                result = "started",
+                handoffId = observedHandoff.handoffId,
+                triggerType = observedHandoff.triggerType.name,
+                positionAnchorMs = positionSampleElapsedMs
+            )
+        }
         lastTrackId = currentTrack.trackId
         TrackCapabilityTracker.onTrackSeen(
             trackId = lastTrackId,
@@ -346,15 +368,45 @@ class PlaybackStateReader(
         }
         observeQueueCandidates(selected, currentTrack)
         val readyAtMs = SystemClock.elapsedRealtime()
+        val handoffTrace = TrackHandoffTraceCoordinator.contextFor(runtimeTrack.trackId)
+        if (mediaDecision.trackChanged) {
+            RealtimeTrace.record(
+                stage = "trackIdentityAccepted",
+                monoMs = readyAtMs,
+                trackId = runtimeTrack.trackId,
+                generation = runtimeTrack.currentTrackGeneration,
+                payloadType = "mediaSession",
+                result = "accepted",
+                handoffId = handoffTrace?.handoffId,
+                triggerType = handoffTrace?.triggerType?.name,
+                positionAnchorMs = runtimeTrack.positionAnchorElapsedMs
+            )
+            RealtimeTrace.record(
+                stage = "mediaGenerationCreated",
+                monoMs = readyAtMs,
+                trackId = runtimeTrack.trackId,
+                generation = runtimeTrack.currentTrackGeneration,
+                payloadType = "trackIdentity",
+                result = "created",
+                handoffId = handoffTrace?.handoffId,
+                triggerType = handoffTrace?.triggerType?.name,
+                positionAnchorMs = runtimeTrack.positionAnchorElapsedMs
+            )
+        }
         RealtimeTrace.record(
-            stage = "playbackStateReady",
+            stage = "playbackReady",
             monoMs = readyAtMs,
             trackId = runtimeTrack.trackId,
             generation = runtimeTrack.currentTrackGeneration,
             payloadType = "playbackState",
             processingMs = (readyAtMs - startedAtMs).coerceAtLeast(0L),
             result = "ready",
-            reason = if (runtimeTrack.isPlaying) "playing" else "paused"
+            reason = if (runtimeTrack.isPlaying) "playing" else "paused",
+            commandSeq = handoffTrace?.commandSeq,
+            commandType = handoffTrace?.commandType,
+            handoffId = handoffTrace?.handoffId,
+            triggerType = handoffTrace?.triggerType?.name,
+            positionAnchorMs = runtimeTrack.positionAnchorElapsedMs
         )
         return response
     }

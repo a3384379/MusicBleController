@@ -34,6 +34,17 @@ internal class BleQueueTerminalCallbackGate {
     }
 }
 
+data class NotifyTraceContext(
+    val trackId: String? = null,
+    val generation: Long? = null,
+    val handoffId: String? = null,
+    val triggerType: String? = null,
+    val positionAnchorMs: Long? = null,
+    val lineIndex: Int? = null,
+    val wordTimingStatus: String? = null,
+    val hasCurrentLyric: Boolean = false
+)
+
 internal class CommandResponseQuietWindows(
     private val quietWindowMs: Long
 ) {
@@ -116,6 +127,7 @@ class BleNotifyQueue(
     private var activeNotifyStartedAtMs = 0L
     private var activeNotifyDeviceAddress: String? = null
     private var activeNotifyPacketType: String? = null
+    private var activeNotifyTraceContext: NotifyTraceContext? = null
 
     fun resetLinkProfile(address: String, mtu: Int) {
         runOnQueueThread { resetLinkProfileOnQueue(address, mtu) }
@@ -144,7 +156,8 @@ class BleNotifyQueue(
         device: BluetoothDevice,
         type: String,
         value: ByteArray,
-        delayAfterMs: Long = SHORT_MESSAGE_DELAY_MS
+        delayAfterMs: Long = SHORT_MESSAGE_DELAY_MS,
+        traceContext: NotifyTraceContext? = null
     ) {
         enqueueJob(
             SendJob(
@@ -157,7 +170,8 @@ class BleNotifyQueue(
                         delayAfterMs = delayAfterMs
                     )
                 ),
-                isLongJob = false
+                isLongJob = false,
+                traceContext = traceContext
             )
         )
     }
@@ -202,7 +216,8 @@ class BleNotifyQueue(
         maxSendDurationMs: Long? = null,
         shouldCancel: (() -> Boolean)? = null,
         onComplete: (() -> Unit)? = null,
-        onFailure: (() -> Unit)? = null
+        onFailure: (() -> Unit)? = null,
+        traceContext: NotifyTraceContext? = null
     ) {
         if (packets.isEmpty()) {
             return
@@ -217,7 +232,8 @@ class BleNotifyQueue(
                 maxSendDurationMs = maxSendDurationMs,
                 shouldCancel = shouldCancel,
                 onComplete = onComplete,
-                onFailure = onFailure
+                onFailure = onFailure,
+                traceContext = traceContext
             )
         )
     }
@@ -226,10 +242,17 @@ class BleNotifyQueue(
         device: BluetoothDevice,
         type: String,
         value: ByteArray,
-        delayAfterMs: Long = SHORT_MESSAGE_DELAY_MS
+        delayAfterMs: Long = SHORT_MESSAGE_DELAY_MS,
+        traceContext: NotifyTraceContext? = null
     ) {
         runOnQueueThread {
-            setLatestInterleavedShortOnQueue(device, type, value, delayAfterMs)
+            setLatestInterleavedShortOnQueue(
+                device,
+                type,
+                value,
+                delayAfterMs,
+                traceContext
+            )
         }
     }
 
@@ -238,7 +261,8 @@ class BleNotifyQueue(
         device: BluetoothDevice,
         type: String,
         value: ByteArray,
-        delayAfterMs: Long
+        delayAfterMs: Long,
+        traceContext: NotifyTraceContext?
     ) {
         latestInterleavedPackets[interleavedPacketKey(device.address, type)] = InterleavedPacket(
             device = device,
@@ -246,7 +270,8 @@ class BleNotifyQueue(
                 type = type,
                 value = value,
                 delayAfterMs = delayAfterMs
-            )
+            ),
+            traceContext = traceContext
         )
         logInterleavedEventThrottled(
             isSavedEvent = true,
@@ -364,6 +389,7 @@ class BleNotifyQueue(
             ?: activeNotifyDeviceAddress
             ?: job.device.address
         val callbackType = activeNotifyPacketType
+        val callbackTraceContext = activeNotifyTraceContext
         val callbackRttMs = if (activeNotifyStartedAtMs > 0L) {
             SystemClock.elapsedRealtime() - activeNotifyStartedAtMs
         } else {
@@ -376,8 +402,35 @@ class BleNotifyQueue(
             chunkIndex = activePacketIndex,
             chunkCount = job.packets.size,
             result = if (status == BluetoothGatt.GATT_SUCCESS) "success" else "failure",
+            reason = if (status == BluetoothGatt.GATT_SUCCESS) null else "callback_failed",
+            trackId = callbackTraceContext?.trackId,
+            generation = callbackTraceContext?.generation,
+            handoffId = callbackTraceContext?.handoffId,
+            triggerType = callbackTraceContext?.triggerType,
+            positionAnchorMs = callbackTraceContext?.positionAnchorMs,
+            lineIndex = callbackTraceContext?.lineIndex,
+            wordTimingStatus = callbackTraceContext?.wordTimingStatus
+        )
+        recordPlaybackSpecificTrace(
+            stage = "playbackNotifyCallback",
+            packetType = callbackType ?: job.type,
+            context = callbackTraceContext,
+            processingMs = callbackRttMs,
+            result = if (status == BluetoothGatt.GATT_SUCCESS) "success" else "failure",
             reason = if (status == BluetoothGatt.GATT_SUCCESS) null else "callback_failed"
         )
+        if (status == BluetoothGatt.GATT_SUCCESS &&
+            callbackType == "playbackState" &&
+            callbackTraceContext?.hasCurrentLyric == true
+        ) {
+            recordContextTrace(
+                stage = "lyricCurrentLineSent",
+                payloadType = "playbackState",
+                context = callbackTraceContext,
+                processingMs = callbackRttMs,
+                result = "sent"
+            )
+        }
         if (callbackType == "albumArtOffer" && status == BluetoothGatt.GATT_SUCCESS) {
             RealtimeTrace.record(
                 stage = "albumArtOfferSent",
@@ -560,8 +613,29 @@ class BleNotifyQueue(
             monoMs = job.enqueuedAtMs,
             payloadType = job.type,
             chunkCount = job.packets.size,
+            result = "queued",
+            trackId = job.traceContext?.trackId,
+            generation = job.traceContext?.generation,
+            handoffId = job.traceContext?.handoffId,
+            triggerType = job.traceContext?.triggerType,
+            positionAnchorMs = job.traceContext?.positionAnchorMs,
+            lineIndex = job.traceContext?.lineIndex,
+            wordTimingStatus = job.traceContext?.wordTimingStatus
+        )
+        recordPlaybackSpecificTrace(
+            stage = "playbackEnqueued",
+            packetType = job.type,
+            context = job.traceContext,
             result = "queued"
         )
+        if (job.type == "playbackState" && job.traceContext?.hasCurrentLyric == true) {
+            recordContextTrace(
+                stage = "lyricCurrentLineEnqueued",
+                payloadType = "playbackState",
+                context = job.traceContext,
+                result = "queued"
+            )
+        }
         sendNextPacket()
     }
 
@@ -642,7 +716,14 @@ class BleNotifyQueue(
                     notificationInFlight = true
                     markNotifyStarted(
                         interleaved.device.address,
-                        interleaved.packet.type
+                        interleaved.packet.type,
+                        interleaved.traceContext
+                    )
+                    recordPlaybackSpecificTrace(
+                        stage = "playbackNotifyStart",
+                        packetType = interleaved.packet.type,
+                        context = interleaved.traceContext,
+                        result = "requested"
                     )
                     logInterleavedEventThrottled(
                         isSavedEvent = false,
@@ -762,13 +843,27 @@ class BleNotifyQueue(
 
         notificationInFlight = true
         activeRequestType = packet.type
-        markNotifyStarted(job.device.address, packet.type)
+        markNotifyStarted(job.device.address, packet.type, job.traceContext)
         RealtimeTrace.record(
             stage = "notifySendStart",
             payloadType = packet.type,
             queueWaitMs = (SystemClock.elapsedRealtime() - job.enqueuedAtMs).coerceAtLeast(0L),
             chunkIndex = activePacketIndex,
             chunkCount = job.packets.size,
+            result = "requested",
+            trackId = job.traceContext?.trackId,
+            generation = job.traceContext?.generation,
+            handoffId = job.traceContext?.handoffId,
+            triggerType = job.traceContext?.triggerType,
+            positionAnchorMs = job.traceContext?.positionAnchorMs,
+            lineIndex = job.traceContext?.lineIndex,
+            wordTimingStatus = job.traceContext?.wordTimingStatus
+        )
+        recordPlaybackSpecificTrace(
+            stage = "playbackNotifyStart",
+            packetType = packet.type,
+            context = job.traceContext,
+            queueWaitMs = (SystemClock.elapsedRealtime() - job.enqueuedAtMs).coerceAtLeast(0L),
             result = "requested"
         )
         val requested = notify(server, characteristic, job.device, packet.value)
@@ -1049,6 +1144,21 @@ class BleNotifyQueue(
                 .coerceAtLeast(0L),
             chunkIndex = selected.nextPacketIndex,
             chunkCount = selected.packets.size,
+            result = "selected",
+            trackId = selected.traceContext?.trackId,
+            generation = selected.traceContext?.generation,
+            handoffId = selected.traceContext?.handoffId,
+            triggerType = selected.traceContext?.triggerType,
+            positionAnchorMs = selected.traceContext?.positionAnchorMs,
+            lineIndex = selected.traceContext?.lineIndex,
+            wordTimingStatus = selected.traceContext?.wordTimingStatus
+        )
+        recordPlaybackSpecificTrace(
+            stage = "playbackDequeued",
+            packetType = selected.type,
+            context = selected.traceContext,
+            queueWaitMs = (SystemClock.elapsedRealtime() - selected.enqueuedAtMs)
+                .coerceAtLeast(0L),
             result = "selected"
         )
         if (selected.isLongJob && LogConfig.DEBUG_VERBOSE_LOG) {
@@ -1161,16 +1271,69 @@ class BleNotifyQueue(
         }
     }
 
-    private fun markNotifyStarted(address: String, type: String) {
+    private fun markNotifyStarted(
+        address: String,
+        type: String,
+        traceContext: NotifyTraceContext?
+    ) {
         activeNotifyStartedAtMs = SystemClock.elapsedRealtime()
         activeNotifyDeviceAddress = address
         activeNotifyPacketType = type
+        activeNotifyTraceContext = traceContext
     }
 
     private fun clearActiveNotifyMetrics() {
         activeNotifyStartedAtMs = 0L
         activeNotifyDeviceAddress = null
         activeNotifyPacketType = null
+        activeNotifyTraceContext = null
+    }
+
+    private fun recordPlaybackSpecificTrace(
+        stage: String,
+        packetType: String,
+        context: NotifyTraceContext?,
+        queueWaitMs: Long? = null,
+        processingMs: Long? = null,
+        result: String,
+        reason: String? = null
+    ) {
+        if (packetType != "playbackState") return
+        recordContextTrace(
+            stage = stage,
+            payloadType = packetType,
+            context = context,
+            queueWaitMs = queueWaitMs,
+            processingMs = processingMs,
+            result = result,
+            reason = reason
+        )
+    }
+
+    private fun recordContextTrace(
+        stage: String,
+        payloadType: String,
+        context: NotifyTraceContext?,
+        queueWaitMs: Long? = null,
+        processingMs: Long? = null,
+        result: String,
+        reason: String? = null
+    ) {
+        RealtimeTrace.record(
+            stage = stage,
+            trackId = context?.trackId,
+            generation = context?.generation,
+            payloadType = payloadType,
+            queueWaitMs = queueWaitMs,
+            processingMs = processingMs,
+            result = result,
+            reason = reason,
+            handoffId = context?.handoffId,
+            triggerType = context?.triggerType,
+            positionAnchorMs = context?.positionAnchorMs,
+            lineIndex = context?.lineIndex,
+            wordTimingStatus = context?.wordTimingStatus
+        )
     }
 
     private fun interleaveIntervalFor(jobType: String): Int {
@@ -1268,7 +1431,8 @@ class BleNotifyQueue(
 
     private data class InterleavedPacket(
         val device: BluetoothDevice,
-        val packet: Packet
+        val packet: Packet,
+        val traceContext: NotifyTraceContext? = null
     )
 
     private data class SendJob(
@@ -1288,7 +1452,8 @@ class BleNotifyQueue(
         var packetsSinceYield: Int = 0,
         val enqueuedAtMs: Long = SystemClock.elapsedRealtime(),
         val terminalCallbackGate: BleQueueTerminalCallbackGate =
-            BleQueueTerminalCallbackGate()
+            BleQueueTerminalCallbackGate(),
+        val traceContext: NotifyTraceContext? = null
     ) {
         val chunkCount: Int
             get() = packets.count {

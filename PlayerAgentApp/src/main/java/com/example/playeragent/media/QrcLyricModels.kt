@@ -243,7 +243,10 @@ data class LyricsReadyGateSnapshot(
     val songKey: String = "",
     val generation: Long = 0L,
     val lineCount: Int = 0,
-    val reason: String = ""
+    val reason: String = "",
+    val wordTimingStatus: String = "NOT_READY",
+    val cacheSource: String = "UNKNOWN",
+    val failureReason: String = ""
 )
 
 data class IncrementalLyricsReady(

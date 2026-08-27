@@ -68,6 +68,66 @@ class RealtimeTraceTest {
     }
 
     @Test
+    fun phaseFourFieldsArePrivacySafeAndRoundTrip() {
+        val event = RealtimeTraceBuffer(capacity = 1) { 88L }.append(
+            stage = "currentWordEligible",
+            trackId = "track-safe-id",
+            generation = 3L,
+            handoffId = "command-42",
+            triggerType = "IOS_NEXT",
+            positionAnchorMs = 700L,
+            lineIndex = 2,
+            wordTimingStatus = "AVAILABLE",
+            cacheSource = "PARSED",
+            failureReason = null
+        )
+
+        assertEquals("command-42", event.handoffId)
+        assertEquals("IOS_NEXT", event.triggerType)
+        assertTrue(event.logLine().contains("wordTimingStatus=AVAILABLE"))
+        assertFalse(event.logLine().contains("wordText="))
+    }
+
+    @Test
+    fun commandHandoffIsPromotedByMatchingMediaObservation() {
+        TrackHandoffTraceCoordinator.clear()
+        val command = TrackHandoffTraceCoordinator.observeCommand(
+            commandSeq = 7L,
+            commandType = "NEXT",
+            nowMs = 100L
+        )
+        val accepted = TrackHandoffTraceCoordinator.observeMediaSessionMetadata(
+            trackId = "track-a",
+            positionAnchorMs = 120L,
+            nowMs = 120L
+        )
+
+        assertEquals("command-7", command?.handoffId)
+        assertEquals(command?.handoffId, accepted?.handoffId)
+        assertEquals(TrackHandoffTriggerType.IOS_NEXT, accepted?.triggerType)
+        assertEquals(accepted, TrackHandoffTraceCoordinator.contextFor("track-a"))
+        TrackHandoffTraceCoordinator.clear()
+    }
+
+    @Test
+    fun changedNotificationCreatesBoundedAutomaticHandoff() {
+        TrackHandoffTraceCoordinator.clear()
+        TrackHandoffTraceCoordinator.observeNotificationMetadata(
+            identityKey = "notification-a",
+            nowMs = 200L
+        )
+        val accepted = TrackHandoffTraceCoordinator.observeMediaSessionMetadata(
+            trackId = "track-b",
+            positionAnchorMs = 220L,
+            nowMs = 220L
+        )
+
+        assertTrue(accepted?.handoffId?.startsWith("sony-200-") == true)
+        assertEquals(TrackHandoffTriggerType.UNKNOWN, accepted?.triggerType)
+        TrackHandoffTraceCoordinator.clear()
+    }
+
+    @Test
     fun disabledTraceDoesNotStoreEvents() {
         val original = RealtimeTrace.enabled
         try {

@@ -20,7 +20,14 @@ data class RealtimeTraceEvent(
     val chunkIndex: Int? = null,
     val chunkCount: Int? = null,
     val result: String? = null,
-    val reason: String? = null
+    val reason: String? = null,
+    val handoffId: String? = null,
+    val triggerType: String? = null,
+    val positionAnchorMs: Long? = null,
+    val lineIndex: Int? = null,
+    val wordTimingStatus: String? = null,
+    val cacheSource: String? = null,
+    val failureReason: String? = null
 ) {
     fun logLine(): String {
         val fields = listOf(
@@ -38,7 +45,14 @@ data class RealtimeTraceEvent(
             "chunkIndex" to chunkIndex?.toString(),
             "chunkCount" to chunkCount?.toString(),
             "result" to result,
-            "reason" to reason
+            "reason" to reason,
+            "handoffId" to handoffId,
+            "triggerType" to triggerType,
+            "positionAnchorMs" to positionAnchorMs?.toString(),
+            "lineIndex" to lineIndex?.toString(),
+            "wordTimingStatus" to wordTimingStatus,
+            "cacheSource" to cacheSource,
+            "failureReason" to failureReason
         )
         return "[RealtimeTrace] " + fields.joinToString(" ") { (key, value) ->
             "$key=${safe(value ?: "-")}"
@@ -82,7 +96,14 @@ class RealtimeTraceBuffer(
         chunkIndex: Int? = null,
         chunkCount: Int? = null,
         result: String? = null,
-        reason: String? = null
+        reason: String? = null,
+        handoffId: String? = null,
+        triggerType: String? = null,
+        positionAnchorMs: Long? = null,
+        lineIndex: Int? = null,
+        wordTimingStatus: String? = null,
+        cacheSource: String? = null,
+        failureReason: String? = null
     ): RealtimeTraceEvent {
         val sampled = monoMs ?: clock()
         val stableMonoMs = maxOf(sampled, lastMonoMs)
@@ -103,7 +124,14 @@ class RealtimeTraceBuffer(
             chunkIndex = chunkIndex,
             chunkCount = chunkCount,
             result = result,
-            reason = reason
+            reason = reason,
+            handoffId = handoffId,
+            triggerType = triggerType,
+            positionAnchorMs = positionAnchorMs,
+            lineIndex = lineIndex,
+            wordTimingStatus = wordTimingStatus,
+            cacheSource = cacheSource,
+            failureReason = failureReason
         )
         storage[nextIndex] = event
         nextIndex = (nextIndex + 1) % capacity
@@ -158,7 +186,14 @@ object RealtimeTrace {
         chunkIndex: Int? = null,
         chunkCount: Int? = null,
         result: String? = null,
-        reason: String? = null
+        reason: String? = null,
+        handoffId: String? = null,
+        triggerType: String? = null,
+        positionAnchorMs: Long? = null,
+        lineIndex: Int? = null,
+        wordTimingStatus: String? = null,
+        cacheSource: String? = null,
+        failureReason: String? = null
     ): RealtimeTraceEvent? {
         if (!enabled) return null
         val event = buffer.append(
@@ -175,7 +210,14 @@ object RealtimeTrace {
             chunkIndex = chunkIndex,
             chunkCount = chunkCount,
             result = result,
-            reason = reason
+            reason = reason,
+            handoffId = handoffId,
+            triggerType = triggerType,
+            positionAnchorMs = positionAnchorMs,
+            lineIndex = lineIndex,
+            wordTimingStatus = wordTimingStatus,
+            cacheSource = cacheSource,
+            failureReason = failureReason
         )
         logExecutor.execute { sink.get().invoke(event.logLine()) }
         return event

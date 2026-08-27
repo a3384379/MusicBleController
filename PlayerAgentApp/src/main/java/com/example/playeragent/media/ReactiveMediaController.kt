@@ -2,6 +2,7 @@ package com.example.playeragent.media
 
 import android.os.SystemClock
 import com.example.playeragent.diagnostics.RealtimeTrace
+import com.example.playeragent.diagnostics.TrackHandoffTraceCoordinator
 
 enum class MediaEventType {
     MEDIA_METADATA_CHANGED,
@@ -114,28 +115,37 @@ class ReactiveMediaController(
                 albumArtReady = false
                 lastCurrentLine = ""
                 lastCurrentWordKey = ""
+                val handoffTrace = TrackHandoffTraceCoordinator.contextFor(stableTrackId)
                 RealtimeTrace.record(
                     stage = "mediaSessionTrackChanged",
                     monoMs = now,
                     trackId = stableTrackId,
                     generation = generation,
                     payloadType = "mediaSession",
-                    result = "changed"
+                    result = "changed",
+                    handoffId = handoffTrace?.handoffId,
+                    triggerType = handoffTrace?.triggerType?.name,
+                    positionAnchorMs = now
                 )
                 RealtimeTrace.record(
-                    stage = "trackIdentityAccepted",
+                    stage = "reactiveTrackIdentityAccepted",
                     monoMs = now,
                     trackId = stableTrackId,
                     generation = generation,
                     payloadType = "mediaSession",
-                    result = "accepted"
+                    result = "accepted",
+                    handoffId = handoffTrace?.handoffId,
+                    triggerType = handoffTrace?.triggerType?.name,
+                    positionAnchorMs = now
                 )
                 RealtimeTrace.record(
                     stage = "trackGenerationCreated",
                     monoMs = now,
                     trackId = stableTrackId,
                     generation = generation,
-                    result = "created"
+                    result = "created",
+                    handoffId = handoffTrace?.handoffId,
+                    triggerType = handoffTrace?.triggerType?.name
                 )
                 logger(
                     "[Engine] event received type=${MediaEventType.TRACK_CHANGED} " +

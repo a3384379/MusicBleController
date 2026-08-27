@@ -111,7 +111,7 @@ struct ContentView: View {
             .onChange(of: manager.title) { oldValue, newValue in
                 guard oldValue != newValue else { return }
                 RealtimeTraceStore.shared.record(
-                    stage: "nowPlayingViewStateChanged",
+                    stage: "nowPlayingStateConsumed",
                     trackId: manager.realtimeTraceTrackId,
                     generation: manager.realtimeTraceGeneration,
                     payloadType: "trackIdentity",

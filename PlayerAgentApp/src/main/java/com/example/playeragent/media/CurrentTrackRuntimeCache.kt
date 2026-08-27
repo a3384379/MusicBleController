@@ -55,6 +55,19 @@ data class CurrentWordState(
         get() = "$trackId|$trackGeneration|$lineIndex|$wordIndex|$wordStartMs"
 }
 
+data class CurrentWordEligibilitySnapshot(
+    val eligible: Boolean,
+    val reason: String,
+    val trackId: String = "",
+    val generation: Long = 0L,
+    val positionMs: Long = 0L,
+    val positionAnchorMs: Long = 0L,
+    val lineIndex: Int = -1,
+    val wordTimingStatus: String = "NOT_READY",
+    val nextBoundaryDelayMs: Long? = null,
+    val state: CurrentWordState? = null
+)
+
 internal object PlaybackPositionAnchorPolicy {
     fun projectedPositionMs(
         positionMs: Long,
@@ -380,6 +393,107 @@ object CurrentTrackRuntimeCache {
         synchronized(lock) {
             val track = current ?: return null
             return findCurrentWordStateLocked(track, timestampMs, elapsedRealtimeMs)
+        }
+    }
+
+    fun currentWordEligibilitySnapshot(
+        timestampMs: Long = System.currentTimeMillis(),
+        elapsedRealtimeMs: Long = SystemClock.elapsedRealtime()
+    ): CurrentWordEligibilitySnapshot {
+        synchronized(lock) {
+            val track = current ?: return CurrentWordEligibilitySnapshot(
+                eligible = false,
+                reason = "LYRIC_NOT_READY"
+            )
+            val common = CurrentWordEligibilitySnapshot(
+                eligible = false,
+                reason = "UNKNOWN",
+                trackId = track.trackId,
+                generation = track.currentTrackGeneration,
+                positionMs = track.positionMs,
+                positionAnchorMs = track.positionAnchorElapsedMs
+            )
+            if (!track.isPlaying) return common.copy(reason = "PAUSED")
+            if (track.positionAnchorElapsedMs <= 0L ||
+                elapsedRealtimeMs < track.positionAnchorElapsedMs
+            ) {
+                return common.copy(reason = "CLOCK_UNTRUSTED")
+            }
+            if (track.lyricLines.isEmpty()) return common.copy(reason = "LYRIC_NOT_READY")
+            val position = PlaybackPositionAnchorPolicy.projectedPositionMs(
+                positionMs = track.positionMs,
+                positionAnchorElapsedMs = track.positionAnchorElapsedMs,
+                nowElapsedMs = elapsedRealtimeMs,
+                durationMs = track.durationMs,
+                isPlaying = track.isPlaying,
+                playbackSpeed = track.playbackSpeed
+            )
+            val lineIndex = findLatestLineIndex(track.lyricLines, position)
+            if (lineIndex < 0) {
+                val firstBoundary = track.lyricLines.firstOrNull()?.let { line ->
+                    line.words.firstOrNull()?.startMs ?: line.timeMs
+                }
+                return common.copy(
+                    reason = "INTRO_WAIT",
+                    positionMs = position,
+                    nextBoundaryDelayMs = firstBoundary
+                        ?.minus(position)
+                        ?.coerceAtLeast(0L)
+                )
+            }
+            val line = track.lyricLines[lineIndex]
+            if (line.words.isEmpty()) {
+                return common.copy(
+                    reason = "NO_WORD_TIMING",
+                    positionMs = position,
+                    lineIndex = lineIndex,
+                    wordTimingStatus = "LINE_ONLY"
+                )
+            }
+            val wordIndex = findLatestWordIndex(line.words, position)
+            if (wordIndex < 0) {
+                return common.copy(
+                    reason = "INTRO_WAIT",
+                    positionMs = position,
+                    lineIndex = lineIndex,
+                    wordTimingStatus = "AVAILABLE",
+                    nextBoundaryDelayMs = (line.words.first().startMs - position)
+                        .coerceAtLeast(0L)
+                )
+            }
+            val word = line.words[wordIndex]
+            val wordEndMs = word.startMs + word.durationMs.coerceAtLeast(0L)
+            if (word.durationMs > 0L && position >= wordEndMs) {
+                val nextBoundary = line.words.getOrNull(wordIndex + 1)?.startMs
+                    ?: track.lyricLines.getOrNull(lineIndex + 1)?.let { nextLine ->
+                        nextLine.words.firstOrNull()?.startMs ?: nextLine.timeMs
+                    }
+                return common.copy(
+                    reason = if (nextBoundary != null) "INTRO_WAIT" else "NO_ACTIVE_LINE",
+                    positionMs = position,
+                    lineIndex = lineIndex,
+                    wordTimingStatus = "AVAILABLE",
+                    nextBoundaryDelayMs = nextBoundary
+                        ?.minus(position)
+                        ?.coerceAtLeast(0L)
+                )
+            }
+            val state = findCurrentWordStateLocked(track, timestampMs, elapsedRealtimeMs)
+            return common.copy(
+                eligible = state != null && state.hasWordTiming,
+                reason = if (state != null && state.hasWordTiming) "ELIGIBLE" else "NO_WORD_TIMING",
+                positionMs = position,
+                lineIndex = lineIndex,
+                wordTimingStatus = if (state?.hasWordTiming == true) "AVAILABLE" else "LINE_ONLY",
+                state = state
+            )
+        }
+    }
+
+    fun traceIdentitySnapshot(): Pair<String, Long>? {
+        synchronized(lock) {
+            val track = current ?: return null
+            return track.trackId to track.currentTrackGeneration
         }
     }
 

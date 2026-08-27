@@ -11,6 +11,7 @@ FAST_SWITCH=false
 MODE="next"
 OUTPUT_DIR_ARG=""
 JSON_OUTPUT=false
+DURATION_MINUTES=0
 
 usage() {
   cat <<'EOF'
@@ -21,6 +22,8 @@ Options:
   --fast-switch           Alternate NEXT/PREVIOUS at 650 ms intervals.
   --previous              Use PREVIOUS for the normal scenario.
   --auto                  Equivalent automatic scenario via Sony MediaSession events.
+  --natural               Observe real natural autoplay without sending controls.
+  --duration-minutes <n>  Observation time for --natural.
   --ios-device <id>       iPhone devicectl identifier.
   --android-device <id>   Sony adb serial.
   --output <dir>          Output directory.
@@ -54,6 +57,14 @@ while [[ $# -gt 0 ]]; do
     --auto)
       MODE="auto"
       shift
+      ;;
+    --natural)
+      MODE="natural"
+      shift
+      ;;
+    --duration-minutes)
+      DURATION_MINUTES="${2:?--duration-minutes requires a count}"
+      shift 2
       ;;
     --ios-device)
       IOS_DEVICE_ID="${2:?--ios-device requires an id}"
@@ -89,7 +100,7 @@ if ! [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || (( RUNS > 500 )); then
 fi
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUTPUT_DIR_ARG:-/tmp/musicble_realtime_v4/$timestamp}"
+OUT_DIR="${OUTPUT_DIR_ARG:-/tmp/musicble_phase4/$timestamp}"
 mkdir -p "$OUT_DIR"
 
 log() {
@@ -280,9 +291,17 @@ if [[ "$MODE" == "auto" ]]; then
     # the active MediaSession and is stable for repeatable automatic-equivalent
     # measurements. This does not call a QQ Music private API.
     "$ADB_BIN" -s "$ANDROID_DEVICE_ID" shell cmd media_session dispatch next
-    sleep 3
+    sleep 4
   done
   sleep 12
+elif [[ "$MODE" == "natural" ]]; then
+  if ! [[ "$DURATION_MINUTES" =~ ^[1-9][0-9]*$ ]]; then
+    emit_failure "natural_duration_minutes_required"
+  fi
+  "$ADB_BIN" -s "$ANDROID_DEVICE_ID" shell log -t RealtimeV4 \
+    "measurement_start mode=natural" >/dev/null 2>&1 || true
+  log "observing natural autoplay for ${DURATION_MINUTES} minutes"
+  sleep "$((DURATION_MINUTES * 60))"
 else
   duration="$(python3 - "$RUNS" "$FAST_SWITCH" <<'PY'
 import math
@@ -300,9 +319,9 @@ copy_ios_log "$IOS_FULL_LOG" || emit_failure "ios_log_copy_failed"
 cleanup
 trap - EXIT
 
-if [[ "$MODE" == "auto" ]]; then
+if [[ "$MODE" == "auto" || "$MODE" == "natural" ]]; then
   LC_ALL=C awk '
-    /RealtimeV4: measurement_start mode=auto/ { capture=1; next }
+    /RealtimeV4: measurement_start mode=(auto|natural)/ { capture=1; next }
     capture && /\[RealtimeTrace\]/ { print }
   ' "$SONY_FULL_LOG" >"$SONY_TRACE_LOG"
 else
@@ -351,6 +370,13 @@ sample_count = (
     if mode == "auto"
     else stage_counts.get("commandIntent", 0)
 )
+trigger_override = {
+    "auto": "SONY_MEDIA_SESSION_NEXT",
+    "natural": "NATURAL_AUTOPLAY",
+}.get(mode)
+if trigger_override:
+    for sample in data.get("samples", []):
+        sample["triggerType"] = trigger_override
 complete = data.get("eventCount", 0) > 0 and sample_count >= requested_runs
 data.update({
     "result": "PASS" if complete else "FAIL",
@@ -380,6 +406,9 @@ data.update({
     },
 })
 path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+(path.parent / "sample_classification.json").write_text(
+    json.dumps(data.get("samples", []), ensure_ascii=False, indent=2) + "\n"
+)
 summary_path = Path(sys.argv[11])
 summary = summary_path.read_text(encoding="utf-8")
 title, body = summary.split("\n\n", 1)

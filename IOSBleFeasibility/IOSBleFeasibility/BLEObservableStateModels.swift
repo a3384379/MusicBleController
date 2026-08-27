@@ -730,6 +730,14 @@ enum RemotePlaybackAnchorPolicy {
     }
 }
 
+enum CurrentWordOrderingDecision: String, Equatable {
+    case accept = "ACCEPT"
+    case generationMismatch = "GENERATION_MISMATCH"
+    case sequenceOld = "SEQUENCE_OLD"
+    case positionStale = "POSITION_STALE"
+    case duplicate = "DUPLICATE"
+}
+
 struct CurrentWordOrderingFence {
     private(set) var generation: Int64 = -1
     private(set) var sequence: Int64 = -1
@@ -740,29 +748,150 @@ struct CurrentWordOrderingFence {
         sequence incomingSequence: Int64,
         positionMs incomingPositionMs: Int64
     ) -> Bool {
+        decision(
+            generation: incomingGeneration,
+            sequence: incomingSequence,
+            positionMs: incomingPositionMs
+        ) == .accept
+    }
+
+    mutating func decision(
+        generation incomingGeneration: Int64,
+        sequence incomingSequence: Int64,
+        positionMs incomingPositionMs: Int64
+    ) -> CurrentWordOrderingDecision {
         if incomingGeneration > 0, incomingSequence > 0 {
-            if incomingGeneration < generation ||
-                (incomingGeneration == generation && incomingSequence <= sequence) {
-                return false
+            if incomingGeneration < generation {
+                return .generationMismatch
+            }
+            if incomingGeneration == generation, incomingSequence < sequence {
+                return .sequenceOld
+            }
+            if incomingGeneration == generation, incomingSequence == sequence {
+                return .duplicate
             }
         }
         if positionMs >= 0,
            incomingPositionMs < positionMs,
            positionMs - incomingPositionMs <= 1_500 {
-            return false
+            return .positionStale
         }
         if incomingGeneration > 0, incomingSequence > 0 {
             generation = incomingGeneration
             sequence = incomingSequence
         }
         positionMs = incomingPositionMs
-        return true
+        return .accept
     }
 
     mutating func reset() {
         generation = -1
         sequence = -1
         positionMs = -1
+    }
+}
+
+enum RealtimeHandoffTriggerType: String, Equatable {
+    case iosNext = "IOS_NEXT"
+    case iosPrevious = "IOS_PREVIOUS"
+    case sonyMediaSessionNext = "SONY_MEDIA_SESSION_NEXT"
+    case naturalAutoplay = "NATURAL_AUTOPLAY"
+    case sonyLocalControl = "SONY_LOCAL_CONTROL"
+    case unknown = "UNKNOWN"
+}
+
+struct RealtimeHandoffContext: Equatable {
+    let handoffId: String
+    let triggerType: RealtimeHandoffTriggerType
+    let commandSeq: Int64?
+    let commandType: String?
+    let createdMonoMs: Int64
+    var trackId: String?
+    var generation: Int64?
+}
+
+struct RealtimeHandoffCorrelation {
+    private static let pendingTTLms: Int64 = 15_000
+    private(set) var pending: RealtimeHandoffContext?
+    private(set) var current: RealtimeHandoffContext?
+    private var nextLocalId: UInt64 = 0
+
+    mutating func registerCommand(
+        sequence: Int64,
+        command: String,
+        monoMs: Int64
+    ) -> RealtimeHandoffContext? {
+        let trigger: RealtimeHandoffTriggerType
+        switch command {
+        case "NEXT": trigger = .iosNext
+        case "PREVIOUS": trigger = .iosPrevious
+        default: return nil
+        }
+        let context = RealtimeHandoffContext(
+            handoffId: "command-\(sequence)",
+            triggerType: trigger,
+            commandSeq: sequence,
+            commandType: command,
+            createdMonoMs: monoMs,
+            trackId: nil,
+            generation: nil
+        )
+        pending = context
+        return context
+    }
+
+    mutating func contextForInbound(monoMs: Int64) -> RealtimeHandoffContext? {
+        expirePending(monoMs: monoMs)
+        return pending ?? current
+    }
+
+    func context(for trackId: String) -> RealtimeHandoffContext? {
+        guard current?.trackId == trackId else { return nil }
+        return current
+    }
+
+    func commandContext(sequence: Int64) -> RealtimeHandoffContext? {
+        if pending?.commandSeq == sequence { return pending }
+        if current?.commandSeq == sequence { return current }
+        return nil
+    }
+
+    mutating func acceptTrack(
+        trackId: String,
+        generation: Int64,
+        monoMs: Int64
+    ) -> RealtimeHandoffContext {
+        expirePending(monoMs: monoMs)
+        var accepted = pending ?? localContext(monoMs: monoMs)
+        accepted.trackId = trackId
+        accepted.generation = generation
+        pending = nil
+        current = accepted
+        return accepted
+    }
+
+    mutating func reset() {
+        pending = nil
+        current = nil
+    }
+
+    private mutating func expirePending(monoMs: Int64) {
+        guard let pending,
+              monoMs - pending.createdMonoMs > Self.pendingTTLms else { return }
+        self.pending = nil
+    }
+
+    private mutating func localContext(monoMs: Int64) -> RealtimeHandoffContext {
+        nextLocalId &+= 1
+        return RealtimeHandoffContext(
+            handoffId: "ios-\(monoMs)-\(nextLocalId)",
+            triggerType: .unknown,
+            commandSeq: nil,
+            commandType: nil,
+            createdMonoMs: monoMs,
+            trackId: nil,
+            generation: nil
+        )
     }
 }
 
@@ -785,6 +914,13 @@ struct RealtimeTraceEvent: Equatable {
     let chunkCount: Int?
     let result: String?
     let reason: String?
+    let handoffId: String?
+    let triggerType: String?
+    let positionAnchorMs: Int64?
+    let lineIndex: Int?
+    let wordTimingStatus: String?
+    let cacheSource: String?
+    let failureReason: String?
 
     var logLine: String {
         let fields: [(String, String)] = [
@@ -802,7 +938,14 @@ struct RealtimeTraceEvent: Equatable {
             ("chunkIndex", chunkIndex.map(String.init) ?? "-"),
             ("chunkCount", chunkCount.map(String.init) ?? "-"),
             ("result", result ?? "-"),
-            ("reason", reason ?? "-")
+            ("reason", reason ?? "-"),
+            ("handoffId", handoffId ?? "-"),
+            ("triggerType", triggerType ?? "-"),
+            ("positionAnchorMs", positionAnchorMs.map(String.init) ?? "-"),
+            ("lineIndex", lineIndex.map(String.init) ?? "-"),
+            ("wordTimingStatus", wordTimingStatus ?? "-"),
+            ("cacheSource", cacheSource ?? "-"),
+            ("failureReason", failureReason ?? "-")
         ]
         return "[RealtimeTrace] " + fields
             .map { "\($0.0)=\(Self.safe($0.1))" }
@@ -860,7 +1003,14 @@ final class RealtimeTraceBuffer {
         chunkIndex: Int? = nil,
         chunkCount: Int? = nil,
         result: String? = nil,
-        reason: String? = nil
+        reason: String? = nil,
+        handoffId: String? = nil,
+        triggerType: String? = nil,
+        positionAnchorMs: Int64? = nil,
+        lineIndex: Int? = nil,
+        wordTimingStatus: String? = nil,
+        cacheSource: String? = nil,
+        failureReason: String? = nil
     ) -> RealtimeTraceEvent {
         lock.lock()
         defer { lock.unlock() }
@@ -884,7 +1034,14 @@ final class RealtimeTraceBuffer {
             chunkIndex: chunkIndex,
             chunkCount: chunkCount,
             result: result,
-            reason: reason
+            reason: reason,
+            handoffId: handoffId,
+            triggerType: triggerType,
+            positionAnchorMs: positionAnchorMs,
+            lineIndex: lineIndex,
+            wordTimingStatus: wordTimingStatus,
+            cacheSource: cacheSource,
+            failureReason: failureReason
         )
         storage[nextIndex] = event
         nextIndex = (nextIndex + 1) % capacity
@@ -953,7 +1110,14 @@ final class RealtimeTraceStore {
         chunkIndex: Int? = nil,
         chunkCount: Int? = nil,
         result: String? = nil,
-        reason: String? = nil
+        reason: String? = nil,
+        handoffId: String? = nil,
+        triggerType: String? = nil,
+        positionAnchorMs: Int64? = nil,
+        lineIndex: Int? = nil,
+        wordTimingStatus: String? = nil,
+        cacheSource: String? = nil,
+        failureReason: String? = nil
     ) -> RealtimeTraceEvent? {
         guard enabled else { return nil }
         let event = buffer.append(
@@ -970,7 +1134,14 @@ final class RealtimeTraceStore {
             chunkIndex: chunkIndex,
             chunkCount: chunkCount,
             result: result,
-            reason: reason
+            reason: reason,
+            handoffId: handoffId,
+            triggerType: triggerType,
+            positionAnchorMs: positionAnchorMs,
+            lineIndex: lineIndex,
+            wordTimingStatus: wordTimingStatus,
+            cacheSource: cacheSource,
+            failureReason: failureReason
         )
         logSink(event.logLine)
         return event

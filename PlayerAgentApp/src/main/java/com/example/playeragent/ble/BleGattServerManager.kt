@@ -24,6 +24,7 @@ import com.example.playeragent.history.PlaybackHistoryRepository
 import com.example.playeragent.history.PlaybackStatsSummary
 import com.example.playeragent.history.StatsRange
 import com.example.playeragent.diagnostics.RealtimeTrace
+import com.example.playeragent.diagnostics.TrackHandoffTraceCoordinator
 import com.example.playeragent.media.AlbumArtPlaceholderPolicy
 import com.example.playeragent.media.AlbumArtTestManager
 import com.example.playeragent.logging.LogConfig
@@ -426,6 +427,11 @@ class BleGattServerManager(
             val command = request.optString("cmd")
             val seq = request.optString("seq").ifBlank { "unknown" }
             val commandSeq = seq.toLongOrNull()
+            val handoffTrace = TrackHandoffTraceCoordinator.observeCommand(
+                commandSeq = commandSeq,
+                commandType = command,
+                nowMs = receiveElapsedMs
+            )
             RealtimeTrace.record(
                 stage = "commandReceived",
                 monoMs = receiveElapsedMs,
@@ -433,7 +439,9 @@ class BleGattServerManager(
                 commandType = command,
                 processingMs = (SystemClock.elapsedRealtime() - receiveElapsedMs)
                     .coerceAtLeast(0L),
-                result = "received"
+                result = "received",
+                handoffId = handoffTrace?.handoffId,
+                triggerType = handoffTrace?.triggerType?.name
             )
             RealtimeTrace.record(
                 stage = "commandValidated",
@@ -441,7 +449,9 @@ class BleGattServerManager(
                 commandType = command,
                 processingMs = (SystemClock.elapsedRealtime() - parseStartedAtMs)
                     .coerceAtLeast(0L),
-                result = "valid"
+                result = "valid",
+                handoffId = handoffTrace?.handoffId,
+                triggerType = handoffTrace?.triggerType?.name
             )
             logger(
                 "[CTRL-Sony] command parsed seq=$seq cmd=$command " +
@@ -502,7 +512,9 @@ class BleGattServerManager(
                     commandSeq = commandSeq,
                     commandType = command,
                     queueWaitMs = (handleStartedAtMs - receiveElapsedMs).coerceAtLeast(0L),
-                    result = "started"
+                    result = "started",
+                    handoffId = handoffTrace?.handoffId,
+                    triggerType = handoffTrace?.triggerType?.name
                 )
                 logger(
                     "[CTRL-Sony] handle async begin seq=$seq cmd=$command " +
@@ -530,7 +542,9 @@ class BleGattServerManager(
                     commandType = command,
                     processingMs = (handleEndedAtMs - handleStartedAtMs).coerceAtLeast(0L),
                     result = if (dispatchResult.isSuccess) "success" else "failure",
-                    reason = if (dispatchResult.isSuccess) null else "handler_exception"
+                    reason = if (dispatchResult.isSuccess) null else "handler_exception",
+                    handoffId = handoffTrace?.handoffId,
+                    triggerType = handoffTrace?.triggerType?.name
                 )
                 logger(
                     "[CTRL-Sony] handle async end seq=$seq cmd=$command " +
@@ -1456,6 +1470,7 @@ class BleGattServerManager(
         albumArtTransferCoordinator.reset()
         multiControllerCommandGate.reset()
         v3SessionCoordinator.clear()
+        TrackHandoffTraceCoordinator.clear()
         lastAutoPushSongKey = null
         lastAutoPushPlaying = null
     }
@@ -1831,6 +1846,32 @@ class BleGattServerManager(
         }
 
         val messageType = readMessageType(message)
+        val runtimeTrace = CurrentTrackRuntimeCache.currentWordEligibilitySnapshot()
+        val traceTrackId = originalObject?.optString("trackId")
+            ?.takeIf { it.isNotBlank() }
+            ?: runtimeTrace.trackId.takeIf { it.isNotBlank() }
+        val traceGeneration = originalObject
+            ?.optLong("generation", 0L)
+            ?.takeIf { it > 0L }
+            ?: runtimeTrace.generation.takeIf { it > 0L }
+        val handoffTrace = traceTrackId?.let(TrackHandoffTraceCoordinator::contextFor)
+        val traceContext = NotifyTraceContext(
+            trackId = traceTrackId,
+            generation = traceGeneration,
+            handoffId = handoffTrace?.handoffId,
+            triggerType = handoffTrace?.triggerType?.name,
+            positionAnchorMs = originalObject
+                ?.optLong("sampleMono", 0L)
+                ?.takeIf { it > 0L }
+                ?: runtimeTrace.positionAnchorMs.takeIf { it > 0L },
+            lineIndex = originalObject
+                ?.optInt("line", -1)
+                ?.takeIf { it >= 0 }
+                ?: runtimeTrace.lineIndex.takeIf { it >= 0 },
+            wordTimingStatus = runtimeTrace.wordTimingStatus,
+            hasCurrentLyric = messageType == "playbackState" &&
+                originalObject?.optString("lyric").orEmpty().isNotBlank()
+        )
         if ((messageType == "playbackState" ||
                 messageType == "trackInfo" ||
                 messageType == "volumeState" ||
@@ -1841,7 +1882,8 @@ class BleGattServerManager(
                 device = device,
                 type = messageType,
                 value = value,
-                delayAfterMs = SHORT_MESSAGE_DELAY_MS
+                delayAfterMs = SHORT_MESSAGE_DELAY_MS,
+                traceContext = traceContext
             )
             return true
         }
@@ -1850,7 +1892,8 @@ class BleGattServerManager(
             device = device,
             type = messageType,
             value = value,
-            delayAfterMs = SHORT_MESSAGE_DELAY_MS
+            delayAfterMs = SHORT_MESSAGE_DELAY_MS,
+            traceContext = traceContext
         )
         return true
     }
@@ -2124,13 +2167,21 @@ class BleGattServerManager(
     private fun scheduleCurrentWordPush(delayMs: Long) {
         val executor = currentWordExecutor ?: return
         currentWordPushTask?.cancel(false)
+        val eligibility = CurrentTrackRuntimeCache.currentWordEligibilitySnapshot()
+        val handoffTrace = TrackHandoffTraceCoordinator.contextFor(eligibility.trackId)
         RealtimeTrace.record(
-            stage = "currentWordScheduleCreated",
-            trackId = CurrentTrackRuntimeCache.trackSnapshot()?.trackId,
-            generation = CurrentTrackRuntimeCache.currentGeneration(),
+            stage = "currentWordSchedulerCreateRequested",
+            trackId = eligibility.trackId.takeIf { it.isNotBlank() },
+            generation = eligibility.generation.takeIf { it > 0L },
             payloadType = "currentWord",
             processingMs = delayMs.coerceAtLeast(0L),
-            result = "scheduled"
+            result = "requested",
+            reason = eligibility.reason,
+            handoffId = handoffTrace?.handoffId,
+            triggerType = handoffTrace?.triggerType?.name,
+            positionAnchorMs = eligibility.positionAnchorMs.takeIf { it > 0L },
+            lineIndex = eligibility.lineIndex.takeIf { it >= 0 },
+            wordTimingStatus = eligibility.wordTimingStatus
         )
         currentWordPushTask = executor.schedule(
             {
@@ -2154,6 +2205,34 @@ class BleGattServerManager(
             },
             delayMs.coerceAtLeast(0L),
             TimeUnit.MILLISECONDS
+        )
+        RealtimeTrace.record(
+            stage = "currentWordSchedulerCreated",
+            trackId = eligibility.trackId.takeIf { it.isNotBlank() },
+            generation = eligibility.generation.takeIf { it > 0L },
+            payloadType = "currentWord",
+            processingMs = delayMs.coerceAtLeast(0L),
+            result = "scheduled",
+            reason = eligibility.reason,
+            handoffId = handoffTrace?.handoffId,
+            triggerType = handoffTrace?.triggerType?.name,
+            positionAnchorMs = eligibility.positionAnchorMs.takeIf { it > 0L },
+            lineIndex = eligibility.lineIndex.takeIf { it >= 0 },
+            wordTimingStatus = eligibility.wordTimingStatus
+        )
+        RealtimeTrace.record(
+            stage = "currentWordFirstBoundaryCalculated",
+            trackId = eligibility.trackId.takeIf { it.isNotBlank() },
+            generation = eligibility.generation.takeIf { it > 0L },
+            payloadType = "currentWord",
+            processingMs = (eligibility.nextBoundaryDelayMs ?: delayMs).coerceAtLeast(0L),
+            result = "calculated",
+            reason = eligibility.reason,
+            handoffId = handoffTrace?.handoffId,
+            triggerType = handoffTrace?.triggerType?.name,
+            positionAnchorMs = eligibility.positionAnchorMs.takeIf { it > 0L },
+            lineIndex = eligibility.lineIndex.takeIf { it >= 0 },
+            wordTimingStatus = eligibility.wordTimingStatus
         )
     }
 
@@ -6524,7 +6603,14 @@ class BleGattServerManager(
             generation = snapshot.generation,
             payloadType = "lyrics",
             result = if (snapshot.lyricsReady) "ready" else "not_ready",
-            reason = snapshot.reason
+            reason = snapshot.reason,
+            wordTimingStatus = snapshot.wordTimingStatus,
+            cacheSource = snapshot.cacheSource,
+            failureReason = snapshot.failureReason.takeIf { it.isNotBlank() },
+            handoffId = TrackHandoffTraceCoordinator.contextFor(snapshot.trackId)?.handoffId,
+            triggerType = TrackHandoffTraceCoordinator.contextFor(snapshot.trackId)
+                ?.triggerType
+                ?.name
         )
         schedulePlaybackUiRefresh("lyrics_ready")
         flushPendingLyricWindow(snapshot)

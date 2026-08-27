@@ -2,6 +2,7 @@ package com.example.playeragent.ble
 
 import android.os.SystemClock
 import com.example.playeragent.diagnostics.RealtimeTrace
+import com.example.playeragent.diagnostics.TrackHandoffTraceCoordinator
 import com.example.playeragent.media.CurrentTrackRuntimeCache
 import com.example.playeragent.media.CurrentWordState
 import com.example.playeragent.media.TrackCapabilityTracker
@@ -46,12 +47,43 @@ class CurrentWordPushEngine(
         force: Boolean = false
     ): CurrentWordState? {
         val startedAt = elapsedRealtime()
+        val eligibility = CurrentTrackRuntimeCache.currentWordEligibilitySnapshot(
+            elapsedRealtimeMs = startedAt
+        )
+        val handoffTrace = TrackHandoffTraceCoordinator.contextFor(eligibility.trackId)
         RealtimeTrace.record(
-            stage = "currentWordEnqueued",
+            stage = "currentWordEligibilityEvaluated",
             monoMs = startedAt,
+            trackId = eligibility.trackId.takeIf { it.isNotBlank() },
+            generation = eligibility.generation.takeIf { it > 0L },
             payloadType = "currentWord",
-            result = "running",
-            reason = reason
+            result = if (eligibility.eligible) "eligible" else "not_eligible",
+            reason = eligibility.reason,
+            handoffId = handoffTrace?.handoffId,
+            triggerType = handoffTrace?.triggerType?.name,
+            positionAnchorMs = eligibility.positionAnchorMs.takeIf { it > 0L },
+            lineIndex = eligibility.lineIndex.takeIf { it >= 0 },
+            wordTimingStatus = eligibility.wordTimingStatus,
+            failureReason = eligibility.reason.takeUnless { eligibility.eligible }
+        )
+        RealtimeTrace.record(
+            stage = if (eligibility.eligible) {
+                "currentWordEligible"
+            } else {
+                "currentWordNotEligible"
+            },
+            monoMs = startedAt,
+            trackId = eligibility.trackId.takeIf { it.isNotBlank() },
+            generation = eligibility.generation.takeIf { it > 0L },
+            payloadType = "currentWord",
+            result = if (eligibility.eligible) "eligible" else "not_eligible",
+            reason = eligibility.reason,
+            handoffId = handoffTrace?.handoffId,
+            triggerType = handoffTrace?.triggerType?.name,
+            positionAnchorMs = eligibility.positionAnchorMs.takeIf { it > 0L },
+            lineIndex = eligibility.lineIndex.takeIf { it >= 0 },
+            wordTimingStatus = eligibility.wordTimingStatus,
+            failureReason = eligibility.reason.takeUnless { eligibility.eligible }
         )
         val state = currentWordState() ?: run {
             recordSkip("missing")
@@ -137,10 +169,13 @@ class CurrentWordPushEngine(
             }
         }
 
-        val sequence = synchronized(lock) {
+        val sequenceAndFirst = synchronized(lock) {
+            val first = nextSequence == 0L
             nextSequence += 1L
-            nextSequence
+            nextSequence to first
         }
+        val sequence = sequenceAndFirst.first
+        val isFirstForGeneration = sequenceAndFirst.second
         val payload = JSONObject()
             .put("type", "currentWord")
             .put("trackId", outgoingTrackId)
@@ -155,6 +190,24 @@ class CurrentWordPushEngine(
             payload.put("sampleMono", state.sampleElapsedMs)
         }
 
+        RealtimeTrace.record(
+            stage = if (isFirstForGeneration) {
+                "currentWordImmediateSnapshotEnqueued"
+            } else {
+                "currentWordBoundaryEnqueued"
+            },
+            trackId = outgoingTrackId,
+            generation = state.trackGeneration,
+            payloadType = "currentWord",
+            result = "enqueued",
+            reason = reason,
+            handoffId = handoffTrace?.handoffId,
+            triggerType = handoffTrace?.triggerType?.name,
+            positionAnchorMs = state.sampleElapsedMs,
+            lineIndex = state.lineIndex,
+            wordTimingStatus = if (state.hasWordTiming) "AVAILABLE" else "LINE_ONLY"
+        )
+
         val sendStartedAt = elapsedRealtime()
         RealtimeTrace.record(
             stage = "currentWordSendStart",
@@ -163,7 +216,12 @@ class CurrentWordPushEngine(
             generation = state.trackGeneration,
             payloadType = "currentWord",
             result = "started",
-            reason = reason
+            reason = reason,
+            handoffId = handoffTrace?.handoffId,
+            triggerType = handoffTrace?.triggerType?.name,
+            positionAnchorMs = state.sampleElapsedMs,
+            lineIndex = state.lineIndex,
+            wordTimingStatus = if (state.hasWordTiming) "AVAILABLE" else "LINE_ONLY"
         )
         val sent = sendStatusMessage(payload.toString())
         val sendEndedAt = elapsedRealtime()
@@ -175,7 +233,13 @@ class CurrentWordPushEngine(
             payloadType = "currentWord",
             processingMs = (sendEndedAt - sendStartedAt).coerceAtLeast(0L),
             result = if (sent) "success" else "failure",
-            reason = if (sent) reason else "send_failed"
+            reason = if (sent) reason else "send_failed",
+            handoffId = handoffTrace?.handoffId,
+            triggerType = handoffTrace?.triggerType?.name,
+            positionAnchorMs = state.sampleElapsedMs,
+            lineIndex = state.lineIndex,
+            wordTimingStatus = if (state.hasWordTiming) "AVAILABLE" else "LINE_ONLY",
+            failureReason = if (sent) null else "UNKNOWN"
         )
         synchronized(lock) {
             if (!sent) {
