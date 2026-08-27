@@ -308,7 +308,7 @@ import math
 import sys
 runs = int(sys.argv[1])
 fast = sys.argv[2].lower() == "true"
-print(math.ceil(runs * (0.65 if fast else 3.0) + 20))
+print(math.ceil(runs * (0.65 if fast else 4.0) + 20))
 PY
   )"
   log "collecting for ${duration}s"
