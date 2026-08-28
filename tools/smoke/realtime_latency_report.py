@@ -296,6 +296,12 @@ def _media_key(event: Event) -> Optional[tuple]:
     return None
 
 
+def _handoff_or_media_key(event: Event) -> Optional[tuple]:
+    if event.handoff_id:
+        return ("handoff", event.handoff_id)
+    return _media_key(event)
+
+
 def first_correlated_events(
     events: list[Event],
     side: str,
@@ -826,9 +832,6 @@ def analyze(
         ("sony", {"playbackEnqueued"}, "firstPlaybackEnqueued", _media_key),
         ("sony", {"playbackNotifyStart"}, "firstPlaybackNotifyStart", _media_key),
         ("sony", {"playbackNotifyCallback"}, "firstPlaybackNotifyCallback", _media_key),
-        ("ios", {"playbackNotifyReceived"}, "firstPlaybackNotifyReceived", _media_key),
-        ("ios", {"playbackDecodeEnd"}, "firstPlaybackDecodeEnd", _media_key),
-        ("ios", {"playbackStatePublished"}, "firstPlaybackPublished", _media_key),
         ("ios", {"nowPlayingStateConsumed"}, "firstUiConsumed", _media_key),
         ("sony", {"lyricReady"}, "firstLyricReady", _media_key),
         ("sony", {"lyricCurrentLineEnqueued"}, "firstLineEnqueued", _media_key),
@@ -840,6 +843,60 @@ def analyze(
         phase4_events.extend(first_correlated_events(
             events, side, stages, canonical, key_function,
         ))
+    identified_playback_receives = [
+        event for event in events
+        if event.stage != "playbackNotifyReceived" or bool(event.track_id)
+    ]
+    phase4_events.extend(first_correlated_events(
+        identified_playback_receives,
+        "ios",
+        {"playbackNotifyReceived"},
+        "firstPlaybackNotifyReceived",
+        _media_key,
+    ))
+    # playbackState JSON does not carry track identity. The receive trace is
+    # recorded immediately before decode and already owns the accepted handoff
+    # identity, so inherit it onto the adjacent decode event instead of pairing
+    # unrelated payloads that merely share a handoff window.
+    playback_receives = [
+        event for event in phase4_events
+        if event.side == "ios" and event.stage == "firstPlaybackNotifyReceived"
+    ]
+    playback_decodes = []
+    for receive in playback_receives:
+        candidates = [
+            event for event in events
+            if event.side == "ios"
+            and event.stage == "playbackDecodeEnd"
+            and event.payload_type == "playbackState"
+            and event.mono_ms >= receive.mono_ms
+            and event.mono_ms - receive.mono_ms <= 100
+            and (
+                not receive.handoff_id
+                or event.handoff_id == receive.handoff_id
+            )
+        ]
+        if candidates:
+            decoded = min(candidates, key=lambda item: (item.mono_ms, item.source_line))
+            canonical_decode = replace(
+                decoded,
+                stage="firstPlaybackDecodeEnd",
+                track_id=receive.track_id,
+                generation=receive.generation,
+                handoff_id=receive.handoff_id or decoded.handoff_id,
+                trigger_type=receive.trigger_type or decoded.trigger_type,
+            )
+            playback_decodes.append(canonical_decode)
+            phase4_events.append(canonical_decode)
+    playback_publishes = first_events_after(
+        events,
+        playback_decodes,
+        "ios",
+        {"playbackStatePublished"},
+        "firstPlaybackPublished",
+        _media_key,
+    )
+    phase4_events.extend(playback_publishes)
     eligible_events = [
         event for event in phase4_events if event.stage == "firstWordEligible"
     ]
@@ -909,7 +966,7 @@ def analyze(
         ("commandCallbackToSonyReceiveMs", "ios", "commandWriteCallback", "sony", "commandReceived", _control_command_or_handoff_key, True),
         ("sonyReceiveToDispatchEndMs", "sony", "commandReceived", "sony", "mediaControlDispatchEnd", _control_command_or_handoff_key, False),
         ("dispatchEndToMetadataObservedMs", "sony", "mediaControlDispatchEnd", "sony", "metadataObserved", _control_command_or_handoff_key, False),
-        ("metadataObservedToTrackAcceptedMs", "sony", "mediaSessionMetadataObserved", "sony", "firstSonyTrackAccepted", _media_key, False),
+        ("metadataObservedToTrackAcceptedMs", "sony", "mediaSessionMetadataObserved", "sony", "firstSonyTrackAccepted", _handoff_or_media_key, False),
         ("trackAcceptedToPlaybackReadyMs", "sony", "firstSonyTrackAccepted", "sony", "firstPlaybackReady", _media_key, False),
         ("playbackReadyToQueueStartMs", "sony", "firstPlaybackReady", "sony", "firstPlaybackEnqueued", _media_key, False),
         ("playbackReadyToNotifyStartMs", "sony", "firstPlaybackReady", "sony", "firstPlaybackNotifyStart", _media_key, False),
@@ -917,7 +974,7 @@ def analyze(
         ("notifyCallbackToIosReceiveMs", "sony", "firstPlaybackNotifyCallback", "ios", "firstPlaybackNotifyReceived", _media_key, True),
         ("iosReceiveToDecodeMs", "ios", "firstPlaybackNotifyReceived", "ios", "firstPlaybackDecodeEnd", _media_key, False),
         ("iosDecodeToPublishMs", "ios", "firstPlaybackDecodeEnd", "ios", "firstPlaybackPublished", _media_key, False),
-        ("publishToUiConsumeMs", "ios", "firstPlaybackPublished", "ios", "firstUiConsumed", _media_key, False),
+        ("publishToUiConsumeMs", "ios", "firstIosTrackAccepted", "ios", "firstUiConsumed", _media_key, False),
         ("totalCommandToTrackPublishMs", "ios", "commandIntent", "ios", "firstIosTrackAccepted", _control_command_or_handoff_key, False),
         ("trackAcceptedToLyricReadyMs", "sony", "firstSonyTrackAccepted", "sony", "firstLyricReady", _media_key, False),
         ("lyricReadyToCurrentLineEnqueueMs", "sony", "firstLyricReady", "sony", "firstLineEnqueued", _media_key, False),

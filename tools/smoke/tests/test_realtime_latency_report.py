@@ -66,6 +66,8 @@ class RealtimeLatencyReportTests(unittest.TestCase):
         )
         self.assertEqual(report["metrics"]["commandIntentToWriteStartMs"]["p50"], 2)
         self.assertEqual(report["metrics"]["dispatchEndToMetadataObservedMs"]["p50"], 1)
+        self.assertEqual(report["metrics"]["metadataObservedToTrackAcceptedMs"]["p50"], 1)
+        self.assertEqual(report["metrics"]["publishToUiConsumeMs"]["p50"], 2)
         self.assertEqual(report["metrics"]["wordEligibleToPublishMs"]["p50"], 6)
         self.assertIn("COMPLETE", report["samples"][0]["classifications"])
         self.assertEqual(report["missingEvents"], [])
@@ -135,6 +137,25 @@ class RealtimeLatencyReportTests(unittest.TestCase):
         self.assertEqual(report["metrics"]["commandIntentToWriteStartMs"]["count"], 1)
         self.assertEqual(report["metrics"]["commandIntentToWriteStartMs"]["p50"], 2)
         self.assertEqual(report["metrics"]["writeStartToCallbackMs"]["p50"], 2)
+
+    def test_phase4_handoff_pairs_payloads_without_generation(self):
+        events = self.phase4_complete_events()
+        normalized = []
+        for item in events:
+            if item.stage in {
+                "mediaSessionMetadataObserved",
+                "playbackDecodeEnd",
+            }:
+                item = REPORT.replace(item, track_id="", generation=None)
+            normalized.append(item)
+        report = REPORT.analyze(
+            normalized,
+            clock_trusted=True,
+            sony_to_ios_offset_ms=0,
+        )
+        self.assertEqual(report["metrics"]["metadataObservedToTrackAcceptedMs"]["p50"], 1)
+        self.assertEqual(report["metrics"]["iosReceiveToDecodeMs"]["p50"], 1)
+        self.assertEqual(report["metrics"]["publishToUiConsumeMs"]["p50"], 2)
 
     def test_phase4_line_only_intro_and_rejected_word_classification(self):
         events = self.phase4_complete_events()
