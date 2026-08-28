@@ -2203,10 +2203,7 @@ class BleGattServerManager(
     private fun scheduleCurrentWordPush(delayMs: Long) {
         val executor = currentWordExecutor ?: return
         currentWordPushTask?.cancel(false)
-        val safeDelayMs = maxOf(
-            delayMs.coerceAtLeast(0L),
-            currentWordPushEngine.generationHoldoffRemainingMs()
-        )
+        val safeDelayMs = delayMs.coerceAtLeast(0L)
         val eligibility = CurrentTrackRuntimeCache.currentWordEligibilitySnapshot()
         val handoffTrace = TrackHandoffTraceCoordinator.contextFor(eligibility.trackId)
         RealtimeTrace.record(
@@ -2304,14 +2301,17 @@ class BleGattServerManager(
             logger("[SongChange] old=$oldSongKey")
             logger("[SongChange] new=$songKey")
             logger("[BLE-A][AutoPush] song changed title=$title")
-            scheduleCurrentWordPush(0L)
+            // A matching lyrics-ready callback is the event barrier for the
+            // new generation. If it never arrives, this bounded task still
+            // re-evaluates the exact track/generation/anchor eligibility.
+            scheduleCurrentWordPush(CURRENT_WORD_TRACK_SWITCH_FALLBACK_MS)
         }
         if (playing != lastAutoPushPlaying) {
             lastAutoPushPlaying = playing
             logger("[BLE-A][AutoPush] play state changed playing=$playing")
-            if (playing) {
+            if (playing && !songChanged) {
                 scheduleCurrentWordPush(0L)
-            } else {
+            } else if (!playing) {
                 currentWordPushTask?.cancel(false)
                 currentWordPushTask = null
             }
@@ -7075,6 +7075,7 @@ class BleGattServerManager(
         private const val AUTO_PUSH_INTERVAL_MS = 1000L
         private const val AUTO_PUSH_PAUSED_INTERVAL_MS = 5000L
         private const val CURRENT_WORD_INITIAL_DELAY_MS = 100L
+        private const val CURRENT_WORD_TRACK_SWITCH_FALLBACK_MS = 250L
         private const val CURRENT_WORD_DRIFT_CORRECTION_MS = 500L
         private const val SERVER_PROTOCOL_VERSION = 2
         private val MULTI_CONTROLLER_DEDUP_COMMANDS = setOf(

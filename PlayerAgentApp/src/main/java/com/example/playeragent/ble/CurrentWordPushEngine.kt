@@ -40,31 +40,16 @@ class CurrentWordPushEngine(
     private var lastPushCostMs: Long = 0L
     private var lastSkipLogAtMs: Long = 0L
     private var lastObservedGeneration: Long = -1L
-    private var generationFirstSeenAtMs: Long = 0L
     private var lastPushedPositionMs: Long = -1L
     private var nextSequence: Long = 0L
     private var lastLoggedLineIndex: Int = -1
 
-    fun observeGeneration(
-        generation: Long,
-        observedAtMs: Long = elapsedRealtime()
-    ) {
+    fun observeGeneration(generation: Long) {
         if (generation <= 0L) return
         synchronized(lock) {
             if (generation != lastObservedGeneration) {
-                prepareGenerationLocked(generation, observedAtMs)
+                prepareGenerationLocked(generation)
             }
-        }
-    }
-
-    fun generationHoldoffRemainingMs(nowMs: Long = elapsedRealtime()): Long {
-        synchronized(lock) {
-            if (lastObservedGeneration <= 0L || generationFirstSeenAtMs <= 0L) {
-                return 0L
-            }
-            return (TRACK_SWITCH_BASELINE_HOLDOFF_MS -
-                (nowMs - generationFirstSeenAtMs).coerceAtLeast(0L))
-                .coerceAtLeast(0L)
         }
     }
 
@@ -140,24 +125,7 @@ class CurrentWordPushEngine(
         synchronized(lock) {
             val now = elapsedRealtime()
             if (state.trackGeneration != lastObservedGeneration) {
-                prepareGenerationLocked(state.trackGeneration, now)
-            }
-            val generationAgeMs = now - generationFirstSeenAtMs
-            if (!force && generationAgeMs < TRACK_SWITCH_BASELINE_HOLDOFF_MS) {
-                recordSkipLocked(
-                    "track_switch_baseline_pending",
-                    now,
-                    state,
-                    key,
-                    extra = " generationAgeMs=$generationAgeMs"
-                )
-                logger(
-                    "[CurrentWordFence] skip reason=track_switch_baseline_pending " +
-                        "trackId=$outgoingTrackId generation=${state.trackGeneration} " +
-                        "generationAgeMs=$generationAgeMs " +
-                        "holdoffMs=$TRACK_SWITCH_BASELINE_HOLDOFF_MS"
-                )
-                return null
+                prepareGenerationLocked(state.trackGeneration)
             }
             if (!force && key == lastPushedKey) {
                 recordSkipLocked("same word", now, state, key)
@@ -342,16 +310,14 @@ class CurrentWordPushEngine(
             lastPushedKey = ""
             lastPushElapsedMs = 0L
             lastObservedGeneration = -1L
-            generationFirstSeenAtMs = 0L
             lastPushedPositionMs = -1L
             nextSequence = 0L
             lastLoggedLineIndex = -1
         }
     }
 
-    private fun prepareGenerationLocked(generation: Long, observedAtMs: Long) {
+    private fun prepareGenerationLocked(generation: Long) {
         lastObservedGeneration = generation
-        generationFirstSeenAtMs = observedAtMs
         lastPushedKey = ""
         lastPushElapsedMs = 0L
         lastPushedPositionMs = -1L
@@ -440,7 +406,6 @@ class CurrentWordPushEngine(
 
     private companion object {
         private const val MIN_CURRENT_WORD_INTERVAL_MS = 60L
-        private const val TRACK_SWITCH_BASELINE_HOLDOFF_MS = 250L
         private const val SKIP_LOG_INTERVAL_MS = 5_000L
         private const val MAX_LOG_WORD_TEXT = 24
         private const val MAX_JITTER_REGRESSION_MS = 1_500L

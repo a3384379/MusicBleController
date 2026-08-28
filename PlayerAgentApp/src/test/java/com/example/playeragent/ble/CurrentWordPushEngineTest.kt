@@ -10,8 +10,7 @@ import org.junit.Test
 
 class CurrentWordPushEngineTest {
     @Test
-    fun generationCreationStartsBoundedHoldoffBeforeFirstEligibleSnapshot() {
-        var nowMs = 1_000L
+    fun eligibleSnapshotPublishesImmediatelyAfterGenerationObservation() {
         var sent = 0
         val engine = CurrentWordPushEngine(
             logger = {},
@@ -23,38 +22,59 @@ class CurrentWordPushEngineTest {
             currentWordEligibility = {
                 eligible(word(positionMs = 1_000L, wordIndex = 1))
             },
-            elapsedRealtime = { nowMs }
+            elapsedRealtime = { 1_000L }
         )
 
         engine.observeGeneration(7L)
-        assertEquals(250L, engine.generationHoldoffRemainingMs())
-        nowMs += 249L
-        assertNull(engine.pushCurrentWord())
-        assertEquals(1L, engine.generationHoldoffRemainingMs())
-        nowMs += 1L
         assertTrue(engine.pushCurrentWord() != null)
         assertEquals(1, sent)
     }
 
     @Test
-    fun observingSameGenerationDoesNotRestartHoldoff() {
+    fun observingSameGenerationPreservesOrderingSequence() {
         var nowMs = 1_000L
+        var state = word(positionMs = 1_000L, wordIndex = 1)
+        val payloads = mutableListOf<JSONObject>()
         val engine = CurrentWordPushEngine(
             logger = {},
-            sendStatusMessage = { true },
-            expectedGeneration = { 7L },
-            currentWordEligibility = {
-                eligible(word(positionMs = 1_000L, wordIndex = 1))
+            sendStatusMessage = {
+                payloads += JSONObject(it)
+                true
             },
+            expectedGeneration = { 7L },
+            currentWordEligibility = { eligible(state) },
             elapsedRealtime = { nowMs }
         )
 
         engine.observeGeneration(7L)
-        nowMs += 200L
-        engine.observeGeneration(7L)
-        assertEquals(50L, engine.generationHoldoffRemainingMs())
-        nowMs += 50L
         assertTrue(engine.pushCurrentWord() != null)
+        nowMs += 100L
+        state = word(positionMs = 1_500L, wordIndex = 2)
+        engine.observeGeneration(7L)
+        assertTrue(engine.pushCurrentWord() != null)
+        assertEquals(1L, payloads[0].getLong("seq"))
+        assertEquals(2L, payloads[1].getLong("seq"))
+    }
+
+    @Test
+    fun eventBarrierStillRejectsSnapshotFromOlderGeneration() {
+        var sent = 0
+        val engine = CurrentWordPushEngine(
+            logger = {},
+            sendStatusMessage = {
+                sent += 1
+                true
+            },
+            expectedGeneration = { 8L },
+            currentWordEligibility = {
+                eligible(word(positionMs = 1_000L, wordIndex = 1))
+            },
+            elapsedRealtime = { 1_000L }
+        )
+
+        engine.observeGeneration(8L)
+        assertNull(engine.pushCurrentWord())
+        assertEquals(0, sent)
     }
 
     @Test
@@ -73,9 +93,6 @@ class CurrentWordPushEngineTest {
             elapsedRealtime = { nowMs }
         )
 
-        // Establish the new-track baseline after its short safety holdoff.
-        assertNull(engine.pushCurrentWord())
-        nowMs += 500L
         assertTrue(engine.pushCurrentWord() != null)
 
         state = word(positionMs = 900L, wordIndex = 0)
@@ -109,8 +126,6 @@ class CurrentWordPushEngineTest {
             elapsedRealtime = { nowMs }
         )
 
-        assertNull(engine.pushCurrentWord())
-        nowMs += 500L
         assertTrue(engine.pushCurrentWord() != null)
 
         state = word(positionMs = 2_000L, wordIndex = 1)
@@ -140,8 +155,6 @@ class CurrentWordPushEngineTest {
             elapsedRealtime = { nowMs }
         )
 
-        assertNull(engine.pushCurrentWord())
-        nowMs += 500L
         assertTrue(engine.pushCurrentWord() != null)
 
         assertEquals(88_000L, payloads.single().getLong("sampleMono"))
@@ -170,7 +183,7 @@ class CurrentWordPushEngineTest {
             elapsedRealtime = { 2_000L }
         )
 
-        engine.observeGeneration(7L, observedAtMs = 1_000L)
+        engine.observeGeneration(7L)
         assertNull(engine.pushCurrentWord())
         assertEquals(0, sent)
     }
