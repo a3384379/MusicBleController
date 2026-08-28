@@ -981,6 +981,29 @@ def analyze(
     eligible_events = [
         event for event in phase4_events if event.stage == "firstWordEligible"
     ]
+    first_eligible_ms_by_key = {
+        _media_key(event): event.mono_ms
+        for event in eligible_events
+        if _media_key(event) is not None
+    }
+    intro_wait_before_first_word_keys = {
+        _media_key(event)
+        for event in events
+        if event.side == "sony"
+        and event.stage in {"currentWordNotEligible", "currentWordEligibilityEvaluated"}
+        and event.reason == "INTRO_WAIT"
+        and _media_key(event) in first_eligible_ms_by_key
+        and event.mono_ms <= first_eligible_ms_by_key[_media_key(event)]
+    }
+    categories["intro_wait_before_first_word"] += len(
+        intro_wait_before_first_word_keys
+    )
+    phase4_events.extend(
+        replace(event, stage="firstIosTrackAcceptedImmediateWord")
+        for event in phase4_events
+        if event.stage == "firstIosTrackAccepted"
+        and _media_key(event) not in intro_wait_before_first_word_keys
+    )
     scheduler_events = first_events_after(
         events,
         eligible_events,
@@ -1071,7 +1094,7 @@ def analyze(
         ("receiveToAcceptMs", "ios", "wordReceived", "ios", "wordAccepted", _media_key, False),
         ("acceptToPublishMs", "ios", "wordAccepted", "ios", "wordPublished", _media_key, False),
         ("wordEligibleToPublishMs", "sony", "firstWordEligible", "ios", "wordPublished", _media_key, True),
-        ("trackAcceptedToFirstWordMs", "ios", "firstIosTrackAccepted", "ios", "wordPublished", _media_key, False),
+        ("trackAcceptedToFirstWordMs", "ios", "firstIosTrackAcceptedImmediateWord", "ios", "wordPublished", _media_key, False),
     )
     for pair_spec in phase4_pair_specs:
         add_phase4_pair(*pair_spec)
@@ -1107,16 +1130,23 @@ def analyze(
         for event in events
         if event.side == "ios" and event.stage in {"previewPublished", "hqPublished"}
     ]
-    t0_pair_specs = (
+    track_identity_t0_events = [
+        replace(event, side="t0", stage="trackT0")
+        for event in events
+        if event.side == "ios"
+        and event.stage == "trackIdentityAccepted"
+        and event.result == "changed"
+    ]
+    track_pair_specs = (
         ("trackToCurrentLyricMs", "currentLyricPublished", _track_key),
         ("trackToCurrentWordMs", "currentWordPublished", _track_key),
         ("trackToPreviewArtMs", "usableArtworkPublished", _track_id_key),
         ("trackToHqArtMs", "hqPublished", _track_id_key),
     )
-    t0_analysis_events = [*events, *usable_artwork_events, *track_t0_events]
-    for name, end_stage, key in t0_pair_specs:
+    track_analysis_events = [*events, *usable_artwork_events, *track_identity_t0_events]
+    for name, end_stage, key in track_pair_specs:
         values, missing = paired_durations(
-            t0_analysis_events,
+            track_analysis_events,
             "t0",
             "trackT0",
             "ios",

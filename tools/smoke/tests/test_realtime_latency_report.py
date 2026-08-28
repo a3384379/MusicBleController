@@ -243,11 +243,14 @@ class RealtimeLatencyReportTests(unittest.TestCase):
             event("ios", "currentWordRejected", 31, reason="SEQUENCE_OLD", handoff_id="command-9", track_id="track-a", generation=4, source_line=41),
             event("sony", "lyricParsedCacheMiss", 12, handoff_id="command-9", track_id="track-a", generation=4, source_line=42),
         ])
-        labels = REPORT.analyze(events)["samples"][0]["classifications"]
+        report = REPORT.analyze(events)
+        labels = report["samples"][0]["classifications"]
         self.assertIn("LINE_ONLY_LYRICS", labels)
         self.assertIn("INTRO_WAIT", labels)
         self.assertIn("STALE_REJECTED", labels)
         self.assertIn("LYRIC_CACHE_MISS", labels)
+        self.assertEqual(report["metrics"]["trackAcceptedToFirstWordMs"]["count"], 0)
+        self.assertEqual(report["diagnostics"]["intro_wait_before_first_word"], 1)
 
     def test_phase4_dual_handoffs_remain_isolated(self):
         first = self.phase4_complete_events()
@@ -289,7 +292,7 @@ class RealtimeLatencyReportTests(unittest.TestCase):
         ]
         report = REPORT.analyze(events)
         self.assertEqual(report["metrics"]["commandToTrackPublishMs"]["p50"], 10)
-        self.assertEqual(report["metrics"]["trackToCurrentWordMs"]["p50"], 70)
+        self.assertEqual(report["metrics"]["trackToCurrentWordMs"]["p50"], 60)
         self.assertEqual(report["metrics"]["trackToCurrentWordMs"]["count"], 1)
         self.assertEqual(report["metrics"]["notifyQueueWaitMs"]["avg"], 12)
         self.assertEqual(report["metrics"]["iOSDecodeDurationMs"]["max"], 4)
@@ -374,6 +377,35 @@ class RealtimeLatencyReportTests(unittest.TestCase):
         self.assertEqual(metric["p50"], 40)
         self.assertEqual(metric["missing"], 1)
 
+    def test_track_media_metrics_start_at_accepted_identity_not_command(self):
+        events = [
+            event(
+                "ios", "commandIntent", 100, command_seq=1,
+                command_type="NEXT", source_line=1,
+            ),
+            event(
+                "ios", "trackIdentityAccepted", 200, track_id="new",
+                generation=2, source_line=2,
+            ),
+            event(
+                "ios", "currentLyricPublished", 260, track_id="new",
+                generation=2, source_line=3,
+            ),
+            event(
+                "ios", "currentWordPublished", 270, track_id="new",
+                generation=2, source_line=4,
+            ),
+            event(
+                "ios", "previewPublished", 280, track_id="new",
+                generation=2, source_line=5,
+            ),
+        ]
+        report = REPORT.analyze(events)
+        self.assertEqual(report["metrics"]["commandToTrackPublishMs"]["p50"], 100)
+        self.assertEqual(report["metrics"]["trackToCurrentLyricMs"]["p50"], 60)
+        self.assertEqual(report["metrics"]["trackToCurrentWordMs"]["p50"], 70)
+        self.assertEqual(report["metrics"]["trackToPreviewArtMs"]["p50"], 80)
+
     def test_automatic_t0_requires_trusted_clock(self):
         events = [
             event(
@@ -397,7 +429,7 @@ class RealtimeLatencyReportTests(unittest.TestCase):
             sony_to_ios_offset_ms=80,
         )
         self.assertEqual(trusted["metrics"]["commandToTrackPublishMs"]["p50"], 30)
-        self.assertEqual(trusted["metrics"]["trackToCurrentLyricMs"]["p50"], 80)
+        self.assertEqual(trusted["metrics"]["trackToCurrentLyricMs"]["p50"], 50)
 
     def test_correctness_flags_stale_publish_and_duplicate_control(self):
         events = [
