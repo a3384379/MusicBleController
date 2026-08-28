@@ -462,8 +462,18 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private var firstConnectionReadyAtMs: Int64 = 0
     private var lastKaraokeOffsetLogAtMs: Int64 = 0
     private var currentTrackID = ""
-    var realtimeTraceTrackId: String { currentTrackID }
-    var realtimeTraceGeneration: Int64 { currentTrackGeneration }
+    func recordNowPlayingStateConsumed() {
+        let handoff = realtimeHandoffCorrelation.context(for: currentTrackID)
+        RealtimeTraceStore.shared.record(
+            stage: "nowPlayingStateConsumed",
+            trackId: currentTrackID,
+            generation: currentTrackGeneration,
+            payloadType: "trackIdentity",
+            result: "changed",
+            handoffId: handoff?.handoffId,
+            triggerType: handoff?.triggerType.rawValue
+        )
+    }
     private var currentTrackGeneration: Int64 = 0
     private var currentTrackGenerationSessionId = ""
     private var currentLiveArtworkKey: String?
@@ -1138,11 +1148,16 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         fastSwitch: Bool
     ) {
         guard realtimeV4Active, realtimeV4RunID == runID else { return }
+        let requiresForeground = mode != "auto" && mode != "natural"
+        let traceProtocolReady = serverProtocolVersion >= 3 &&
+            (!serverSupportsClockSyncV1 || lyricClockSyncConfident)
         let ready = sonyPeripheral?.state == .connected &&
             sonyCommandCharacteristic != nil &&
             sonyStatusCharacteristic != nil &&
             isConnectionHealthyOrSuspect &&
-            !currentTrackID.isEmpty
+            !currentTrackID.isEmpty &&
+            traceProtocolReady &&
+            (!requiresForeground || appLifecycleState == "active")
         guard ready else {
             if attempt >= 40 {
                 log("[RealtimeV4] abort runId=\(runID) reason=not_ready")

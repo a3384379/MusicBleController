@@ -70,6 +70,23 @@ class RealtimeLatencyReportTests(unittest.TestCase):
         self.assertIn("COMPLETE", report["samples"][0]["classifications"])
         self.assertEqual(report["missingEvents"], [])
 
+    def test_phase4_prefers_ios_command_anchor_across_unrelated_monotonic_clocks(self):
+        events = self.phase4_complete_events()
+        events.append(event(
+            "sony",
+            "mediaSessionMetadataObserved",
+            1,
+            command_seq=9,
+            command_type="NEXT",
+            track_id="track-a",
+            generation=4,
+            source_line=90,
+        ))
+        samples, _ = REPORT.classify_transition_samples(events, clock_trusted=True)
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0]["handoffId"], "command-9")
+        self.assertEqual(samples[0]["triggerType"], "IOS_NEXT")
+
     def test_phase4_missing_ios_and_sony_events_are_named(self):
         ios_missing = [
             item for item in self.phase4_complete_events()

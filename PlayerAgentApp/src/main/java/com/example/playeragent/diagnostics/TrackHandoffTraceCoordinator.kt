@@ -29,6 +29,7 @@ data class TrackHandoffTraceContext(
  */
 object TrackHandoffTraceCoordinator {
     private const val PENDING_TTL_MS = 15_000L
+    private const val NOTIFICATION_FOLLOWUP_WINDOW_MS = 1_200L
     private val lock = Any()
     private var nextLocalId = 0L
     private var pending: TrackHandoffTraceContext? = null
@@ -67,11 +68,15 @@ object TrackHandoffTraceCoordinator {
                 existing
             } else {
                 lastNotificationIdentityKey = identityKey
-                existing ?: TrackHandoffTraceContext(
-                    handoffId = localIdLocked(nowMs),
-                    triggerType = TrackHandoffTriggerType.UNKNOWN,
-                    createdMonoMs = nowMs
-                ).also { pending = it }
+                existing
+                    ?: active?.takeIf {
+                        nowMs - it.createdMonoMs <= NOTIFICATION_FOLLOWUP_WINDOW_MS
+                    }
+                    ?: TrackHandoffTraceContext(
+                        handoffId = localIdLocked(nowMs),
+                        triggerType = TrackHandoffTriggerType.UNKNOWN,
+                        createdMonoMs = nowMs
+                    ).also { pending = it }
             }
         }
         RealtimeTrace.record(

@@ -34,6 +34,8 @@ data class RealtimeTraceEvent(
             "side" to side,
             "stage" to stage,
             "monoMs" to monoMs.toString(),
+            "handoffId" to handoffId,
+            "triggerType" to triggerType,
             "commandSeq" to commandSeq?.toString(),
             "commandType" to commandType,
             "trackId" to trackId,
@@ -46,17 +48,15 @@ data class RealtimeTraceEvent(
             "chunkCount" to chunkCount?.toString(),
             "result" to result,
             "reason" to reason,
-            "handoffId" to handoffId,
-            "triggerType" to triggerType,
             "positionAnchorMs" to positionAnchorMs?.toString(),
             "lineIndex" to lineIndex?.toString(),
             "wordTimingStatus" to wordTimingStatus,
             "cacheSource" to cacheSource,
             "failureReason" to failureReason
         )
-        return "[RealtimeTrace] " + fields.joinToString(" ") { (key, value) ->
-            "$key=${safe(value ?: "-")}"
-        }
+        return "[RealtimeTrace] " + fields
+            .filter { (_, value) -> value != null }
+            .joinToString(" ") { (key, value) -> "$key=${safe(value.orEmpty())}" }
     }
 
     private fun safe(value: String): String = value

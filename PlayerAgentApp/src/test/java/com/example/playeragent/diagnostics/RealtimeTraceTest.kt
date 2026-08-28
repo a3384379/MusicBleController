@@ -85,6 +85,8 @@ class RealtimeTraceTest {
         assertEquals("command-42", event.handoffId)
         assertEquals("IOS_NEXT", event.triggerType)
         assertTrue(event.logLine().contains("wordTimingStatus=AVAILABLE"))
+        assertTrue(event.logLine().length < 300)
+        assertFalse(event.logLine().contains(" commandSeq=-"))
         assertFalse(event.logLine().contains("wordText="))
     }
 
@@ -125,6 +127,40 @@ class RealtimeTraceTest {
         assertTrue(accepted?.handoffId?.startsWith("sony-200-") == true)
         assertEquals(TrackHandoffTriggerType.UNKNOWN, accepted?.triggerType)
         TrackHandoffTraceCoordinator.clear()
+    }
+
+    @Test
+    fun notificationFollowingMediaObservationKeepsCommandHandoff() {
+        val original = RealtimeTrace.enabled
+        try {
+            RealtimeTrace.clear()
+            RealtimeTrace.enabled = true
+            TrackHandoffTraceCoordinator.clear()
+            TrackHandoffTraceCoordinator.observeCommand(
+                commandSeq = 11L,
+                commandType = "NEXT",
+                nowMs = 1_000L
+            )
+            TrackHandoffTraceCoordinator.observeMediaSessionMetadata(
+                trackId = "track-c",
+                positionAnchorMs = 1_050L,
+                nowMs = 1_050L
+            )
+            TrackHandoffTraceCoordinator.observeNotificationMetadata(
+                identityKey = "notification-c",
+                nowMs = 1_400L
+            )
+
+            val notification = RealtimeTrace.snapshot().last {
+                it.stage == "notificationMetadataObserved"
+            }
+            assertEquals("command-11", notification.handoffId)
+            assertEquals("IOS_NEXT", notification.triggerType)
+        } finally {
+            TrackHandoffTraceCoordinator.clear()
+            RealtimeTrace.enabled = original
+            RealtimeTrace.clear()
+        }
     }
 
     @Test

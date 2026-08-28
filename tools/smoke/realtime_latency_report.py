@@ -547,7 +547,7 @@ def derive_track_t0(
 
 
 def classify_transition_samples(events: list[Event], clock_trusted: bool) -> tuple[list[dict], list[dict]]:
-    anchors = [
+    anchor_candidates = [
         event for event in events
         if (
             event.side == "ios"
@@ -558,6 +558,25 @@ def classify_transition_samples(events: list[Event], clock_trusted: bool) -> tup
             and event.stage == "mediaSessionMetadataObserved"
         )
     ]
+    # Sony and iOS monotonic clocks are not directly sortable. When a remote
+    # command and its Sony MediaSession observation share the same command
+    # sequence, keep the iOS intent as the sample anchor; it carries the stable
+    # handoff id even when Android's bounded product log truncates a legacy line.
+    anchors_by_identity = {}
+    for candidate in anchor_candidates:
+        identity = candidate.handoff_id or (
+            f"command-{candidate.command_seq}"
+            if candidate.command_seq is not None
+            else f"track-{candidate.track_id}-{candidate.generation}"
+        )
+        existing = anchors_by_identity.get(identity)
+        if existing is None or (
+            candidate.side == "ios"
+            and candidate.stage == "commandIntent"
+            and existing.stage != "commandIntent"
+        ):
+            anchors_by_identity[identity] = candidate
+    anchors = list(anchors_by_identity.values())
     samples = []
     missing_events = []
     seen = set()
