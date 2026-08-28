@@ -273,6 +273,33 @@ class BleNotifyQueue(
             ),
             traceContext = traceContext
         )
+        RealtimeTrace.record(
+            stage = "notifyEnqueued",
+            payloadType = type,
+            chunkCount = 1,
+            result = "queued_interleaved",
+            trackId = traceContext?.trackId,
+            generation = traceContext?.generation,
+            handoffId = traceContext?.handoffId,
+            triggerType = traceContext?.triggerType,
+            positionAnchorMs = traceContext?.positionAnchorMs,
+            lineIndex = traceContext?.lineIndex,
+            wordTimingStatus = traceContext?.wordTimingStatus
+        )
+        recordPlaybackSpecificTrace(
+            stage = "playbackEnqueued",
+            packetType = type,
+            context = traceContext,
+            result = "queued_interleaved"
+        )
+        if (type == "playbackState" && traceContext?.hasCurrentLyric == true) {
+            recordContextTrace(
+                stage = "lyricCurrentLineEnqueued",
+                payloadType = "playbackState",
+                context = traceContext,
+                result = "queued_interleaved"
+            )
+        }
         logInterleavedEventThrottled(
             isSavedEvent = true,
             message = "[BleNotifyQueue] long job active, $type saved as latest"

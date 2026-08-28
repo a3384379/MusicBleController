@@ -4,6 +4,7 @@ import android.os.SystemClock
 import com.example.playeragent.diagnostics.RealtimeTrace
 import com.example.playeragent.diagnostics.TrackHandoffTraceCoordinator
 import com.example.playeragent.media.CurrentTrackRuntimeCache
+import com.example.playeragent.media.CurrentWordEligibilitySnapshot
 import com.example.playeragent.media.CurrentWordState
 import com.example.playeragent.media.TrackCapabilityTracker
 import org.json.JSONObject
@@ -21,8 +22,11 @@ class CurrentWordPushEngine(
     private val normalizeTrackId: (String) -> String = { it },
     private val includeClockSyncFields: () -> Boolean = { false },
     private val expectedGeneration: () -> Long = { CurrentTrackRuntimeCache.currentGeneration() },
-    private val currentWordState: () -> CurrentWordState? = {
-        CurrentTrackRuntimeCache.currentWordState()
+    private val currentWordEligibility: (Long) -> CurrentWordEligibilitySnapshot = {
+        elapsedRealtimeMs ->
+        CurrentTrackRuntimeCache.currentWordEligibilitySnapshot(
+            elapsedRealtimeMs = elapsedRealtimeMs
+        )
     },
     private val elapsedRealtime: () -> Long = { SystemClock.elapsedRealtime() }
 ) {
@@ -41,15 +45,36 @@ class CurrentWordPushEngine(
     private var nextSequence: Long = 0L
     private var lastLoggedLineIndex: Int = -1
 
+    fun observeGeneration(
+        generation: Long,
+        observedAtMs: Long = elapsedRealtime()
+    ) {
+        if (generation <= 0L) return
+        synchronized(lock) {
+            if (generation != lastObservedGeneration) {
+                prepareGenerationLocked(generation, observedAtMs)
+            }
+        }
+    }
+
+    fun generationHoldoffRemainingMs(nowMs: Long = elapsedRealtime()): Long {
+        synchronized(lock) {
+            if (lastObservedGeneration <= 0L || generationFirstSeenAtMs <= 0L) {
+                return 0L
+            }
+            return (TRACK_SWITCH_BASELINE_HOLDOFF_MS -
+                (nowMs - generationFirstSeenAtMs).coerceAtLeast(0L))
+                .coerceAtLeast(0L)
+        }
+    }
+
     @Synchronized
     fun pushCurrentWord(
         reason: String = "diff",
         force: Boolean = false
     ): CurrentWordState? {
         val startedAt = elapsedRealtime()
-        val eligibility = CurrentTrackRuntimeCache.currentWordEligibilitySnapshot(
-            elapsedRealtimeMs = startedAt
-        )
+        val eligibility = currentWordEligibility(startedAt)
         val handoffTrace = TrackHandoffTraceCoordinator.contextFor(eligibility.trackId)
         RealtimeTrace.record(
             stage = "currentWordEligibilityEvaluated",
@@ -68,7 +93,7 @@ class CurrentWordPushEngine(
         )
         RealtimeTrace.record(
             stage = if (eligibility.eligible) {
-                "currentWordEligible"
+                "currentWordTimingEligible"
             } else {
                 "currentWordNotEligible"
             },
@@ -85,7 +110,11 @@ class CurrentWordPushEngine(
             wordTimingStatus = eligibility.wordTimingStatus,
             failureReason = eligibility.reason.takeUnless { eligibility.eligible }
         )
-        val state = currentWordState() ?: run {
+        if (!eligibility.eligible) {
+            recordSkip(eligibility.reason.lowercase())
+            return null
+        }
+        val state = eligibility.state ?: run {
             recordSkip("missing")
             return null
         }
@@ -111,12 +140,7 @@ class CurrentWordPushEngine(
         synchronized(lock) {
             val now = elapsedRealtime()
             if (state.trackGeneration != lastObservedGeneration) {
-                lastObservedGeneration = state.trackGeneration
-                generationFirstSeenAtMs = now
-                lastPushedKey = ""
-                lastPushedPositionMs = -1L
-                nextSequence = 0L
-                lastLoggedLineIndex = -1
+                prepareGenerationLocked(state.trackGeneration, now)
             }
             val generationAgeMs = now - generationFirstSeenAtMs
             if (!force && generationAgeMs < TRACK_SWITCH_BASELINE_HOLDOFF_MS) {
@@ -169,6 +193,35 @@ class CurrentWordPushEngine(
             }
         }
 
+        val schedulerCreatedAt = elapsedRealtime()
+        RealtimeTrace.record(
+            stage = "currentWordEligible",
+            monoMs = schedulerCreatedAt,
+            trackId = eligibility.trackId.takeIf { it.isNotBlank() },
+            generation = eligibility.generation.takeIf { it > 0L },
+            payloadType = "currentWord",
+            result = "eligible",
+            reason = eligibility.reason,
+            handoffId = handoffTrace?.handoffId,
+            triggerType = handoffTrace?.triggerType?.name,
+            positionAnchorMs = eligibility.positionAnchorMs.takeIf { it > 0L },
+            lineIndex = eligibility.lineIndex.takeIf { it >= 0 },
+            wordTimingStatus = eligibility.wordTimingStatus
+        )
+        RealtimeTrace.record(
+            stage = "currentWordSchedulerCreated",
+            monoMs = schedulerCreatedAt,
+            trackId = eligibility.trackId.takeIf { it.isNotBlank() },
+            generation = eligibility.generation.takeIf { it > 0L },
+            payloadType = "currentWord",
+            result = "activated",
+            reason = eligibility.reason,
+            handoffId = handoffTrace?.handoffId,
+            triggerType = handoffTrace?.triggerType?.name,
+            positionAnchorMs = eligibility.positionAnchorMs.takeIf { it > 0L },
+            lineIndex = eligibility.lineIndex.takeIf { it >= 0 },
+            wordTimingStatus = eligibility.wordTimingStatus
+        )
         val sequenceAndFirst = synchronized(lock) {
             val first = nextSequence == 0L
             nextSequence += 1L
@@ -296,6 +349,16 @@ class CurrentWordPushEngine(
         }
     }
 
+    private fun prepareGenerationLocked(generation: Long, observedAtMs: Long) {
+        lastObservedGeneration = generation
+        generationFirstSeenAtMs = observedAtMs
+        lastPushedKey = ""
+        lastPushElapsedMs = 0L
+        lastPushedPositionMs = -1L
+        nextSequence = 0L
+        lastLoggedLineIndex = -1
+    }
+
     fun resetTimeline() {
         synchronized(lock) {
             lastPushedKey = ""
@@ -377,7 +440,7 @@ class CurrentWordPushEngine(
 
     private companion object {
         private const val MIN_CURRENT_WORD_INTERVAL_MS = 60L
-        private const val TRACK_SWITCH_BASELINE_HOLDOFF_MS = 450L
+        private const val TRACK_SWITCH_BASELINE_HOLDOFF_MS = 250L
         private const val SKIP_LOG_INTERVAL_MS = 5_000L
         private const val MAX_LOG_WORD_TEXT = 24
         private const val MAX_JITTER_REGRESSION_MS = 1_500L

@@ -845,6 +845,42 @@ class BleGattServerManager(
         }
     }
 
+    private fun publishLyricsReadyPlaybackIfCurrent(ready: LyricsReadyGateSnapshot) {
+        val currentTrack = CurrentTrackRuntimeCache.trackSnapshot()
+        val currentTrackId = currentTrack?.trackId.orEmpty()
+        val currentGeneration = currentTrack?.currentTrackGeneration ?: 0L
+        val currentLyric = currentTrack?.currentLine.orEmpty()
+        if (!CurrentLyricFastPublishPolicy.shouldPublish(
+                ready = ready,
+                currentTrackId = currentTrackId,
+                currentGeneration = currentGeneration,
+                currentLyric = currentLyric,
+                hasSubscribers = subscribedDevices.isNotEmpty()
+            )
+        ) {
+            logger(
+                "[CurrentLyricFastPublish] skipped reason=identity_or_content_mismatch " +
+                    "readyGeneration=${ready.generation} currentGeneration=$currentGeneration"
+            )
+            return
+        }
+        val source = JSONObject()
+            .put("title", currentTrack?.title.orEmpty())
+            .put("artist", currentTrack?.artist.orEmpty())
+            .put("album", currentTrack?.album.orEmpty())
+            .put("playing", currentTrack?.isPlaying == true)
+            .put("position", currentTrack?.positionMs ?: 0L)
+            .put("positionSampleElapsedMs", currentTrack?.positionAnchorElapsedMs ?: 0L)
+            .put("speed", currentTrack?.playbackSpeed?.toDouble() ?: 1.0)
+            .put("duration", currentTrack?.durationMs ?: 0L)
+            .put("lyric", currentLyric)
+        val sent = sendCompactPlaybackState(source)
+        logger(
+            "[CurrentLyricFastPublish] result=${if (sent) "sent" else "failed"} " +
+                "generation=$currentGeneration"
+        )
+    }
+
     @SuppressLint("MissingPermission")
     @Synchronized
     fun close() {
@@ -1872,10 +1908,10 @@ class BleGattServerManager(
             hasCurrentLyric = messageType == "playbackState" &&
                 originalObject?.optString("lyric").orEmpty().isNotBlank()
         )
-        if ((messageType == "playbackState" ||
-                messageType == "trackInfo" ||
-                messageType == "volumeState" ||
-                messageType == "currentWord") &&
+        // Latency-critical state must enter the normal P0 queue. A latest-only
+        // interleaved packet can otherwise remain parked when the active long
+        // transfer ends before its next interleave boundary.
+        if ((messageType == "trackInfo" || messageType == "volumeState") &&
             notifyQueue.hasLongJobActiveOrQueued(device.address)
         ) {
             notifyQueue.setLatestInterleavedShort(
@@ -2159,7 +2195,7 @@ class BleGattServerManager(
             return
         }
         logger("[CurrentWordPush] started")
-        currentWordExecutor = executionHub.scheduled
+        currentWordExecutor = executionHub.currentWord
         scheduleCurrentWordPush(CURRENT_WORD_INITIAL_DELAY_MS)
     }
 
@@ -2167,6 +2203,10 @@ class BleGattServerManager(
     private fun scheduleCurrentWordPush(delayMs: Long) {
         val executor = currentWordExecutor ?: return
         currentWordPushTask?.cancel(false)
+        val safeDelayMs = maxOf(
+            delayMs.coerceAtLeast(0L),
+            currentWordPushEngine.generationHoldoffRemainingMs()
+        )
         val eligibility = CurrentTrackRuntimeCache.currentWordEligibilitySnapshot()
         val handoffTrace = TrackHandoffTraceCoordinator.contextFor(eligibility.trackId)
         RealtimeTrace.record(
@@ -2174,7 +2214,7 @@ class BleGattServerManager(
             trackId = eligibility.trackId.takeIf { it.isNotBlank() },
             generation = eligibility.generation.takeIf { it > 0L },
             payloadType = "currentWord",
-            processingMs = delayMs.coerceAtLeast(0L),
+            processingMs = safeDelayMs,
             result = "requested",
             reason = eligibility.reason,
             handoffId = handoffTrace?.handoffId,
@@ -2203,15 +2243,15 @@ class BleGattServerManager(
                     logger("[CurrentWordPush] paused; boundary task suspended")
                 }
             },
-            delayMs.coerceAtLeast(0L),
+            safeDelayMs,
             TimeUnit.MILLISECONDS
         )
         RealtimeTrace.record(
-            stage = "currentWordSchedulerCreated",
+            stage = "currentWordSchedulerScheduled",
             trackId = eligibility.trackId.takeIf { it.isNotBlank() },
             generation = eligibility.generation.takeIf { it > 0L },
             payloadType = "currentWord",
-            processingMs = delayMs.coerceAtLeast(0L),
+            processingMs = safeDelayMs,
             result = "scheduled",
             reason = eligibility.reason,
             handoffId = handoffTrace?.handoffId,
@@ -2225,7 +2265,7 @@ class BleGattServerManager(
             trackId = eligibility.trackId.takeIf { it.isNotBlank() },
             generation = eligibility.generation.takeIf { it > 0L },
             payloadType = "currentWord",
-            processingMs = (eligibility.nextBoundaryDelayMs ?: delayMs).coerceAtLeast(0L),
+            processingMs = (eligibility.nextBoundaryDelayMs ?: safeDelayMs).coerceAtLeast(0L),
             result = "calculated",
             reason = eligibility.reason,
             handoffId = handoffTrace?.handoffId,
@@ -2256,13 +2296,15 @@ class BleGattServerManager(
             val oldSongKey = lastAutoPushSongKey.orEmpty()
             lastAutoPushSongKey = songKey
             notifyQueue.onMediaGenerationChanged()
-            currentWordPushEngine.reset()
+            currentWordPushEngine.observeGeneration(
+                CurrentTrackRuntimeCache.currentGeneration()
+            )
             notifyQueue.cancelJobTypes(setOf("currentWord"), "track changed")
             logger("[SongChange] detected title=$title")
             logger("[SongChange] old=$oldSongKey")
             logger("[SongChange] new=$songKey")
             logger("[BLE-A][AutoPush] song changed title=$title")
-            scheduleCurrentWordPush(CURRENT_WORD_TRACK_SWITCH_DELAY_MS)
+            scheduleCurrentWordPush(0L)
         }
         if (playing != lastAutoPushPlaying) {
             lastAutoPushPlaying = playing
@@ -6612,6 +6654,7 @@ class BleGattServerManager(
                 ?.triggerType
                 ?.name
         )
+        publishLyricsReadyPlaybackIfCurrent(snapshot)
         schedulePlaybackUiRefresh("lyrics_ready")
         flushPendingLyricWindow(snapshot)
         if (!snapshot.lyricsReady) {
@@ -7032,7 +7075,6 @@ class BleGattServerManager(
         private const val AUTO_PUSH_INTERVAL_MS = 1000L
         private const val AUTO_PUSH_PAUSED_INTERVAL_MS = 5000L
         private const val CURRENT_WORD_INITIAL_DELAY_MS = 100L
-        private const val CURRENT_WORD_TRACK_SWITCH_DELAY_MS = 450L
         private const val CURRENT_WORD_DRIFT_CORRECTION_MS = 500L
         private const val SERVER_PROTOCOL_VERSION = 2
         private val MULTI_CONTROLLER_DEDUP_COMMANDS = setOf(

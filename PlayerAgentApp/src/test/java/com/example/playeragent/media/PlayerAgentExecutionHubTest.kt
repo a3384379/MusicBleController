@@ -12,11 +12,12 @@ class PlayerAgentExecutionHubTest {
     fun lanesUseBoundedNamedThreadsAndCloseTogether() {
         val hub = PlayerAgentExecutionHub("HubTest")
         val names = mutableListOf<String>()
-        val latch = CountDownLatch(4)
+        val latch = CountDownLatch(5)
         listOf(
             hub.realtime,
             hub.foregroundIO,
             hub.scheduled,
+            hub.currentWord,
             hub.maintenance
         ).forEach { executor ->
             executor.execute {
@@ -25,8 +26,9 @@ class PlayerAgentExecutionHubTest {
             }
         }
         assertTrue(latch.await(2, TimeUnit.SECONDS))
-        assertEquals(4, names.size)
+        assertEquals(5, names.size)
         assertTrue(names.all { it.startsWith("HubTest-") })
+        assertTrue(names.any { it == "HubTest-CurrentWord" })
 
         hub.close()
         assertTrue(hub.isShutdown())

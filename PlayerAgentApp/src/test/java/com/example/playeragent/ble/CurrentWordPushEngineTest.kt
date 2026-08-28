@@ -1,6 +1,7 @@
 package com.example.playeragent.ble
 
 import com.example.playeragent.media.CurrentWordState
+import com.example.playeragent.media.CurrentWordEligibilitySnapshot
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -8,6 +9,54 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CurrentWordPushEngineTest {
+    @Test
+    fun generationCreationStartsBoundedHoldoffBeforeFirstEligibleSnapshot() {
+        var nowMs = 1_000L
+        var sent = 0
+        val engine = CurrentWordPushEngine(
+            logger = {},
+            sendStatusMessage = {
+                sent += 1
+                true
+            },
+            expectedGeneration = { 7L },
+            currentWordEligibility = {
+                eligible(word(positionMs = 1_000L, wordIndex = 1))
+            },
+            elapsedRealtime = { nowMs }
+        )
+
+        engine.observeGeneration(7L)
+        assertEquals(250L, engine.generationHoldoffRemainingMs())
+        nowMs += 249L
+        assertNull(engine.pushCurrentWord())
+        assertEquals(1L, engine.generationHoldoffRemainingMs())
+        nowMs += 1L
+        assertTrue(engine.pushCurrentWord() != null)
+        assertEquals(1, sent)
+    }
+
+    @Test
+    fun observingSameGenerationDoesNotRestartHoldoff() {
+        var nowMs = 1_000L
+        val engine = CurrentWordPushEngine(
+            logger = {},
+            sendStatusMessage = { true },
+            expectedGeneration = { 7L },
+            currentWordEligibility = {
+                eligible(word(positionMs = 1_000L, wordIndex = 1))
+            },
+            elapsedRealtime = { nowMs }
+        )
+
+        engine.observeGeneration(7L)
+        nowMs += 200L
+        engine.observeGeneration(7L)
+        assertEquals(50L, engine.generationHoldoffRemainingMs())
+        nowMs += 50L
+        assertTrue(engine.pushCurrentWord() != null)
+    }
+
     @Test
     fun blocksSmallPositionRegressionAndAddsOrderingFence() {
         var nowMs = 1_000L
@@ -20,7 +69,7 @@ class CurrentWordPushEngineTest {
                 true
             },
             expectedGeneration = { 7L },
-            currentWordState = { state },
+            currentWordEligibility = { eligible(state) },
             elapsedRealtime = { nowMs }
         )
 
@@ -56,7 +105,7 @@ class CurrentWordPushEngineTest {
                 true
             },
             expectedGeneration = { 7L },
-            currentWordState = { state },
+            currentWordEligibility = { eligible(state) },
             elapsedRealtime = { nowMs }
         )
 
@@ -82,8 +131,11 @@ class CurrentWordPushEngineTest {
             },
             includeClockSyncFields = { true },
             expectedGeneration = { 7L },
-            currentWordState = {
-                word(positionMs = 1_000L, wordIndex = 1).copy(sampleElapsedMs = 88_000L)
+            currentWordEligibility = {
+                eligible(
+                    word(positionMs = 1_000L, wordIndex = 1)
+                        .copy(sampleElapsedMs = 88_000L)
+                )
             },
             elapsedRealtime = { nowMs }
         )
@@ -95,6 +147,32 @@ class CurrentWordPushEngineTest {
         assertEquals(88_000L, payloads.single().getLong("sampleMono"))
         assertTrue(payloads.single().has("timestamp"))
         assertTrue(payloads.single().toString().toByteArray().size <= 182)
+    }
+
+    @Test
+    fun introWaitNeverPublishesFutureWordSnapshot() {
+        var sent = 0
+        val futureWord = word(positionMs = 1_000L, wordIndex = 0)
+        val engine = CurrentWordPushEngine(
+            logger = {},
+            sendStatusMessage = {
+                sent += 1
+                true
+            },
+            expectedGeneration = { 7L },
+            currentWordEligibility = {
+                eligible(futureWord).copy(
+                    eligible = false,
+                    reason = "INTRO_WAIT",
+                    state = futureWord
+                )
+            },
+            elapsedRealtime = { 2_000L }
+        )
+
+        engine.observeGeneration(7L, observedAtMs = 1_000L)
+        assertNull(engine.pushCurrentWord())
+        assertEquals(0, sent)
     }
 
     private fun word(positionMs: Long, wordIndex: Int): CurrentWordState {
@@ -109,6 +187,20 @@ class CurrentWordPushEngineTest {
             hasWordTiming = true,
             positionMs = positionMs,
             timestampMs = 10_000L + positionMs
+        )
+    }
+
+    private fun eligible(state: CurrentWordState): CurrentWordEligibilitySnapshot {
+        return CurrentWordEligibilitySnapshot(
+            eligible = true,
+            reason = "ELIGIBLE",
+            trackId = state.trackId,
+            generation = state.trackGeneration,
+            positionMs = state.positionMs,
+            positionAnchorMs = state.sampleElapsedMs,
+            lineIndex = state.lineIndex,
+            wordTimingStatus = "AVAILABLE",
+            state = state
         )
     }
 }

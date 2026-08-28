@@ -24,6 +24,10 @@ class PlayerAgentExecutionHub(
     val scheduled: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "$threadNamePrefix-Scheduled")
     }
+    val currentWord: ScheduledExecutorService =
+        Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "$threadNamePrefix-CurrentWord")
+        }
     val maintenance: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "$threadNamePrefix-Maintenance").apply {
             priority = Thread.MIN_PRIORITY
@@ -45,7 +49,7 @@ class PlayerAgentExecutionHub(
     fun isShutdown(): Boolean = executors().all(ExecutorService::isShutdown)
 
     private fun executors(): List<ExecutorService> =
-        listOf(realtime, foregroundIO, scheduled, maintenance)
+        listOf(realtime, foregroundIO, scheduled, currentWord, maintenance)
 
     companion object {
         private const val SHUTDOWN_WAIT_MS = 1_500L

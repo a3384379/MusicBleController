@@ -92,6 +92,30 @@ internal object PlaybackPositionAnchorPolicy {
     }
 }
 
+internal object RuntimeLyricLineProjectionPolicy {
+    fun currentLineText(
+        lines: List<RuntimeLyricLine>,
+        positionMs: Long
+    ): String {
+        var low = 0
+        var high = lines.lastIndex
+        var lineIndex = -1
+        while (low <= high) {
+            val mid = (low + high) ushr 1
+            if (lines[mid].timeMs <= positionMs) {
+                lineIndex = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        while (lineIndex >= 0 && lines[lineIndex].text.isBlank()) {
+            lineIndex -= 1
+        }
+        return lines.getOrNull(lineIndex)?.text.orEmpty()
+    }
+}
+
 object CurrentTrackRuntimeCache {
     private val lock = Any()
 
@@ -177,10 +201,18 @@ object CurrentTrackRuntimeCache {
         logger: ((String) -> Unit)? = null
     ) {
         val runtimeLines = lines.map { it.toRuntimeLine() }
-        mutate(logger) { previous, now, _ ->
+        mutate(logger) { previous, now, startedAt ->
             if (previous == null || previous.songKey != songKey) {
                 previous
             } else {
+                val projectedPosition = PlaybackPositionAnchorPolicy.projectedPositionMs(
+                    positionMs = previous.positionMs,
+                    positionAnchorElapsedMs = previous.positionAnchorElapsedMs,
+                    nowElapsedMs = startedAt,
+                    durationMs = previous.durationMs,
+                    isPlaying = previous.isPlaying,
+                    playbackSpeed = previous.playbackSpeed
+                )
                 logger?.invoke(
                     "[RuntimeCache] lyrics updated songKey=$songKey " +
                         "lines=${runtimeLines.size} source=$lyricSource"
@@ -191,7 +223,10 @@ object CurrentTrackRuntimeCache {
                     lyricLines = runtimeLines,
                     translationLines = runtimeLines.map { it.translation },
                     romanizationLines = runtimeLines.map { it.romanization },
-                    currentWord = findCurrentWord(runtimeLines, previous.positionMs),
+                    positionMs = projectedPosition,
+                    positionAnchorElapsedMs = startedAt,
+                    currentLine = findCurrentLineText(runtimeLines, projectedPosition),
+                    currentWord = findCurrentWord(runtimeLines, projectedPosition),
                     lastUpdatedAtMs = now
                 )
             }
@@ -612,8 +647,7 @@ object CurrentTrackRuntimeCache {
         lines: List<RuntimeLyricLine>,
         positionMs: Long
     ): String {
-        val lineIndex = findCurrentLineIndexed(lines, positionMs)?.lineIndex ?: return ""
-        return lines.getOrNull(lineIndex)?.text.orEmpty()
+        return RuntimeLyricLineProjectionPolicy.currentLineText(lines, positionMs)
     }
 
     private fun findCurrentWordStateLocked(
