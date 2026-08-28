@@ -469,30 +469,44 @@ class BleGattServerManager(
                 )
             }
             if (responseNeeded) {
-                // Stop issuing new notify packets before the ATT response. A dense
-                // artwork transfer can otherwise fill Sony's L2CAP hold queue and
-                // make sendResponse() look successful locally while iOS never gets
-                // its write callback.
-                notifyQueue.onCommandWriteReceived(device?.address.orEmpty())
-                val responseStartMs = SystemClock.elapsedRealtime()
-                logger(
-                    "[CTRL-Sony] sendResponse begin seq=$seq cmd=$command " +
-                        "timeMs=${System.currentTimeMillis()}"
-                )
-                val ok = sendWriteResponse(
-                    device,
-                    requestId,
-                    BluetoothGatt.GATT_SUCCESS,
-                    offset,
-                    value
-                )
-                logger(
-                    "[CTRL-Sony] sendResponse end seq=$seq cmd=$command " +
-                        "costMs=${SystemClock.elapsedRealtime() - responseStartMs} ok=$ok"
-                )
-                if (ok) {
-                    notifyQueue.onCommandResponseSent(device?.address.orEmpty())
-                    recordCommandSuccess(command, device?.address)
+                val queued = notifyQueue.sendCommandResponseWhenIdle(
+                    deviceAddress = device?.address.orEmpty(),
+                    commandSeq = commandSeq,
+                    commandType = command
+                ) {
+                    val responseStartMs = SystemClock.elapsedRealtime()
+                    logger(
+                        "[CTRL-Sony] sendResponse begin seq=$seq cmd=$command " +
+                            "timeMs=${System.currentTimeMillis()}"
+                    )
+                    val ok = sendWriteResponse(
+                        device,
+                        requestId,
+                        BluetoothGatt.GATT_SUCCESS,
+                        offset,
+                        value
+                    )
+                    logger(
+                        "[CTRL-Sony] sendResponse end seq=$seq cmd=$command " +
+                            "costMs=${SystemClock.elapsedRealtime() - responseStartMs} ok=$ok"
+                    )
+                    if (ok) {
+                        notifyQueue.onCommandResponseSent(device?.address.orEmpty())
+                        recordCommandSuccess(command, device?.address)
+                    }
+                }
+                if (!queued) {
+                    logger(
+                        "[CTRL-Sony] command response rejected seq=$seq cmd=$command " +
+                            "reason=response_queue_full"
+                    )
+                    sendWriteResponse(
+                        device,
+                        requestId,
+                        BluetoothGatt.GATT_FAILURE,
+                        offset,
+                        value
+                    )
                 }
             }
             val dispatchExecutor = when (command) {
