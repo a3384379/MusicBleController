@@ -41,6 +41,9 @@
 10. 协商 `mediaCacheValidationV1` 后，iOS 对当前歌曲的精确 FullLyrics cache 发 fingerprint/schema/行数校验；命中时 Sony 跳过完整正文传输，CurrentLine/CurrentWord 仍正常增量发布。
 11. iOS cache v3 分离远端 QRC fingerprint 与本地持久化正文 fingerprint；媒体 TrackInfo、PlaybackState、歌词、CurrentWord、Preview/HQ 统一使用经过 identity 复核的 wire generation。
 12. 高频切歌与封面传输并发时，Sony 优先保留 command write response 窗口，并将封面 binary 最小 pacing 固定为 15ms；健康链路不会仅因歌曲 generation 变化显示“正在连接”。
+13. V4 第四阶段以本地 `handoffId` 关联 command、MediaSession、PlaybackState、歌词和 CurrentWord；该 ID 只用于 Trace，不进入 BLE payload。
+14. 歌词 ready 后，Sony 通过精确 trackId/generation 屏障立即发布包含 current line 的 PlaybackState，并立即恢复独立 CurrentWord boundary scheduler，不再等待下一轮 AutoPush。
+15. 有效 command write response 与同设备在途 notify 在 `BleNotifyQueue` 的 callback 边界串行化；另一控制器的响应保持按设备隔离，避免 Sony 本地 `sendResponse=true` 但 L2CAP 实际丢响应造成 iOS 假重连。
 
 ## 关键状态
 
@@ -72,6 +75,7 @@
 - Smoke 报告：`/tmp/music_ble_ios_smoke/<timestamp>/report.json`。
 - V4 实时性 Trace、SLO 与真机基线：[REALTIME_SLO_V4.md](/Volumes/雷电/project/MusicBleController/docs/REALTIME_SLO_V4.md)；自动报告位于 `/tmp/musicble_realtime_v4/<timestamp>/`。
 - V4 预测来源、Hot Set、缓存校验与 Gate 4 跳过依据：[PREDICTIVE_MEDIA_ENGINE_V4.md](/Volumes/雷电/project/MusicBleController/docs/PREDICTIVE_MEDIA_ENGINE_V4.md)。
+- V4 Cold-Path Handoff、current lyric/CurrentWord 首包、command response 竞态与第四阶段实测：[COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。
 
 ## 修改后必须跑哪些 smoke test
 

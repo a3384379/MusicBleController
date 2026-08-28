@@ -28,6 +28,7 @@
 8. CoreBluetooth 状态恢复优先复用已连接 Sony 和已恢复 characteristic；iOS 17+ 同时启用系统自动重连，系统重连期间禁止自建 reconnect work item 竞争，前台超过连接超时后再回退主动扫描。进入 inactive/background 后暂停 health、订阅/写超时和时钟同步；回到前台先用单次探针验证，收到有效 notify 后才恢复状态、音量和歌词同步。
 9. 单次 `didWrite` 回调超时只标记 suspect 并延长等待，不移除 in-flight 请求、不推进写队列；连续两次写回调超时才 hard reconnect。
 10. Sony 端业务静默只触发按地址的轻量 notify 探针；只有真实 notify 失败达到阈值才隔离该地址，禁止用静默时间直接重建共享 GATT。
+11. Sony 对合法 command 的 ATT response 与同设备在途 notify 在 queue callback 边界串行化；这防止 `sendResponse()` 本地成功但 L2CAP 未实际发出的 write callback 缺失。业务命令仍异步执行，不靠延迟媒体 generation 伪造连接健康。
 
 ## 关键状态
 
@@ -61,6 +62,7 @@
 - 假连接：看 `[BLE-Health] suspect`、`probe sent`、`probe timeout`、`hard reconnect reason=...`。
 - 恢复竞态：看 `[BLE-Restore] restored`、`foreground restore skipped`、`reuse restored notifying characteristic`。
 - 写回调偶发丢失：看 `[CTRL-iOS] write timeout extended`；第一轮超时后 in-flight 序号应保持不变。
+- 高频切歌 write callback 缺失：同时检查 Sony `commandResponseDeferred/Released`、notify callback 和 L2CAP failure；response release 应发生在同设备在途 notify callback 之后，且不应触发 iOS hard reconnect。
 - 前后台恢复：看 `BLE watchdogs paused`、`foreground validation queued/success`，验证成功前不应出现状态/音量/歌词同步突发。
 - 胶囊闪烁：区分 `connectionDisplayState` 和 `connectionHealthState`，日常模式不应展示技术细节。
 
@@ -69,3 +71,5 @@
 - 改连接、重连、Health、UI 胶囊：quick smoke。
 - 改 `autoReconnectEnabled` 默认值/UserDefaults/Preferences：full smoke。
 - 真机建议测试：`reconnect_sync_v28_test.sh`、Sony 服务停止/恢复、App 前后台、Force Reconnect。
+
+第四阶段正常 NEXT/PREVIOUS/Sony dispatch-next 共 90 次和 100 次快速压力中，合法 command response 未观察到 L2CAP failure、iOS write timeout 或 hard reconnect。此前复现的“实际连接仍在但 UI 长时间显示正在连接”包含 ATT response 与在途 notify 冲突这一根因；修复细节见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。

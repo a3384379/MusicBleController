@@ -146,3 +146,11 @@ Preview/HQ 的正式传输继续使用 Sony/iOS 精确封面栅栏；15ms 封面
 - 双控制器混合 capability 真机、两小时 soak：需第二控制器/专门长时间窗口，未执行时必须标记 SKIPPED。
 
 这些边界是审计结论，不是未来协议承诺。只有实际设备暴露稳定队列且审计证明准确率、提前量和 BLE 收益后，才重新打开跨端预取 Gate。
+
+## 16. 第四阶段 Cold-Path 后续
+
+第四阶段没有重新打开 Predictive Prefetch，也没有猜测候选歌曲。它处理所有歌曲都适用的 current lyric/CurrentWord 冷路径：lyrics-ready 事件直接发布精确 current line，CurrentWord 使用独立 boundary scheduler 和 event barrier，P0 状态不再停留在结束的大任务 interleave slot。
+
+第三阶段的 `mediaCacheValidationV1`、FullLyrics skip、Hot Set 容量/TTL、15ms AlbumArt pacing、wire generation 和全部 capability/legacy fallback 保持不变。第四阶段正常场景的 current lyric p95 降至 94.3～115.2ms，立即 eligible Track → first word p95 降至 146.8～225.4ms；远程 command → Track 仍受 QQ 音乐/MediaSession dispatch → metadata 的约 0.78 秒外部长尾限制。
+
+详细结果见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。

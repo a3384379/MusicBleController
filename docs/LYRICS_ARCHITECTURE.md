@@ -86,3 +86,14 @@
 - docs-only：`git diff --check`。
 
 V4 实时性观测使用 `trackId + generation` 关联 `lyricRequestQueued`、`lyricReady`、pending、LyricWindow、FullLyrics 和 CurrentWord 阶段。Trace 不读取歌词正文，也不改变 QRC 加载、pending flush、队列优先级或 stale fence；指标定义见 [REALTIME_SLO_V4.md](/Volumes/雷电/project/MusicBleController/docs/REALTIME_SLO_V4.md)。
+
+## V4 Cold-Path Current Lyric 与 CurrentWord
+
+- `LyricManager` 对 lookup requested/start、runtime/parsed cache hit/miss、load、ready 和 current line selected 输出 `handoffId/trackId/generation/positionAnchor/lineIndex/wordTimingStatus/cacheSource/failureReason`；不写歌词正文。
+- `lyricsReady` 先把精确匹配的行写入 `CurrentTrackRuntimeCache`，再通过 `LyricsReadyGateSnapshot` 触发 current PlaybackState 首包。只有当前 trackId、generation、非空 current line 和订阅状态完全匹配才发送，旧 Track 不会借 fast publish 回写。
+- CurrentWord eligibility 区分 `ELIGIBLE`、`INTRO_WAIT`、`LINE_ONLY/NO_WORD_TIMING`、`LYRIC_NOT_READY`、`PAUSED`、`CLOCK_UNTRUSTED` 和 `NO_ACTIVE_LINE`。前奏/逐行/无歌词样本不冒充系统延迟失败。
+- CurrentWord 使用独立 scheduled executor；匹配 generation 的 `lyricsReady` 是首包事件屏障，250ms 仅作 bounded fallback。若 position 已在词内立即发送 snapshot，否则按真实下一边界调度；暂停时 suspended，seek/恢复时重算。
+- generation、sequence、position 和 anchor fence 全部保留。iOS 明确记录 `TRACK_MISMATCH/GENERATION_MISMATCH/SEQUENCE_OLD/POSITION_STALE/ANCHOR_STALE/DUPLICATE`，只有 accepted 后才发布。
+- 第四阶段没有修改 QRC Triple DES、parser、index schema、fuzzy、negative、alias 或 Recovery Engine。正式 30 次场景的 Track → current lyric p95 为 94.3～115.2ms；立即 eligible Track → first word p95 为 146.8～225.4ms。
+
+详细状态机、样本覆盖和未达标项见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。

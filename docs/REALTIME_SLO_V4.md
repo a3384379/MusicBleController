@@ -216,3 +216,25 @@ Sony 同一 `commandSeq + commandType` 的多次 `mediaControlDispatchStart` 计
 最终压力还统一了 TrackInfo、PlaybackState、歌词、CurrentWord 和 A1 封面的 wire generation，并为 command write response 预留 radio window。封面 binary 使用 15ms 最小 pacing 后，313/313 次 command write 获得 callback，write timeout、response failed 和 L2CAP congestion 均为 0；切歌期间没有虚假“正在连接”，也没有 Sony/iOS 新旧封面 generation 分叉。
 
 Cold Path 最终 p95：command→Track 632.6ms（相对 621.8ms +1.7%）、Track→current lyric 1210.1ms（-1.7%）、Track→Preview 707.2ms（+8.8%）、Track→HQ 707.2ms（+8.4%）、iOS decode 1ms、publish 18.5ms。可比项均未超过第二阶段 10% 回退边界，Preview/HQ 仍满足 Cold SLO；CurrentWord 只有 1 个 362ms 可关联样本，不据此宣称统计改善。
+
+## 19. 第四阶段 Cold-Path 结果
+
+第四阶段为每次转换增加本地 `handoffId` 和触发类型，并把 Track、current lyric、CurrentWord 拆到 command、MediaSession、identity、playback、queue、notify、iOS decode/publish/UI consume 的完整闭环。Clock Sync sample count 在一次运行内回退即判定整轮跨设备时钟不可信；启动/重连的同 Track refresh 不计入 Handoff。
+
+正常 30 次场景的 p95：
+
+| metric | NEXT | PREVIOUS | Sony dispatch-next | Phase4 target |
+|---|---:|---:|---:|---|
+| command/Track T0 → Track publish | 1025.9ms | 1005.2ms | 148.2ms | 远程 ≤350ms，未满足 |
+| Track → current lyric | 115.2ms | 94.3ms | 107.8ms | ≤500ms，满足 |
+| word eligible → published | 193.0ms | 282.4ms | 279.1ms | ≤250ms，仅 NEXT 满足 |
+| immediately eligible Track → first word | 172.2ms | 146.8ms | 225.4ms | ≤500ms，满足 |
+| Track → Preview/HQ | 68.3ms | 79.4ms | 66.5ms | ≤800/2500ms，满足 |
+
+Sony scheduler 段已经收敛：eligible → scheduler p95 0ms、scheduler → enqueue p95 ≤1ms、enqueue → send p95 0ms。current lyric 的 lyrics ready 事件现在直接触发精确 current PlaybackState；CurrentWord 使用独立 executor、lyrics-ready 事件屏障和 250ms fallback，generation/sequence/position/anchor fence 不变。
+
+远程 Track SLO 的主要剩余段是 QQ 音乐/MediaSession 的 dispatch → metadata observed（NEXT 773.3ms、PREVIOUS 781.4ms），不是 iOS decode/publish 或 Sony queue。PREVIOUS/Sony dispatch-next 的 word eligible → publish 目标差约 32/29ms，主要在 send 后到 CoreBluetooth 接收/接受；不得继续盲目调低 Sony scheduler 或图片 pacing。
+
+第四阶段还把合法 ATT command response 与同设备在途 notify 串行化到 callback 边界，解决本地 `sendResponse=true` 但 L2CAP 丢 response 导致的 iOS 假重连。正常 90 次转换与 100 次压力中 L2CAP response failure、write timeout、hard reconnect、stale accepted 和 duplicate control 均为 0。
+
+完整状态机、修改前后数据、资源与未完成项见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。120 分钟自然播放完成 30 次真实转换，但约第 97 分钟出现 4 次 L2CAP write failure、1 次 Sony 系统 Bluetooth HCI timeout/process death；PlayerAgent 在约 4.4 秒内恢复连接，但 Soak 仍为 FAIL。自然场景又因 iOS 滚动 Trace 不完整和重连后的 Clock Sync 不可信而无法生成正式跨端 p95。双控制器真机因缺少第二 Controller 为 `BLOCKED_BY_HARDWARE`，因此第四阶段不能标记完整完成。

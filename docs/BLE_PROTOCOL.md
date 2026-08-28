@@ -152,6 +152,18 @@ V4 第三阶段没有实现 `prefetchManifest`、`PREFETCH_MEDIA` 或 purpose=pr
 - Sony 端 45 秒无业务流量只会按设备发送 `{"type":"link"}` 小探针，不再重建共享 GATT。探针的真实 notify 失败累计到阈值后，仅隔离失败地址，其他控制器继续工作。
 - 恢复连接的 smoke 参数通过一次性 App 容器标记传递，避免 CoreBluetooth 后台恢复抢先启动导致测试序列丢失。
 
+## V4 Cold-Path Handoff 与 ATT response 边界
+
+- `handoffId` 和 `triggerType` 只存在于两端本地 Realtime Trace。远程 NEXT/PREVIOUS 复用 command seq；Sony 本地转换使用进程内 ID。BLE JSON、UUID、A1/A2 header 和旧客户端解析均不改变。
+- TrackInfo、PlaybackState、CurrentWord 属于 P0。PlaybackState/CurrentWord 不再只停留在 long-job 的 latest-interleaved slot；它们进入普通 P0 队列，在包边界抢占 FullLyrics、HQ、history 和 diagnostics。
+- 25ms command response quiet window 仍按设备限制新的 response-sensitive 媒体包，多个 burst 命令不能无限延长首个 deadline。
+- Sony 栈可能在同设备 notify 尚未 callback 时让 `sendResponse()` 本地返回成功、但 L2CAP 实际丢弃 ATT response。合法 JSON command response 因此先进入最多 8 项的有界 gate；同设备等待 notify callback/cancelled-callback drain，其他未阻塞设备可以先释放。
+- response ready 时不启动新 notify；response 实际发送后重新保留 quiet window。disconnect 按地址移除 pending response，关闭服务清空全部状态；队列满返回明确 GATT failure。
+- `commandResponseDeferred/Released/Rejected` 只写 Trace。命令业务仍在原 executor 异步执行，response 排队不阻塞 GATT callback 或 MediaSession callback。
+- 第四阶段正常 90 次转换和 100 次压力下没有 L2CAP response failure、write timeout 或 hard reconnect；但双控制器真机仍因缺少第二 Controller 标记 `BLOCKED_BY_HARDWARE`。
+
+实现、边界和完整性能数据见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。
+
 ## 不允许随便修改的点
 
 - 不要改 UUID。
