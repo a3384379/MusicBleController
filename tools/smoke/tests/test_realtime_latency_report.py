@@ -111,6 +111,31 @@ class RealtimeLatencyReportTests(unittest.TestCase):
         self.assertIn("COMMAND_ONLY", labels)
         self.assertNotIn("COMPLETE", labels)
 
+    def test_phase4_control_segments_ignore_protocol_commands(self):
+        events = self.phase4_complete_events()
+        events.extend([
+            event(
+                "ios", "commandIntent", 40, command_seq=10,
+                command_type="CAPABILITIES", source_line=40,
+            ),
+            event(
+                "ios", "commandWriteStart", 140, command_seq=10,
+                command_type="CAPABILITIES", source_line=41,
+            ),
+            event(
+                "ios", "commandWriteCallback", 340, command_seq=10,
+                command_type="CAPABILITIES", source_line=42,
+            ),
+        ])
+        report = REPORT.analyze(
+            events,
+            clock_trusted=True,
+            sony_to_ios_offset_ms=0,
+        )
+        self.assertEqual(report["metrics"]["commandIntentToWriteStartMs"]["count"], 1)
+        self.assertEqual(report["metrics"]["commandIntentToWriteStartMs"]["p50"], 2)
+        self.assertEqual(report["metrics"]["writeStartToCallbackMs"]["p50"], 2)
+
     def test_phase4_line_only_intro_and_rejected_word_classification(self):
         events = self.phase4_complete_events()
         events.extend([

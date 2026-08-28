@@ -531,6 +531,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private var trackMatrixV31Active = false
     private var realtimeV4RunID = ""
     private var realtimeV4Active = false
+    private var realtimeV4KeepsScreenAwake = false
     #endif
     private var remoteLogExpectedChunks = 0
     private var remoteLogExpectedLines = 0
@@ -1123,6 +1124,8 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         let runID = "\(currentTimeMs())"
         realtimeV4RunID = runID
         realtimeV4Active = true
+        realtimeV4KeepsScreenAwake = mode != "auto" && mode != "natural"
+        UIApplication.shared.isIdleTimerDisabled = realtimeV4KeepsScreenAwake
         RealtimeTraceStore.shared.buffer.clear()
         AppLogStore.shared.clear()
         log(
@@ -1149,8 +1152,9 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     ) {
         guard realtimeV4Active, realtimeV4RunID == runID else { return }
         let requiresForeground = mode != "auto" && mode != "natural"
-        let traceProtocolReady = serverProtocolVersion >= 3 &&
-            (!serverSupportsClockSyncV1 || lyricClockSyncConfident)
+        // Clock sync quality controls only cross-device duration eligibility.
+        // Same-device handoff segments remain valid and must still be sampled.
+        let traceProtocolReady = serverProtocolVersion >= 3
         let ready = sonyPeripheral?.state == .connected &&
             sonyCommandCharacteristic != nil &&
             sonyStatusCharacteristic != nil &&
@@ -1160,8 +1164,10 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
             (!requiresForeground || appLifecycleState == "active")
         guard ready else {
             if attempt >= 40 {
-                log("[RealtimeV4] abort runId=\(runID) reason=not_ready")
-                realtimeV4Active = false
+                finishRealtimeV4SmokeTest(
+                    runID: runID,
+                    message: "[RealtimeV4] abort runId=\(runID) reason=not_ready"
+                )
                 return
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -1180,11 +1186,14 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         log(
             "[RealtimeV4] start runId=\(runID) runs=\(runs) " +
                 "mode=\(mode) fastSwitch=\(fastSwitch) " +
-                "protocolVersion=\(serverProtocolVersion) mtu=\(negotiatedMTU)"
+                "protocolVersion=\(serverProtocolVersion) mtu=\(negotiatedMTU) " +
+                "clockSyncTrusted=\(lyricClockSyncConfident)"
         )
         if mode == "auto" || mode == "natural" {
-            log("[RealtimeV4] observing Sony-local track changes runId=\(runID)")
-            realtimeV4Active = false
+            finishRealtimeV4SmokeTest(
+                runID: runID,
+                message: "[RealtimeV4] observing Sony-local track changes runId=\(runID)"
+            )
             return
         }
         runRealtimeV4Command(
@@ -1204,9 +1213,19 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         interval: TimeInterval
     ) {
         guard realtimeV4Active, realtimeV4RunID == runID else { return }
+        guard appLifecycleState == "active" else {
+            finishRealtimeV4SmokeTest(
+                runID: runID,
+                message: "[RealtimeV4] abort runId=\(runID) reason=left_foreground " +
+                    "completed=\(index)"
+            )
+            return
+        }
         guard index < runs else {
-            log("[RealtimeV4] end runId=\(runID) completed=\(runs)")
-            realtimeV4Active = false
+            finishRealtimeV4SmokeTest(
+                runID: runID,
+                message: "[RealtimeV4] end runId=\(runID) completed=\(runs)"
+            )
             return
         }
         let command: String
@@ -1231,6 +1250,16 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
                 mode: mode,
                 interval: interval
             )
+        }
+    }
+
+    private func finishRealtimeV4SmokeTest(runID: String, message: String) {
+        guard realtimeV4RunID == runID else { return }
+        log(message)
+        realtimeV4Active = false
+        if realtimeV4KeepsScreenAwake {
+            UIApplication.shared.isIdleTimerDisabled = false
+            realtimeV4KeepsScreenAwake = false
         }
     }
 

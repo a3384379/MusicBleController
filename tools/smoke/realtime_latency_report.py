@@ -276,6 +276,17 @@ def _command_or_handoff_key(event: Event) -> Optional[tuple]:
     return ("command", *command) if command is not None else None
 
 
+def _control_command_or_handoff_key(event: Event) -> Optional[tuple]:
+    is_control = event.command_type in {"NEXT", "PREVIOUS"}
+    is_control_handoff = (
+        event.trigger_type in {"IOS_NEXT", "IOS_PREVIOUS"}
+        or bool(event.handoff_id and event.handoff_id.startswith("command-"))
+    )
+    if not is_control and not is_control_handoff:
+        return None
+    return _command_or_handoff_key(event)
+
+
 def _media_key(event: Event) -> Optional[tuple]:
     track = _track_key(event)
     if track is not None:
@@ -893,11 +904,11 @@ def analyze(
         metrics[name] = summarize(values, missing)
 
     phase4_pair_specs = (
-        ("commandIntentToWriteStartMs", "ios", "commandIntent", "ios", "commandWriteStart", _command_or_handoff_key, False),
-        ("writeStartToCallbackMs", "ios", "commandWriteStart", "ios", "commandWriteCallback", _command_or_handoff_key, False),
-        ("commandCallbackToSonyReceiveMs", "ios", "commandWriteCallback", "sony", "commandReceived", _command_or_handoff_key, True),
-        ("sonyReceiveToDispatchEndMs", "sony", "commandReceived", "sony", "mediaControlDispatchEnd", _command_or_handoff_key, False),
-        ("dispatchEndToMetadataObservedMs", "sony", "mediaControlDispatchEnd", "sony", "metadataObserved", _command_or_handoff_key, False),
+        ("commandIntentToWriteStartMs", "ios", "commandIntent", "ios", "commandWriteStart", _control_command_or_handoff_key, False),
+        ("writeStartToCallbackMs", "ios", "commandWriteStart", "ios", "commandWriteCallback", _control_command_or_handoff_key, False),
+        ("commandCallbackToSonyReceiveMs", "ios", "commandWriteCallback", "sony", "commandReceived", _control_command_or_handoff_key, True),
+        ("sonyReceiveToDispatchEndMs", "sony", "commandReceived", "sony", "mediaControlDispatchEnd", _control_command_or_handoff_key, False),
+        ("dispatchEndToMetadataObservedMs", "sony", "mediaControlDispatchEnd", "sony", "metadataObserved", _control_command_or_handoff_key, False),
         ("metadataObservedToTrackAcceptedMs", "sony", "mediaSessionMetadataObserved", "sony", "firstSonyTrackAccepted", _media_key, False),
         ("trackAcceptedToPlaybackReadyMs", "sony", "firstSonyTrackAccepted", "sony", "firstPlaybackReady", _media_key, False),
         ("playbackReadyToQueueStartMs", "sony", "firstPlaybackReady", "sony", "firstPlaybackEnqueued", _media_key, False),
@@ -907,7 +918,7 @@ def analyze(
         ("iosReceiveToDecodeMs", "ios", "firstPlaybackNotifyReceived", "ios", "firstPlaybackDecodeEnd", _media_key, False),
         ("iosDecodeToPublishMs", "ios", "firstPlaybackDecodeEnd", "ios", "firstPlaybackPublished", _media_key, False),
         ("publishToUiConsumeMs", "ios", "firstPlaybackPublished", "ios", "firstUiConsumed", _media_key, False),
-        ("totalCommandToTrackPublishMs", "ios", "commandIntent", "ios", "firstIosTrackAccepted", _command_or_handoff_key, False),
+        ("totalCommandToTrackPublishMs", "ios", "commandIntent", "ios", "firstIosTrackAccepted", _control_command_or_handoff_key, False),
         ("trackAcceptedToLyricReadyMs", "sony", "firstSonyTrackAccepted", "sony", "firstLyricReady", _media_key, False),
         ("lyricReadyToCurrentLineEnqueueMs", "sony", "firstLyricReady", "sony", "firstLineEnqueued", _media_key, False),
         ("currentLineEnqueueToPublishMs", "sony", "firstLineEnqueued", "ios", "firstLinePublished", _media_key, True),
