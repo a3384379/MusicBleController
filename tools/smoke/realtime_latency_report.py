@@ -563,7 +563,11 @@ def derive_track_t0(
     return t0_events, track_publish_values, missing
 
 
-def classify_transition_samples(events: list[Event], clock_trusted: bool) -> tuple[list[dict], list[dict]]:
+def classify_transition_samples(
+    events: list[Event],
+    clock_trusted: bool,
+    sony_to_ios_offset_ms: Optional[int] = None,
+) -> tuple[list[dict], list[dict]]:
     anchor_candidates = [
         event for event in events
         if (
@@ -597,6 +601,7 @@ def classify_transition_samples(events: list[Event], clock_trusted: bool) -> tup
     samples = []
     missing_events = []
     seen = set()
+    used_ios_identity_lines = set()
     for index, anchor in enumerate(sorted(anchors, key=lambda item: item.mono_ms)):
         anchor_identity = anchor.handoff_id or (
             f"command-{anchor.command_seq}" if anchor.command_seq is not None
@@ -605,6 +610,35 @@ def classify_transition_samples(events: list[Event], clock_trusted: bool) -> tup
         if anchor_identity in seen:
             continue
         seen.add(anchor_identity)
+        linked_ios_identity = None
+        if (
+            anchor.side == "sony"
+            and anchor.stage == "mediaSessionMetadataObserved"
+            and anchor.track_id
+            and clock_trusted
+            and sony_to_ios_offset_ms is not None
+        ):
+            mapped_anchor_ms = anchor.mono_ms + sony_to_ios_offset_ms
+            ios_identity_candidates = [
+                candidate for candidate in events
+                if candidate.side == "ios"
+                and candidate.stage == "trackIdentityAccepted"
+                and candidate.result == "changed"
+                and candidate.source_line not in used_ios_identity_lines
+                and candidate.track_id
+                and candidate.track_id[:12] == anchor.track_id[:12]
+                and mapped_anchor_ms - 100 <= candidate.mono_ms <= mapped_anchor_ms + 15_000
+            ]
+            if ios_identity_candidates:
+                linked_ios_identity = min(
+                    ios_identity_candidates,
+                    key=lambda candidate: (
+                        abs(candidate.mono_ms - mapped_anchor_ms),
+                        candidate.mono_ms,
+                        candidate.source_line,
+                    ),
+                )
+                used_ios_identity_lines.add(linked_ios_identity.source_line)
         upper_bound = anchor.mono_ms + 15_000
         grouped = []
         for candidate in events:
@@ -617,20 +651,42 @@ def classify_transition_samples(events: list[Event], clock_trusted: bool) -> tup
                 anchor.handoff_id
                 and candidate.handoff_id == anchor.handoff_id
             )
+            same_linked_ios_handoff = bool(
+                linked_ios_identity
+                and linked_ios_identity.handoff_id
+                and candidate.handoff_id == linked_ios_identity.handoff_id
+            )
             same_command = bool(
                 anchor.command_seq is not None
                 and candidate.command_seq == anchor.command_seq
             )
             same_track = bool(
                 anchor.track_id
-                and candidate.track_id == anchor.track_id
+                and candidate.track_id
+                and candidate.track_id[:12] == anchor.track_id[:12]
                 and (
-                    anchor.generation is None
-                    or candidate.generation is None
-                    or anchor.generation == candidate.generation
+                    linked_ios_identity is not None
+                    and candidate.side == "ios"
+                    and candidate.generation == linked_ios_identity.generation
+                    or linked_ios_identity is None
+                    and (
+                        anchor.generation is None
+                        or candidate.generation is None
+                        or anchor.generation == candidate.generation
+                    )
+                )
+                and (
+                    linked_ios_identity is None
+                    or candidate.side != "ios"
+                    or abs(candidate.mono_ms - linked_ios_identity.mono_ms) <= 15_000
                 )
             )
-            if same_handoff or same_command or same_track:
+            if (
+                same_handoff
+                or same_linked_ios_handoff
+                or same_command
+                or same_track
+            ):
                 grouped.append(candidate)
         stages = {event.stage for event in grouped}
         is_command = anchor.stage == "commandIntent"
@@ -1161,6 +1217,7 @@ def analyze(
     samples, missing_events = classify_transition_samples(
         events,
         clock_trusted and sony_to_ios_offset_ms is not None,
+        sony_to_ios_offset_ms,
     )
 
     return {

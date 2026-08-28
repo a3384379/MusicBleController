@@ -89,6 +89,44 @@ class RealtimeLatencyReportTests(unittest.TestCase):
         self.assertEqual(samples[0]["handoffId"], "command-9")
         self.assertEqual(samples[0]["triggerType"], "IOS_NEXT")
 
+    def test_phase4_correlates_automatic_handoff_across_trace_id_and_digest_width(self):
+        common_sony = {
+            "handoff_id": "sony-100-7",
+            "track_id": "123456789abc-full-digest",
+        }
+        common_ios = {
+            "handoff_id": "ios-1100-1",
+            "track_id": "123456789abc",
+            "generation": 7,
+        }
+        events = [
+            event("sony", "notificationMetadataObserved", 99, **common_sony, source_line=1),
+            event("sony", "playbackReadStart", 99, **common_sony, source_line=2),
+            event("sony", "mediaSessionMetadataObserved", 100, **common_sony, source_line=3),
+            event("sony", "trackIdentityCandidate", 101, **common_sony, source_line=4),
+            event("sony", "trackIdentityAccepted", 102, generation=7, **common_sony, source_line=5),
+            event("sony", "mediaGenerationCreated", 103, generation=7, **common_sony, source_line=6),
+            event("sony", "playbackReady", 104, generation=7, **common_sony, source_line=7),
+            event("sony", "playbackEnqueued", 105, generation=7, **common_sony, source_line=8),
+            event("sony", "playbackDequeued", 106, generation=7, **common_sony, source_line=9),
+            event("sony", "playbackNotifyStart", 107, generation=7, **common_sony, source_line=10),
+            event("sony", "playbackNotifyCallback", 108, generation=7, **common_sony, source_line=11),
+            event("ios", "trackIdentityAccepted", 1100, result="changed", **common_ios, source_line=12),
+            event("ios", "nowPlayingStateConsumed", 1101, **common_ios, source_line=13),
+            event("ios", "playbackNotifyReceived", 1102, **common_ios, source_line=14),
+            event("ios", "playbackDecodeEnd", 1103, **common_ios, source_line=15),
+            event("ios", "playbackStatePublished", 1104, **common_ios, source_line=16),
+        ]
+        samples, missing = REPORT.classify_transition_samples(
+            events,
+            clock_trusted=True,
+            sony_to_ios_offset_ms=1_000,
+        )
+        self.assertEqual(len(samples), 1)
+        self.assertIn("COMPLETE", samples[0]["classifications"])
+        self.assertEqual(samples[0]["eventCount"], len(events))
+        self.assertEqual(missing, [])
+
     def test_phase4_missing_ios_and_sony_events_are_named(self):
         ios_missing = [
             item for item in self.phase4_complete_events()
