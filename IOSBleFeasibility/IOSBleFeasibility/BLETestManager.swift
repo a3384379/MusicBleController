@@ -1124,7 +1124,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         let runID = "\(currentTimeMs())"
         realtimeV4RunID = runID
         realtimeV4Active = true
-        realtimeV4KeepsScreenAwake = mode != "auto" && mode != "natural"
+        realtimeV4KeepsScreenAwake = mode != "natural"
         UIApplication.shared.isIdleTimerDisabled = realtimeV4KeepsScreenAwake
         RealtimeTraceStore.shared.buffer.clear()
         AppLogStore.shared.clear()
@@ -1151,7 +1151,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         fastSwitch: Bool
     ) {
         guard realtimeV4Active, realtimeV4RunID == runID else { return }
-        let requiresForeground = mode != "auto" && mode != "natural"
+        let requiresForeground = mode != "natural"
         // Clock sync quality controls only cross-device duration eligibility.
         // Same-device handoff segments remain valid and must still be sampled.
         let traceProtocolReady = serverProtocolVersion >= 3
@@ -1189,7 +1189,18 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
                 "protocolVersion=\(serverProtocolVersion) mtu=\(negotiatedMTU) " +
                 "clockSyncTrusted=\(lyricClockSyncConfident)"
         )
-        if mode == "auto" || mode == "natural" {
+        if mode == "auto" {
+            log("[RealtimeV4] observing Sony-local track changes runId=\(runID)")
+            let observationSeconds = TimeInterval(runs * 4 + 16)
+            DispatchQueue.main.asyncAfter(deadline: .now() + observationSeconds) { [weak self] in
+                self?.finishRealtimeV4SmokeTest(
+                    runID: runID,
+                    message: "[RealtimeV4] end runId=\(runID) observed=\(runs)"
+                )
+            }
+            return
+        }
+        if mode == "natural" {
             finishRealtimeV4SmokeTest(
                 runID: runID,
                 message: "[RealtimeV4] observing Sony-local track changes runId=\(runID)"
