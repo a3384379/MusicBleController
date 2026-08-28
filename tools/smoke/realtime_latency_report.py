@@ -732,9 +732,9 @@ def classify_transition_samples(
             and event.result == "changed"
             for event in grouped
         )
-        if is_command and not ios_track_changed:
+        if not ios_track_changed:
             classifications.append("NO_TRACK_CHANGE")
-            if not any(event.side == "sony" for event in grouped):
+            if is_command and not any(event.side == "sony" for event in grouped):
                 classifications.append("COMMAND_ONLY")
         lyric_ready = [event for event in grouped if event.stage == "lyricReady"]
         if lyric_ready and not any(event.result == "ready" for event in lyric_ready):
@@ -771,7 +771,7 @@ def classify_transition_samples(
             classifications.append("FAILED")
         if absent:
             classifications.append("TRACE_INCOMPLETE")
-        elif ios_track_changed or not is_command:
+        elif ios_track_changed:
             classifications.append("COMPLETE")
         sample_id = anchor.handoff_id or f"sample-{index + 1}"
         sample = {

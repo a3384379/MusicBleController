@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -126,6 +127,31 @@ class RealtimeLatencyReportTests(unittest.TestCase):
         self.assertIn("COMPLETE", samples[0]["classifications"])
         self.assertEqual(samples[0]["eventCount"], len(events))
         self.assertEqual(missing, [])
+
+    def test_phase4_automatic_refresh_is_not_counted_as_track_change(self):
+        command_stages = {
+            "commandIntent", "commandEnqueued", "commandWriteStart",
+            "commandWriteCallback", "commandReceived", "commandValidated",
+            "mediaControlDispatchStart", "mediaControlDispatchEnd",
+        }
+        events = []
+        for item in self.phase4_complete_events():
+            if item.stage in command_stages:
+                continue
+            if item.side == "ios" and item.stage == "trackIdentityAccepted":
+                item = replace(item, result="refreshed")
+            events.append(item)
+
+        samples, missing = REPORT.classify_transition_samples(
+            events,
+            clock_trusted=True,
+            sony_to_ios_offset_ms=0,
+        )
+
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(missing, [])
+        self.assertIn("NO_TRACK_CHANGE", samples[0]["classifications"])
+        self.assertNotIn("COMPLETE", samples[0]["classifications"])
 
     def test_phase4_missing_ios_and_sony_events_are_named(self):
         ios_missing = [
