@@ -141,6 +141,47 @@ class RealtimeLatencyReportTests(unittest.TestCase):
         report = REPORT.analyze(sony_missing, clock_trusted=True, sony_to_ios_offset_ms=0)
         self.assertIn("mediaGenerationCreated", report["missingEvents"][0]["missingEvents"])
 
+    def test_phase4_current_line_uses_first_enqueue_after_lyrics_ready(self):
+        events = [
+            item for item in self.phase4_complete_events()
+            if item.stage != "lyricCurrentLineEnqueued"
+        ]
+        events.extend([
+            event(
+                "sony", "lyricCurrentLineEnqueued", 5,
+                track_id="track-a", generation=4, source_line=80,
+            ),
+            event(
+                "sony", "lyricCurrentLineEnqueued", 27,
+                track_id="track-a", generation=4, source_line=81,
+            ),
+        ])
+        report = REPORT.analyze(
+            events,
+            clock_trusted=True,
+            sony_to_ios_offset_ms=0,
+        )
+        self.assertEqual(
+            report["metrics"]["lyricReadyToCurrentLineEnqueueMs"]["p50"],
+            4,
+        )
+
+    def test_phase4_current_line_publish_ignores_earlier_cached_slice(self):
+        events = self.phase4_complete_events()
+        events.append(event(
+            "ios", "lyricCurrentLinePublished", 10,
+            track_id="track-a", generation=4, result="published", source_line=82,
+        ))
+        report = REPORT.analyze(
+            events,
+            clock_trusted=True,
+            sony_to_ios_offset_ms=0,
+        )
+        metric = report["metrics"]["currentLineEnqueueToPublishMs"]
+        self.assertEqual(metric["count"], 1)
+        self.assertEqual(metric["p50"], 1)
+        self.assertEqual(metric["missing"], 0)
+
     def test_phase4_command_only_is_not_a_handoff_sample(self):
         report = REPORT.analyze([
             event("ios", "commandIntent", 1, command_seq=3, command_type="NEXT", handoff_id="command-3", source_line=1),

@@ -369,6 +369,7 @@ def paired_durations(
     cross_device: bool = False,
     clock_trusted: bool = False,
     sony_to_ios_offset_ms: Optional[int] = None,
+    cross_device_tolerance_ms: int = 75,
 ) -> tuple[list[int], int]:
     starts = [
         event for event in events
@@ -409,7 +410,10 @@ def paired_durations(
             end_ms = end.mono_ms
             if cross_device and end.side == "sony":
                 end_ms += sony_to_ios_offset_ms or 0
-            minimum_end_ms = start_ms - 75 if cross_device else start_ms
+            minimum_end_ms = (
+                start_ms - cross_device_tolerance_ms
+                if cross_device else start_ms
+            )
             if end.source_line not in used_end_lines and end_ms >= minimum_end_ms:
                 eligible.append((end_ms, end))
         if not eligible:
@@ -890,8 +894,6 @@ def analyze(
         ("sony", {"playbackNotifyCallback"}, "firstPlaybackNotifyCallback", _media_key),
         ("ios", {"nowPlayingStateConsumed"}, "firstUiConsumed", _media_key),
         ("sony", {"lyricReady"}, "firstLyricReady", _media_key),
-        ("sony", {"lyricCurrentLineEnqueued"}, "firstLineEnqueued", _media_key),
-        ("ios", {"lyricCurrentLinePublished", "currentLyricPublished"}, "firstLinePublished", _media_key),
         ("sony", {"currentWordEligible"}, "firstWordEligible", _media_key),
         ("ios", {"trackIdentityAccepted"}, "firstIosTrackAccepted", _media_key),
     )
@@ -899,6 +901,29 @@ def analyze(
         phase4_events.extend(first_correlated_events(
             events, side, stages, canonical, key_function,
         ))
+    # Keep every non-empty line publication available for pairing. The first
+    # publication for a generation can legitimately predate lyricsReady (for
+    # example, a cached/stale UI slice). Cross-device pairing below selects the
+    # first exact-identity publication after the Sony enqueue using clockSync.
+    phase4_events.extend(
+        replace(event, stage="firstLinePublished")
+        for event in events
+        if event.side == "ios"
+        and event.stage == "lyricCurrentLinePublished"
+        and event.result != "empty"
+        and _media_key(event) is not None
+    )
+    lyric_ready_events = [
+        event for event in phase4_events if event.stage == "firstLyricReady"
+    ]
+    phase4_events.extend(first_events_after(
+        events,
+        lyric_ready_events,
+        "sony",
+        {"lyricCurrentLineEnqueued"},
+        "firstLineEnqueued",
+        _media_key,
+    ))
     identified_playback_receives = [
         event for event in events
         if event.stage != "playbackNotifyReceived" or bool(event.track_id)
@@ -1000,6 +1025,7 @@ def analyze(
         end_stage: str,
         key: Callable[[Event], Optional[tuple]],
         cross_device: bool = False,
+        cross_device_tolerance_ms: int = 75,
     ) -> None:
         values, missing = paired_durations(
             phase4_events,
@@ -1012,6 +1038,7 @@ def analyze(
             cross_device=cross_device,
             clock_trusted=clock_trusted,
             sony_to_ios_offset_ms=sony_to_ios_offset_ms,
+            cross_device_tolerance_ms=cross_device_tolerance_ms,
         )
         metric_samples[name] = values
         metrics[name] = summarize(values, missing)
@@ -1034,7 +1061,7 @@ def analyze(
         ("totalCommandToTrackPublishMs", "ios", "commandIntent", "ios", "firstIosTrackAccepted", _control_command_or_handoff_key, False),
         ("trackAcceptedToLyricReadyMs", "sony", "firstSonyTrackAccepted", "sony", "firstLyricReady", _media_key, False),
         ("lyricReadyToCurrentLineEnqueueMs", "sony", "firstLyricReady", "sony", "firstLineEnqueued", _media_key, False),
-        ("currentLineEnqueueToPublishMs", "sony", "firstLineEnqueued", "ios", "firstLinePublished", _media_key, True),
+        ("currentLineEnqueueToPublishMs", "sony", "firstLineEnqueued", "ios", "firstLinePublished", _media_key, True, 0),
         ("trackAcceptedToWordEligibleMs", "sony", "firstSonyTrackAccepted", "sony", "firstWordEligible", _media_key, False),
         ("lyricReadyToWordEligibleMs", "sony", "firstLyricReady", "sony", "firstWordEligible", _media_key, False),
         ("wordEligibleToSchedulerCreatedMs", "sony", "firstWordEligible", "sony", "wordSchedulerCreated", _media_key, False),
