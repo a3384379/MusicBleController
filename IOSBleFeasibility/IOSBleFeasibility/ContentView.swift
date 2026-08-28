@@ -108,10 +108,6 @@ struct ContentView: View {
                     showSystemHealthOverview = false
                 }
             }
-            .onChange(of: manager.title) { oldValue, newValue in
-                guard oldValue != newValue else { return }
-                manager.recordNowPlayingStateConsumed()
-            }
         }
     }
 }
@@ -600,6 +596,10 @@ private struct TrackInfoStoreView: View {
             }
         }
         .frame(maxWidth: .infinity)
+        .onChange(of: manager.playbackStore.metadata) { oldValue, newValue in
+            guard oldValue != newValue else { return }
+            manager.recordNowPlayingStateConsumed()
+        }
     }
 
     private var artworkSize: CGFloat { metrics.artworkSize }
