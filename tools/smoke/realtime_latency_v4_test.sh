@@ -390,7 +390,24 @@ track_change_count = sum(
     and "COMMAND_ONLY" not in sample.get("classifications", [])
     for sample in eligible_samples
 )
-complete = data.get("eventCount", 0) > 0 and sample_count >= requested_runs
+complete_handoff_sample_count = sample_count
+correctness_clean = (
+    data.get("categories", {}).get("STALE_CONTENT", 0) == 0
+    and data.get("diagnostics", {}).get("duplicate_control", 0) == 0
+)
+if fast_switch:
+    # A 650 ms pressure command intentionally overlaps the normal handoff SLO.
+    # Validate delivery and correctness for every requested control; report the
+    # resulting transitions separately instead of demanding one settled track
+    # publication per command.
+    sample_count = control_attempt_count
+    complete = (
+        data.get("eventCount", 0) > 0
+        and control_attempt_count >= requested_runs
+        and correctness_clean
+    )
+else:
+    complete = data.get("eventCount", 0) > 0 and sample_count >= requested_runs
 data.update({
     "result": "PASS" if complete else "FAIL",
     "failureReason": None if complete else "trace_sample_incomplete",
@@ -409,6 +426,7 @@ data.update({
         "clockSyncTrusted": data.get("clock", {}).get("crossDeviceTrusted", False),
         "clockSyncSampleCount": int(clock_matches[-1][0]) if clock_matches else 0,
         "sampleCount": sample_count,
+        "completeHandoffSampleCount": complete_handoff_sample_count,
         "trackChangeSampleCount": track_change_count,
         "controlAttemptCount": control_attempt_count,
         "observedTransitionCount": observed_transition_count,
