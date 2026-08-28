@@ -194,17 +194,30 @@ def load_events(paths: Iterable[Path]) -> tuple[list[Event], int]:
 
 def discover_clock_sync(paths: Iterable[Path]) -> tuple[bool, Optional[int]]:
     pattern = re.compile(
-        r"\[ClockSync\]\s+pong\b.*\boffsetMs=(-?\d+)\b.*\bconfident=(true|false)\b",
+        r"\[ClockSync\]\s+pong\b.*\boffsetMs=(-?\d+)\b.*\bsamples=(\d+)\b"
+        r".*\bconfident=(true|false)\b",
         re.IGNORECASE,
     )
     latest = None
+    previous_sample_count = None
+    reset_seen = False
     for path in paths:
         if not path.exists():
             continue
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             match = pattern.search(line)
             if match:
-                latest = (match.group(2).lower() == "true", int(match.group(1)))
+                sample_count = int(match.group(2))
+                if (previous_sample_count is not None
+                        and sample_count < previous_sample_count):
+                    reset_seen = True
+                previous_sample_count = sample_count
+                latest = (match.group(3).lower() == "true", int(match.group(1)))
+    # One offset must never be applied across a hard reconnect. Even if the
+    # final segment later converges, its offset cannot validate events from the
+    # earlier segment; keep cross-device metrics unavailable for that run.
+    if reset_seen:
+        return False, None
     return latest or (False, None)
 
 
@@ -898,8 +911,19 @@ def analyze(
         ("ios", {"trackIdentityAccepted"}, "firstIosTrackAccepted", _media_key),
     )
     for side, stages, canonical, key_function in first_stage_specs:
+        source_events = events
+        if canonical == "firstIosTrackAccepted":
+            # A reconnect baseline can refresh the already-visible identity
+            # before the requested measurement starts. It is not a handoff and
+            # must not make the old generation eligible for first-word SLOs.
+            source_events = [
+                event for event in events
+                if event.stage != "trackIdentityAccepted"
+                or event.side != "ios"
+                or event.result == "changed"
+            ]
         phase4_events.extend(first_correlated_events(
-            events, side, stages, canonical, key_function,
+            source_events, side, stages, canonical, key_function,
         ))
     # Keep every non-empty line publication available for pairing. The first
     # publication for a generation can legitimately predate lyricsReady (for
@@ -978,6 +1002,17 @@ def analyze(
         _media_key,
     )
     phase4_events.extend(playback_publishes)
+    accepted_media_keys = {
+        _media_key(event)
+        for event in phase4_events
+        if event.stage == "firstIosTrackAccepted"
+        and _media_key(event) is not None
+    }
+    phase4_events = [
+        event for event in phase4_events
+        if event.stage != "firstWordEligible"
+        or _media_key(event) in accepted_media_keys
+    ]
     eligible_events = [
         event for event in phase4_events if event.stage == "firstWordEligible"
     ]

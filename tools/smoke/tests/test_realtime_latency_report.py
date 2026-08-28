@@ -182,6 +182,58 @@ class RealtimeLatencyReportTests(unittest.TestCase):
         self.assertEqual(metric["p50"], 1)
         self.assertEqual(metric["missing"], 0)
 
+    def test_phase4_currentword_slo_ignores_reconnect_identity_refresh(self):
+        shifted_handoff = [
+            REPORT.replace(
+                item,
+                mono_ms=item.mono_ms + 1_000,
+                source_line=item.source_line + 20,
+            )
+            for item in self.phase4_complete_events()
+        ]
+        reconnect_baseline = [
+            event(
+                "sony", "currentWordEligible", 1,
+                track_id="track-old", generation=3, source_line=1,
+            ),
+            event(
+                "sony", "currentWordSchedulerCreated", 2,
+                track_id="track-old", generation=3, source_line=2,
+            ),
+            event(
+                "sony", "currentWordImmediateSnapshotEnqueued", 3,
+                track_id="track-old", generation=3, source_line=3,
+            ),
+            event(
+                "sony", "currentWordSendStart", 4,
+                track_id="track-old", generation=3, source_line=4,
+            ),
+            event(
+                "ios", "trackIdentityAccepted", 5, result="refreshed",
+                track_id="track-old", generation=3, source_line=5,
+            ),
+            event(
+                "ios", "currentWordReceived", 900,
+                track_id="track-old", generation=3, source_line=6,
+            ),
+            event(
+                "ios", "currentWordAccepted", 901,
+                track_id="track-old", generation=3, source_line=7,
+            ),
+            event(
+                "ios", "currentWordPublished", 902,
+                track_id="track-old", generation=3, source_line=8,
+            ),
+        ]
+        report = REPORT.analyze(
+            [*reconnect_baseline, *shifted_handoff],
+            clock_trusted=True,
+            sony_to_ios_offset_ms=0,
+        )
+        metric = report["metrics"]["wordEligibleToPublishMs"]
+        self.assertEqual(metric["count"], 1)
+        self.assertEqual(metric["p50"], 6)
+
     def test_phase4_command_only_is_not_a_handoff_sample(self):
         report = REPORT.analyze([
             event("ios", "commandIntent", 1, command_seq=3, command_type="NEXT", handoff_id="command-3", source_line=1),
@@ -489,6 +541,26 @@ class RealtimeLatencyReportTests(unittest.TestCase):
                 "jitterMs=4 samples=3 confident=true\n"
             )
             self.assertEqual(REPORT.discover_clock_sync([path]), (True, 123))
+
+    def test_clock_sync_discovery_allows_initial_convergence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ios.log"
+            path.write_text(
+                "[ClockSync] pong seq=1 offsetMs=120 jitterMs=8 samples=1 confident=false\n"
+                "[ClockSync] pong seq=2 offsetMs=122 jitterMs=4 samples=2 confident=false\n"
+                "[ClockSync] pong seq=3 offsetMs=123 jitterMs=2 samples=3 confident=true\n"
+            )
+            self.assertEqual(REPORT.discover_clock_sync([path]), (True, 123))
+
+    def test_clock_sync_discovery_rejects_offset_across_reconnect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ios.log"
+            path.write_text(
+                "[ClockSync] pong seq=5 offsetMs=123 jitterMs=2 samples=5 confident=true\n"
+                "[ClockSync] pong seq=6 offsetMs=451 jitterMs=9 samples=1 confident=false\n"
+                "[ClockSync] pong seq=8 offsetMs=450 jitterMs=2 samples=3 confident=true\n"
+            )
+            self.assertEqual(REPORT.discover_clock_sync([path]), (False, None))
 
     def test_report_bundle_contains_required_files_without_trace_input(self):
         with tempfile.TemporaryDirectory() as directory:
