@@ -168,50 +168,6 @@ class BleNotifyQueuePolicyTest {
     }
 
     @Test
-    fun deferredCommandResponsesStayBoundedAndFifo() {
-        val gate = DeferredCommandResponseGate(maxPending = 2)
-        val sent = mutableListOf<String>()
-
-        assertTrue(gate.enqueue(response("ios", 1, sent)))
-        assertTrue(gate.enqueue(response("android", 2, sent)))
-        assertFalse(gate.enqueue(response("ios", 3, sent)))
-        assertTrue(gate.hasPending())
-
-        gate.drainReady().forEach { it.send() }
-        assertEquals(listOf("ios-1", "android-2"), sent)
-        assertFalse(gate.hasPending())
-    }
-
-    @Test
-    fun deferredCommandResponsesClearOnlyDisconnectedController() {
-        val gate = DeferredCommandResponseGate(maxPending = 4)
-        val sent = mutableListOf<String>()
-        gate.enqueue(response("ios", 1, sent))
-        gate.enqueue(response("android", 2, sent))
-        gate.enqueue(response("ios", 3, sent))
-
-        assertEquals(2, gate.remove("ios"))
-        gate.drainReady().forEach { it.send() }
-        assertEquals(listOf("android-2"), sent)
-        assertEquals(0, gate.clear())
-    }
-
-    @Test
-    fun deferredCommandResponseDoesNotWaitForOtherControllerNotify() {
-        val gate = DeferredCommandResponseGate(maxPending = 4)
-        val sent = mutableListOf<String>()
-        gate.enqueue(response("ios", 1, sent))
-        gate.enqueue(response("android", 2, sent))
-
-        gate.drainReady(blockedDeviceAddress = "ios").forEach { it.send() }
-        assertEquals(listOf("android-2"), sent)
-        assertTrue(gate.hasPending())
-
-        gate.drainReady().forEach { it.send() }
-        assertEquals(listOf("android-2", "ios-1"), sent)
-    }
-
-    @Test
     fun everyLongTransferChecksRealtimePacketsAfterEachChunk() {
         listOf(
             "albumArt",
@@ -273,16 +229,4 @@ class BleNotifyQueuePolicyTest {
         pending.single().invoke()
         assertEquals(1, callbackCount)
     }
-
-    private fun response(
-        address: String,
-        sequence: Long,
-        sent: MutableList<String>
-    ) = DeferredCommandResponseGate.Pending(
-        deviceAddress = address,
-        commandSeq = sequence,
-        commandType = "NEXT",
-        queuedAtMs = sequence,
-        send = { sent += "$address-$sequence" }
-    )
 }

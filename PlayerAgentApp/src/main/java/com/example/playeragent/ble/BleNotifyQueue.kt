@@ -87,55 +87,6 @@ internal class CommandResponseQuietWindows(
     }
 }
 
-internal class DeferredCommandResponseGate(
-    private val maxPending: Int
-) {
-    data class Pending(
-        val deviceAddress: String,
-        val commandSeq: Long?,
-        val commandType: String,
-        val queuedAtMs: Long,
-        val send: () -> Unit
-    )
-
-    private val pending = ArrayDeque<Pending>()
-
-    fun enqueue(response: Pending): Boolean {
-        if (pending.size >= maxPending) return false
-        pending.addLast(response)
-        return true
-    }
-
-    fun hasPending(): Boolean = pending.isNotEmpty()
-
-    fun drainReady(blockedDeviceAddress: String? = null): List<Pending> {
-        val ready = mutableListOf<Pending>()
-        val retained = mutableListOf<Pending>()
-        while (pending.isNotEmpty()) {
-            val response = pending.removeFirst()
-            if (blockedDeviceAddress != null &&
-                response.deviceAddress == blockedDeviceAddress
-            ) {
-                retained += response
-            } else {
-                ready += response
-            }
-        }
-        retained.forEach(pending::addLast)
-        return ready
-    }
-
-    fun remove(deviceAddress: String): Int {
-        val retained = pending.filterNot { it.deviceAddress == deviceAddress }
-        val removed = pending.size - retained.size
-        pending.clear()
-        retained.forEach(pending::addLast)
-        return removed
-    }
-
-    fun clear(): Int = pending.size.also { pending.clear() }
-}
-
 class BleNotifyQueue(
     private val serverProvider: () -> BluetoothGattServer?,
     private val characteristicProvider: () -> BluetoothGattCharacteristic?,
@@ -173,8 +124,6 @@ class BleNotifyQueue(
     private var cancelledCallbackDrainRunnable: Runnable? = null
     private val commandResponseQuietWindows =
         CommandResponseQuietWindows(COMMAND_RESPONSE_QUIET_MS)
-    private val deferredCommandResponses =
-        DeferredCommandResponseGate(MAX_DEFERRED_COMMAND_RESPONSES)
     private var activeNotifyStartedAtMs = 0L
     private var activeNotifyDeviceAddress: String? = null
     private var activeNotifyPacketType: String? = null
@@ -228,49 +177,13 @@ class BleNotifyQueue(
     }
 
     /**
-     * Serializes an ATT write response behind the currently in-flight notification.
-     * Some Sony Bluetooth stacks return true from sendResponse() even when the response
-     * collides with that notification in L2CAP and never reaches the controller.
+     * Gives the ATT write response a short radio window before the next notification packet.
+     * Older Sony Bluetooth stacks can otherwise acknowledge sendResponse() locally while the
+     * iOS client never receives its write callback during a dense album-art transfer.
      */
-    fun sendCommandResponseWhenIdle(
-        deviceAddress: String,
-        commandSeq: Long?,
-        commandType: String,
-        send: () -> Unit
-    ): Boolean {
-        val nowMs = SystemClock.elapsedRealtime()
-        val queued: Boolean
-        val reason: String
-        synchronized(this) {
-            reserveCommandResponseWindow(deviceAddress, nowMs)
-            reason = when {
-                notificationInFlight && activeNotifyDeviceAddress == deviceAddress ->
-                    "notify_in_flight"
-                drainingCancelledCallback -> "cancelled_callback_drain"
-                else -> "queue_boundary"
-            }
-            queued = deferredCommandResponses.enqueue(
-                DeferredCommandResponseGate.Pending(
-                    deviceAddress = deviceAddress,
-                    commandSeq = commandSeq,
-                    commandType = commandType,
-                    queuedAtMs = nowMs,
-                    send = send
-                )
-            )
-        }
-        RealtimeTrace.record(
-            stage = if (queued) "commandResponseDeferred" else "commandResponseRejected",
-            monoMs = nowMs,
-            commandSeq = commandSeq,
-            commandType = commandType,
-            result = if (queued) "queued" else "rejected",
-            reason = if (queued) reason else "response_queue_full"
-        )
-        if (queued) {
-            handler.post { flushDeferredCommandResponses() }
-        }
-        return queued
+    @Synchronized
+    fun onCommandWriteReceived(deviceAddress: String) {
+        reserveCommandResponseWindow(deviceAddress, SystemClock.elapsedRealtime())
     }
 
     @Synchronized
@@ -287,40 +200,6 @@ class BleNotifyQueue(
                 (quietUntilMs - nowMs).coerceAtLeast(0L)
             )
         }
-    }
-
-    private fun flushDeferredCommandResponses() {
-        val responses = synchronized(this) {
-            if (drainingCancelledCallback) {
-                return
-            }
-            deferredCommandResponses.drainReady(
-                blockedDeviceAddress = if (notificationInFlight) {
-                    activeNotifyDeviceAddress
-                } else {
-                    null
-                }
-            )
-        }
-        if (responses.isEmpty()) return
-        responses.forEach { response ->
-            val releasedAtMs = SystemClock.elapsedRealtime()
-            RealtimeTrace.record(
-                stage = "commandResponseReleased",
-                monoMs = releasedAtMs,
-                commandSeq = response.commandSeq,
-                commandType = response.commandType,
-                queueWaitMs = (releasedAtMs - response.queuedAtMs).coerceAtLeast(0L),
-                result = "released"
-            )
-            runCatching(response.send).onFailure { exception ->
-                logger(
-                    "[BleNotifyQueue] command response failed " +
-                        "cmd=${response.commandType} reason=${exception.message}"
-                )
-            }
-        }
-        handler.post { sendNextPacket() }
     }
 
     @Synchronized
@@ -532,7 +411,6 @@ class BleNotifyQueue(
 
         cancelNotifyTimeout()
         notificationInFlight = false
-        handler.post { flushDeferredCommandResponses() }
         val callbackAddress = deviceAddress
             ?.takeIf { it.isNotBlank() }
             ?: activeNotifyDeviceAddress
@@ -640,13 +518,6 @@ class BleNotifyQueue(
         jobs.removeAll { it.device.address == address }
         latestInterleavedPackets.entries.removeAll { it.value.device.address == address }
         commandResponseQuietWindows.remove(address)
-        val abandonedResponses = deferredCommandResponses.remove(address)
-        if (abandonedResponses > 0) {
-            logger(
-                "[BleNotifyQueue] abandoned command responses count=$abandonedResponses " +
-                    "reason=device_disconnected"
-            )
-        }
         linkProfiles.remove(address)
         lastServedDeviceByPriority.entries.removeAll { it.value == address }
         val activeDeviceRemoved = activeJob?.device?.address == address ||
@@ -694,7 +565,6 @@ class BleNotifyQueue(
         activeJobStartedAtMs = 0L
         notificationInFlight = false
         commandResponseQuietWindows.clear()
-        deferredCommandResponses.clear()
         activeRequestType = null
         activeRequestId += 1
         clearActiveNotifyMetrics()
@@ -723,7 +593,6 @@ class BleNotifyQueue(
         activePacketIndex = 0
         notificationInFlight = false
         commandResponseQuietWindows.clear()
-        deferredCommandResponses.clear()
         activeRequestType = null
         activeRequestId += 1
         clearActiveNotifyMetrics()
@@ -799,10 +668,7 @@ class BleNotifyQueue(
 
     @Synchronized
     private fun sendNextPacket() {
-        if (notificationInFlight ||
-            drainingCancelledCallback ||
-            deferredCommandResponses.hasPending()
-        ) {
+        if (notificationInFlight || drainingCancelledCallback) {
             return
         }
 
@@ -1171,7 +1037,6 @@ class BleNotifyQueue(
         cancelledCallbackDrainRunnable?.let(handler::removeCallbacks)
         cancelledCallbackDrainRunnable = null
         drainingCancelledCallback = false
-        handler.post { flushDeferredCommandResponses() }
         handler.postDelayed({ sendNextPacket() }, SHORT_MESSAGE_DELAY_MS)
     }
 
@@ -1658,7 +1523,6 @@ class BleNotifyQueue(
         private const val NOTIFY_CALLBACK_TIMEOUT_MS = 2_000L
         private const val CANCELLED_CALLBACK_DRAIN_MS = 750L
         private const val COMMAND_RESPONSE_QUIET_MS = 25L
-        private const val MAX_DEFERRED_COMMAND_RESPONSES = 8
         private const val BULK_YIELD_INTERVAL = 4
         private const val BACKGROUND_YIELD_INTERVAL = 1
         private const val CONGESTED_CALLBACK_LOG_RTT_MS = 120L
