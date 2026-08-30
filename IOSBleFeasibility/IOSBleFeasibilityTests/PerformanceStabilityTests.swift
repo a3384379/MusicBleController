@@ -1239,6 +1239,48 @@ final class PerformanceStabilityTests: XCTestCase {
         )
     }
 
+    func testControlWriteSupersedesOnlyUnprotectedPlaybackRefreshes() {
+        XCTAssertTrue(
+            CommandWriteQueuePolicy.shouldDropPending(
+                existingCommand: "GET_PLAYBACK_STATE",
+                existingIsProtected: false,
+                incomingCommand: "NEXT",
+                incomingIsControl: true
+            )
+        )
+        XCTAssertTrue(
+            CommandWriteQueuePolicy.shouldDropPending(
+                existingCommand: "GET_PLAYBACK_STATE",
+                existingIsProtected: false,
+                incomingCommand: "GET_PLAYBACK_STATE",
+                incomingIsControl: false
+            )
+        )
+        XCTAssertFalse(
+            CommandWriteQueuePolicy.shouldDropPending(
+                existingCommand: "GET_PLAYBACK_STATE",
+                existingIsProtected: true,
+                incomingCommand: "PREVIOUS",
+                incomingIsControl: true
+            )
+        )
+        XCTAssertFalse(
+            CommandWriteQueuePolicy.shouldDropPending(
+                existingCommand: "GET_FULL_LYRICS",
+                existingIsProtected: false,
+                incomingCommand: "NEXT",
+                incomingIsControl: true
+            )
+        )
+    }
+
+    func testTrackSkipFallbackWaitsForAuthoritativeIdentityWindow() {
+        XCTAssertEqual(CommandRefreshPolicy.fallbackDelay(for: "NEXT"), 1.0)
+        XCTAssertEqual(CommandRefreshPolicy.fallbackDelay(for: "PREVIOUS"), 1.0)
+        XCTAssertEqual(CommandRefreshPolicy.fallbackDelay(for: "PLAY_PAUSE"), 0.5)
+        XCTAssertEqual(CommandRefreshPolicy.fallbackDelay(for: "SEEK_TO"), 0.5)
+    }
+
     func testCurrentWordOrderingFenceRejectsDuplicatesAndSmallRegression() {
         var fence = CurrentWordOrderingFence()
         XCTAssertTrue(fence.shouldAccept(generation: 7, sequence: 1, positionMs: 1_000))

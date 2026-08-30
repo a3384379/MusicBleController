@@ -92,13 +92,15 @@ P0 仍包括控制状态、TrackInfo、PlaybackState 和 CurrentWord；P1 lyricW
 
 正式样本的 `wordEligible → schedulerCreated` p95 为 0ms，`schedulerCreated → firstEnqueue` p95 为 0.5～1ms，`firstEnqueue → send` p95 为 0ms，证明 Sony scheduler 和 enqueue 已不是剩余长尾。PREVIOUS 与 Sony dispatch-next 的约 250ms 目标偏差发生在 send 后的 BLE/CoreBluetooth 接收或 iOS accept 段，不应继续盲调 scheduler。
 
-## 13. Command Response Quiet Window
+## 13. Command Response 与控制后媒体发布
 
-第三阶段的 25ms per-device quiet window 只阻止新的 response-sensitive 大包，但真机复现到一个更窄的竞态：Sony 已有 notify 在途时收到 ATT command write，`sendResponse()` 本地返回成功，L2CAP 实际写入失败，iOS 永远收不到 write callback 并在 5 秒后硬重连。
+第三阶段保留的 25ms per-device quiet window 继续只限制 response 后的新 response-sensitive 媒体包。合法 JSON command 当前直接调用 `sendResponse()`，命令业务仍在原 executor 异步执行；没有延迟 response gate，也没有 pending response closure。
 
-第四阶段把有效 JSON 命令的 ATT response 串行化到同一个 `BleNotifyQueue` callback 边界：最多缓存 8 个 response；同设备在途 notify callback 或 cancelled-callback drain 完成后释放；另一控制器未被该 notify 阻塞时可以独立释放。response ready 时不启动新 notify，response 发送后重新保留 25ms quiet window。断开按设备清理，服务关闭全量清理，队列满明确返回 GATT failure。
+提交 `3596804` 曾把 ATT response 串行化到同设备 notify callback 边界。它在一轮压力 Trace 中消除了 write timeout，但安装后出现 iOS 和 Android Controller 同时拿不到部分歌词、进度和图片的产品回归，因此由 `1154397` 完整回退。旧轮次的 `commandResponseDeferred/Released/Rejected` 数据只能解释实验，不再描述当前协议路径。
 
-Trace 为 `commandResponseDeferred/Released/Rejected`。正式 NEXT/PREVIOUS/dispatch-next 各 30 次和 100 次压力中，没有 L2CAP response failure、iOS write timeout 或硬重连；正常轮次的 response release 最大 33ms，压力轮次最大 212ms。无效 JSON 的错误响应仍走直接失败路径，不影响合法产品命令。
+当前跟进优化避免再改 ATT 生命周期：iOS 在串行写队列中合并过期的普通 `GET_PLAYBACK_STATE`，NEXT/PREVIOUS fallback 从 500ms 调整为 1 秒，并在正式新 trackId 到达时取消；前台验证和 Health probe 不参与丢弃。Sony 的 220ms 控制后 fallback 始终发送轻量 PlaybackState，但只有读取到与控制前不同的非空 `trackId` 才附带 TrackInfo/AlbumArt。这样既保留冷路径兜底，也避免用旧歌曲媒体抢占新身份、歌词、CurrentWord 和封面。
+
+新增 Trace 为 iOS `commandRefreshSuperseded` 与 Sony `postControlMediaDeferred/postControlMediaPublished`。该策略已通过纯策略单测、Sony unit/assemble 和 Swift 源码解析；iPhone + Sony 真机压力尚未重新执行，因此不能宣称假重连或媒体缺失已经完成验收。
 
 ## 14. AlbumArt 15ms Pacing
 
@@ -108,9 +110,9 @@ AlbumArt binary 15ms 最小 pacing 保持不变，没有为 Track 或 CurrentWor
 
 ## 15. 双控制器行为
 
-实现继续按设备隔离 capability、MTU、transfer、quiet window、response gate、notify failure 和 cleanup。新增 response gate 的策略测试覆盖同设备阻塞、另一设备可释放、FIFO 容量和 disconnect cleanup。
+实现继续按设备隔离 capability、MTU、transfer、quiet window、notify failure 和 cleanup；当前代码没有 response gate。
 
-本阶段只有 iPhone 与 Sony 真机，缺少第二台 Android Controller，因此“两端同时订阅、40 次交替、20 次近同时控制、单端断开/notify failure”真机矩阵为 `BLOCKED_BY_HARDWARE`，不能用单元测试代替，也不能据此宣称第四阶段完整完成。
+按当前产品优先级，本轮先闭环 iPhone 控制端与 Sony PlayerAgent。Android Controller 与双控制器并发矩阵延期，标记 `SKIPPED（当前范围）`，不能用单元测试代替，也不作为这轮 iOS + Sony 优化的完成声明。
 
 ## 16. 修改前数据
 
@@ -129,7 +131,7 @@ Sony dispatch-next 是 `adb shell cmd media_session dispatch next` 的自动等�
 
 ## 17. 修改后数据
 
-最终产品 commit 的正常 30 次结果：
+回退前历史真机轮次的正常 30 次结果：
 
 | metric | NEXT p95 | PREVIOUS p95 | Sony dispatch-next p95 | target/result |
 |---|---:|---:|---:|---|
@@ -147,6 +149,8 @@ Sony dispatch-next 是 `adb shell cmd media_session dispatch next` 的自动等�
 
 100 次快速压力完成 100 个控制尝试、观察到 88 次转换；Clock Sync 因测试中跨重连 sample reset 被正确标记为不可信，所以跨设备耗时不生成。所有 8 个 CurrentWord reject 均为 `TRACK_MISMATCH`，9 个 Track Identity reject 为 generation conflict/stale generation，属于栅栏生效；stale accepted、duplicate control、hard reconnect、write timeout、L2CAP response failure 均为 0。
 
+上述数字来自包含后来已回退 response gate 的构建，只用于保留 CurrentWord、歌词和队列优化的历史证据，不等价于 `1154397` 之后当前代码的最终产品结果。当前工作树的 iOS fallback 合并与 Sony identity-gated post-control media 尚未产生新的真机 p95；正式 before/after 表必须等 iPhone + Sony 被工具重新识别后生成。
+
 ## 18. 两小时 Soak
 
 最终真机轮次实际观察 120 分钟。Sony Trace 有 33 条 track-change 事件；按精确 trackId 的相邻状态去除 2 条同曲刷新后，为 31 个顺序唯一状态、30 次真实自然转换。该轮没有发送 dispatch-next；测试工具仅依据明确的 `mode=natural` 测量场景在报告层标为 `NATURAL_AUTOPLAY`，设备原始 Trace 的 `triggerType` 仍为 `UNKNOWN`，不能表述成 QQ 音乐主动提供了自然播放来源标签。
@@ -159,7 +163,7 @@ iOS App 日志只有 current + old 两段滚动文件。末尾原生报告虽然
 
 ## 19. 资源开销
 
-新增常驻状态仅为两端单个 pending/current Handoff context、固定 2048 条 Trace ring、最多 8 个短 command response closure 和已有队列中的 trace context，目标远低于 2MB。新增大块歌词/图片 cache、持续轮询、主线程磁盘 I/O和网络访问均为 0。
+新增常驻状态仅为两端单个 pending/current Handoff context、固定 2048 条 Trace ring、一个可取消的 iOS playback fallback work item 和已有队列中的 trace context，目标远低于 2MB。新增大块歌词/图片 cache、持续轮询、主线程磁盘 I/O和网络访问均为 0。
 
 Sony 新增一个 CurrentWord 单线程 scheduler，替代共享 executor 上的同类任务，不增加周期任务数量；暂停或无歌词时没有固定轮询。iOS 没有新增 Timer，界面只在 metadata Slice 真正变化时记录 consume，不引入整页随机 identity 重绘。
 
@@ -172,7 +176,8 @@ Sony 新增一个 CurrentWord 单线程 scheduler，替代共享 executor 上的
 - 立即 eligible Track → first word 虽达到 500ms，但每场景只有 25/25/23 个正式样本，未达到各 30 个覆盖目标。
 - 120 分钟自然播放虽完成 30 次真实转换，但 Sony 系统 Bluetooth stack 在约第 97 分钟发生 1 次 HCI timeout/process death；4 次 L2CAP write failure，Soak 为 FAIL。
 - iOS 滚动日志只恢复到 19 次 Track change、7 个完整 UI Handoff；Clock Sync 又因 Bluetooth 重启不可信，自然场景跨端 p95 为 `NOT APPLICABLE`。
-- 双控制器真机矩阵因缺少第二 Controller 为 `BLOCKED_BY_HARDWARE`。
+- Android Controller 与双控制器矩阵按当前优先级延期，为 `SKIPPED（当前范围）`。
+- 回退后的 iPhone + Sony 高频 NEXT/PREVIOUS、歌词、CurrentWord、Preview/HQ 与连接胶囊回归尚未执行；当前不能把历史轮次结果当成新策略 PASS。
 - 快速压力发生过 Clock Sync reset，因此该轮跨设备 p95 为不可用，不能用同端片段冒充完整延迟。
 
 在上述项闭环前，第四阶段结论只能是“未完成，存在阻断项”。

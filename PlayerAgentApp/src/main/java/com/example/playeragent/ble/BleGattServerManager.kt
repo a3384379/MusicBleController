@@ -58,6 +58,18 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
+internal object PostControlBroadcastPolicy {
+    fun shouldIncludeTrackMedia(
+        command: String,
+        trackIdBeforeControl: String,
+        observedTrackId: String
+    ): Boolean {
+        if (command != "NEXT" && command != "PREVIOUS") return false
+        if (observedTrackId.isBlank()) return false
+        return trackIdBeforeControl.isBlank() || observedTrackId != trackIdBeforeControl
+    }
+}
+
 class BleGattServerManager(
     context: Context,
     private val bluetoothManager: BluetoothManager,
@@ -1281,6 +1293,11 @@ class BleGattServerManager(
             "VOLUME_UP",
             "VOLUME_DOWN" -> {
                 cancelHistoryTransfersForControl(sourceAddress, command)
+                val trackIdBeforeControl = if (command == "NEXT" || command == "PREVIOUS") {
+                    currentTrackSnapshot()?.trackId.orEmpty()
+                } else {
+                    ""
+                }
                 if (command in MULTI_CONTROLLER_DEDUP_COMMANDS &&
                     !multiControllerCommandGate.shouldExecute(
                         command,
@@ -1302,7 +1319,7 @@ class BleGattServerManager(
                 }
                 mediaCommandExecutor.execute(command, seq)
                 if (command in MULTI_CONTROLLER_DEDUP_COMMANDS) {
-                    scheduleAuthoritativeStateBroadcast(command)
+                    scheduleAuthoritativeStateBroadcast(command, trackIdBeforeControl)
                 }
             }
 
@@ -1407,7 +1424,10 @@ class BleGattServerManager(
         }
     }
 
-    private fun scheduleAuthoritativeStateBroadcast(command: String) {
+    private fun scheduleAuthoritativeStateBroadcast(
+        command: String,
+        trackIdBeforeControl: String = ""
+    ) {
         val delayMs = when (command) {
             "PLAY_PAUSE" -> 100L
             "SEEK_TO" -> 150L
@@ -1416,7 +1436,37 @@ class BleGattServerManager(
         }
         albumArtHandler.postDelayed({
             if (!started || subscribedDevices.isEmpty()) return@postDelayed
-            sendPlaybackState(includeAlbumArt = command == "NEXT" || command == "PREVIOUS")
+            val source = playbackStateReader.readPlaybackState()
+            val observedTrackId = source.optString("trackId")
+            val includeTrackMedia = PostControlBroadcastPolicy.shouldIncludeTrackMedia(
+                command = command,
+                trackIdBeforeControl = trackIdBeforeControl,
+                observedTrackId = observedTrackId
+            )
+            if ((command == "NEXT" || command == "PREVIOUS") && !includeTrackMedia) {
+                logger(
+                    "[ControlHandoff] media deferred cmd=$command " +
+                        "reason=identity_unchanged"
+                )
+            }
+            if (command == "NEXT" || command == "PREVIOUS") {
+                val handoffTrace = observedTrackId.takeIf { it.isNotBlank() }
+                    ?.let(TrackHandoffTraceCoordinator::contextFor)
+                RealtimeTrace.record(
+                    stage = if (includeTrackMedia) {
+                        "postControlMediaPublished"
+                    } else {
+                        "postControlMediaDeferred"
+                    },
+                    commandType = command,
+                    trackId = observedTrackId.takeIf { it.isNotBlank() },
+                    result = if (includeTrackMedia) "published" else "deferred",
+                    reason = if (includeTrackMedia) "identity_changed" else "identity_unchanged",
+                    handoffId = handoffTrace?.handoffId,
+                    triggerType = handoffTrace?.triggerType?.name
+                )
+            }
+            publishPlaybackState(source, includeAlbumArt = includeTrackMedia)
         }, delayMs)
     }
 
@@ -1538,6 +1588,10 @@ class BleGattServerManager(
 
     private fun sendPlaybackState(includeAlbumArt: Boolean = false) {
         val source = playbackStateReader.readPlaybackState()
+        publishPlaybackState(source, includeAlbumArt)
+    }
+
+    private fun publishPlaybackState(source: JSONObject, includeAlbumArt: Boolean) {
         onPlaybackUiState(source)
         if (includeAlbumArt) {
             sendTrackInfo(source)

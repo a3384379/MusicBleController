@@ -7,6 +7,45 @@ import org.junit.Test
 
 class BleGattServerManagerPolicyTest {
     @Test
+    fun postControlBroadcastIncludesMediaOnlyAfterIdentityChanges() {
+        assertFalse(
+            PostControlBroadcastPolicy.shouldIncludeTrackMedia(
+                command = "NEXT",
+                trackIdBeforeControl = "track-a",
+                observedTrackId = "track-a"
+            )
+        )
+        assertTrue(
+            PostControlBroadcastPolicy.shouldIncludeTrackMedia(
+                command = "NEXT",
+                trackIdBeforeControl = "track-a",
+                observedTrackId = "track-b"
+            )
+        )
+        assertTrue(
+            PostControlBroadcastPolicy.shouldIncludeTrackMedia(
+                command = "PREVIOUS",
+                trackIdBeforeControl = "",
+                observedTrackId = "track-b"
+            )
+        )
+        assertFalse(
+            PostControlBroadcastPolicy.shouldIncludeTrackMedia(
+                command = "PLAY_PAUSE",
+                trackIdBeforeControl = "track-a",
+                observedTrackId = "track-b"
+            )
+        )
+        assertFalse(
+            PostControlBroadcastPolicy.shouldIncludeTrackMedia(
+                command = "NEXT",
+                trackIdBeforeControl = "track-a",
+                observedTrackId = ""
+            )
+        )
+    }
+
+    @Test
     fun playbackPollingSlowsOnlyAfterPausedStateIsKnown() {
         assertEquals(1_000L, BleGattServerManager.autoPushPollIntervalMs(null))
         assertEquals(1_000L, BleGattServerManager.autoPushPollIntervalMs(true))

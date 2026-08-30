@@ -235,6 +235,6 @@ Sony scheduler 段已经收敛：eligible → scheduler p95 0ms、scheduler → 
 
 远程 Track SLO 的主要剩余段是 QQ 音乐/MediaSession 的 dispatch → metadata observed（NEXT 773.3ms、PREVIOUS 781.4ms），不是 iOS decode/publish 或 Sony queue。PREVIOUS/Sony dispatch-next 的 word eligible → publish 目标差约 32/29ms，主要在 send 后到 CoreBluetooth 接收/接受；不得继续盲目调低 Sony scheduler 或图片 pacing。
 
-第四阶段还把合法 ATT command response 与同设备在途 notify 串行化到 callback 边界，解决本地 `sendResponse=true` 但 L2CAP 丢 response 导致的 iOS 假重连。正常 90 次转换与 100 次压力中 L2CAP response failure、write timeout、hard reconnect、stale accepted 和 duplicate control 均为 0。
+第四阶段曾实验把合法 ATT command response 与同设备在途 notify 串行化到 callback 边界；该构建的 90 次转换与 100 次压力虽未观察到 command failure，但随后安装验证出现 iOS 和 Android Controller 媒体/控制回归，因此该实验由 `1154397` 回退，不能再作为当前最终结论。当前实现保持即时 ATT response，并通过 iOS 合并过期 PlaybackState fallback、Sony 在正式 trackId 变化前延迟 TrackInfo/AlbumArt 来减少竞争，未改变协议。
 
-完整状态机、修改前后数据、资源与未完成项见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。120 分钟自然播放完成 30 次真实转换，但约第 97 分钟出现 4 次 L2CAP write failure、1 次 Sony 系统 Bluetooth HCI timeout/process death；PlayerAgent 在约 4.4 秒内恢复连接，但 Soak 仍为 FAIL。自然场景又因 iOS 滚动 Trace 不完整和重连后的 Clock Sync 不可信而无法生成正式跨端 p95。双控制器真机因缺少第二 Controller 为 `BLOCKED_BY_HARDWARE`，因此第四阶段不能标记完整完成。
+完整状态机、历史修改前后数据、资源与未完成项见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。120 分钟自然播放完成 30 次真实转换，但约第 97 分钟出现 4 次 L2CAP write failure、1 次 Sony 系统 Bluetooth HCI timeout/process death；PlayerAgent 在约 4.4 秒内恢复连接，但 Soak 仍为 FAIL。自然场景又因 iOS 滚动 Trace 不完整和重连后的 Clock Sync 不可信而无法生成正式跨端 p95。当前优先闭环 iPhone + Sony，双控制器矩阵延期；回退后的新控制/媒体策略仍需真机复测，因此第四阶段不能标记完整完成。

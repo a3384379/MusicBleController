@@ -67,6 +67,8 @@ CoreBluetooth 使用 `com.musicblecontroller.sony.central.v1` 做状态恢复，
 
 命令写回调连续超时仍会触发真实传输自愈。若 CoreBluetooth transport 尚连接且最近 notify 证明链路活跃，自愈期间最多 8 秒保持已连接展示；正式同步完成后结束保护，连接失败或保护窗到期则恢复真实重连状态。该策略只稳定产品展示，不跳过重连，也不把超时命令补发。
 
+用户控制与播放状态 fallback 共用串行 command write 队列，但普通 `GET_PLAYBACK_STATE` 会被更新的 fallback 或新的用户控制合并；前台恢复验证与 Health probe 的请求序列受保护。NEXT/PREVIOUS fallback 等待 1 秒，优先让 Sony 的正式 TrackInfo/PlaybackState 主动推送完成；新 trackId 一旦被接受即取消剩余 fallback。该策略不新增 Timer、不重发控制命令，也不改变 BLE 协议。
+
 ## 关键状态
 
 - 连接：`connectionStatus`、`connectionDisplayState`、`connectionHealthState`、`autoReconnectState`。

@@ -40,10 +40,10 @@
 9. V4 第三阶段先审计 MediaSession queue；有稳定 queueItemId/mediaId 时 Sony 才允许 CONFIRMED/STRONG 候选晋升。当前真机 QQ 音乐不暴露队列，因此只保留 WEAK 历史候选的本地 QRC 索引预热，不向控制端发送候选。
 10. 协商 `mediaCacheValidationV1` 后，iOS 对当前歌曲的精确 FullLyrics cache 发 fingerprint/schema/行数校验；命中时 Sony 跳过完整正文传输，CurrentLine/CurrentWord 仍正常增量发布。
 11. iOS cache v3 分离远端 QRC fingerprint 与本地持久化正文 fingerprint；媒体 TrackInfo、PlaybackState、歌词、CurrentWord、Preview/HQ 统一使用经过 identity 复核的 wire generation。
-12. 高频切歌与封面传输并发时，Sony 优先保留 command write response 窗口，并将封面 binary 最小 pacing 固定为 15ms；健康链路不会仅因歌曲 generation 变化显示“正在连接”。
+12. 高频切歌与封面传输并发时，Sony 对合法 command 保持即时 ATT response，并在 response 后按设备保留 25ms quiet window；封面 binary 最小 pacing 固定为 15ms。健康链路不会仅因歌曲 generation 变化显示“正在连接”。
 13. V4 第四阶段以本地 `handoffId` 关联 command、MediaSession、PlaybackState、歌词和 CurrentWord；该 ID 只用于 Trace，不进入 BLE payload。
 14. 歌词 ready 后，Sony 通过精确 trackId/generation 屏障立即发布包含 current line 的 PlaybackState，并立即恢复独立 CurrentWord boundary scheduler，不再等待下一轮 AutoPush。
-15. 有效 command write response 与同设备在途 notify 在 `BleNotifyQueue` 的 callback 边界串行化；另一控制器的响应保持按设备隔离，避免 Sony 本地 `sendResponse=true` 但 L2CAP 实际丢响应造成 iOS 假重连。
+15. iOS 控制写会取消尚未执行的普通 `GET_PLAYBACK_STATE` fallback，并把 NEXT/PREVIOUS 的兜底读取合并到播放器身份切换窗之后；前台验证和 Health 探针不参与丢弃。Sony 的 220ms 控制后广播始终发布轻量 PlaybackState，但只有实际 `trackId` 已变化才附带 TrackInfo/封面，避免旧身份和旧图占用正式新歌曲通道。
 
 ## 关键状态
 

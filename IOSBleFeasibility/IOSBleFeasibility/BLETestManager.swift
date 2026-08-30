@@ -75,6 +75,33 @@ enum CommandWriteTimeoutPolicy {
     }
 }
 
+enum CommandWriteQueuePolicy {
+    static func shouldDropPending(
+        existingCommand: String,
+        existingIsProtected: Bool,
+        incomingCommand: String,
+        incomingIsControl: Bool
+    ) -> Bool {
+        guard !existingIsProtected else { return false }
+        guard existingCommand == "GET_PLAYBACK_STATE" else { return false }
+        return incomingIsControl || incomingCommand == existingCommand
+    }
+}
+
+enum CommandRefreshPolicy {
+    static func fallbackDelay(for command: String) -> TimeInterval {
+        switch command {
+        case "NEXT", "PREVIOUS":
+            // QQ Music exposes the new MediaSession identity around 0.8s p95.
+            // An earlier GET_PLAYBACK_STATE usually returns the old track and
+            // competes with the authoritative TrackInfo/artwork push.
+            return 1.0
+        default:
+            return 0.5
+        }
+    }
+}
+
 enum LyricSecondaryLoadState: Equatable {
     case idle
     case loading
@@ -433,6 +460,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private var realtimeHandoffCorrelation = RealtimeHandoffCorrelation()
     private var commandWriteInflight: [CommandWriteInfo] = []
     private var pendingCommandWrites: [PendingCommandWrite] = []
+    private var playbackStateRefreshWorkItem: DispatchWorkItem?
     private var commandWriteTimeoutWorkItem: DispatchWorkItem?
     private var consecutiveCommandWriteTimeouts = 0
     private var volumeWriteInFlightSeq: UInt64?
@@ -1831,17 +1859,17 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
 
     func sendPlayPause() {
         sendUserCommand(cmd: "PLAY_PAUSE")
-        refreshPlaybackState(after: 0.5)
+        refreshPlaybackState(after: CommandRefreshPolicy.fallbackDelay(for: "PLAY_PAUSE"))
     }
 
     func sendNext() {
         sendUserCommand(cmd: "NEXT")
-        refreshPlaybackState(after: 0.5)
+        refreshPlaybackState(after: CommandRefreshPolicy.fallbackDelay(for: "NEXT"))
     }
 
     func sendPrevious() {
         sendUserCommand(cmd: "PREVIOUS")
-        refreshPlaybackState(after: 0.5)
+        refreshPlaybackState(after: CommandRefreshPolicy.fallbackDelay(for: "PREVIOUS"))
     }
 
     func sendVolumeUp() {
@@ -2484,6 +2512,8 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private func sendUserCommand(cmd: String, extra: [String: Any] = [:]) {
+        playbackStateRefreshWorkItem?.cancel()
+        playbackStateRefreshWorkItem = nil
         let seq = nextCommandSeq()
         let intentMonoMs = monotonicTimeMs()
         let handoff = realtimeHandoffCorrelation.registerCommand(
@@ -2577,6 +2607,33 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private func enqueueCommandWrite(_ request: PendingCommandWrite) {
+        let protectedSequences = Set(
+            [foregroundValidationCommandSeq, healthProbeCommandSeq].compactMap { $0 }
+        )
+        let pendingBeforeCoalescing = pendingCommandWrites.count
+        pendingCommandWrites.removeAll { existing in
+            CommandWriteQueuePolicy.shouldDropPending(
+                existingCommand: existing.cmd,
+                existingIsProtected: protectedSequences.contains(existing.seq),
+                incomingCommand: request.cmd,
+                incomingIsControl: request.isControl
+            )
+        }
+        let supersededCount = pendingBeforeCoalescing - pendingCommandWrites.count
+        if supersededCount > 0 {
+            ctrlLog(
+                "[CTRL-iOS] superseded playback refresh count=\(supersededCount) " +
+                    "incomingSeq=\(request.seq) incomingCmd=\(request.cmd)"
+            )
+            RealtimeTraceStore.shared.record(
+                stage: "commandRefreshSuperseded",
+                commandSeq: Int64(request.seq),
+                commandType: request.cmd,
+                processingMs: Int64(supersededCount),
+                result: "dropped",
+                reason: "control_or_newer_refresh"
+            )
+        }
         if foregroundValidationPending,
            foregroundValidationCommandSeq == request.seq {
             pendingCommandWrites.insert(request, at: 0)
@@ -3352,9 +3409,14 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private func refreshPlaybackState(after delay: TimeInterval) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.sendGetPlaybackState()
+        playbackStateRefreshWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.playbackStateRefreshWorkItem = nil
+            self.sendGetPlaybackState()
         }
+        playbackStateRefreshWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
     private func refreshVolume(after delay: TimeInterval) {
@@ -4288,6 +4350,8 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         firstConnectionReadyAtMs = 0
         commandWriteTimeoutWorkItem?.cancel()
         commandWriteTimeoutWorkItem = nil
+        playbackStateRefreshWorkItem?.cancel()
+        playbackStateRefreshWorkItem = nil
         consecutiveCommandWriteTimeouts = 0
         foregroundValidationTimeoutWorkItem?.cancel()
         foregroundValidationTimeoutWorkItem = nil
@@ -4517,6 +4581,8 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         subscribeNotifyTimeoutWorkItem = nil
         commandWriteTimeoutWorkItem?.cancel()
         commandWriteTimeoutWorkItem = nil
+        playbackStateRefreshWorkItem?.cancel()
+        playbackStateRefreshWorkItem = nil
         foregroundValidationTimeoutWorkItem?.cancel()
         foregroundValidationTimeoutWorkItem = nil
         foregroundInflightSettleWorkItem?.cancel()
@@ -6682,6 +6748,8 @@ extension BLETestManager: CBPeripheralDelegate {
             (!trackID.isEmpty && trackID != currentTrackID) ||
             (generation > 0 && currentTrackGeneration > 0 && generation != currentTrackGeneration)
         if trackChanged {
+            playbackStateRefreshWorkItem?.cancel()
+            playbackStateRefreshWorkItem = nil
             resetCurrentWordFence()
             lyric = ""
             fullLyricsTrackId = ""
