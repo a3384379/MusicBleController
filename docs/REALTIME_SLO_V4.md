@@ -221,7 +221,7 @@ Cold Path 最终 p95：command→Track 632.6ms（相对 621.8ms +1.7%）、Track
 
 第四阶段为每次转换增加本地 `handoffId` 和触发类型，并把 Track、current lyric、CurrentWord 拆到 command、MediaSession、identity、playback、queue、notify、iOS decode/publish/UI consume 的完整闭环。Clock Sync sample count 在一次运行内回退即判定整轮跨设备时钟不可信；启动/重连的同 Track refresh 不计入 Handoff。
 
-正常 30 次场景的 p95：
+包含后来已回退 response gate 的历史 30 次场景 p95：
 
 | metric | NEXT | PREVIOUS | Sony dispatch-next | Phase4 target |
 |---|---:|---:|---:|---|
@@ -237,4 +237,6 @@ Sony scheduler 段已经收敛：eligible → scheduler p95 0ms、scheduler → 
 
 第四阶段曾实验把合法 ATT command response 与同设备在途 notify 串行化到 callback 边界；该构建的 90 次转换与 100 次压力虽未观察到 command failure，但随后安装验证出现 iOS 和 Android Controller 媒体/控制回归，因此该实验由 `1154397` 回退，不能再作为当前最终结论。当前实现保持即时 ATT response，并通过 iOS 合并过期 PlaybackState fallback、Sony 在正式 trackId 变化前延迟 TrackInfo/AlbumArt 来减少竞争，未改变协议。
 
-完整状态机、历史修改前后数据、资源与未完成项见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。120 分钟自然播放完成 30 次真实转换，但约第 97 分钟出现 4 次 L2CAP write failure、1 次 Sony 系统 Bluetooth HCI timeout/process death；PlayerAgent 在约 4.4 秒内恢复连接，但 Soak 仍为 FAIL。自然场景又因 iOS 滚动 Trace 不完整和重连后的 Clock Sync 不可信而无法生成正式跨端 p95。当前优先闭环 iPhone + Sony，双控制器矩阵延期；回退后的新控制/媒体策略仍需真机复测，因此第四阶段不能标记完整完成。
+回退后的当前提交又完成 NEXT、PREVIOUS、Sony dispatch-next 各 30 次：三轮 Handoff 均 30/30 PASS，Track publish p95 分别为 1026.0ms、640.0ms、145.0ms；`lyrics ready → current line enqueue` p95 为 69.5ms、21.8ms、43.8ms。TrackInfo 现始终走普通 P0 队列，Clock Sync 探针在大媒体接收时有界延后并成对恢复。100 次快速压力中 100/100 写回调，stale accepted、duplicate control、command timeout、hard reconnect 均为 0。
+
+完整状态机、当前/历史修改前后数据、资源与未完成项见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。120 分钟自然播放完成 30 次真实转换，但约第 97 分钟出现 4 次 L2CAP write failure、1 次 Sony 系统 Bluetooth HCI timeout/process death；PlayerAgent 在约 4.4 秒内恢复连接，但 Soak 仍为 FAIL。当前逐字测试歌单每场景仅产生 2 个立即 eligible 样本，双控制器矩阵也按当前优先级延期，因此第四阶段仍不能标记完整完成。

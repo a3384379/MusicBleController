@@ -94,6 +94,6 @@ V4 实时性观测使用 `trackId + generation` 关联 `lyricRequestQueued`、`l
 - CurrentWord eligibility 区分 `ELIGIBLE`、`INTRO_WAIT`、`LINE_ONLY/NO_WORD_TIMING`、`LYRIC_NOT_READY`、`PAUSED`、`CLOCK_UNTRUSTED` 和 `NO_ACTIVE_LINE`。前奏/逐行/无歌词样本不冒充系统延迟失败。
 - CurrentWord 使用独立 scheduled executor；匹配 generation 的 `lyricsReady` 是首包事件屏障，250ms 仅作 bounded fallback。若 position 已在词内立即发送 snapshot，否则按真实下一边界调度；暂停时 suspended，seek/恢复时重算。
 - generation、sequence、position 和 anchor fence 全部保留。iOS 明确记录 `TRACK_MISMATCH/GENERATION_MISMATCH/SEQUENCE_OLD/POSITION_STALE/ANCHOR_STALE/DUPLICATE`，只有 accepted 后才发布。
-- 第四阶段没有修改 QRC Triple DES、parser、index schema、fuzzy、negative、alias 或 Recovery Engine。正式 30 次场景的 Track → current lyric p95 为 94.3～115.2ms；立即 eligible Track → first word p95 为 146.8～225.4ms。
+- 第四阶段没有修改 QRC Triple DES、parser、index schema、fuzzy、negative、alias 或 Recovery Engine。当前复测中 `lyrics ready → current line enqueue` p95 为 21.8～69.5ms，三场景均满足 100ms；Sony dispatch-next 的有效 Track → current lyric p95 为 112.4ms。NEXT/PREVIOUS 原始 p95 被 `WAITING_QQMUSIC_CACHE/NO_QRC_FILE` 样本拉到约 3.8～3.9 秒，报告已按原因单独分类，不能归因于 parser 或首包 enqueue。
 
 详细状态机、样本覆盖和未达标项见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。

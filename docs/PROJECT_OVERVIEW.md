@@ -44,6 +44,7 @@
 13. V4 第四阶段以本地 `handoffId` 关联 command、MediaSession、PlaybackState、歌词和 CurrentWord；该 ID 只用于 Trace，不进入 BLE payload。
 14. 歌词 ready 后，Sony 通过精确 trackId/generation 屏障立即发布包含 current line 的 PlaybackState，并立即恢复独立 CurrentWord boundary scheduler，不再等待下一轮 AutoPush。
 15. iOS 控制写会取消尚未执行的普通 `GET_PLAYBACK_STATE` fallback，并把 NEXT/PREVIOUS 的兜底读取合并到播放器身份切换窗之后；前台验证和 Health 探针不参与丢弃。Sony 的 220ms 控制后广播始终发布轻量 PlaybackState，但只有实际 `trackId` 已变化才附带 TrackInfo/封面，避免旧身份和旧图占用正式新歌曲通道。
+16. Sony TrackInfo 始终进入既有 P0 实时队列并在长媒体任务包边界抢占；latest-only interleaved 槽只保留可替换的 volumeState。iOS Clock Sync 后台探针在 FullLyrics/图片接收期间有界延后，媒体空闲后事件化恢复，不新增 Timer。
 
 ## 关键状态
 

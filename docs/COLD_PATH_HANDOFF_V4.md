@@ -52,7 +52,9 @@ MediaSession metadata 是正式身份来源；QQ 音乐通知 metadata 仅作为
 
 ## 6. Track Fast Lane
 
-没有新增协议类型。TrackInfo、PlaybackState 和 CurrentWord 继续使用现有 JSON status，并进入既有 P0 实时队列。第四阶段修正了一个队列边界：PlaybackState 和 CurrentWord 不再作为长任务的 latest-only interleaved 数据停留在一个已经结束的传输后面；它们进入普通 P0 队列并可抢占后台任务。
+没有新增协议类型。TrackInfo、PlaybackState 和 CurrentWord 继续使用现有 JSON status，并进入既有 P0 实时队列。第四阶段先修正了 PlaybackState/CurrentWord 的队列边界；本轮真机 Trace 又发现 TrackInfo 在存在长任务时仍会被发送层放入 latest-only interleaved 槽。该槽只在长任务包边界被读取，长任务恰好结束时可能让歌曲身份滞留，而新的无身份 PlaybackState 已先到达 iOS。
+
+`80222a5` 将 TrackInfo 恢复到普通 P0 队列，只保留可替换的 volumeState 使用 latest-only 槽。TrackInfo 因此可以在长任务下一包边界抢占，并先于随后排队的 PlaybackState 建立正式 trackId/generation。两轮 NEXT 真机 Trace 中，修改后的 TrackInfo 全部为 `queued`，不再出现 `queued_interleaved`；正常 TrackInfo queue wait 的 p95 为 5～18ms。此修复消除了偶发身份滞留边界，但没有把它误报为约 1 秒远程切歌长尾的主因。
 
 第一份身份不等待 FullLyrics、translation、romanization、Preview、HQ、history 或 diagnostics。iOS 仍在正式 trackId/generation 被接受后发布 metadata，缓存快照不计作新歌发布。
 
@@ -100,7 +102,9 @@ P0 仍包括控制状态、TrackInfo、PlaybackState 和 CurrentWord；P1 lyricW
 
 当前跟进优化避免再改 ATT 生命周期：iOS 在串行写队列中合并过期的普通 `GET_PLAYBACK_STATE`，NEXT/PREVIOUS fallback 从 500ms 调整为 1 秒，并在正式新 trackId 到达时取消；前台验证和 Health probe 不参与丢弃。Sony 的 220ms 控制后 fallback 始终发送轻量 PlaybackState，但只有读取到与控制前不同的非空 `trackId` 才附带 TrackInfo/AlbumArt。这样既保留冷路径兜底，也避免用旧歌曲媒体抢占新身份、歌词、CurrentWord 和封面。
 
-新增 Trace 为 iOS `commandRefreshSuperseded` 与 Sony `postControlMediaDeferred/postControlMediaPublished`。该策略已通过纯策略单测、Sony unit/assemble 和 Swift 源码解析；iPhone + Sony 真机压力尚未重新执行，因此不能宣称假重连或媒体缺失已经完成验收。
+新增 Trace 为 iOS `commandRefreshSuperseded` 与 Sony `postControlMediaDeferred/postControlMediaPublished`。该策略先通过纯策略单测、Sony unit/assemble 和 Swift 源码解析，本轮再由下述 iPhone + Sony 正常与压力场景完成真机复核。
+
+本轮进一步让 iOS Clock Sync bootstrap/refresh PING 在 FullLyrics 或图片 receiving/decoding 期间事件化延后，媒体空闲后有界恢复；没有新增 Timer。NEXT 30 次中 `clockSyncProbeDeferred/Resumed` 成对出现，command timeout 与 hard reconnect 均为 0。随后的 NEXT、PREVIOUS、Sony dispatch-next 各 30 次以及 100 次快速压力均完成，严格报告均为 PASS（第一轮 NEXT 曾因一条已存在但未关联 handoff ID 的重复 Notification Trace 判为 29/30；`3f706b4` 修复纯观测关联后复跑为 30/30）。
 
 ## 14. AlbumArt 15ms Pacing
 
@@ -149,7 +153,24 @@ Sony dispatch-next 是 `adb shell cmd media_session dispatch next` 的自动等�
 
 100 次快速压力完成 100 个控制尝试、观察到 88 次转换；Clock Sync 因测试中跨重连 sample reset 被正确标记为不可信，所以跨设备耗时不生成。所有 8 个 CurrentWord reject 均为 `TRACK_MISMATCH`，9 个 Track Identity reject 为 generation conflict/stale generation，属于栅栏生效；stale accepted、duplicate control、hard reconnect、write timeout、L2CAP response failure 均为 0。
 
-上述数字来自包含后来已回退 response gate 的构建，只用于保留 CurrentWord、歌词和队列优化的历史证据，不等价于 `1154397` 之后当前代码的最终产品结果。当前工作树的 iOS fallback 合并与 Sony identity-gated post-control media 尚未产生新的真机 p95；正式 before/after 表必须等 iPhone + Sony 被工具重新识别后生成。
+上述数字来自包含后来已回退 response gate 的构建，只用于保留 CurrentWord、歌词和队列优化的历史证据，不等价于 `1154397` 之后当前代码的最终产品结果。下面单独列出回退后当前提交的真机复测，不混用两组数据。
+
+当前提交 `3f706b4` 的 iPhone + Sony 正常场景复测如下：
+
+| metric | NEXT p95 | PREVIOUS p95 | Sony dispatch-next p95 | 结论 |
+|---|---:|---:|---:|---|
+| command/Track T0 → Track publish | 1026.0ms | 640.0ms | 145.0ms | 远程仍 FAIL ≤350ms；Sony 等价场景 PASS |
+| metadata observed → Track accepted | 301.0ms | 91.1ms | 103.4ms | NEXT 有长尾，PREVIOUS/等价稳定 |
+| playback ready → notify start | 129.0ms | 19.5ms | 72.4ms | P0 队列无系统性阻塞 |
+| lyric ready → current line enqueue | 69.5ms | 21.8ms | 43.8ms | 三场景均 PASS ≤100ms |
+| Track → current lyric（原始） | 3843.9ms | 3948.9ms | 112.4ms | NEXT/PREVIOUS 被 QQ 音乐 QRC 缺失/等待样本拉长 |
+| word eligible → publish | 407.7ms（2） | 445.2ms（2） | 81.1ms（2） | 样本不足，不能形成 p95 验收 |
+| Track → Preview | 1992.1ms | 171.8ms | 138.1ms | NEXT 冷传输 FAIL；其余 PASS |
+| Track → HQ | 3543.7ms | 171.8ms | 138.1ms | NEXT 冷传输 FAIL；其余 PASS |
+
+括号为 CurrentWord 有效样本数。当前播放列表绝大多数歌曲只有逐行歌词，本轮每场景都只有 2 个立即 eligible 样本，因此必须保留为覆盖缺口。报告器新增 `lyricMissingReasons` 与聚合计数，区分 `WAITING_QQMUSIC_CACHE`、`NO_QRC_FILE`、`NO_LINE_AT_POSITION`、精确缓存 miss 等原因；既有指标重新生成后数值不变。
+
+100 次 650ms 快速压力完成 100 个控制意图和 100 个写回调，播放器实际产生 55 次 Track change；报告按压力口径 PASS。`stale accepted`、`duplicate control`、command timeout、hard reconnect、CurrentWord reject 均为 0。30 个被取消的媒体任务全部是切歌触发的 `track_changed/stale_generation` 主动取消，没有队列永久卡住；快速压力数据不计入正常 SLO。
 
 ## 18. 两小时 Soak
 
@@ -171,13 +192,13 @@ Sony 新增一个 CurrentWord 单线程 scheduler，替代共享 executor 上的
 
 ## 20. 未完成问题
 
-- 远程 NEXT/PREVIOUS command → Track publish p95 仍约 1 秒，未达到 350ms；外部播放器 dispatch → metadata p95 约 0.78 秒。
-- PREVIOUS 和 Sony dispatch-next 的 word eligible → publish p95 分别比 250ms 目标高 32.4ms 和 29.1ms；剩余长尾在跨端 notify 接收/接受，不在 Sony scheduler/enqueue。
-- 立即 eligible Track → first word 虽达到 500ms，但每场景只有 25/25/23 个正式样本，未达到各 30 个覆盖目标。
+- 远程 NEXT/PREVIOUS command → Track publish p95 分别为 1026.0ms 和 640.0ms，均未达到 350ms；当前主要剩余段仍是播放器切换/metadata 暴露及其波动。
+- 当前轮 NEXT/PREVIOUS/Sony dispatch-next 的 word eligible → publish 只有 2/2/2 个样本，分别为 407.7ms、445.2ms、81.1ms；覆盖不足，不能形成正式 p95 结论。
+- 当前轮每场景只有 2 个立即 eligible Track → first word 样本，未达到各 30 个覆盖目标；需要换用确实含逐字 QRC 的测试歌单再验收。
 - 120 分钟自然播放虽完成 30 次真实转换，但 Sony 系统 Bluetooth stack 在约第 97 分钟发生 1 次 HCI timeout/process death；4 次 L2CAP write failure，Soak 为 FAIL。
 - iOS 滚动日志只恢复到 19 次 Track change、7 个完整 UI Handoff；Clock Sync 又因 Bluetooth 重启不可信，自然场景跨端 p95 为 `NOT APPLICABLE`。
 - Android Controller 与双控制器矩阵按当前优先级延期，为 `SKIPPED（当前范围）`。
-- 回退后的 iPhone + Sony 高频 NEXT/PREVIOUS、歌词、CurrentWord、Preview/HQ 与连接胶囊回归尚未执行；当前不能把历史轮次结果当成新策略 PASS。
-- 快速压力发生过 Clock Sync reset，因此该轮跨设备 p95 为不可用，不能用同端片段冒充完整延迟。
+- 回退后的 iPhone + Sony NEXT、PREVIOUS、Sony dispatch-next 各 30 次和 100 次快速压力已执行并 PASS；远程 Track、部分 QRC 冷路径和 NEXT 冷图片仍未达到目标。
+- 历史快速压力曾发生 Clock Sync reset；本轮 100 次压力 Clock Sync 可信且无 hard reconnect，但仍只按正确性口径验收，不作为正常 SLO。
 
 在上述项闭环前，第四阶段结论只能是“未完成，存在阻断项”。

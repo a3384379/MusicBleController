@@ -151,6 +151,6 @@ Preview/HQ 的正式传输继续使用 Sony/iOS 精确封面栅栏；15ms 封面
 
 第四阶段没有重新打开 Predictive Prefetch，也没有猜测候选歌曲。它处理所有歌曲都适用的 current lyric/CurrentWord 冷路径：lyrics-ready 事件直接发布精确 current line，CurrentWord 使用独立 boundary scheduler 和 event barrier，P0 状态不再停留在结束的大任务 interleave slot。
 
-第三阶段的 `mediaCacheValidationV1`、FullLyrics skip、Hot Set 容量/TTL、15ms AlbumArt pacing、wire generation 和全部 capability/legacy fallback 保持不变。第四阶段正常场景的 current lyric p95 降至 94.3～115.2ms，立即 eligible Track → first word p95 降至 146.8～225.4ms；远程 command → Track 仍受 QQ 音乐/MediaSession dispatch → metadata 的约 0.78 秒外部长尾限制。
+第三阶段的 `mediaCacheValidationV1`、FullLyrics skip、Hot Set 容量/TTL、15ms AlbumArt pacing、wire generation 和全部 capability/legacy fallback 保持不变。回退后当前复测的 `lyrics ready → current line enqueue` p95 为 21.8～69.5ms，Sony dispatch-next 的 Track → current lyric p95 为 112.4ms；远程 NEXT/PREVIOUS Track publish p95 仍为 1026.0/640.0ms。当前歌单每场景仅有 2 个立即 eligible CurrentWord 样本，不据此宣称逐字 p95 完成。
 
 详细结果见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。

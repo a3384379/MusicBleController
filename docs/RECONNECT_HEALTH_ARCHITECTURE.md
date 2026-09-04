@@ -72,4 +72,4 @@
 - 改 `autoReconnectEnabled` 默认值/UserDefaults/Preferences：full smoke。
 - 真机建议测试：`reconnect_sync_v28_test.sh`、Sony 服务停止/恢复、App 前后台、Force Reconnect。
 
-第四阶段旧真机轮次曾在延迟 response 实验下观察到 90 次正常转换和 100 次压力中无 command failure，但该实验安装后又造成 iOS/Android 媒体与控制回归，已经回退，不能继续作为当前实现的验收结论。当前策略只合并 iOS 过期 fallback，并让 Sony 在新身份确认前不广播旧 TrackInfo/封面；仍需 iPhone + Sony 真机重新验证“连接胶囊不误降级、歌词/CurrentWord/封面不中断”。修复边界见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。
+第四阶段旧真机轮次曾在延迟 response 实验下观察到 90 次正常转换和 100 次压力中无 command failure，但该实验安装后又造成 iOS/Android 媒体与控制回归，已经回退，不能继续作为当前实现的验收结论。当前实现保持即时 ATT response，只合并 iOS 过期 fallback、让 Sony 在新身份确认前不广播旧 TrackInfo/封面，并把 Clock Sync 后台探针避让 FullLyrics/图片接收。回退后的 NEXT、PREVIOUS、Sony dispatch-next 各 30 次及 100 次压力均为 PASS；command timeout、hard reconnect、stale accepted 和 duplicate control 均为 0。修复边界见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。
