@@ -7,6 +7,26 @@ import org.junit.Test
 
 class BleGattServerManagerPolicyTest {
     @Test
+    fun trackIdentityAlwaysUsesRealtimeQueueDuringLongMediaTransfer() {
+        assertFalse(
+            StatusMessageDeliveryPolicy.canUseLatestInterleavedSlot("trackInfo")
+        )
+        assertFalse(
+            StatusMessageDeliveryPolicy.canUseLatestInterleavedSlot("playbackState")
+        )
+        assertFalse(
+            StatusMessageDeliveryPolicy.canUseLatestInterleavedSlot("currentWord")
+        )
+        assertTrue(
+            StatusMessageDeliveryPolicy.canUseLatestInterleavedSlot("volumeState")
+        )
+        assertEquals(
+            BleNotifyQueue.Priority.P0_REALTIME,
+            BleNotifyQueue.priorityFor("trackInfo")
+        )
+    }
+
+    @Test
     fun postControlBroadcastIncludesMediaOnlyAfterIdentityChanges() {
         assertFalse(
             PostControlBroadcastPolicy.shouldIncludeTrackMedia(

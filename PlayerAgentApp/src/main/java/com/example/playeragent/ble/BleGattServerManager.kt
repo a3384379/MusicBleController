@@ -70,6 +70,12 @@ internal object PostControlBroadcastPolicy {
     }
 }
 
+internal object StatusMessageDeliveryPolicy {
+    fun canUseLatestInterleavedSlot(messageType: String): Boolean {
+        return messageType == "volumeState"
+    }
+}
+
 class BleGattServerManager(
     context: Context,
     private val bluetoothManager: BluetoothManager,
@@ -1962,10 +1968,10 @@ class BleGattServerManager(
             hasCurrentLyric = messageType == "playbackState" &&
                 originalObject?.optString("lyric").orEmpty().isNotBlank()
         )
-        // Latency-critical state must enter the normal P0 queue. A latest-only
-        // interleaved packet can otherwise remain parked when the active long
-        // transfer ends before its next interleave boundary.
-        if ((messageType == "trackInfo" || messageType == "volumeState") &&
+        // Track identity must enter the normal P0 queue so it can preempt a long
+        // transfer at the next packet boundary. Only replaceable volume state may
+        // use the latest-only interleaved slot.
+        if (StatusMessageDeliveryPolicy.canUseLatestInterleavedSlot(messageType) &&
             notifyQueue.hasLongJobActiveOrQueued(device.address)
         ) {
             notifyQueue.setLatestInterleavedShort(
