@@ -62,6 +62,23 @@ METRIC_NAMES = (
     "iOSPublishDurationMs",
 )
 
+LYRIC_MISSING_REASONS = {
+    "NO_QRC_FILE",
+    "WAITING_QQMUSIC_CACHE",
+    "TRACK_IDENTITY_INCOMPLETE",
+    "EXACT_CACHE_MISS",
+    "PARSED_CACHE_INVALID",
+    "LYRIC_LOAD_RUNNING",
+    "NO_LINE_AT_POSITION",
+    "POSITION_ANCHOR_UNTRUSTED",
+    "GENERATION_MISMATCH",
+    "TRACK_MISMATCH",
+    "STALE_PACKET",
+    "IOS_CACHE_CORRUPTED",
+    "NOT_SUPPORTED",
+    "UNKNOWN",
+}
+
 
 @dataclass(frozen=True)
 class Event:
@@ -739,6 +756,14 @@ def classify_transition_samples(
         lyric_ready = [event for event in grouped if event.stage == "lyricReady"]
         if lyric_ready and not any(event.result == "ready" for event in lyric_ready):
             classifications.append("NO_LYRICS")
+        lyric_missing_reasons = sorted({
+            reason
+            for event in grouped
+            if event.stage.startswith("lyric")
+            for reason in [(event.failure_reason or event.reason or "").upper()]
+            if reason in LYRIC_MISSING_REASONS
+        })
+        classifications.extend(lyric_missing_reasons)
         if any(event.word_timing_status == "LINE_ONLY" for event in grouped):
             classifications.append("LINE_ONLY_LYRICS")
         if any(event.word_timing_status == "AVAILABLE" for event in grouped):
@@ -786,6 +811,7 @@ def classify_transition_samples(
             "generation": anchor.generation,
             "eventCount": len(grouped),
             "classifications": sorted(set(classifications)),
+            "lyricMissingReasons": lyric_missing_reasons,
             "missingEvents": absent,
         }
         samples.append(sample)
@@ -1311,6 +1337,11 @@ def analyze(
         clock_trusted and sony_to_ios_offset_ms is not None,
         sony_to_ios_offset_ms,
     )
+    lyric_missing_reason_counts = Counter(
+        reason
+        for sample in samples
+        for reason in sample.get("lyricMissingReasons", [])
+    )
 
     return {
         "schemaVersion": 2,
@@ -1326,6 +1357,7 @@ def analyze(
         "diagnostics": dict(sorted(categories.items())),
         "slowSamples": slow_samples,
         "samples": samples,
+        "lyricMissingReasonCounts": dict(sorted(lyric_missing_reason_counts.items())),
         "missingEvents": missing_events,
     }
 
@@ -1350,6 +1382,14 @@ def render_summary(report: dict) -> str:
     lines.extend(("", "## Diagnostic categories", ""))
     if report["categories"]:
         lines.extend(f"- {key}: {value}" for key, value in report["categories"].items())
+    else:
+        lines.append("- none")
+    lines.extend(("", "## Lyric wait and missing reasons", ""))
+    if report["lyricMissingReasonCounts"]:
+        lines.extend(
+            f"- {key}: {value}"
+            for key, value in report["lyricMissingReasonCounts"].items()
+        )
     else:
         lines.append("- none")
     return "\n".join(lines) + "\n"

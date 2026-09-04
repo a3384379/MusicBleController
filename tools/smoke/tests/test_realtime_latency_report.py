@@ -330,6 +330,39 @@ class RealtimeLatencyReportTests(unittest.TestCase):
         self.assertEqual(report["metrics"]["trackAcceptedToFirstWordMs"]["count"], 0)
         self.assertEqual(report["diagnostics"]["intro_wait_before_first_word"], 1)
 
+    def test_phase4_records_qqmusic_cache_wait_without_calling_ready_track_no_lyrics(self):
+        events = self.phase4_complete_events()
+        events.insert(
+            25,
+            event(
+                "sony", "lyricReady", 22,
+                result="not_ready",
+                failure_reason="WAITING_QQMUSIC_CACHE",
+                handoff_id="command-9",
+                track_id="track-a",
+                generation=4,
+                source_line=70,
+            ),
+        )
+
+        report = REPORT.analyze(
+            events,
+            clock_trusted=True,
+            sony_to_ios_offset_ms=0,
+        )
+
+        sample = report["samples"][0]
+        self.assertIn("WAITING_QQMUSIC_CACHE", sample["classifications"])
+        self.assertEqual(
+            sample["lyricMissingReasons"],
+            ["WAITING_QQMUSIC_CACHE"],
+        )
+        self.assertNotIn("NO_LYRICS", sample["classifications"])
+        self.assertEqual(
+            report["lyricMissingReasonCounts"],
+            {"WAITING_QQMUSIC_CACHE": 1},
+        )
+
     def test_phase4_dual_handoffs_remain_isolated(self):
         first = self.phase4_complete_events()
         second = [
