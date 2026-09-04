@@ -164,6 +164,47 @@ class RealtimeTraceTest {
     }
 
     @Test
+    fun repeatedNotificationFollowingMediaObservationKeepsCommandHandoff() {
+        val original = RealtimeTrace.enabled
+        try {
+            RealtimeTrace.clear()
+            RealtimeTrace.enabled = true
+            TrackHandoffTraceCoordinator.clear()
+            TrackHandoffTraceCoordinator.observeCommand(
+                commandSeq = 12L,
+                commandType = "NEXT",
+                nowMs = 1_000L
+            )
+            TrackHandoffTraceCoordinator.observeMediaSessionMetadata(
+                trackId = "track-d",
+                positionAnchorMs = 1_050L,
+                nowMs = 1_050L
+            )
+            TrackHandoffTraceCoordinator.observeNotificationMetadata(
+                identityKey = "notification-d",
+                nowMs = 1_100L
+            )
+            TrackHandoffTraceCoordinator.observeNotificationMetadata(
+                identityKey = "notification-d",
+                nowMs = 1_150L
+            )
+
+            val notifications = RealtimeTrace.snapshot().filter {
+                it.stage == "notificationMetadataObserved"
+            }
+            assertEquals(2, notifications.size)
+            notifications.forEach {
+                assertEquals("command-12", it.handoffId)
+                assertEquals("IOS_NEXT", it.triggerType)
+            }
+        } finally {
+            TrackHandoffTraceCoordinator.clear()
+            RealtimeTrace.enabled = original
+            RealtimeTrace.clear()
+        }
+    }
+
+    @Test
     fun disabledTraceDoesNotStoreEvents() {
         val original = RealtimeTrace.enabled
         try {

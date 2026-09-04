@@ -64,14 +64,15 @@ object TrackHandoffTraceCoordinator {
     ) {
         val context = synchronized(lock) {
             val existing = validPendingLocked(nowMs)
+            val activeFollowup = active?.takeIf {
+                nowMs - it.createdMonoMs <= NOTIFICATION_FOLLOWUP_WINDOW_MS
+            }
             if (identityKey.isBlank() || identityKey == lastNotificationIdentityKey) {
-                existing
+                existing ?: activeFollowup
             } else {
                 lastNotificationIdentityKey = identityKey
                 existing
-                    ?: active?.takeIf {
-                        nowMs - it.createdMonoMs <= NOTIFICATION_FOLLOWUP_WINDOW_MS
-                    }
+                    ?: activeFollowup
                     ?: TrackHandoffTraceContext(
                         handoffId = localIdLocked(nowMs),
                         triggerType = TrackHandoffTriggerType.UNKNOWN,
