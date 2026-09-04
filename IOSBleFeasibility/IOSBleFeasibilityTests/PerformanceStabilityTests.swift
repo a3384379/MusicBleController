@@ -1410,6 +1410,35 @@ final class PerformanceStabilityTests: XCTestCase {
             1,
             accuracy: 0.001
         )
+        XCTAssertEqual(
+            CompactSliderPresentation.normalizedProgress(
+                value: 35,
+                lowerBound: 10,
+                upperBound: 60
+            ),
+            0.5,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            CompactSliderPresentation.normalizedProgress(
+                value: -10,
+                lowerBound: 0,
+                upperBound: 100
+            ),
+            0,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            CompactSliderPresentation.normalizedProgress(
+                value: 140,
+                lowerBound: 0,
+                upperBound: 100
+            ),
+            1,
+            accuracy: 0.001
+        )
+        XCTAssertLessThan(CompactSliderPresentation.thumbDiameter, 16)
+        XCTAssertGreaterThanOrEqual(CompactSliderPresentation.interactionHeight, 28)
     }
 
     func testA1AndA2DispatchAndOutOfOrderAssembly() {

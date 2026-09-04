@@ -822,27 +822,26 @@ private struct PlaybackProgressStoreView: View {
 
     var body: some View {
         let timeline = manager.playbackStore.timeline
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             Text(format(displayedPosition, duration: timeline.durationMs))
-                .frame(width: 46, alignment: .leading)
-            Slider(
+                .frame(width: 44, alignment: .leading)
+            CompactPlayerSlider(
                 value: Binding(
                     get: { Double(displayedPosition) },
                     set: manager.updateSeekPosition
                 ),
-                in: 0...Double(max(timeline.durationMs, 1)),
+                range: 0...Double(max(timeline.durationMs, 1)),
+                step: nil,
+                accentColor: playerVisualState(manager: manager).accentColor,
+                isEnabled: manager.connectionStore.presentation.isConnected && timeline.durationMs > 0,
+                accessibilityLabel: "播放进度",
+                accessibilityValue: "\(format(displayedPosition, duration: timeline.durationMs))，共 \(format(timeline.durationMs, duration: timeline.durationMs))",
                 onEditingChanged: { editing in
                     editing ? manager.beginSeeking() : manager.finishSeeking()
                 }
             )
-            .tint(playerVisualState(manager: manager).accentColor)
-            .disabled(!manager.connectionStore.presentation.isConnected || timeline.durationMs <= 0)
-            .accessibilityLabel("播放进度")
-            .accessibilityValue(
-                "\(format(displayedPosition, duration: timeline.durationMs))，共 \(format(timeline.durationMs, duration: timeline.durationMs))"
-            )
             Text(format(timeline.durationMs, duration: timeline.durationMs))
-                .frame(width: 46, alignment: .trailing)
+                .frame(width: 44, alignment: .trailing)
         }
         .font(.caption.monospacedDigit().weight(.semibold))
         .foregroundStyle(.white.opacity(0.72))
@@ -856,6 +855,87 @@ private struct PlaybackProgressStoreView: View {
         guard duration > 0 else { return "00:00" }
         let seconds = max(milliseconds, 0) / 1_000
         return String(format: "%02lld:%02lld", seconds / 60, seconds % 60)
+    }
+}
+
+private struct CompactPlayerSlider: View {
+    let value: Binding<Double>
+    let range: ClosedRange<Double>
+    let step: Double?
+    let accentColor: Color
+    let isEnabled: Bool
+    let accessibilityLabel: String
+    let accessibilityValue: String
+    let onEditingChanged: (Bool) -> Void
+
+    var body: some View {
+        GeometryReader { proxy in
+            let thumbDiameter = CompactSliderPresentation.thumbDiameter
+            let trackWidth = max(proxy.size.width - thumbDiameter, 0)
+            let progress = CGFloat(
+                CompactSliderPresentation.normalizedProgress(
+                    value: value.wrappedValue,
+                    lowerBound: range.lowerBound,
+                    upperBound: range.upperBound
+                )
+            )
+            let fillWidth = trackWidth * progress
+            let centerY = proxy.size.height / 2
+            let thumbX = thumbDiameter / 2 + fillWidth
+
+            ZStack(alignment: .topLeading) {
+                Capsule()
+                    .fill(.white.opacity(0.18))
+                    .frame(width: trackWidth, height: CompactSliderPresentation.trackHeight)
+                    .position(x: proxy.size.width / 2, y: centerY)
+
+                Capsule()
+                    .fill(accentColor)
+                    .frame(width: fillWidth, height: CompactSliderPresentation.trackHeight)
+                    .position(x: thumbDiameter / 2 + fillWidth / 2, y: centerY)
+
+                Circle()
+                    .fill(.white)
+                    .frame(width: thumbDiameter, height: thumbDiameter)
+                    .overlay {
+                        Circle().strokeBorder(accentColor.opacity(0.72), lineWidth: 1)
+                    }
+                    .shadow(color: .black.opacity(0.24), radius: 2, y: 1)
+                    .position(x: thumbX, y: centerY)
+                    .allowsHitTesting(false)
+
+                interactiveSlider
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+                    .opacity(0.001)
+            }
+        }
+        .frame(height: CompactSliderPresentation.interactionHeight)
+        .contentShape(Rectangle())
+        .opacity(isEnabled ? 1 : 0.45)
+    }
+
+    @ViewBuilder
+    private var interactiveSlider: some View {
+        if let step {
+            Slider(
+                value: value,
+                in: range,
+                step: step,
+                onEditingChanged: onEditingChanged
+            )
+            .disabled(!isEnabled)
+            .accessibilityLabel(accessibilityLabel)
+            .accessibilityValue(accessibilityValue)
+        } else {
+            Slider(
+                value: value,
+                in: range,
+                onEditingChanged: onEditingChanged
+            )
+            .disabled(!isEnabled)
+            .accessibilityLabel(accessibilityLabel)
+            .accessibilityValue(accessibilityValue)
+        }
     }
 }
 
@@ -903,29 +983,27 @@ private struct VolumeControlStoreView: View {
 
     var body: some View {
         let volume = manager.playbackStore.volume
-        HStack(spacing: 12) {
+        HStack(spacing: 8) {
             Image(systemName: volumeIcon)
-                .font(.system(size: 20, weight: .semibold))
+                .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.92))
-                .frame(width: 24)
+                .frame(width: 18)
                 .accessibilityHidden(true)
 
             GeometryReader { proxy in
                 ZStack(alignment: .leading) {
-                    Slider(
+                    CompactPlayerSlider(
                         value: Binding(
                             get: { Double(displayedVolume) },
                             set: manager.updateVolumeSeekValue
                         ),
-                        in: 0...Double(max(volume.maximum, 1)),
+                        range: 0...Double(max(volume.maximum, 1)),
                         step: 1,
+                        accentColor: playerVisualState(manager: manager).accentColor,
+                        isEnabled: isAvailable,
+                        accessibilityLabel: "音量",
+                        accessibilityValue: volume.maximum > 0 ? "\(displayedVolume)，最大 \(volume.maximum)" : "尚未同步",
                         onEditingChanged: handleEditing
-                    )
-                    .tint(playerVisualState(manager: manager).accentColor)
-                    .disabled(!isAvailable)
-                    .accessibilityLabel("音量")
-                    .accessibilityValue(
-                        volume.maximum > 0 ? "\(displayedVolume)，最大 \(volume.maximum)" : "尚未同步"
                     )
 
                     if feedbackVisible, isAvailable {
@@ -943,12 +1021,12 @@ private struct VolumeControlStoreView: View {
                     }
                 }
             }
-            .frame(height: 32)
+            .frame(height: CompactSliderPresentation.interactionHeight)
         }
-        .padding(.horizontal, 14)
-        .frame(height: 44)
-        .background(.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 20))
-        .overlay { RoundedRectangle(cornerRadius: 20).strokeBorder(.white.opacity(0.07)) }
+        .padding(.horizontal, 11)
+        .frame(height: 36)
+        .background(.black.opacity(0.13), in: RoundedRectangle(cornerRadius: 16))
+        .overlay { RoundedRectangle(cornerRadius: 16).strokeBorder(.white.opacity(0.06)) }
         .opacity(isAvailable ? 1 : 0.48)
     }
 
@@ -1154,6 +1232,21 @@ struct CompactVolumePresentation {
     static func normalizedProgress(current: Int, maximum: Int) -> Double {
         guard maximum > 0 else { return 0 }
         return min(max(Double(current) / Double(maximum), 0), 1)
+    }
+}
+
+struct CompactSliderPresentation {
+    static let trackHeight: CGFloat = 3
+    static let thumbDiameter: CGFloat = 11
+    static let interactionHeight: CGFloat = 32
+
+    static func normalizedProgress(
+        value: Double,
+        lowerBound: Double,
+        upperBound: Double
+    ) -> Double {
+        guard upperBound > lowerBound else { return 0 }
+        return min(max((value - lowerBound) / (upperBound - lowerBound), 0), 1)
     }
 }
 
