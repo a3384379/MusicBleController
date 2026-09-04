@@ -1281,6 +1281,35 @@ final class PerformanceStabilityTests: XCTestCase {
         XCTAssertEqual(CommandRefreshPolicy.fallbackDelay(for: "SEEK_TO"), 0.5)
     }
 
+    func testClockSyncProbeDefersOnlyForActiveLargeMediaReception() {
+        XCTAssertTrue(
+            ClockSyncProbeMediaPolicy.shouldDefer(
+                isFullLyricsReceiving: true,
+                artworkTransferState: "idle"
+            )
+        )
+        XCTAssertTrue(
+            ClockSyncProbeMediaPolicy.shouldDefer(
+                isFullLyricsReceiving: false,
+                artworkTransferState: "receiving"
+            )
+        )
+        XCTAssertTrue(
+            ClockSyncProbeMediaPolicy.shouldDefer(
+                isFullLyricsReceiving: false,
+                artworkTransferState: "DECODING"
+            )
+        )
+        for state in ["idle", "failed", "timeout"] {
+            XCTAssertFalse(
+                ClockSyncProbeMediaPolicy.shouldDefer(
+                    isFullLyricsReceiving: false,
+                    artworkTransferState: state
+                )
+            )
+        }
+    }
+
     func testCurrentWordOrderingFenceRejectsDuplicatesAndSmallRegression() {
         var fence = CurrentWordOrderingFence()
         XCTAssertTrue(fence.shouldAccept(generation: 7, sequence: 1, positionMs: 1_000))

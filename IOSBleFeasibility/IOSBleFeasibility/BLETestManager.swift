@@ -102,6 +102,23 @@ enum CommandRefreshPolicy {
     }
 }
 
+enum ClockSyncProbeMediaPolicy {
+    static func shouldDefer(
+        isFullLyricsReceiving: Bool,
+        artworkTransferState: String
+    ) -> Bool {
+        if isFullLyricsReceiving {
+            return true
+        }
+        switch artworkTransferState.lowercased() {
+        case "receiving", "decoding":
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 enum LyricSecondaryLoadState: Equatable {
     case idle
     case loading
@@ -223,6 +240,11 @@ private struct ClockSyncProbe {
     let clientSendDate: Date
 }
 
+private struct DeferredClockSyncProbeBatch {
+    let count: Int
+    let reason: String
+}
+
 final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private static let logTimestampFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -261,7 +283,12 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         didSet { syncFullLyricsStore() }
     }
     @Published private(set) var isFullLyricsReceiving = false {
-        didSet { syncFullLyricsStore() }
+        didSet {
+            syncFullLyricsStore()
+            if oldValue, !isFullLyricsReceiving {
+                resumeDeferredClockSyncProbesIfPossible()
+            }
+        }
     }
     @Published private(set) var translationLyricsState: LyricSecondaryLoadState = .idle {
         didSet { syncFullLyricsStore() }
@@ -643,6 +670,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private var clockSyncProbes: [String: ClockSyncProbe] = [:]
     private var clockSyncBootstrapWorkItems: [DispatchWorkItem] = []
     private var clockSyncRefreshWorkItem: DispatchWorkItem?
+    private var deferredClockSyncProbeBatch: DeferredClockSyncProbeBatch?
     private var remotePlaybackSpeed = 1.0
     private var lastStaleRemoteAnchorLogAtMs: Int64 = 0
     private var healthProbeFailureCount = 0
@@ -991,6 +1019,9 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         }
         if mediaLoadingState.artwork != artworkStage {
             mediaLoadingState.artwork = artworkStage
+        }
+        if transfer.state != "receiving", transfer.state != "decoding" {
+            resumeDeferredClockSyncProbesIfPossible()
         }
     }
 
@@ -3530,6 +3561,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         clockSyncBootstrapWorkItems.removeAll()
         clockSyncRefreshWorkItem?.cancel()
         clockSyncRefreshWorkItem = nil
+        deferredClockSyncProbeBatch = nil
         clockSyncProbes.removeAll()
         clockSynchronizer.reset()
         sonyUnixMinusElapsedMs = nil
@@ -3548,6 +3580,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         clockSyncBootstrapWorkItems.removeAll()
         clockSyncRefreshWorkItem?.cancel()
         clockSyncRefreshWorkItem = nil
+        deferredClockSyncProbeBatch = nil
         clockSyncProbes.removeAll()
         log("[ClockSync] scheduling paused reason=\(reason)")
     }
@@ -3563,11 +3596,21 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
 
     private func scheduleClockSyncProbes(count: Int, reason: String) {
         guard appLifecycleState == "active", count > 0 else { return }
+        if deferClockSyncProbesIfMediaBusy(count: count, reason: reason) {
+            return
+        }
         clockSyncBootstrapWorkItems.forEach { $0.cancel() }
         clockSyncBootstrapWorkItems.removeAll()
         for index in 0..<count {
             let item = DispatchWorkItem { [weak self] in
                 guard let self, self.appLifecycleState == "active" else { return }
+                let remainingCount = count - index
+                if self.deferClockSyncProbesIfMediaBusy(
+                    count: remainingCount,
+                    reason: reason
+                ) {
+                    return
+                }
                 self.sendClockSyncProbe(reason: reason, sample: index + 1, total: count)
             }
             clockSyncBootstrapWorkItems.append(item)
@@ -3596,6 +3639,81 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
             deadline: .now() + Double(CLOCK_SYNC_REFRESH_INTERVAL_MS) / 1_000.0,
             execute: item
         )
+    }
+
+    @discardableResult
+    private func deferClockSyncProbesIfMediaBusy(count: Int, reason: String) -> Bool {
+        let transfer = albumArtReceiver.transferSnapshot()
+        guard ClockSyncProbeMediaPolicy.shouldDefer(
+            isFullLyricsReceiving: isFullLyricsReceiving,
+            artworkTransferState: transfer.state
+        ) else {
+            return false
+        }
+
+        clockSyncBootstrapWorkItems.forEach { $0.cancel() }
+        clockSyncBootstrapWorkItems.removeAll()
+        let boundedCount = min(max(count, 1), CLOCK_SYNC_BOOTSTRAP_SAMPLE_COUNT)
+        let existing = deferredClockSyncProbeBatch
+        if existing == nil || boundedCount > (existing?.count ?? 0) {
+            deferredClockSyncProbeBatch = DeferredClockSyncProbeBatch(
+                count: boundedCount,
+                reason: reason
+            )
+        }
+        let mediaReason: String
+        if isFullLyricsReceiving {
+            mediaReason = "full_lyrics"
+        } else {
+            let quality = transfer.quality.lowercased()
+            mediaReason = quality.isEmpty || quality == "-"
+                ? "artwork"
+                : "artwork_\(quality)"
+        }
+        if existing == nil {
+            log(
+                "[ClockSync] probes deferred reason=\(reason) " +
+                    "media=\(mediaReason) count=\(boundedCount)"
+            )
+            RealtimeTraceStore.shared.record(
+                stage: "clockSyncProbeDeferred",
+                payloadType: "clockSync",
+                processingMs: Int64(boundedCount),
+                result: "deferred",
+                reason: mediaReason
+            )
+        }
+        return true
+    }
+
+    private func resumeDeferredClockSyncProbesIfPossible() {
+        guard let deferred = deferredClockSyncProbeBatch,
+              appLifecycleState == "active",
+              serverSupportsClockSyncV1,
+              sonyCharacteristicsReady else {
+            return
+        }
+        let transfer = albumArtReceiver.transferSnapshot()
+        guard !ClockSyncProbeMediaPolicy.shouldDefer(
+            isFullLyricsReceiving: isFullLyricsReceiving,
+            artworkTransferState: transfer.state
+        ) else {
+            return
+        }
+
+        deferredClockSyncProbeBatch = nil
+        log(
+            "[ClockSync] probes resumed reason=\(deferred.reason) " +
+                "count=\(deferred.count)"
+        )
+        RealtimeTraceStore.shared.record(
+            stage: "clockSyncProbeResumed",
+            payloadType: "clockSync",
+            processingMs: Int64(deferred.count),
+            result: "resumed",
+            reason: "media_idle"
+        )
+        scheduleClockSyncProbes(count: deferred.count, reason: deferred.reason)
     }
 
     private func sendClockSyncProbe(reason: String, sample: Int, total: Int) {
