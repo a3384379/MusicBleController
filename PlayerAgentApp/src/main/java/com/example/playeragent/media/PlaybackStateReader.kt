@@ -9,18 +9,33 @@ import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.Bundle
 import android.os.SystemClock
+import com.example.playeragent.diagnostics.RealtimeTrace
+import com.example.playeragent.diagnostics.TrackHandoffTraceCoordinator
 import com.example.playeragent.history.FastPlaybackSnapshot
 import com.example.playeragent.logging.LogConfig
 import com.example.playeragent.service.PlayerNotificationListenerService
 import org.json.JSONObject
 import java.security.MessageDigest
 
+internal object TrackIdentityFastLanePolicy {
+    fun shouldPublish(
+        trackChanged: Boolean,
+        trackId: String,
+        title: String
+    ): Boolean {
+        return trackChanged && trackId.isNotBlank() && title.isNotBlank()
+    }
+}
+
 class PlaybackStateReader(
     context: Context,
     private val logger: (String) -> Unit,
     private val includeLyric: Boolean = true,
     private val reactiveMediaController: ReactiveMediaController = ReactiveMediaController(logger),
-    private val onLyricsReady: (LyricsReadyGateSnapshot) -> Unit = {}
+    private val onLyricsReady: (LyricsReadyGateSnapshot) -> Unit = {},
+    private val executionHub: PlayerAgentExecutionHub? = null,
+    private val enableTrackIdentityFastLane: Boolean = false,
+    private val onTrackIdentityReady: (JSONObject) -> Unit = {}
 ) {
 
     private val appContext = context.applicationContext
@@ -30,6 +45,7 @@ class PlaybackStateReader(
         LyricManager(
             context = appContext,
             logger = logger,
+            executionHub = executionHub,
             onLyricsReady = { snapshot ->
                 reactiveMediaController.markLyricsTaskFinished(
                     trackId = snapshot.trackId,
@@ -47,11 +63,12 @@ class PlaybackStateReader(
     private var durationMissingLogged = false
     private var lastLoggedLyric: String? = null
     private var lastTrackId: String = ""
-    private var lastObservedTrack: PredictiveLyricsTrack? = null
+    private var lastObservedTrack: PredictiveMediaTrack? = null
     private var lastCandidateDiagnosticKey: String = ""
     private var lastCandidateDiagnosticAtMs: Long = 0L
     private var lastReactiveTraceKey: String = ""
     private val transitionStats = mutableMapOf<String, TransitionStat>()
+    private val predictionSourceResolver = PredictionSourceResolver()
 
     fun close() {
         if (lyricManagerHolder.isInitialized()) {
@@ -62,6 +79,17 @@ class PlaybackStateReader(
 
     fun readPlaybackState(): JSONObject {
         val startedAtMs = SystemClock.elapsedRealtime()
+        val pendingHandoff = TrackHandoffTraceCoordinator.pendingContext(startedAtMs)
+        RealtimeTrace.record(
+            stage = "playbackReadStart",
+            monoMs = startedAtMs,
+            payloadType = "playbackState",
+            result = "started",
+            commandSeq = pendingHandoff?.commandSeq,
+            commandType = pendingHandoff?.commandType,
+            handoffId = pendingHandoff?.handoffId,
+            triggerType = pendingHandoff?.triggerType?.name
+        )
         verbose("[PlaybackState] GET_PLAYBACK_STATE received")
 
         if (mediaSessionManager == null) {
@@ -114,7 +142,12 @@ class PlaybackStateReader(
         }
         val playbackState = selected.playbackState
         val playing = playbackState?.state == PlaybackState.STATE_PLAYING
-        val position = calculatePosition(playbackState)
+        val positionSampleElapsedMs = SystemClock.elapsedRealtime()
+        val positionSampleUnixMs = System.currentTimeMillis()
+        val playbackSpeed = playbackState?.playbackSpeed
+            ?.takeIf { it.isFinite() && it > 0f }
+            ?: 1f
+        val position = calculatePosition(playbackState, positionSampleElapsedMs)
 
         val title = metadata?.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty()
         val artist = metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty()
@@ -126,9 +159,123 @@ class PlaybackStateReader(
             title = title,
             artist = artist,
             album = album,
-            durationMs = duration
+            durationMs = duration,
+            mediaId = mediaId
         )
+        val observedHandoff = TrackHandoffTraceCoordinator.observeMediaSessionMetadata(
+            trackId = currentTrack.trackId,
+            positionAnchorMs = positionSampleElapsedMs
+        )
+        if (observedHandoff != null && pendingHandoff == null) {
+            RealtimeTrace.record(
+                stage = "playbackReadStart",
+                monoMs = startedAtMs,
+                trackId = currentTrack.trackId,
+                payloadType = "playbackState",
+                result = "started",
+                handoffId = observedHandoff.handoffId,
+                triggerType = observedHandoff.triggerType.name,
+                positionAnchorMs = positionSampleElapsedMs
+            )
+        }
         lastTrackId = currentTrack.trackId
+        val songKey = buildLyricSongKey(title, artist, album)
+        val mediaDecision = reactiveMediaController.onPlaybackObserved(
+            trackId = lastTrackId,
+            songKey = songKey,
+            title = title,
+            artist = artist,
+            album = album,
+            positionMs = position,
+            durationMs = duration,
+            isPlaying = playing
+        )
+        val fastIdentityPublished = enableTrackIdentityFastLane &&
+            TrackIdentityFastLanePolicy.shouldPublish(
+                trackChanged = mediaDecision.trackChanged,
+                trackId = lastTrackId,
+                title = title
+            )
+        if (fastIdentityPublished) {
+            val identityResponse = JSONObject()
+                .put("type", "playbackState")
+                .put("playing", playing)
+                .put("title", title)
+                .put("artist", artist)
+                .put("album", album)
+                .put("position", position)
+                .put("positionSampleElapsedMs", positionSampleElapsedMs)
+                .put("positionSampleUnixMs", positionSampleUnixMs)
+                .put("speed", playbackSpeed.toDouble())
+                .put("duration", duration)
+                .put("lyric", "")
+                .put("lyricStatus", "LOADING")
+                .put("lyricReason", "TRACK_IDENTITY_READY")
+                .put("lyricSuggestion", "")
+            val runtimeTrack = CurrentTrackRuntimeCache.updatePlaybackState(
+                trackId = lastTrackId,
+                songKey = songKey,
+                title = title,
+                artist = artist,
+                album = album,
+                positionMs = position,
+                positionSampleElapsedMs = positionSampleElapsedMs,
+                durationMs = duration,
+                isPlaying = playing,
+                playbackSpeed = playbackSpeed,
+                currentLine = "",
+                lyricSource = "NONE",
+                lastPlaybackState = identityResponse,
+                diagnosticSnapshot = "",
+                logger = logger
+            )
+            val acceptedAtMs = SystemClock.elapsedRealtime()
+            val handoffTrace = TrackHandoffTraceCoordinator.contextFor(runtimeTrack.trackId)
+            RealtimeTrace.record(
+                stage = "trackIdentityAccepted",
+                monoMs = acceptedAtMs,
+                trackId = runtimeTrack.trackId,
+                generation = runtimeTrack.currentTrackGeneration,
+                payloadType = "mediaSession",
+                result = "accepted",
+                reason = "fast_lane",
+                handoffId = handoffTrace?.handoffId,
+                triggerType = handoffTrace?.triggerType?.name,
+                positionAnchorMs = runtimeTrack.positionAnchorElapsedMs
+            )
+            RealtimeTrace.record(
+                stage = "mediaGenerationCreated",
+                monoMs = acceptedAtMs,
+                trackId = runtimeTrack.trackId,
+                generation = runtimeTrack.currentTrackGeneration,
+                payloadType = "trackIdentity",
+                result = "created",
+                reason = "fast_lane",
+                handoffId = handoffTrace?.handoffId,
+                triggerType = handoffTrace?.triggerType?.name,
+                positionAnchorMs = runtimeTrack.positionAnchorElapsedMs
+            )
+            RealtimeTrace.record(
+                stage = "trackIdentityFastReady",
+                monoMs = acceptedAtMs,
+                trackId = runtimeTrack.trackId,
+                generation = runtimeTrack.currentTrackGeneration,
+                payloadType = "trackInfo",
+                processingMs = (acceptedAtMs - startedAtMs).coerceAtLeast(0L),
+                result = "ready",
+                handoffId = handoffTrace?.handoffId,
+                triggerType = handoffTrace?.triggerType?.name,
+                positionAnchorMs = runtimeTrack.positionAnchorElapsedMs
+            )
+            runCatching {
+                onTrackIdentityReady(identityResponse)
+            }.onFailure { exception ->
+                logger(
+                    "[PlaybackState] track identity fast lane callback failed: " +
+                        exception.message
+                )
+            }
+        }
         TrackCapabilityTracker.onTrackSeen(
             trackId = lastTrackId,
             protocolId = lastTrackId,
@@ -157,17 +304,6 @@ class PlaybackStateReader(
                     .isNotBlank()
         )
         observeTrackTransition(currentTrack)
-        val songKey = buildLyricSongKey(title, artist, album)
-        val mediaDecision = reactiveMediaController.onPlaybackObserved(
-            trackId = lastTrackId,
-            songKey = songKey,
-            title = title,
-            artist = artist,
-            album = album,
-            positionMs = position,
-            durationMs = duration,
-            isPlaying = playing
-        )
         if (mediaDecision.trackChanged) {
             LyricTraceLogger.stage(
                 runId = "unknown",
@@ -262,9 +398,10 @@ class PlaybackStateReader(
             lastLoggedLyric = lyric
             logger("[PlaybackState] lyric=$lyric")
         }
-        val lyricStatus = lyricManager.currentStatusText()
-        val lyricReason = lyricManager.currentUnavailableReason()
-        val diagnostic = lyricManager.diagnosticSnapshot(lastTrackId)
+        val lyricState = lyricManager.playbackLyricStatusSnapshot(lastTrackId)
+        val lyricStatus = lyricState.statusText
+        val lyricReason = lyricState.reason
+        val diagnostic = lyricState.diagnostic
         val totalCostMs = SystemClock.elapsedRealtime() - startedAtMs
         if (LogConfig.DEBUG_VERBOSE_LOG || totalCostMs > SLOW_PLAYBACK_READ_MS) {
             logger(
@@ -292,20 +429,25 @@ class PlaybackStateReader(
             .put("artist", artist)
             .put("album", album)
             .put("position", position)
+            .put("positionSampleElapsedMs", positionSampleElapsedMs)
+            .put("positionSampleUnixMs", positionSampleUnixMs)
+            .put("speed", playbackSpeed.toDouble())
             .put("duration", duration)
             .put("lyric", lyric)
             .put("lyricStatus", lyricStatus)
             .put("lyricReason", lyricReason)
             .put("lyricSuggestion", diagnostic.suggestion)
-        CurrentTrackRuntimeCache.updatePlaybackState(
+        val runtimeTrack = CurrentTrackRuntimeCache.updatePlaybackState(
             trackId = lastTrackId,
             songKey = songKey,
             title = title,
             artist = artist,
             album = album,
             positionMs = position,
+            positionSampleElapsedMs = positionSampleElapsedMs,
             durationMs = duration,
             isPlaying = playing,
+            playbackSpeed = playbackSpeed,
             currentLine = lyric,
             lyricSource = diagnostic.source,
             lastPlaybackState = response,
@@ -322,17 +464,75 @@ class PlaybackStateReader(
                 )
             }
         }
+        observeQueueCandidates(selected, currentTrack)
+        val readyAtMs = SystemClock.elapsedRealtime()
+        val handoffTrace = TrackHandoffTraceCoordinator.contextFor(runtimeTrack.trackId)
+        if (mediaDecision.trackChanged && !fastIdentityPublished) {
+            RealtimeTrace.record(
+                stage = "trackIdentityAccepted",
+                monoMs = readyAtMs,
+                trackId = runtimeTrack.trackId,
+                generation = runtimeTrack.currentTrackGeneration,
+                payloadType = "mediaSession",
+                result = "accepted",
+                handoffId = handoffTrace?.handoffId,
+                triggerType = handoffTrace?.triggerType?.name,
+                positionAnchorMs = runtimeTrack.positionAnchorElapsedMs
+            )
+            RealtimeTrace.record(
+                stage = "mediaGenerationCreated",
+                monoMs = readyAtMs,
+                trackId = runtimeTrack.trackId,
+                generation = runtimeTrack.currentTrackGeneration,
+                payloadType = "trackIdentity",
+                result = "created",
+                handoffId = handoffTrace?.handoffId,
+                triggerType = handoffTrace?.triggerType?.name,
+                positionAnchorMs = runtimeTrack.positionAnchorElapsedMs
+            )
+        }
+        RealtimeTrace.record(
+            stage = "playbackReady",
+            monoMs = readyAtMs,
+            trackId = runtimeTrack.trackId,
+            generation = runtimeTrack.currentTrackGeneration,
+            payloadType = "playbackState",
+            processingMs = (readyAtMs - startedAtMs).coerceAtLeast(0L),
+            result = "ready",
+            reason = if (runtimeTrack.isPlaying) "playing" else "paused",
+            commandSeq = handoffTrace?.commandSeq,
+            commandType = handoffTrace?.commandType,
+            handoffId = handoffTrace?.handoffId,
+            triggerType = handoffTrace?.triggerType?.name,
+            positionAnchorMs = runtimeTrack.positionAnchorElapsedMs
+        )
         return response
     }
 
     fun notifyManualNextHint(seq: String? = null) {
-        logger("[PredictiveLyricsCandidate] manual next requested seq=${seq.orEmpty()}")
+        notifyManualTrackHint(PredictionDirection.NEXT, seq)
+    }
+
+    fun notifyManualPreviousHint(seq: String? = null) {
+        notifyManualTrackHint(PredictionDirection.PREVIOUS, seq)
+    }
+
+    private fun notifyManualTrackHint(direction: PredictionDirection, seq: String?) {
+        val mode = if (direction == PredictionDirection.NEXT) {
+            PredictiveCandidateMode.MANUAL_NEXT
+        } else {
+            PredictiveCandidateMode.MANUAL_PREVIOUS
+        }
+        logger(
+            "[PredictionSource] manual direction=${direction.name} " +
+                "seqPresent=${!seq.isNullOrBlank()}"
+        )
         val selected = selectedControllerForPrediction()
         if (selected == null) {
             logCandidateUnavailable(
-                source = PredictiveLyricsPipeline.SOURCE_MANUAL_NEXT_WITH_QUEUE,
+                source = mode.source.wireName,
                 reason = "no_active_session",
-                detail = "seq=${seq.orEmpty()}"
+                detail = "direction=${direction.name}"
             )
             return
         }
@@ -346,21 +546,23 @@ class PlaybackStateReader(
             title = metadata?.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty(),
             artist = metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty(),
             album = metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM).orEmpty(),
-            durationMs = metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
+            durationMs = metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L,
+            mediaId = metadata?.getString(MediaMetadata.METADATA_KEY_MEDIA_ID).orEmpty()
         )
-        val candidate = predictiveCandidate(selected, current, PredictiveCandidateMode.MANUAL_NEXT)
+        val candidate = predictiveCandidate(selected, current, mode)
         if (candidate == null) {
             logger(
-                "[PredictiveLyricsCandidate] rejected source=manual_next_with_queue " +
-                    "reason=no_safe_queue_candidate seq=${seq.orEmpty()}"
+                "[PredictionSource] rejected source=${mode.source.wireName} " +
+                    "reason=no_safe_queue_candidate direction=${direction.name}"
             )
             return
         }
         logger(
-            "[PredictiveLyricsCandidate] manual next hint seq=${seq.orEmpty()} " +
-                "title=${candidate.track.title} artist=${candidate.track.artist}"
+            "[PredictionSource] selected candidateId=${candidate.candidateKey} " +
+                "identityDigest=${candidate.track.identityDigest} " +
+                "source=${candidate.source.wireName} confidence=${candidate.confidence.name}"
         )
-        lyricManager.preloadPredictiveLyrics(candidate)
+        lyricManager.preloadPredictiveMedia(candidate)
     }
 
     fun lyricLinesSnapshot(): List<LyricManager.LyricLine> {
@@ -540,9 +742,9 @@ class PlaybackStateReader(
 
     private fun predictiveCandidate(
         controller: MediaController,
-        current: PredictiveLyricsTrack,
+        current: PredictiveMediaTrack,
         mode: PredictiveCandidateMode
-    ): PredictiveLyricsCandidate? {
+    ): PredictionCandidate? {
         val queueCandidate = queuePredictiveCandidate(controller, current, mode)
         if (queueCandidate != null) {
             return queueCandidate
@@ -555,81 +757,67 @@ class PlaybackStateReader(
 
     private fun queuePredictiveCandidate(
         controller: MediaController,
-        current: PredictiveLyricsTrack,
+        current: PredictiveMediaTrack,
         mode: PredictiveCandidateMode
-    ): PredictiveLyricsCandidate? {
+    ): PredictionCandidate? {
         logMediaSessionQueueDiagnostics(controller, current, mode)
         val queue = controller.queue
         if (queue == null) {
-            logCandidateUnavailable(mode.source, "queue_null")
+            logCandidateUnavailable(mode.source.wireName, "queue_null")
             return null
         }
         if (queue.isEmpty()) {
-            logCandidateUnavailable(mode.source, "queue_empty")
+            logCandidateUnavailable(mode.source.wireName, "queue_empty")
             return null
         }
-        val activeQueueId = controller.playbackState?.activeQueueItemId ?: -1L
-        val currentIndexByQueueId = if (activeQueueId >= 0) {
-            queue.indexOfFirst { it.queueId == activeQueueId }
-        } else {
-            -1
-        }
-        val currentIndex = if (currentIndexByQueueId >= 0) {
-            currentIndexByQueueId
-        } else {
-            queue.indexOfFirst { item ->
-                val track = trackFromDescription(item.description)
-                sameTrackIdentity(track, current, allowMissingDuration = true)
-            }
-        }
-        if (currentIndex < 0) {
-            logCandidateUnavailable(mode.source, "active_queue_id_unknown")
-            return null
-        }
-        if (currentIndex + 1 >= queue.size) {
-            logCandidateUnavailable(mode.source, "no_next_queue_item")
-            return null
-        }
-        val nextItem = queue[currentIndex + 1]
-        val nextTrack = trackFromDescription(nextItem.description)
-        if (nextTrack.title.isBlank()) {
-            logCandidateUnavailable(mode.source, "metadata_missing")
-            return null
-        }
-        return PredictiveLyricsCandidate(
-            source = mode.source,
-            confidence = 1.0,
-            track = nextTrack,
-            mediaId = nextItem.description.mediaId.orEmpty(),
-            queueId = nextItem.queueId,
-            reason = if (mode == PredictiveCandidateMode.MANUAL_NEXT) {
-                "manual next with visible queue"
-            } else {
-                "next queue item"
+        val snapshot = PredictionQueueSnapshot(
+            activeQueueItemId = controller.playbackState?.activeQueueItemId ?: -1L,
+            items = queue.map { item ->
+                PredictionQueueItem(
+                    queueItemId = item.queueId,
+                    mediaId = item.description.mediaId.orEmpty(),
+                    track = trackFromDescription(item.description)
+                )
             }
         )
+        return predictionSourceResolver.resolve(
+            snapshot = snapshot,
+            current = current,
+            direction = mode.direction,
+            source = mode.source
+        ) ?: run {
+            logCandidateUnavailable(mode.source.wireName, "no_directional_queue_item")
+            null
+        }
     }
 
-    private fun historyPredictiveCandidate(current: PredictiveLyricsTrack): PredictiveLyricsCandidate? {
+    private fun historyPredictiveCandidate(current: PredictiveMediaTrack): PredictionCandidate? {
         val transition = transitionStats[current.fallbackKey] ?: return null
         if (transition.count < HISTORY_TRANSITION_MIN_COUNT) {
             return null
         }
+        val createdAt = SystemClock.elapsedRealtime()
+        val candidateKey = PredictionIdentity.candidateKey(
+            transition.next,
+            -1L
+        )
         logger(
-            "[PredictiveLyricsCandidate] history transition candidate " +
-                "confidence=0.7 title=${transition.next.title} " +
-                "artist=${transition.next.artist} reason=repeated_transition " +
+            "[PredictionSource] history candidateId=$candidateKey " +
+                "identityDigest=${transition.next.identityDigest} confidence=WEAK " +
                 "count=${transition.count}"
         )
-        return PredictiveLyricsCandidate(
-            source = PredictiveLyricsPipeline.SOURCE_HISTORY_TRANSITION,
-            confidence = 0.7,
+        return PredictionCandidate(
+            candidateKey = candidateKey,
+            source = PredictionSource.HISTORY_TRANSITION,
+            confidence = PredictionConfidence.WEAK,
+            direction = PredictionDirection.NEXT,
             track = transition.next,
-            reason = "repeated transition count=${transition.count}"
+            createdElapsedMs = createdAt,
+            expiresElapsedMs = createdAt + PredictionSourceResolver.DEFAULT_CANDIDATE_TTL_MS
         )
     }
 
-    private fun observeTrackTransition(current: PredictiveLyricsTrack) {
+    private fun observeTrackTransition(current: PredictiveMediaTrack) {
         if (current.title.isBlank()) {
             return
         }
@@ -649,17 +837,35 @@ class PlaybackStateReader(
             }
             transitionStats[key] = TransitionStat(current, nextCount)
             logger(
-                "[PredictiveLyricsCandidate] history transition learned " +
-                    "from=${previous.title}|${previous.artist} " +
-                    "to=${current.title}|${current.artist} count=$nextCount"
+                "[PredictionSource] history transition learned " +
+                    "fromDigest=${previous.identityDigest} " +
+                    "toDigest=${current.identityDigest} count=$nextCount"
             )
         }
         lastObservedTrack = current
     }
 
+    private fun observeQueueCandidates(
+        controller: MediaController,
+        current: PredictiveMediaTrack
+    ) {
+        val next = predictiveCandidate(controller, current, PredictiveCandidateMode.AUTO)
+        if (next != null) {
+            lyricManager.preloadPredictiveMedia(next)
+        }
+        val previous = queuePredictiveCandidate(
+            controller,
+            current,
+            PredictiveCandidateMode.AUTO_PREVIOUS
+        )
+        if (previous != null) {
+            lyricManager.preloadPredictiveMedia(previous)
+        }
+    }
+
     private fun logMediaSessionQueueDiagnostics(
         controller: MediaController,
-        current: PredictiveLyricsTrack,
+        current: PredictiveMediaTrack,
         mode: PredictiveCandidateMode
     ) {
         val metadata = controller.metadata
@@ -670,25 +876,23 @@ class PlaybackStateReader(
         val metadataAlbum = metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM).orEmpty()
         val metadataDuration = metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
         val metadataMediaId = metadata?.getString(MediaMetadata.METADATA_KEY_MEDIA_ID).orEmpty()
-        val currentQueueItem = queue?.firstOrNull { it.queueId == activeQueueId }
-        val currentQueueId = currentQueueItem?.queueId ?: -1L
-        val queueHead = queue?.take(3)?.joinToString(";") { item ->
-            val desc = item.description
-            "id=${item.queueId},title=${desc.title?.toString().orEmpty()}," +
-                "artist=${desc.subtitle?.toString().orEmpty()}," +
-                "mediaId=${desc.mediaId.orEmpty()}"
-        }.orEmpty()
+        val currentQueueId = queue?.firstOrNull { it.queueId == activeQueueId }?.queueId ?: -1L
+        val completeQueueIdentityCount = queue?.count { item ->
+            !item.description.mediaId.isNullOrBlank() &&
+                !item.description.title.isNullOrBlank() &&
+                !item.description.subtitle.isNullOrBlank()
+        } ?: 0
         logger(
-            "[PredictiveLyricsCandidate] queue diagnostic source=${mode.source} " +
+            "[PredictionSource] queue diagnostic source=${mode.source.wireName} " +
                 "hasQueue=${queue != null} queueSize=${queue?.size ?: -1} " +
                 "activeQueueId=$activeQueueId currentQueueId=$currentQueueId " +
-                "currentTitle=${current.title} currentArtist=${current.artist} " +
+                "currentIdentityDigest=${current.identityDigest} " +
                 "metadataTitlePresent=${metadataTitle.isNotBlank()} " +
                 "metadataArtistPresent=${metadataArtist.isNotBlank()} " +
                 "metadataAlbumPresent=${metadataAlbum.isNotBlank()} " +
                 "metadataDurationMs=$metadataDuration " +
-                "metadataMediaId=${metadataMediaId.ifBlank { "none" }} " +
-                "queueHead=$queueHead"
+                "metadataMediaIdPresent=${metadataMediaId.isNotBlank()} " +
+                "completeQueueIdentityCount=$completeQueueIdentityCount"
         )
     }
 
@@ -705,7 +909,7 @@ class PlaybackStateReader(
         lastCandidateDiagnosticKey = key
         lastCandidateDiagnosticAtMs = now
         logger(
-            "[PredictiveLyricsCandidate] source=$source unavailable reason=$reason" +
+            "[PredictionSource] source=$source unavailable reason=$reason" +
                 if (detail.isNotBlank()) " $detail" else ""
         )
     }
@@ -719,7 +923,7 @@ class PlaybackStateReader(
         val controllers = try {
             manager.getActiveSessions(listenerComponent)
         } catch (exception: Exception) {
-            logger("[PredictiveLyricsCandidate] source=manual_next_with_queue unavailable reason=getActiveSessions_failed")
+            logger("[PredictionSource] source=manual_queue unavailable reason=getActiveSessions_failed")
             return null
         }
         return selectQqMusicController(controllers)
@@ -734,7 +938,7 @@ class PlaybackStateReader(
         } ?: qqControllers.firstOrNull()
     }
 
-    private fun trackFromDescription(description: MediaDescription): PredictiveLyricsTrack {
+    private fun trackFromDescription(description: MediaDescription): PredictiveMediaTrack {
         val title = description.title?.toString().orEmpty().trim()
         val artist = description.subtitle?.toString().orEmpty().trim()
         val album = description.description?.toString().orEmpty().trim()
@@ -750,7 +954,8 @@ class PlaybackStateReader(
             title = title,
             artist = artist,
             album = album,
-            durationMs = duration
+            durationMs = duration,
+            mediaId = mediaId
         )
     }
 
@@ -759,22 +964,24 @@ class PlaybackStateReader(
         title: String,
         artist: String,
         album: String,
-        durationMs: Long
-    ): PredictiveLyricsTrack {
+        durationMs: Long,
+        mediaId: String = ""
+    ): PredictiveMediaTrack {
         val safeAlbum = album.trim()
-        return PredictiveLyricsTrack(
+        return PredictiveMediaTrack(
             trackId = trackId,
             songKey = buildLyricSongKey(title, artist, safeAlbum),
             title = title.trim(),
             artist = artist.trim(),
             album = safeAlbum,
-            durationMs = durationMs
+            durationMs = durationMs,
+            mediaId = mediaId
         )
     }
 
     private fun sameTrackIdentity(
-        left: PredictiveLyricsTrack,
-        right: PredictiveLyricsTrack,
+        left: PredictiveMediaTrack,
+        right: PredictiveMediaTrack,
         allowMissingDuration: Boolean
     ): Boolean {
         if (!sameTrackTitleArtist(left, right)) {
@@ -787,14 +994,14 @@ class PlaybackStateReader(
     }
 
     private fun sameTrackTitleArtist(
-        left: PredictiveLyricsTrack,
-        right: PredictiveLyricsTrack
+        left: PredictiveMediaTrack,
+        right: PredictiveMediaTrack
     ): Boolean {
         if (!left.title.equals(right.title, ignoreCase = true)) {
             return false
         }
-        return left.artist.isBlank() ||
-            right.artist.isBlank() ||
+        return left.artist.isNotBlank() &&
+            right.artist.isNotBlank() &&
             left.artist.equals(right.artist, ignoreCase = true)
     }
 
@@ -810,17 +1017,20 @@ class PlaybackStateReader(
         )
         keys.forEach { key ->
             if (extras.containsKey(key)) {
-                val value = extras.get(key)
-                when (value) {
-                    is Number -> return value.toLong()
-                    is String -> value.toLongOrNull()?.let { return it }
-                }
+                val longValue = extras.getLong(key, Long.MIN_VALUE)
+                if (longValue != Long.MIN_VALUE) return longValue
+                val intValue = extras.getInt(key, Int.MIN_VALUE)
+                if (intValue != Int.MIN_VALUE) return intValue.toLong()
+                extras.getString(key)?.toLongOrNull()?.let { return it }
             }
         }
         return 0L
     }
 
-    private fun calculatePosition(playbackState: PlaybackState?): Long {
+    private fun calculatePosition(
+        playbackState: PlaybackState?,
+        nowElapsedMs: Long = SystemClock.elapsedRealtime()
+    ): Long {
         if (playbackState == null) {
             return 0L
         }
@@ -830,7 +1040,7 @@ class PlaybackStateReader(
             return basePosition
         }
 
-        val elapsedSinceUpdate = SystemClock.elapsedRealtime() - playbackState.lastPositionUpdateTime
+        val elapsedSinceUpdate = nowElapsedMs - playbackState.lastPositionUpdateTime
         val adjustedPosition = basePosition + (elapsedSinceUpdate * playbackState.playbackSpeed).toLong()
         return adjustedPosition.coerceAtLeast(0L)
     }
@@ -842,13 +1052,24 @@ class PlaybackStateReader(
         private const val QQ_MUSIC_PACKAGE = "com.tencent.qqmusic"
     }
 
-    private enum class PredictiveCandidateMode(val source: String) {
-        AUTO(PredictiveLyricsPipeline.SOURCE_MEDIA_SESSION_QUEUE),
-        MANUAL_NEXT(PredictiveLyricsPipeline.SOURCE_MANUAL_NEXT_WITH_QUEUE)
+    private enum class PredictiveCandidateMode(
+        val source: PredictionSource,
+        val direction: PredictionDirection
+    ) {
+        AUTO(PredictionSource.MEDIA_SESSION_QUEUE, PredictionDirection.NEXT),
+        AUTO_PREVIOUS(PredictionSource.MEDIA_SESSION_QUEUE, PredictionDirection.PREVIOUS),
+        MANUAL_NEXT(
+            PredictionSource.MANUAL_NEXT_WITH_QUEUE,
+            PredictionDirection.NEXT
+        ),
+        MANUAL_PREVIOUS(
+            PredictionSource.MANUAL_PREVIOUS_WITH_QUEUE,
+            PredictionDirection.PREVIOUS
+        )
     }
 
     private data class TransitionStat(
-        val next: PredictiveLyricsTrack,
+        val next: PredictiveMediaTrack,
         val count: Int
     )
 }

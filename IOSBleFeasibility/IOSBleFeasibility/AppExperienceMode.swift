@@ -9,18 +9,18 @@ enum AppExperienceMode: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .daily:
-            return "日常模式"
+            return AppLocalization.string("日常模式")
         case .debug:
-            return "调试模式"
+            return AppLocalization.string("调试模式")
         }
     }
 
     var toggleTitle: String {
         switch self {
         case .daily:
-            return "进入调试模式"
+            return AppLocalization.string("进入调试模式")
         case .debug:
-            return "退出调试模式"
+            return AppLocalization.string("退出调试模式")
         }
     }
 

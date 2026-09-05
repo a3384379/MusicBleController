@@ -8,12 +8,12 @@ DEVICE_ID="${DEVICE_ID:-}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
 SKIP_INSTALL="${SKIP_INSTALL:-false}"
 
-if [[ -z "${JAVA_HOME:-}" ]]; then
-  bundled_jbr="/Volumes/雷电/Android Studio.app/Contents/jbr/Contents/Home"
-  if [[ -d "$bundled_jbr" ]]; then
-    export JAVA_HOME="$bundled_jbr"
-    export PATH="$JAVA_HOME/bin:$PATH"
-  fi
+bundled_jbr="/Volumes/雷电/Android Studio.app/Contents/jbr/Contents/Home"
+if [[ -d "$bundled_jbr" ]]; then
+  # Prefer the known-good Android Studio runtime even when an inherited shell
+  # still points at Java 8; AGP 8.5 requires Java 11 or newer.
+  export JAVA_HOME="$bundled_jbr"
+  export PATH="$JAVA_HOME/bin:$PATH"
 fi
 
 echo "JAVA_HOME=${JAVA_HOME:-unset}"

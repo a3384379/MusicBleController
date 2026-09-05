@@ -23,9 +23,9 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Used to test BLE connection with Sony PlayerAgent.</string>
+	<string>Bluetooth connects to your Sony player to control playback and sync lyrics, artwork, and Live Activities.</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
-	<string>Used to test BLE connection with Sony PlayerAgent.</string>
+	<string>Bluetooth connects to your Sony player to control playback and sync media information.</string>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
 	<key>UIBackgroundModes</key>

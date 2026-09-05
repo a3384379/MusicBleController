@@ -1,6 +1,7 @@
 package com.example.playeragent.media
 
 import android.os.SystemClock
+import com.example.playeragent.diagnostics.RealtimeTrace
 import com.example.playeragent.logging.LogConfig
 import org.json.JSONObject
 
@@ -46,10 +47,73 @@ data class CurrentWordState(
     val hasWordTiming: Boolean,
     val positionMs: Long,
     val timestampMs: Long,
-    val version: Int = 1
+    val sampleElapsedMs: Long = 0L,
+    val playbackSpeed: Float = 1f,
+    val version: Int = 2
 ) {
     val wordKey: String
         get() = "$trackId|$trackGeneration|$lineIndex|$wordIndex|$wordStartMs"
+}
+
+data class CurrentWordEligibilitySnapshot(
+    val eligible: Boolean,
+    val reason: String,
+    val trackId: String = "",
+    val generation: Long = 0L,
+    val positionMs: Long = 0L,
+    val positionAnchorMs: Long = 0L,
+    val lineIndex: Int = -1,
+    val wordTimingStatus: String = "NOT_READY",
+    val nextBoundaryDelayMs: Long? = null,
+    val state: CurrentWordState? = null
+)
+
+internal object PlaybackPositionAnchorPolicy {
+    fun projectedPositionMs(
+        positionMs: Long,
+        positionAnchorElapsedMs: Long,
+        nowElapsedMs: Long,
+        durationMs: Long,
+        isPlaying: Boolean,
+        playbackSpeed: Float
+    ): Long {
+        val elapsedMs = if (isPlaying && positionAnchorElapsedMs > 0L) {
+            (nowElapsedMs - positionAnchorElapsedMs).coerceAtLeast(0L)
+        } else {
+            0L
+        }
+        val speed = playbackSpeed.takeIf { it.isFinite() && it > 0f } ?: 1f
+        val projected = positionMs + (elapsedMs * speed).toLong()
+        return if (durationMs > 0L) {
+            projected.coerceIn(0L, durationMs)
+        } else {
+            projected.coerceAtLeast(0L)
+        }
+    }
+}
+
+internal object RuntimeLyricLineProjectionPolicy {
+    fun currentLineText(
+        lines: List<RuntimeLyricLine>,
+        positionMs: Long
+    ): String {
+        var low = 0
+        var high = lines.lastIndex
+        var lineIndex = -1
+        while (low <= high) {
+            val mid = (low + high) ushr 1
+            if (lines[mid].timeMs <= positionMs) {
+                lineIndex = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        while (lineIndex >= 0 && lines[lineIndex].text.isBlank()) {
+            lineIndex -= 1
+        }
+        return lines.getOrNull(lineIndex)?.text.orEmpty()
+    }
 }
 
 object CurrentTrackRuntimeCache {
@@ -72,8 +136,10 @@ object CurrentTrackRuntimeCache {
         artist: String,
         album: String,
         positionMs: Long,
+        positionSampleElapsedMs: Long,
         durationMs: Long,
         isPlaying: Boolean,
+        playbackSpeed: Float,
         currentLine: String,
         lyricSource: String,
         lastPlaybackState: JSONObject,
@@ -110,8 +176,10 @@ object CurrentTrackRuntimeCache {
                 artist = artist,
                 album = album,
                 positionMs = positionMs,
+                positionAnchorElapsedMs = positionSampleElapsedMs,
                 durationMs = durationMs,
                 isPlaying = isPlaying,
+                playbackSpeed = playbackSpeed,
                 currentLine = currentLine,
                 currentWord = findCurrentWord(base.lyricLines, positionMs),
                 lyricSource = lyricSource,
@@ -133,10 +201,18 @@ object CurrentTrackRuntimeCache {
         logger: ((String) -> Unit)? = null
     ) {
         val runtimeLines = lines.map { it.toRuntimeLine() }
-        mutate(logger) { previous, now, _ ->
+        mutate(logger) { previous, now, startedAt ->
             if (previous == null || previous.songKey != songKey) {
                 previous
             } else {
+                val projectedPosition = PlaybackPositionAnchorPolicy.projectedPositionMs(
+                    positionMs = previous.positionMs,
+                    positionAnchorElapsedMs = previous.positionAnchorElapsedMs,
+                    nowElapsedMs = startedAt,
+                    durationMs = previous.durationMs,
+                    isPlaying = previous.isPlaying,
+                    playbackSpeed = previous.playbackSpeed
+                )
                 logger?.invoke(
                     "[RuntimeCache] lyrics updated songKey=$songKey " +
                         "lines=${runtimeLines.size} source=$lyricSource"
@@ -147,7 +223,10 @@ object CurrentTrackRuntimeCache {
                     lyricLines = runtimeLines,
                     translationLines = runtimeLines.map { it.translation },
                     romanizationLines = runtimeLines.map { it.romanization },
-                    currentWord = findCurrentWord(runtimeLines, previous.positionMs),
+                    positionMs = projectedPosition,
+                    positionAnchorElapsedMs = startedAt,
+                    currentLine = findCurrentLineText(runtimeLines, projectedPosition),
+                    currentWord = findCurrentWord(runtimeLines, projectedPosition),
                     lastUpdatedAtMs = now
                 )
             }
@@ -162,7 +241,7 @@ object CurrentTrackRuntimeCache {
         logger: ((String) -> Unit)? = null
     ) {
         val runtimeLines = lines.map { it.toRuntimeLine() }
-        mutate(logger) { previous, now, _ ->
+        mutate(logger) { previous, now, startedAt ->
             if (previous == null || previous.songKey != songKey) {
                 previous
             } else {
@@ -181,6 +260,7 @@ object CurrentTrackRuntimeCache {
                     translationLines = runtimeLines.map { it.translation },
                     romanizationLines = runtimeLines.map { it.romanization },
                     positionMs = positionMs,
+                    positionAnchorElapsedMs = startedAt,
                     currentLine = currentLine,
                     currentWord = currentWord,
                     lastUpdatedAtMs = now
@@ -195,12 +275,13 @@ object CurrentTrackRuntimeCache {
         currentLine: String,
         logger: ((String) -> Unit)? = null
     ) {
-        mutate(logger) { previous, now, _ ->
+        mutate(logger) { previous, now, startedAt ->
             if (previous == null || previous.songKey != songKey) {
                 previous
             } else {
                 previous.copy(
                     positionMs = positionMs,
+                    positionAnchorElapsedMs = startedAt,
                     currentLine = currentLine,
                     currentWord = findCurrentWord(previous.lyricLines, positionMs),
                     lastUpdatedAtMs = now
@@ -253,8 +334,20 @@ object CurrentTrackRuntimeCache {
         synchronized(lock) {
             if (current == null) {
                 cacheMiss += 1
+                RealtimeTrace.record(
+                    stage = "runtimeCacheMiss",
+                    payloadType = "currentTrack",
+                    result = "miss"
+                )
             } else {
                 cacheHit += 1
+                RealtimeTrace.record(
+                    stage = "runtimeCacheHit",
+                    trackId = current?.trackId,
+                    generation = current?.currentTrackGeneration,
+                    payloadType = "currentTrack",
+                    result = "hit"
+                )
             }
             return CurrentTrackRuntimeCacheSnapshot(
                 track = current,
@@ -290,7 +383,11 @@ object CurrentTrackRuntimeCache {
     ): PlaybackStateSnapshot? {
         synchronized(lock) {
             val track = current ?: return null
-            val wordState = findCurrentWordStateLocked(track, System.currentTimeMillis())
+            val wordState = findCurrentWordStateLocked(
+                track = track,
+                timestampMs = System.currentTimeMillis(),
+                elapsedRealtimeMs = SystemClock.elapsedRealtime()
+            )
             val snapshot = PlaybackStateSnapshot(
                 trackId = track.trackId,
                 title = track.title,
@@ -314,7 +411,9 @@ object CurrentTrackRuntimeCache {
                 albumArtState = track.albumArtState,
                 volume = volume,
                 connectionState = connectionState,
-                lastUpdatedAtMs = track.lastUpdatedAtMs
+                // Playback diffs compare position samples, so this must use the
+                // monotonic position anchor rather than metadata/artwork update time.
+                lastUpdatedAtMs = track.positionAnchorElapsedMs
             )
             lastSnapshot = snapshot
             PlaybackStateDiffEngine.recordSnapshotBuilt()
@@ -322,22 +421,131 @@ object CurrentTrackRuntimeCache {
         }
     }
 
-    fun currentWordState(timestampMs: Long = System.currentTimeMillis()): CurrentWordState? {
+    fun currentWordState(
+        timestampMs: Long = System.currentTimeMillis(),
+        elapsedRealtimeMs: Long = SystemClock.elapsedRealtime()
+    ): CurrentWordState? {
         synchronized(lock) {
             val track = current ?: return null
-            return findCurrentWordStateLocked(track, timestampMs)
+            return findCurrentWordStateLocked(track, timestampMs, elapsedRealtimeMs)
+        }
+    }
+
+    fun currentWordEligibilitySnapshot(
+        timestampMs: Long = System.currentTimeMillis(),
+        elapsedRealtimeMs: Long = SystemClock.elapsedRealtime()
+    ): CurrentWordEligibilitySnapshot {
+        synchronized(lock) {
+            val track = current ?: return CurrentWordEligibilitySnapshot(
+                eligible = false,
+                reason = "LYRIC_NOT_READY"
+            )
+            val common = CurrentWordEligibilitySnapshot(
+                eligible = false,
+                reason = "UNKNOWN",
+                trackId = track.trackId,
+                generation = track.currentTrackGeneration,
+                positionMs = track.positionMs,
+                positionAnchorMs = track.positionAnchorElapsedMs
+            )
+            if (!track.isPlaying) return common.copy(reason = "PAUSED")
+            if (track.positionAnchorElapsedMs <= 0L ||
+                elapsedRealtimeMs < track.positionAnchorElapsedMs
+            ) {
+                return common.copy(reason = "CLOCK_UNTRUSTED")
+            }
+            if (track.lyricLines.isEmpty()) return common.copy(reason = "LYRIC_NOT_READY")
+            val position = PlaybackPositionAnchorPolicy.projectedPositionMs(
+                positionMs = track.positionMs,
+                positionAnchorElapsedMs = track.positionAnchorElapsedMs,
+                nowElapsedMs = elapsedRealtimeMs,
+                durationMs = track.durationMs,
+                isPlaying = track.isPlaying,
+                playbackSpeed = track.playbackSpeed
+            )
+            val lineIndex = findLatestLineIndex(track.lyricLines, position)
+            if (lineIndex < 0) {
+                val firstBoundary = track.lyricLines.firstOrNull()?.let { line ->
+                    line.words.firstOrNull()?.startMs ?: line.timeMs
+                }
+                return common.copy(
+                    reason = "INTRO_WAIT",
+                    positionMs = position,
+                    nextBoundaryDelayMs = firstBoundary
+                        ?.minus(position)
+                        ?.coerceAtLeast(0L)
+                )
+            }
+            val line = track.lyricLines[lineIndex]
+            if (line.words.isEmpty()) {
+                return common.copy(
+                    reason = "NO_WORD_TIMING",
+                    positionMs = position,
+                    lineIndex = lineIndex,
+                    wordTimingStatus = "LINE_ONLY"
+                )
+            }
+            val wordIndex = findLatestWordIndex(line.words, position)
+            if (wordIndex < 0) {
+                return common.copy(
+                    reason = "INTRO_WAIT",
+                    positionMs = position,
+                    lineIndex = lineIndex,
+                    wordTimingStatus = "AVAILABLE",
+                    nextBoundaryDelayMs = (line.words.first().startMs - position)
+                        .coerceAtLeast(0L)
+                )
+            }
+            val word = line.words[wordIndex]
+            val wordEndMs = word.startMs + word.durationMs.coerceAtLeast(0L)
+            if (word.durationMs > 0L && position >= wordEndMs) {
+                val nextBoundary = line.words.getOrNull(wordIndex + 1)?.startMs
+                    ?: track.lyricLines.getOrNull(lineIndex + 1)?.let { nextLine ->
+                        nextLine.words.firstOrNull()?.startMs ?: nextLine.timeMs
+                    }
+                return common.copy(
+                    reason = if (nextBoundary != null) "INTRO_WAIT" else "NO_ACTIVE_LINE",
+                    positionMs = position,
+                    lineIndex = lineIndex,
+                    wordTimingStatus = "AVAILABLE",
+                    nextBoundaryDelayMs = nextBoundary
+                        ?.minus(position)
+                        ?.coerceAtLeast(0L)
+                )
+            }
+            val state = findCurrentWordStateLocked(track, timestampMs, elapsedRealtimeMs)
+            return common.copy(
+                eligible = state != null && state.hasWordTiming,
+                reason = if (state != null && state.hasWordTiming) "ELIGIBLE" else "NO_WORD_TIMING",
+                positionMs = position,
+                lineIndex = lineIndex,
+                wordTimingStatus = if (state?.hasWordTiming == true) "AVAILABLE" else "LINE_ONLY",
+                state = state
+            )
+        }
+    }
+
+    fun traceIdentitySnapshot(): Pair<String, Long>? {
+        synchronized(lock) {
+            val track = current ?: return null
+            return track.trackId to track.currentTrackGeneration
         }
     }
 
     /** Delay to the next word/line boundary, capped for periodic drift correction. */
     fun nextCurrentWordBoundaryDelayMs(
         timestampMs: Long = System.currentTimeMillis(),
+        elapsedRealtimeMs: Long = SystemClock.elapsedRealtime(),
         maximumDriftCorrectionMs: Long = 500L
     ): Long? {
         synchronized(lock) {
             val track = current ?: return null
             if (!track.isPlaying || track.lyricLines.isEmpty()) return null
-            val state = findCurrentWordStateLocked(track, timestampMs) ?: return maximumDriftCorrectionMs
+            val state = findCurrentWordStateLocked(
+                track,
+                timestampMs,
+                elapsedRealtimeMs
+            ) ?: return maximumDriftCorrectionMs
             val line = track.lyricLines.getOrNull(state.lineIndex)
             val candidates = mutableListOf<Long>()
             if (line != null && state.wordIndex >= 0) {
@@ -439,28 +647,25 @@ object CurrentTrackRuntimeCache {
         lines: List<RuntimeLyricLine>,
         positionMs: Long
     ): String {
-        val lineIndex = findCurrentLineIndexed(lines, positionMs)?.lineIndex ?: return ""
-        return lines.getOrNull(lineIndex)?.text.orEmpty()
+        return RuntimeLyricLineProjectionPolicy.currentLineText(lines, positionMs)
     }
 
     private fun findCurrentWordStateLocked(
         track: CurrentTrackSnapshot,
-        timestampMs: Long
+        timestampMs: Long,
+        elapsedRealtimeMs: Long
     ): CurrentWordState? {
         if (track.trackId.isBlank() || track.lyricLines.isEmpty()) {
             return null
         }
-        val elapsedMs = if (track.isPlaying && track.lastUpdatedAtMs > 0L) {
-            (timestampMs - track.lastUpdatedAtMs).coerceAtLeast(0L)
-        } else {
-            0L
-        }
-        val rawPosition = track.positionMs + elapsedMs
-        val position = if (track.durationMs > 0L) {
-            rawPosition.coerceIn(0L, track.durationMs)
-        } else {
-            rawPosition.coerceAtLeast(0L)
-        }
+        val position = PlaybackPositionAnchorPolicy.projectedPositionMs(
+            positionMs = track.positionMs,
+            positionAnchorElapsedMs = track.positionAnchorElapsedMs,
+            nowElapsedMs = elapsedRealtimeMs,
+            durationMs = track.durationMs,
+            isPlaying = track.isPlaying,
+            playbackSpeed = track.playbackSpeed
+        )
         val indexed = findCurrentWordIndexed(track.lyricLines, position)
             ?: findCurrentLineIndexed(track.lyricLines, position)
             ?: return null
@@ -474,7 +679,9 @@ object CurrentTrackRuntimeCache {
             wordEndMs = indexed.word.startMs + indexed.word.durationMs.coerceAtLeast(0L),
             hasWordTiming = indexed.hasWordTiming,
             positionMs = position,
-            timestampMs = timestampMs
+            timestampMs = timestampMs,
+            sampleElapsedMs = elapsedRealtimeMs,
+            playbackSpeed = track.playbackSpeed
         )
     }
 

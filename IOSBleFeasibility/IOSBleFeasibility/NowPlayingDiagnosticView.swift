@@ -156,6 +156,33 @@ struct NowPlayingDiagnosticView: View {
                 diagnosticRow("轻量词丢弃", "\(snapshot.currentWord.dropCount) 次")
                 diagnosticRow("平均间隔", "\(snapshot.currentWord.averageUpdateIntervalMs)ms")
                 diagnosticRow("最近延迟", "\(snapshot.currentWord.lastLatencyMs)ms")
+                diagnosticRow(
+                    "自动校时",
+                    snapshot.currentWord.automaticSyncEnabled ? "开启" : "关闭"
+                )
+                diagnosticRow(
+                    "自动补偿",
+                    "\(snapshot.currentWord.automaticCompensationMs)ms"
+                )
+                diagnosticRow("人工微调", "\(snapshot.currentWord.manualFineTuneMs)ms")
+                if snapshot.currentWord.legacyFallbackMs != 0 {
+                    diagnosticRow(
+                        "旧协议补偿",
+                        "\(snapshot.currentWord.legacyFallbackMs)ms"
+                    )
+                }
+                diagnosticRow(
+                    "校时质量",
+                    snapshot.currentWord.clockSyncConfident ? "可信" : "采样中"
+                )
+                diagnosticRow(
+                    "校时 RTT",
+                    "\(snapshot.currentWord.clockBestRoundTripMs)ms"
+                )
+                diagnosticRow(
+                    "校时抖动",
+                    "\(snapshot.currentWord.clockOffsetJitterMs)ms"
+                )
             }
         }
     }
@@ -250,7 +277,7 @@ struct NowPlayingDiagnosticView: View {
     private func selfHealingCard(_ snapshot: NowPlayingDiagnosticSnapshot) -> some View {
         DiagnosticCard {
             VStack(alignment: .leading, spacing: 12) {
-                Label("Self-Healing", systemImage: "cross.case")
+                Label("自愈引擎", systemImage: "cross.case")
                     .font(.headline.weight(.bold))
 
                 Text(snapshot.selfHealing.overallStatus)
@@ -281,7 +308,7 @@ struct NowPlayingDiagnosticView: View {
     private func recentIssuesCard(_ snapshot: NowPlayingDiagnosticSnapshot) -> some View {
         DiagnosticCard {
             VStack(alignment: .leading, spacing: 12) {
-                Label("Recent Issues", systemImage: "exclamationmark.triangle")
+                Label("最近问题", systemImage: "exclamationmark.triangle")
                     .font(.headline.weight(.bold))
 
                 VStack(alignment: .leading, spacing: 8) {
@@ -305,7 +332,7 @@ struct NowPlayingDiagnosticView: View {
     private func quickActionsCard(_ snapshot: NowPlayingDiagnosticSnapshot) -> some View {
         DiagnosticCard {
             VStack(alignment: .leading, spacing: 12) {
-                Label("Quick Actions", systemImage: "bolt.fill")
+                Label("快捷操作", systemImage: "bolt.fill")
                     .font(.headline.weight(.bold))
 
                 LazyVGrid(
@@ -404,11 +431,11 @@ struct NowPlayingDiagnosticView: View {
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.78))
                 .lineLimit(2)
-            Text("Recover: \(report.recoveryAction)")
+            Text("恢复：\(report.recoveryAction)")
                 .font(.caption2)
                 .foregroundStyle(.white.opacity(0.54))
                 .lineLimit(3)
-            Text("Verify: \(report.verifySignal)")
+            Text("验证：\(report.verifySignal)")
                 .font(.caption2)
                 .foregroundStyle(.white.opacity(0.54))
                 .lineLimit(3)

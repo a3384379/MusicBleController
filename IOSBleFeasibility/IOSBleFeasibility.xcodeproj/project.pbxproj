@@ -36,6 +36,15 @@
 		A10000000000000000000027 /* PreferencesStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000030 /* PreferencesStore.swift */; };
 		A10000000000000000000028 /* AlbumArtReceiver.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000031 /* AlbumArtReceiver.swift */; };
 		A10000000000000000000029 /* SelfHealingEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000032 /* SelfHealingEngine.swift */; };
+		A10000000000000000000033 /* ArtworkImageCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000033 /* ArtworkImageCache.swift */; };
+		A10000000000000000000034 /* LastNowPlayingSnapshotStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000034 /* LastNowPlayingSnapshotStore.swift */; };
+		A10000000000000000000035 /* MediaLoadingState.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000035 /* MediaLoadingState.swift */; };
+		A10000000000000000000036 /* BLEObservableStateModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000036 /* BLEObservableStateModels.swift */; };
+		A10000000000000000000037 /* BLEBinaryChunkCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000037 /* BLEBinaryChunkCodec.swift */; };
+		A10000000000000000000038 /* FullLyricsCacheStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000038 /* FullLyricsCacheStore.swift */; };
+		A10000000000000000000039 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000039 /* Localizable.xcstrings */; };
+		A10000000000000000000040 /* InfoPlist.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000040 /* InfoPlist.xcstrings */; };
+		A10000000000000000000041 /* PlayerProductUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000041 /* PlayerProductUI.swift */; };
 		B10000000000000000000001 /* SonyMusicActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* SonyMusicActivityAttributes.swift */; };
 		B10000000000000000000002 /* LiveActivityManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000002 /* LiveActivityManager.swift */; };
 		B10000000000000000000003 /* SonyMusicLiveActivityExtensionBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000004 /* SonyMusicLiveActivityExtensionBundle.swift */; };
@@ -49,6 +58,8 @@
 		B10000000000000000000011 /* PlayPauseLiveActivityIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000016 /* PlayPauseLiveActivityIntent.swift */; };
 		B10000000000000000000012 /* PreviousLiveActivityIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000017 /* PreviousLiveActivityIntent.swift */; };
 		B10000000000000000000013 /* NextLiveActivityIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000018 /* NextLiveActivityIntent.swift */; };
+		B10000000000000000000014 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000039 /* Localizable.xcstrings */; };
+		C10000000000000000000001 /* PerformanceStabilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000000000000000000001 /* PerformanceStabilityTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -58,6 +69,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = B50000000000000000000001;
 			remoteInfo = SonyMusicLiveActivityExtension;
+		};
+		C80000000000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A60000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A50000000000000000000001;
+			remoteInfo = sonyMusic;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -106,8 +124,17 @@
 		A20000000000000000000028 /* AppExperienceMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppExperienceMode.swift; sourceTree = "<group>"; };
 		A20000000000000000000029 /* PreferencesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreferencesView.swift; sourceTree = "<group>"; };
 		A20000000000000000000030 /* PreferencesStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreferencesStore.swift; sourceTree = "<group>"; };
+		A20000000000000000000041 /* PlayerProductUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerProductUI.swift; sourceTree = "<group>"; };
 		A20000000000000000000031 /* AlbumArtReceiver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlbumArtReceiver.swift; sourceTree = "<group>"; };
 		A20000000000000000000032 /* SelfHealingEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfHealingEngine.swift; sourceTree = "<group>"; };
+		A20000000000000000000033 /* ArtworkImageCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArtworkImageCache.swift; sourceTree = "<group>"; };
+		A20000000000000000000034 /* LastNowPlayingSnapshotStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LastNowPlayingSnapshotStore.swift; sourceTree = "<group>"; };
+		A20000000000000000000035 /* MediaLoadingState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaLoadingState.swift; sourceTree = "<group>"; };
+		A20000000000000000000036 /* BLEObservableStateModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEObservableStateModels.swift; sourceTree = "<group>"; };
+		A20000000000000000000037 /* BLEBinaryChunkCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEBinaryChunkCodec.swift; sourceTree = "<group>"; };
+		A20000000000000000000038 /* FullLyricsCacheStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FullLyricsCacheStore.swift; sourceTree = "<group>"; };
+		A20000000000000000000039 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
+		A20000000000000000000040 /* InfoPlist.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = InfoPlist.xcstrings; sourceTree = "<group>"; };
 		B20000000000000000000001 /* SonyMusicActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SonyMusicActivityAttributes.swift; sourceTree = "<group>"; };
 		B20000000000000000000002 /* LiveActivityManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityManager.swift; sourceTree = "<group>"; };
 		B20000000000000000000004 /* SonyMusicLiveActivityExtensionBundle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SonyMusicLiveActivityExtensionBundle.swift; sourceTree = "<group>"; };
@@ -116,6 +143,8 @@
 		B20000000000000000000007 /* SonyMusicLiveActivityExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = SonyMusicLiveActivityExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		B20000000000000000000008 /* LiveActivityArtworkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityArtworkView.swift; sourceTree = "<group>"; };
 		B20000000000000000000009 /* SonyMusicLiveActivityExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = SonyMusicLiveActivityExtension.entitlements; sourceTree = "<group>"; };
+		C20000000000000000000001 /* PerformanceStabilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceStabilityTests.swift; sourceTree = "<group>"; };
+		C20000000000000000000002 /* IOSBleFeasibilityTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = IOSBleFeasibilityTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -133,6 +162,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		C30000000000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -141,6 +177,7 @@
 			children = (
 				A40000000000000000000002 /* IOSBleFeasibility */,
 				B40000000000000000000001 /* SonyMusicLiveActivityExtension */,
+				C40000000000000000000001 /* IOSBleFeasibilityTests */,
 				A40000000000000000000003 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -150,9 +187,18 @@
 			children = (
 				A20000000000000000000001 /* IOSBleFeasibilityApp.swift */,
 				A20000000000000000000002 /* ContentView.swift */,
+				A20000000000000000000041 /* PlayerProductUI.swift */,
 				A20000000000000000000008 /* FullLyricsView.swift */,
 				A20000000000000000000009 /* DebugToolsView.swift */,
 				A20000000000000000000031 /* AlbumArtReceiver.swift */,
+				A20000000000000000000033 /* ArtworkImageCache.swift */,
+				A20000000000000000000034 /* LastNowPlayingSnapshotStore.swift */,
+				A20000000000000000000035 /* MediaLoadingState.swift */,
+				A20000000000000000000036 /* BLEObservableStateModels.swift */,
+				A20000000000000000000037 /* BLEBinaryChunkCodec.swift */,
+				A20000000000000000000038 /* FullLyricsCacheStore.swift */,
+				A20000000000000000000039 /* Localizable.xcstrings */,
+				A20000000000000000000040 /* InfoPlist.xcstrings */,
 				A20000000000000000000032 /* SelfHealingEngine.swift */,
 				B20000000000000000000001 /* SonyMusicActivityAttributes.swift */,
 				B20000000000000000000002 /* LiveActivityManager.swift */,
@@ -190,6 +236,7 @@
 			children = (
 				A20000000000000000000006 /* sonyMusic.app */,
 				B20000000000000000000007 /* SonyMusicLiveActivityExtension.appex */,
+				C20000000000000000000002 /* IOSBleFeasibilityTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -204,6 +251,14 @@
 				B20000000000000000000009 /* SonyMusicLiveActivityExtension.entitlements */,
 			);
 			path = SonyMusicLiveActivityExtension;
+			sourceTree = "<group>";
+		};
+		C40000000000000000000001 /* IOSBleFeasibilityTests */ = {
+			isa = PBXGroup;
+			children = (
+				C20000000000000000000001 /* PerformanceStabilityTests.swift */,
+			);
+			path = IOSBleFeasibilityTests;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -245,6 +300,24 @@
 			productReference = B20000000000000000000007 /* SonyMusicLiveActivityExtension.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		C50000000000000000000001 /* IOSBleFeasibilityTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C90000000000000000000001 /* Build configuration list for PBXNativeTarget "IOSBleFeasibilityTests" */;
+			buildPhases = (
+				C30000000000000000000002 /* Sources */,
+				C30000000000000000000001 /* Frameworks */,
+				C30000000000000000000003 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				C80000000000000000000002 /* PBXTargetDependency */,
+			);
+			name = IOSBleFeasibilityTests;
+			productName = IOSBleFeasibilityTests;
+			productReference = C20000000000000000000002 /* IOSBleFeasibilityTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -271,6 +344,10 @@
 							};
 						};
 					};
+					C50000000000000000000001 = {
+						CreatedOnToolsVersion = 16.2;
+						TestTargetID = A50000000000000000000001;
+					};
 				};
 			};
 			buildConfigurationList = A90000000000000000000001 /* Build configuration list for PBXProject "IOSBleFeasibility" */;
@@ -279,6 +356,7 @@
 			hasScannedForEncodings = 0;
 			knownRegions = (
 				en,
+				"zh-Hans",
 				Base,
 			);
 			mainGroup = A40000000000000000000001;
@@ -288,6 +366,7 @@
 			targets = (
 				A50000000000000000000001 /* sonyMusic */,
 				B50000000000000000000001 /* SonyMusicLiveActivityExtension */,
+				C50000000000000000000001 /* IOSBleFeasibilityTests */,
 			);
 		};
 /* End PBXProject section */
@@ -298,10 +377,20 @@
 			buildActionMask = 2147483647;
 			files = (
 				A10000000000000000000005 /* Assets.xcassets in Resources */,
+				A10000000000000000000039 /* Localizable.xcstrings in Resources */,
+				A10000000000000000000040 /* InfoPlist.xcstrings in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		B30000000000000000000003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B10000000000000000000014 /* Localizable.xcstrings in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C30000000000000000000003 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -317,6 +406,7 @@
 			files = (
 				A10000000000000000000001 /* IOSBleFeasibilityApp.swift in Sources */,
 				A10000000000000000000002 /* ContentView.swift in Sources */,
+				A10000000000000000000041 /* PlayerProductUI.swift in Sources */,
 				A10000000000000000000006 /* FullLyricsView.swift in Sources */,
 				A10000000000000000000007 /* DebugToolsView.swift in Sources */,
 				B10000000000000000000001 /* SonyMusicActivityAttributes.swift in Sources */,
@@ -334,6 +424,12 @@
 				A10000000000000000000026 /* PreferencesView.swift in Sources */,
 				A10000000000000000000027 /* PreferencesStore.swift in Sources */,
 				A10000000000000000000028 /* AlbumArtReceiver.swift in Sources */,
+				A10000000000000000000033 /* ArtworkImageCache.swift in Sources */,
+				A10000000000000000000034 /* LastNowPlayingSnapshotStore.swift in Sources */,
+				A10000000000000000000035 /* MediaLoadingState.swift in Sources */,
+				A10000000000000000000036 /* BLEObservableStateModels.swift in Sources */,
+				A10000000000000000000037 /* BLEBinaryChunkCodec.swift in Sources */,
+				A10000000000000000000038 /* FullLyricsCacheStore.swift in Sources */,
 				A10000000000000000000029 /* SelfHealingEngine.swift in Sources */,
 				A10000000000000000000019 /* LyricDisplayMode.swift in Sources */,
 				A10000000000000000000021 /* LyricDiagnostic.swift in Sources */,
@@ -365,6 +461,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		C30000000000000000000002 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C10000000000000000000001 /* PerformanceStabilityTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -372,6 +476,11 @@
 			isa = PBXTargetDependency;
 			target = B50000000000000000000001 /* SonyMusicLiveActivityExtension */;
 			targetProxy = B80000000000000000000001 /* PBXContainerItemProxy */;
+		};
+		C80000000000000000000002 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A50000000000000000000001 /* sonyMusic */;
+			targetProxy = C80000000000000000000001 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -482,6 +591,7 @@
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_STRICT_CONCURRENCY = targeted;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
 			};
@@ -510,6 +620,7 @@
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_STRICT_CONCURRENCY = targeted;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
 			};
@@ -537,6 +648,7 @@
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_STRICT_CONCURRENCY = targeted;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
 			};
@@ -566,8 +678,47 @@
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = targeted;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		C70000000000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 98K7KHA6Z7;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sqz.IOSBleFeasibilityTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_STRICT_CONCURRENCY = targeted;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/sonyMusic.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/sonyMusic";
+			};
+			name = Debug;
+		};
+		C70000000000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 98K7KHA6Z7;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sqz.IOSBleFeasibilityTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_STRICT_CONCURRENCY = targeted;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/sonyMusic.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/sonyMusic";
 			};
 			name = Release;
 		};
@@ -597,6 +748,15 @@
 			buildConfigurations = (
 				B70000000000000000000001 /* Debug */,
 				B70000000000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		C90000000000000000000001 /* Build configuration list for PBXNativeTarget "IOSBleFeasibilityTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C70000000000000000000001 /* Debug */,
+				C70000000000000000000002 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

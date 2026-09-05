@@ -397,9 +397,9 @@ if [[ "$SONY_ONLY" == true ]]; then
     for _ in $(seq 1 "$EXPECTED_TRACK_COUNT"); do
       "$ADB_BIN" -s "$ANDROID_DEVICE_ID" shell cmd media_session dispatch next || true
       sleep 1
-      "$ADB_BIN" -s "$ANDROID_DEVICE_ID" shell am start-foreground-service \
-        -n com.example.playeragent/.service.PlayerAgentForegroundService \
-        -a com.example.playeragent.ACTION_REFRESH_CURRENT_LYRIC || true
+      "$ADB_BIN" -s "$ANDROID_DEVICE_ID" shell am broadcast \
+        -p com.example.playeragent \
+        -a com.example.playeragent.debug.REFRESH_CURRENT_LYRIC || true
       sleep "$interval"
     done
   ) >"$OUT_DIR/sony_next_driver.out" 2>"$OUT_DIR/sony_next_driver.err" &

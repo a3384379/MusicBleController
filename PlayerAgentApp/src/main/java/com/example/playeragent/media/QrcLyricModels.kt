@@ -3,6 +3,7 @@ package com.example.playeragent.media
 import android.content.Context
 import android.os.Environment
 import io.github.proify.qrckit.decrypt.QrcDecrypter
+import org.json.JSONObject
 import java.io.File
 import java.nio.charset.Charset
 import java.security.MessageDigest
@@ -103,7 +104,7 @@ enum class QrcWordTimingStatus {
 
 const val QRC_CACHE_SCHEMA_V1 = 1
 const val QRC_CACHE_SCHEMA_V2 = 2
-const val QRC_CACHE_BUILD_VERSION = 3
+const val QRC_CACHE_BUILD_VERSION = 4
 
 data class LyricCacheStats(
     val l1Hit: Long = 0,
@@ -148,7 +149,13 @@ data class QrcGroupIndexEntry(
     val hasQrc: Boolean,
     val hasProducer: Boolean,
     val hasTranslrc: Boolean,
-    val hasRomaqrc: Boolean
+    val hasRomaqrc: Boolean,
+    val exSavingTime: Long = 0L,
+    val sidecarLastModified: Long = 0L,
+    val firstLyricTitleCandidate: String = "",
+    val lastLyricEndMs: Long = 0L,
+    val metadataComplete: Boolean = false,
+    val fingerprint: String = ""
 ) {
     fun toGroup(): QrcLyricManager.QrcGroup {
         return QrcLyricManager.QrcGroup(
@@ -161,6 +168,20 @@ data class QrcGroupIndexEntry(
             lastModified = lastModified
         )
     }
+
+    fun toFileGroup(): QrcFileGroup {
+        return QrcFileGroup(
+            groupId = groupId,
+            qrcFile = qrcFile,
+            producerFile = producerFile,
+            exFile = exFile,
+            translrcFile = translrcFile,
+            romaqrcFile = romaqrcFile,
+            lastModified = lastModified
+        )
+    }
+
+    fun effectiveModifiedAt(): Long = maxOf(lastModified, sidecarLastModified, exSavingTime)
 }
 
 data class QrcPersistentIndexStatus(
@@ -187,8 +208,10 @@ data class CurrentTrackSnapshot(
     val trackChangedAtMs: Long,
     val hasLyrics: Boolean,
     val positionMs: Long = 0L,
+    val positionAnchorElapsedMs: Long = 0L,
     val durationMs: Long = 0L,
     val isPlaying: Boolean = false,
+    val playbackSpeed: Float = 1f,
     val albumArtId: String? = null,
     val lyricSource: String = "NONE",
     val lyricLines: List<RuntimeLyricLine> = emptyList(),
@@ -220,7 +243,10 @@ data class LyricsReadyGateSnapshot(
     val songKey: String = "",
     val generation: Long = 0L,
     val lineCount: Int = 0,
-    val reason: String = ""
+    val reason: String = "",
+    val wordTimingStatus: String = "NOT_READY",
+    val cacheSource: String = "UNKNOWN",
+    val failureReason: String = ""
 )
 
 data class IncrementalLyricsReady(
@@ -396,6 +422,37 @@ object QrcLyricUtils {
         return Triple(title, artist, "")
     }
 
+    fun readExSavingTime(file: File?): Long {
+        if (file == null || !file.canRead() || file.length() > MAX_EX_BYTES) {
+            return 0L
+        }
+        return try {
+            JSONObject(file.readText(Charsets.UTF_8)).optLong("saving_t", 0L)
+        } catch (_: Exception) {
+            0L
+        }
+    }
+
+    fun sidecarLastModified(group: QrcFileGroup): Long {
+        return listOfNotNull(
+            group.producerFile,
+            group.exFile,
+            group.translrcFile,
+            group.romaqrcFile
+        ).maxOfOrNull(File::lastModified) ?: 0L
+    }
+
+    fun fingerprintKey(group: QrcFileGroup): String {
+        val value = buildFingerprint(group)
+        return listOf(
+            value.qrcLastModified, value.qrcSize,
+            value.producerLastModified, value.producerSize,
+            value.exLastModified, value.exSize,
+            value.translrcLastModified, value.translrcSize,
+            value.romaqrcLastModified, value.romaqrcSize
+        ).joinToString(":")
+    }
+
     fun parseAuxiliaryLyricFile(
         file: File?,
         groupId: String,
@@ -441,16 +498,26 @@ object QrcLyricUtils {
             return emptyMap()
         }
         val matched = mutableMapOf<Int, Pair<Long, String>>()
-        auxiliaryLines.forEach { auxiliary ->
-            var bestIndex = -1
-            var bestDelta = Long.MAX_VALUE
-            lines.forEachIndexed { index, line ->
-                val delta = kotlin.math.abs(line.timeMs - auxiliary.timeMs)
-                if (delta < bestDelta) {
-                    bestDelta = delta
-                    bestIndex = index
-                }
+        val sortedLines = lines.withIndex().sortedBy { it.value.timeMs }
+        var cursor = 0
+        auxiliaryLines.sortedBy(QrcAuxiliaryLyricLine::timeMs).forEach { auxiliary ->
+            while (cursor + 1 < sortedLines.size &&
+                sortedLines[cursor + 1].value.timeMs <= auxiliary.timeMs
+            ) {
+                cursor += 1
             }
+            val nearby = listOfNotNull(
+                sortedLines.getOrNull(cursor),
+                sortedLines.getOrNull(cursor + 1),
+                sortedLines.getOrNull(cursor - 1)
+            )
+            val best = nearby.minByOrNull {
+                kotlin.math.abs(it.value.timeMs - auxiliary.timeMs)
+            }
+            val bestIndex = best?.index ?: -1
+            val bestDelta = best?.let {
+                kotlin.math.abs(it.value.timeMs - auxiliary.timeMs)
+            } ?: Long.MAX_VALUE
             if (bestIndex >= 0 && bestDelta <= AUXILIARY_ALIGN_TOLERANCE_MS) {
                 val existing = matched[bestIndex]
                 if (existing == null || bestDelta < existing.first) {
@@ -473,7 +540,7 @@ object QrcLyricUtils {
                     match.groupValues[2].trim()
         }
         val producerMetadata = parseProducerMetadata(group.producerFile)
-        val title = sanitizeMetadataTitle(
+        val metadataTitle = sanitizeMetadataTitle(
             metadata["ti"].orEmpty().ifBlank { producerMetadata.first },
             group.groupId,
             logger
@@ -505,6 +572,10 @@ object QrcLyricUtils {
             }
         }.distinctBy { it.timeMs to it.text }
             .sortedBy(QrcLyricLine::timeMs)
+        val inferredTitle = QrcCurrentTrackMatchPolicy.extractTitleCandidate(
+            baseLines.map(QrcLyricLine::text)
+        )
+        val title = metadataTitle.ifBlank { inferredTitle }
         val auxiliary = applyAuxiliaryLyricsDetailed(
             groupId = group.groupId,
             lines = baseLines,
@@ -748,19 +819,26 @@ object QrcLyricUtils {
         }
 
         val words = matches.mapIndexedNotNull { index, match ->
-            val relativeStartMs = match.groupValues.getOrNull(1)?.toLongOrNull()
+            val encodedStartMs = match.groupValues.getOrNull(1)?.toLongOrNull()
                 ?: return@mapIndexedNotNull null
             val durationMs = match.groupValues.getOrNull(2)?.toLongOrNull()
                 ?: return@mapIndexedNotNull null
-            val textStart = match.range.last + 1
-            val textEnd = matches.getOrNull(index + 1)?.range?.first ?: body.length
+            // QQ QRC places the timing marker after the word it describes. The encoded start
+            // is normally an absolute playback position, although a few older files use a
+            // line-relative value.
+            val textStart = matches.getOrNull(index - 1)?.range?.last?.plus(1) ?: 0
+            val textEnd = match.range.first
             val wordText = body.substring(textStart, textEnd)
                 .replace(QRC_WORD_TIME_REGEX, "")
             if (wordText.isBlank()) {
                 null
             } else {
                 QrcLyricWord(
-                    startMs = lineStartMs + relativeStartMs,
+                    startMs = if (encodedStartMs < lineStartMs) {
+                        lineStartMs + encodedStartMs
+                    } else {
+                        encodedStartMs
+                    },
                     durationMs = durationMs,
                     text = wordText
                 )
@@ -832,6 +910,7 @@ object QrcLyricUtils {
     }
 
     private const val MAX_PRODUCER_BYTES = 8 * 1024
+    private const val MAX_EX_BYTES = 16 * 1024
     private const val MIN_HEX_LENGTH = 128
     private const val AUXILIARY_ALIGN_TOLERANCE_MS = 800L
     private val GROUP_FILE_REGEX =

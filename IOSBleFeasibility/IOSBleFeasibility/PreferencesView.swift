@@ -25,11 +25,15 @@ struct PreferencesView: View {
 
                 ScrollView(showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 14) {
-                        modeSection
-                        connectionSection
+                        currentDeviceSection
+                        playerDisplaySection
                         lyricSection
                         artworkSection
-                        cacheAndLogSection
+                        connectionAndSystemSection
+                        playbackHistorySection
+                        if preferences.appExperienceMode == .debug {
+                            advancedSection
+                        }
                         aboutSection
                     }
                     .padding(.horizontal, 18)
@@ -54,8 +58,36 @@ struct PreferencesView: View {
         .presentationDragIndicator(.visible)
     }
 
-    private var modeSection: some View {
-        PreferencesCard(title: "使用模式", systemImage: "person.crop.circle") {
+    private var currentDeviceSection: some View {
+        PreferencesCard(title: "当前设备", systemImage: "hifispeaker.2") {
+            preferencesRow(
+                "设备",
+                bleManager.connectedDeviceName == "-" ? "Sony" : bleManager.connectedDeviceName
+            )
+            preferencesRow("状态", displayConnectionState, valueColor: connectionStatusColor)
+            if bleManager.currentMtuBytesForPreferences > 0 {
+                preferencesRow("MTU", "\(bleManager.currentMtuBytesForPreferences)")
+            }
+            actionButton("重新连接", "antenna.radiowaves.left.and.right") {
+                bleManager.forceReconnect()
+                actionStatus = AppLocalization.string("已请求重新连接")
+            }
+        }
+    }
+
+    private var playerDisplaySection: some View {
+        PreferencesCard(title: "播放器显示", systemImage: "rectangle.inset.filled.and.person.filled") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("界面语言")
+                    .font(.subheadline.weight(.semibold))
+                Picker("界面语言", selection: appLanguageBinding) {
+                    ForEach(AppLanguage.allCases) { language in
+                        Text(language.title).tag(language)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+
             Picker("使用模式", selection: appModeBinding) {
                 ForEach(AppExperienceMode.allCases) { mode in
                     Text(mode.title).tag(mode)
@@ -63,7 +95,22 @@ struct PreferencesView: View {
             }
             .pickerStyle(.segmented)
 
-            Text("日常模式保留播放器核心功能；调试模式显示诊断、日志和高级入口。")
+            Text("日常模式保留核心功能；调试模式显示诊断、日志和协议入口。")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.58))
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("性能模式")
+                    .font(.subheadline.weight(.semibold))
+                Picker("性能模式", selection: performanceModeBinding) {
+                    ForEach(PlaybackPerformanceMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+
+            Text(preferences.playbackPerformanceMode.detail)
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.58))
 
@@ -78,26 +125,18 @@ struct PreferencesView: View {
                 .pickerStyle(.segmented)
             }
 
-            Text("默认使用歌词优先样式；其它样式先作为本地设置保留，方便后续扩展。")
+            Text("默认展示封面、标题与歌手；歌词优先突出当前歌词；节奏优先展示播放状态与节奏条。")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.58))
         }
     }
 
-    private var connectionSection: some View {
-        PreferencesCard(title: "连接", systemImage: "antenna.radiowaves.left.and.right") {
+    private var connectionAndSystemSection: some View {
+        PreferencesCard(title: "连接与系统", systemImage: "antenna.radiowaves.left.and.right") {
             Toggle("自动重连", isOn: autoReconnectBinding)
-                .tint(.green)
+                .tint(PlayerDesignTokens.stableAccent)
 
             preferencesRow("当前连接状态", displayConnectionState)
-            preferencesRow("Health 状态", bleManager.connectionHealthState)
-            preferencesRow(
-                "MTU",
-                bleManager.currentMtuBytesForPreferences > 0
-                    ? "\(bleManager.currentMtuBytesForPreferences)"
-                    : "-"
-            )
-            preferencesRow("最近重连原因", bleManager.connectionHealthLastHardReconnectReason)
 
             Text("关闭自动重连后，手动扫描 / 重连仍然可用。")
                 .font(.caption)
@@ -108,13 +147,20 @@ struct PreferencesView: View {
     private var lyricSection: some View {
         PreferencesCard(title: "歌词", systemImage: "text.quote") {
             VStack(alignment: .leading, spacing: 10) {
+                Toggle("自动同步歌词时间", isOn: automaticLyricSyncBinding)
+                    .tint(PlayerDesignTokens.stableAccent)
+
+                Text("自动补偿 Sony 与 iPhone 时钟差及蓝牙传输延迟")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.58))
+
                 HStack {
-                    Text("歌词偏移校准")
+                    Text("人工微调")
                         .font(.subheadline.weight(.semibold))
                     Spacer()
                     Text(offsetLabel(Int64(preferences.lyricOffsetMs)))
                         .font(.caption.monospacedDigit().weight(.bold))
-                        .foregroundStyle(.green)
+                        .foregroundStyle(PlayerDesignTokens.stableAccent)
                 }
 
                 Slider(
@@ -122,7 +168,7 @@ struct PreferencesView: View {
                     in: -2_000...2_000,
                     step: 100
                 )
-                .tint(.green)
+                .tint(PlayerDesignTokens.stableAccent)
             }
 
             Picker("歌词显示模式", selection: lyricDisplayModeBinding) {
@@ -138,7 +184,7 @@ struct PreferencesView: View {
         let enhancement = bleManager.artworkEnhancementStatus
         return PreferencesCard(title: "封面", systemImage: "photo.on.rectangle") {
             Toggle("封面增强", isOn: artworkEnhancementBinding)
-                .tint(.green)
+                .tint(PlayerDesignTokens.stableAccent)
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("封面显示尺寸")
@@ -157,16 +203,40 @@ struct PreferencesView: View {
         }
     }
 
-    private var cacheAndLogSection: some View {
-        PreferencesCard(title: "缓存与日志", systemImage: "externaldrive") {
+    private var playbackHistorySection: some View {
+        PreferencesCard(title: "播放历史", systemImage: "clock.arrow.circlepath") {
+            preferencesRow(
+                "本地记录",
+                "\(bleManager.playbackHistorySessions.count) 条"
+            )
+            actionButton("同步播放历史", "arrow.clockwise") {
+                guard !bleManager.isPlaybackHistorySyncing else { return }
+                bleManager.syncPlaybackHistory()
+                actionStatus = AppLocalization.string("已请求同步播放历史")
+            }
+            actionButton("清理增强封面缓存", "photo.badge.minus") {
+                bleManager.clearEnhancedArtworkCache()
+                actionStatus = AppLocalization.string("已请求清理增强封面缓存")
+            }
+        }
+    }
+
+    private var advancedSection: some View {
+        PreferencesCard(title: "高级与诊断", systemImage: "waveform.path.ecg.rectangle") {
+            Toggle("强制使用 V2 协议", isOn: forceProtocolV2Binding)
+                .tint(PlayerDesignTokens.warning)
+
+            Text("仅用于跨端 A/B 与紧急回退；切换后请重新连接。")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.58))
+
+            preferencesRow("Health 状态", bleManager.connectionHealthState)
+            preferencesRow("最近重连原因", bleManager.connectionHealthLastHardReconnectReason)
+
             VStack(spacing: 10) {
-                actionButton("清理增强封面缓存", "trash") {
-                    bleManager.clearEnhancedArtworkCache()
-                    actionStatus = "已请求清理增强封面缓存"
-                }
                 actionButton("复制最近日志路径", "doc.on.clipboard") {
                     UIPasteboard.general.string = AppLogStore.shared.currentLogURL.path
-                    actionStatus = "已复制日志路径"
+                    actionStatus = AppLocalization.string("已复制日志路径")
                 }
                 if AppLogStore.shared.currentLogFileExists() {
                     ShareLink(item: AppLogStore.shared.currentLogURL) {
@@ -181,7 +251,7 @@ struct PreferencesView: View {
                         nowPlaying: bleManager.makeNowPlayingDiagnosticSnapshot()
                     )
                     UIPasteboard.general.string = snapshot.copyText
-                    actionStatus = "已复制诊断摘要"
+                    actionStatus = AppLocalization.string("已复制诊断摘要")
                 }
             }
 
@@ -194,19 +264,19 @@ struct PreferencesView: View {
             if !actionStatus.isEmpty {
                 Text(actionStatus)
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(.green.opacity(0.9))
+                    .foregroundStyle(PlayerDesignTokens.stableAccent.opacity(0.9))
             }
         }
     }
 
     private var aboutSection: some View {
         PreferencesCard(title: "关于", systemImage: "info.circle") {
-            preferencesRow("App", "Sony Music BLE Controller")
+            preferencesRow("应用", "Sony 音乐控制器")
             preferencesRow("版本", appVersion)
-            preferencesRow("Build", buildVersion)
+            preferencesRow("构建版本", buildVersion)
             preferencesRow("签名有效期", signingProfileExpireText, valueColor: signingProfileStatusColor)
             preferencesRow("剩余时间", signingProfileRemainingText, valueColor: signingProfileStatusColor)
-            preferencesRow("签名 Team", signingProfile?.teamIdentifier ?? "-")
+            preferencesRow("签名团队", signingProfile?.teamIdentifier ?? "-")
             preferencesRow("当前模式", preferences.appExperienceMode.title)
             preferencesRow("连接设备", bleManager.connectedDeviceName == "-" ? "Sony" : bleManager.connectedDeviceName)
         }
@@ -219,6 +289,13 @@ struct PreferencesView: View {
         )
     }
 
+    private var appLanguageBinding: Binding<AppLanguage> {
+        Binding(
+            get: { preferences.appLanguage },
+            set: { preferences.appLanguage = $0 }
+        )
+    }
+
     private var autoReconnectBinding: Binding<Bool> {
         Binding(
             get: { preferences.autoReconnectEnabled },
@@ -226,10 +303,31 @@ struct PreferencesView: View {
         )
     }
 
+    private var performanceModeBinding: Binding<PlaybackPerformanceMode> {
+        Binding(
+            get: { preferences.playbackPerformanceMode },
+            set: { preferences.playbackPerformanceMode = $0 }
+        )
+    }
+
+    private var forceProtocolV2Binding: Binding<Bool> {
+        Binding(
+            get: { preferences.forceProtocolV2 },
+            set: { preferences.forceProtocolV2 = $0 }
+        )
+    }
+
     private var karaokeOffsetBinding: Binding<Double> {
         Binding(
             get: { Double(preferences.lyricOffsetMs) },
             set: { bleManager.setKaraokeOffsetMs(Int64($0)) }
+        )
+    }
+
+    private var automaticLyricSyncBinding: Binding<Bool> {
+        Binding(
+            get: { preferences.automaticLyricSyncEnabled },
+            set: { bleManager.setAutomaticLyricSyncEnabled($0) }
         )
     }
 
@@ -266,11 +364,15 @@ struct PreferencesView: View {
 
     private var displayConnectionState: String {
         switch bleManager.connectionDisplayState {
-        case "connected": return "已连接"
-        case "reconnecting": return "正在重连"
-        case "disconnected": return "未连接"
+        case "connected": return AppLocalization.string("已连接")
+        case "reconnecting": return AppLocalization.string("正在重连")
+        case "disconnected": return AppLocalization.string("未连接")
         default: return bleManager.connectionDisplayState
         }
+    }
+
+    private var connectionStatusColor: Color {
+        ConnectionStatusPresentation.resolve(bleManager.connectionStore.presentation).color
     }
 
     private var appVersion: String {
@@ -331,7 +433,7 @@ struct PreferencesView: View {
         valueColor: Color = .white.opacity(0.82)
     ) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text(title)
+            Text(AppLocalization.string(title))
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.white.opacity(0.52))
                 .frame(width: 96, alignment: .leading)
@@ -355,7 +457,7 @@ struct PreferencesView: View {
     }
 
     private func settingsActionLabel(_ title: String, _ systemImage: String) -> some View {
-        Label(title, systemImage: systemImage)
+        Label(AppLocalization.string(title), systemImage: systemImage)
             .font(.subheadline.weight(.semibold))
             .foregroundStyle(.white)
             .frame(maxWidth: .infinity)
@@ -417,7 +519,7 @@ private struct PreferencesCard<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 13) {
-            Label(title, systemImage: systemImage)
+            Label(AppLocalization.string(title), systemImage: systemImage)
                 .font(.headline.weight(.bold))
 
             content

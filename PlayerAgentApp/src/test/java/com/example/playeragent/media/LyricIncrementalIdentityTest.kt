@@ -41,4 +41,28 @@ class LyricIncrementalIdentityTest {
             )
         )
     }
+
+    @Test
+    fun `runtime track can seed an empty lyric manager`() {
+        assertTrue(
+            canAdoptIncrementalLyricTrack(
+                activeSongKey = null,
+                activeTrackId = "",
+                snapshotSongKey = "末班车|赵乃吉|末班车",
+                snapshotTrackId = "track-1"
+            )
+        )
+    }
+
+    @Test
+    fun `runtime track never replaces an established active song`() {
+        assertFalse(
+            canAdoptIncrementalLyricTrack(
+                activeSongKey = "当前歌曲|歌手|专辑",
+                activeTrackId = "track-2",
+                snapshotSongKey = "末班车|赵乃吉|末班车",
+                snapshotTrackId = "track-1"
+            )
+        )
+    }
 }

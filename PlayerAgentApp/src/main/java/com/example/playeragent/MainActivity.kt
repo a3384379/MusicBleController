@@ -6,6 +6,7 @@ import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -25,7 +26,6 @@ import android.widget.Button
 import android.widget.GridLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import com.example.playeragent.ble.ControllerScannerManager
 import com.example.playeragent.ble.BleHealthState
@@ -57,11 +57,23 @@ import com.example.playeragent.media.QrcV2RebuildProgress
 import com.example.playeragent.media.QrcV2RebuildStatus
 import com.example.playeragent.media.QrcWatcherStatus
 import com.example.playeragent.service.PlayerAgentForegroundService
+import com.example.playeragent.service.PlayerNotificationListenerService
 import com.example.playeragent.service.QQMusicLyricAccessibilityService
+import com.example.playeragent.ui.SonyPlayerUiState
+import com.example.playeragent.ui.PlayerLogAdapter
+import com.example.playeragent.ui.PlayerAgentNavigationView
+import com.example.playeragent.ui.PlayerAgentProductUiState
+import com.example.playeragent.ui.PlayerAgentUiInputs
+import com.example.playeragent.ui.PlayerAgentUiStateMapper
+import com.example.playeragent.ui.SafeRepairAction
+import com.example.playeragent.ui.SetupAction
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import java.text.SimpleDateFormat
 import java.security.MessageDigest
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
 
@@ -69,9 +81,11 @@ class MainActivity : Activity() {
     private lateinit var bleStatusTextView: TextView
     private lateinit var accessibilityStatusTextView: TextView
     private lateinit var currentSongTextView: TextView
+    private lateinit var currentArtistAlbumTextView: TextView
     private lateinit var currentLyricTextView: TextView
     private lateinit var currentAlbumArtImageView: ImageView
     private lateinit var currentAlbumArtTextView: TextView
+    private lateinit var suggestedActionButton: Button
     private lateinit var artworkDiscoveryStatusTextView: TextView
     private lateinit var qrcCacheBuildTextView: TextView
     private lateinit var qrcStaleCacheRebuildTextView: TextView
@@ -80,8 +94,8 @@ class MainActivity : Activity() {
     private lateinit var qrcCacheOverviewTextView: TextView
     private lateinit var maintenanceStatusTextView: TextView
     private lateinit var historyStatusTextView: TextView
-    private lateinit var logTextView: TextView
-    private lateinit var logScrollView: ScrollView
+    private lateinit var logRecyclerView: RecyclerView
+    private lateinit var logAdapter: PlayerLogAdapter
     private lateinit var logSectionBody: LinearLayout
     private lateinit var buildTaskStatusTextView: TextView
     private lateinit var buildTaskBadgeTextView: TextView
@@ -99,6 +113,8 @@ class MainActivity : Activity() {
     private lateinit var currentTrackDebugStatusTextView: TextView
     private lateinit var currentTrackBadgeTextView: TextView
     private lateinit var maintenanceSummaryTextView: TextView
+    private lateinit var productNavigationView: PlayerAgentNavigationView
+    private var lastProductUiState: PlayerAgentProductUiState? = null
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var controllerScannerManager: ControllerScannerManager? = null
     private var rfcommClientManager: RfcommClientManager? = null
@@ -110,6 +126,29 @@ class MainActivity : Activity() {
     private var qrcStaleCacheRebuildManager: QrcStaleCacheRebuildManager? = null
     private var lyricWarmupManager: LyricWarmupManager? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val uiMediaExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "PlayerAgent-UiMediaIO")
+    }
+    private val qqMusicArtworkListener: (String) -> Unit = { event ->
+        mainHandler.post {
+            if (!::currentAlbumArtImageView.isInitialized) {
+                return@post
+            }
+            val playback = lastSonyPlayerUiState.playback
+            if (lastPlayerUiSongKey.isBlank() ||
+                playback.title.isBlank() ||
+                playback.title == "-"
+            ) {
+                return@post
+            }
+            appendLog("[PlayerUI] artwork source event=$event")
+            refreshCurrentAlbumArtForSong(
+                songKey = lastPlayerUiSongKey,
+                expectedTitle = playback.title,
+                expectedArtist = playback.artist.takeUnless { it == "-" }.orEmpty()
+            )
+        }
+    }
     @Volatile private var debugStatsLoading = false
     @Volatile private var lastDebugStatsLoadAt = 0L
     private var debugStatsLoadRunnable: Runnable? = null
@@ -117,6 +156,7 @@ class MainActivity : Activity() {
     private var lastPlayerUiLyric: String = ""
     private var lastPlayerUiLyricStatus: String = ""
     private var lastPlayerUiAlbumArtStatus: String = "未检测"
+    private var lastSonyPlayerUiState = SonyPlayerUiState()
     private var albumArtRefreshGeneration = 0L
     private var controlServiceStatusRefreshRunnable: Runnable? = null
     private var lastQrcV2BuildProgress = QrcV2RebuildProgress()
@@ -202,7 +242,6 @@ class MainActivity : Activity() {
         refreshControlServiceStatus()
         appendLog("[PlayerAgent] UI ready")
         appendLog("[UI] first lightweight render ready costMs=${System.currentTimeMillis() - startedAt}")
-        scheduleDebugStatsLoad()
         refreshCurrentMedia()
     }
 
@@ -218,6 +257,12 @@ class MainActivity : Activity() {
         } else {
             registerReceiver(logReceiver, filter)
         }
+        PlayerNotificationListenerService.removeQqMusicArtworkListener(
+            qqMusicArtworkListener
+        )
+        PlayerNotificationListenerService.addQqMusicArtworkListener(
+            qqMusicArtworkListener
+        )
         refreshControlServiceStatus()
     }
 
@@ -235,6 +280,9 @@ class MainActivity : Activity() {
     override fun onStop() {
         super.onStop()
         stopControlServiceStatusRefresh()
+        PlayerNotificationListenerService.removeQqMusicArtworkListener(
+            qqMusicArtworkListener
+        )
         unregisterReceiver(logReceiver)
     }
 
@@ -244,6 +292,7 @@ class MainActivity : Activity() {
         artworkDiscoveryManager?.shutdown()
         controllerScannerManager?.stopScan()
         rfcommClientManager?.close()
+        uiMediaExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -270,122 +319,147 @@ class MainActivity : Activity() {
     }
 
     private fun setupUi() {
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.rgb(18, 18, 20))
-            setPadding(dp(20), dp(24), dp(20), dp(32))
-        }
-
-        content.addView(TextView(this).apply {
-            text = "PlayerAgent"
-            textSize = 26f
-            setTextColor(Color.WHITE)
-            setPadding(0, 0, 0, dp(2))
-        })
-        content.addView(TextView(this).apply {
-            text = "索尼音乐播放器控制服务"
-            textSize = 14f
-            setTextColor(Color.rgb(165, 170, 178))
-            setPadding(0, 0, 0, dp(14))
-        })
-
-        val serviceCard = collapsibleCard(content, "服务状态", expanded = true)
-        statusTextView = statusValue("Service：未启动")
-        serviceCard.addView(statusTextView)
-        bleStatusTextView = statusValue("BLE：未启动")
-        serviceCard.addView(bleStatusTextView)
-        accessibilityStatusTextView = statusValue("通知读取权限：未知")
-        serviceCard.addView(accessibilityStatusTextView)
-        serviceCard.addView(buttonGrid(listOf(
-            "启动控制服务" to ::startPlayerAgentService,
-            "停止控制服务" to ::stopPlayerAgentService,
-            "恢复蓝牙服务" to ::recoverBleStack,
-            "打开通知读取权限" to ::openNotificationAccessSettings,
-            "打开无障碍设置" to ::openAccessibilitySettings
-        )))
-
-        val playerCard = collapsibleCard(content, "当前播放", expanded = true)
-        currentAlbumArtImageView = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            background = roundedBackground(Color.rgb(42, 44, 50), dp(16))
-            setImageResource(android.R.drawable.ic_media_play)
-        }
-        playerCard.addView(
-            currentAlbumArtImageView,
-            LinearLayout.LayoutParams(dp(150), dp(150)).apply {
-                gravity = Gravity.CENTER_HORIZONTAL
-                bottomMargin = dp(10)
-            }
+        productNavigationView = PlayerAgentNavigationView(
+            context = this,
+            onSetupAction = ::handleSetupAction,
+            onSafeRepair = ::performSafeRepair,
+            onRelinkLyrics = ::refreshCurrentLyric
         )
-        currentAlbumArtTextView = statusValue("封面：未检测").also(playerCard::addView)
-        currentSongTextView = statusValue("歌曲：未检测").also(playerCard::addView)
-        currentLyricTextView = statusValue("当前歌词：暂无歌词").also(playerCard::addView)
+        val views = productNavigationView.build()
+        currentAlbumArtImageView = views.currentAlbumArt
+        currentAlbumArtTextView = views.currentAlbumArtStatus
+        currentSongTextView = views.currentSong
+        currentArtistAlbumTextView = views.currentArtistAlbum
+        currentLyricTextView = views.currentLyric
+        suggestedActionButton = views.suggestedAction
+        accessibilityStatusTextView = views.accessibilityStatus
 
-        val historyCard = collapsibleCard(content, "播放历史与收听统计", expanded = false)
-        historyStatusTextView = statusValue("播放历史：未刷新").also(historyCard::addView)
-        historyCard.addView(buttonGrid(listOf(
-            "刷新历史状态" to ::refreshHistoryStatus,
-            "显示最近 10 条" to ::showRecentHistory,
-            "显示今日统计" to ::showTodayHistoryStats,
-            "清空播放历史" to { confirmAction("清空 Sony 本地播放历史？", ::clearPlayHistory) }
-        )))
-
-        val lyricCard = collapsibleCard(content, "歌词缓存与逐字时间", expanded = false)
-        setupMaintenancePanel(lyricCard)
-
-        val connectionCard = collapsibleCard(content, "连接与兼容", expanded = false)
-        connectionCard.addView(buttonGrid(listOf(
+        statusTextView = statusValue("Service：未启动").also(views.linkHost::addView)
+        bleStatusTextView = statusValue("BLE：未启动").also(views.linkHost::addView)
+        views.linkHost.addView(buttonGrid(listOf(
+            "启动服务" to ::startPlayerAgentService,
+            "恢复 BLE" to ::recoverBleStack,
             "扫描控制端" to ::startControllerScan,
-            "连接经典蓝牙控制端" to ::connectRfcommServer,
-            "恢复蓝牙服务" to ::recoverBleStack,
-            "启动 QRC 监听器" to ::startQrcWatcher,
-            "停止 QRC 监听器" to ::stopQrcWatcher
+            "经典蓝牙兼容" to ::connectRfcommServer,
+            "通知读取权限" to ::openNotificationAccessSettings
         )))
 
-        val mediaCard = collapsibleCard(content, "媒体诊断", expanded = false)
+        views.lyricsHost.addView(buttonGrid(listOf(
+                "扫描歌词文件" to ::scanLrcFiles,
+                "检测歌词来源" to ::testLyricSource,
+                "测试当前歌词" to ::testCurrentLyric,
+                "歌词解析诊断" to ::testLrcDebug,
+                "解析首个 QRC" to ::dumpFirstQrc,
+                "启动 QRC 监听" to ::startQrcWatcher,
+                "停止 QRC 监听" to ::stopQrcWatcher,
+                "无障碍诊断" to ::dumpAccessibilityTree,
+                "打开无障碍设置" to ::openAccessibilitySettings
+        )))
+        setupMaintenancePanel(views.lyricsHost)
+        scheduleDebugStatsLoad()
+
         artworkDiscoveryStatusTextView = statusValue(
             ArtworkDiscoveryStatus().displayText()
-        ).also(mediaCard::addView)
-        mediaCard.addView(buttonGrid(listOf(
-            "扫描歌词文件" to ::scanLrcFiles,
+        ).also(views.artworkHost::addView)
+        views.artworkHost.addView(buttonGrid(listOf(
             "测试当前封面" to ::testAlbumArt,
             "发现高清封面" to ::discoverHqArtwork,
-            "停止封面发现" to ::stopArtworkDiscovery,
-            "检测歌词来源" to ::testLyricSource,
-            "测试当前歌词" to ::testCurrentLyric,
-            "歌词解析诊断" to ::testLrcDebug,
-            "解析首个 QRC 文件" to ::dumpFirstQrc,
-            "无障碍节点诊断" to ::dumpAccessibilityTree,
-            "刷新歌词统计" to ::refreshLyricStats,
-            "重置歌词统计" to ::resetLyricStats
+            "停止封面发现" to ::stopArtworkDiscovery
         )))
 
-        logSectionBody = collapsibleCard(content, "日志", expanded = false)
-        logSectionBody.addView(buttonGrid(listOf(
+        historyStatusTextView = statusValue("播放历史：进入后按需加载")
+            .also(views.logsHost::addView)
+        views.logsHost.addView(buttonGrid(listOf(
+            "刷新历史" to ::refreshHistoryStatus,
+            "最近 10 条" to ::showRecentHistory,
+            "今日统计" to ::showTodayHistoryStats,
+            "清空历史" to { confirmAction("清空 Sony 本地播放历史？", ::clearPlayHistory) }
+        )))
+        logSectionBody = views.logsHost
+        views.logsHost.addView(buttonGrid(listOf(
             "显示/隐藏日志" to ::toggleLogs,
             "导出日志" to ::exportLog,
             "清空日志" to ::clearLog
         )))
-        logTextView = TextView(this).apply {
-            textSize = 12f
-            setTextColor(Color.rgb(215, 218, 224))
-            setTextIsSelectable(true)
-            setPadding(dp(10), dp(10), dp(10), dp(10))
+        logAdapter = PlayerLogAdapter().apply {
+            replace(LogBuffer.getRecentLogs(PlayerLogAdapter.MAX_ROWS))
         }
-        logScrollView = ScrollView(this).apply {
+        logRecyclerView = RecyclerView(this).apply {
             visibility = View.GONE
-            background = roundedBackground(Color.rgb(24, 25, 29), dp(12))
-            addView(logTextView)
+            background = roundedBackground(Color.rgb(24, 34, 48), dp(12))
+            layoutManager = LinearLayoutManager(this@MainActivity)
+            adapter = logAdapter
+            setHasFixedSize(true)
         }
-        logSectionBody.addView(
-            logScrollView,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(260)
+        views.logsHost.addView(logRecyclerView, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(260)
+        ))
+
+        setContentView(views.root)
+        refreshProductUi()
+    }
+
+    private fun refreshProductUi() {
+        if (!::productNavigationView.isInitialized) return
+        val snapshot = PlayerAgentForegroundService.bleHealthSnapshot()
+        val state = PlayerAgentUiStateMapper.map(
+            PlayerAgentUiInputs(
+                healthState = snapshot.healthState,
+                serviceRunning = PlayerAgentForegroundService.isRunning(),
+                notificationAccess = hasNotificationAccess(),
+                fileAccess = hasLyricStorageAccess(),
+                accessibilityEnabled = QQMusicLyricAccessibilityService.isEnabled(this),
+                runtimePermissions = hasRequiredPermissions(),
+                hasPlayback = lastPlayerUiSongKey.isNotBlank(),
+                lyricStatus = lastPlayerUiLyricStatus,
+                artworkStatus = lastPlayerUiAlbumArtStatus
             )
         )
+        lastProductUiState = state
+        productNavigationView.render(state)
+    }
 
-        setContentView(ScrollView(this).apply { addView(content) })
+    private fun handleSetupAction(action: SetupAction) {
+        when (action) {
+            SetupAction.NONE -> Unit
+            SetupAction.OPEN_NOTIFICATION_ACCESS -> openNotificationAccessSettings()
+            SetupAction.OPEN_FILE_ACCESS -> ensureLyricStorageAccess()
+            SetupAction.OPEN_ACCESSIBILITY -> openAccessibilitySettings()
+            SetupAction.REQUEST_RUNTIME_PERMISSIONS -> ensureRequiredPermissions()
+            SetupAction.START_SERVICE -> startPlayerAgentService()
+        }
+    }
+
+    private fun performSafeRepair() {
+        refreshProductUi()
+        when (lastProductUiState?.safeRepairActions?.firstOrNull()) {
+            SafeRepairAction.REQUEST_RUNTIME_PERMISSIONS -> ensureRequiredPermissions()
+            SafeRepairAction.OPEN_NOTIFICATION_ACCESS -> openNotificationAccessSettings()
+            SafeRepairAction.OPEN_FILE_ACCESS -> ensureLyricStorageAccess()
+            SafeRepairAction.OPEN_ACCESSIBILITY -> openAccessibilitySettings()
+            SafeRepairAction.START_SERVICE -> startPlayerAgentService()
+            SafeRepairAction.RECOVER_BLE -> recoverBleStack()
+            null -> appendLog("[ProductUI] safe repair check complete; no action needed")
+        }
+    }
+
+    private fun hasNotificationAccess(): Boolean {
+        val listeners = Settings.Secure.getString(
+            contentResolver,
+            "enabled_notification_listeners"
+        ).orEmpty()
+        return listeners.split(':')
+            .mapNotNull(ComponentName::unflattenFromString)
+            .any { it.packageName == packageName }
+    }
+
+    private fun hasLyricStorageAccess(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) ==
+                PackageManager.PERMISSION_GRANTED
+        }
     }
 
     private fun setupMaintenancePanel(parent: LinearLayout) {
@@ -858,45 +932,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun collapsibleCard(
-        parent: LinearLayout,
-        title: String,
-        expanded: Boolean
-    ): LinearLayout {
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = roundedBackground(Color.rgb(30, 31, 36), dp(18))
-            setPadding(dp(14), dp(12), dp(14), dp(14))
-        }
-        val body = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = if (expanded) View.VISIBLE else View.GONE
-        }
-        val header = TextView(this).apply {
-            text = if (expanded) "▼ $title" else "▶ $title"
-            textSize = 17f
-            setTextColor(Color.WHITE)
-            setPadding(0, 0, 0, dp(10))
-            setOnClickListener {
-                val nowExpanded = body.visibility != View.VISIBLE
-                body.visibility = if (nowExpanded) View.VISIBLE else View.GONE
-                text = if (nowExpanded) "▼ $title" else "▶ $title"
-            }
-        }
-        card.addView(header)
-        card.addView(body)
-        parent.addView(
-            card,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                bottomMargin = dp(12)
-            }
-        )
-        return body
-    }
-
     private fun buttonGrid(items: List<Pair<String, () -> Unit>>): GridLayout {
         return GridLayout(this).apply {
             columnCount = 2
@@ -1017,6 +1052,7 @@ class MainActivity : Activity() {
         val serviceRunning = PlayerAgentForegroundService.isRunning()
         setControlServiceStatus(if (serviceRunning) "运行中" else "未启动")
         setBleStatus(PlayerAgentForegroundService.bleHealthSnapshot())
+        refreshProductUi()
     }
 
     private fun setControlServiceStatus(status: String) {
@@ -1066,7 +1102,7 @@ class MainActivity : Activity() {
     }
 
     private fun refreshCurrentMedia() {
-        Thread {
+        uiMediaExecutor.execute {
             val state = try {
                 PlaybackStateReader(
                     context = this,
@@ -1080,45 +1116,35 @@ class MainActivity : Activity() {
                 null
             }
 
-            val albumArt = try {
-                AlbumArtTestManager(
-                    context = this,
-                    logger = ::appendThreadSafeLog
-                ).readCurrentNotificationAlbumArt()
-            } catch (_: Exception) {
-                null
-            }
-
             runOnUiThread {
                 if (state != null) {
+                    val title = state.optString("title")
+                    val artist = state.optString("artist")
+                    val album = state.optString("album")
+                    val songKey = playerUiSongKey(title, artist, album)
+                    val songChanged = songKey != lastPlayerUiSongKey
                     renderPlayerUiState(
-                        title = state.optString("title"),
-                        artist = state.optString("artist"),
-                        album = state.optString("album"),
+                        title = title,
+                        artist = artist,
+                        album = album,
                         lyric = state.optString("lyric"),
                         positionMs = state.optLong("position"),
                         durationMs = state.optLong("duration"),
                         allowAlbumArtRefresh = false
                     )
-                }
-
-                if (albumArt != null) {
-                    lastPlayerUiAlbumArtStatus =
-                        "READY ${albumArt.bitmap.width}x${albumArt.bitmap.height}"
-                    currentAlbumArtImageView.setImageBitmap(albumArt.bitmap)
-                    currentAlbumArtTextView.text =
-                        "封面：${albumArt.bitmap.width} x ${albumArt.bitmap.height}"
-                } else {
-                    lastPlayerUiAlbumArtStatus = "SOURCE_NOT_PROVIDED"
-                    currentAlbumArtImageView
-                        .setImageResource(android.R.drawable.ic_media_play)
-                    currentAlbumArtTextView.text = "封面：未找到"
+                    if (songChanged) {
+                        showAlbumArtLoading()
+                    }
+                    if (title.isNotBlank()) {
+                        refreshCurrentAlbumArtForSong(
+                            songKey = songKey,
+                            expectedTitle = title,
+                            expectedArtist = artist
+                        )
+                    }
                 }
                 refreshMaintenanceUiState()
             }
-        }.apply {
-            name = "MainStatusRefreshThread"
-            start()
         }
     }
 
@@ -1160,8 +1186,21 @@ class MainActivity : Activity() {
         val safeTitle = title.ifBlank { "-" }
         val safeArtist = artist.ifBlank { "-" }
         val safeAlbum = album.ifBlank { "-" }
-        val songKey = "$safeTitle|$safeArtist|$safeAlbum"
+        val songKey = playerUiSongKey(title, artist, album)
         val songChanged = songKey != lastPlayerUiSongKey
+        val lyricText = lyric.ifBlank { "暂无歌词" }
+        val rawStatus = lyricStatus.ifBlank { "unknown" }
+        val nextUiState = lastSonyPlayerUiState.copy(
+            playback = SonyPlayerUiState.PlaybackState(
+                title = safeTitle,
+                artist = safeArtist,
+                album = safeAlbum
+            ),
+            lyrics = SonyPlayerUiState.LyricsState(
+                text = lyricText,
+                rawStatus = rawStatus
+            )
+        )
         if (songChanged) {
             lastPlayerUiSongKey = songKey
             appendLog(
@@ -1169,39 +1208,74 @@ class MainActivity : Activity() {
                     "artist=$safeArtist album=$safeAlbum"
             )
             if (allowAlbumArtRefresh) {
-                lastPlayerUiAlbumArtStatus = "LOADING"
-                currentAlbumArtImageView.setImageResource(android.R.drawable.ic_media_play)
-                    currentAlbumArtTextView.text = "封面：加载中..."
-                refreshCurrentAlbumArtForSong(songKey)
+                showAlbumArtLoading()
+                if (title.isNotBlank()) {
+                    refreshCurrentAlbumArtForSong(
+                        songKey = songKey,
+                        expectedTitle = title,
+                        expectedArtist = artist
+                    )
+                }
             }
         }
 
-        currentSongTextView.text = "歌曲名：$safeTitle\n歌手：$safeArtist\n专辑：$safeAlbum"
-            .replace("歌曲名：-\n歌手：-\n专辑：-", "歌曲：未检测")
-        val lyricText = lyric.ifBlank { "暂无歌词" }
-        val statusText = lyricStatus.ifBlank { "unknown" }
-        lastPlayerUiLyricStatus = statusText
-        val hint = if (statusText == "waiting QQMusic lyric cache") {
-            "\n提示：QQ音乐可能尚未生成歌词缓存，可在 QQ音乐中打开歌词/桌面歌词后稍等。"
-        } else {
-            ""
+        if (nextUiState.playback != lastSonyPlayerUiState.playback) {
+            val hasPlayback = safeTitle != "-" || safeArtist != "-" || safeAlbum != "-"
+            currentSongTextView.text = if (hasPlayback) {
+                safeTitle
+            } else {
+                getString(R.string.home_no_playback)
+            }
+            currentArtistAlbumTextView.text = if (hasPlayback) {
+                getString(R.string.home_artist_album, safeArtist, safeAlbum)
+            } else {
+                ""
+            }
         }
-        currentLyricTextView.text = "当前歌词：$lyricText\nLyric status：$statusText$hint"
-        if (lyricText != lastPlayerUiLyric) {
+        if (nextUiState.lyrics != lastSonyPlayerUiState.lyrics) {
+            lastPlayerUiLyricStatus = rawStatus
+            currentLyricTextView.text =
+                "当前歌词：$lyricText\n${nextUiState.lyrics.displayStatus}"
+            suggestedActionButton.visibility = if (nextUiState.lyrics.needsRelink) {
+                View.VISIBLE
+            } else {
+                View.GONE
+            }
+        }
+        if (lyricText != lastPlayerUiLyric && lyricText != "暂无歌词") {
             lastPlayerUiLyric = lyricText
             appendLog("[PlayerUI] lyric changed text=$lyricText")
         }
-        refreshMaintenanceUiState()
+        lastSonyPlayerUiState = nextUiState
+        refreshProductUi()
+        if (songChanged) refreshMaintenanceUiState()
     }
 
-    private fun refreshCurrentAlbumArtForSong(songKey: String) {
+    private fun playerUiSongKey(title: String, artist: String, album: String): String {
+        return "${title.ifBlank { "-" }}|${artist.ifBlank { "-" }}|${album.ifBlank { "-" }}"
+    }
+
+    private fun showAlbumArtLoading() {
+        lastPlayerUiAlbumArtStatus = "LOADING"
+        currentAlbumArtImageView.setImageResource(android.R.drawable.ic_media_play)
+        currentAlbumArtTextView.text = "封面：加载中..."
+    }
+
+    private fun refreshCurrentAlbumArtForSong(
+        songKey: String,
+        expectedTitle: String,
+        expectedArtist: String
+    ) {
         val generation = ++albumArtRefreshGeneration
-        Thread {
+        uiMediaExecutor.execute {
             val albumArt = try {
                 AlbumArtTestManager(
                     context = this,
                     logger = ::appendThreadSafeLog
-                ).readCurrentNotificationAlbumArt()
+                ).readCurrentNotificationAlbumArt(
+                    expectedTitle = expectedTitle,
+                    expectedArtist = expectedArtist
+                )
             } catch (exception: Exception) {
                 appendThreadSafeLog(
                     "[PlayerUI] album art refresh failed=${exception.message}"
@@ -1223,9 +1297,15 @@ class MainActivity : Activity() {
                     appendLog(
                         "[PlayerUI] album art changed exists=true " +
                             "width=${albumArt.bitmap.width} " +
-                            "height=${albumArt.bitmap.height}"
+                        "height=${albumArt.bitmap.height}"
                     )
                 } else {
+                    if (lastPlayerUiAlbumArtStatus.startsWith("READY")) {
+                        appendLog(
+                            "[PlayerUI] album art retained reason=transient_exact_source_miss"
+                        )
+                        return@runOnUiThread
+                    }
                     lastPlayerUiAlbumArtStatus = "SOURCE_NOT_PROVIDED"
                     currentAlbumArtImageView
                         .setImageResource(android.R.drawable.ic_media_play)
@@ -1233,10 +1313,8 @@ class MainActivity : Activity() {
                     appendLog("[PlayerUI] album art changed exists=false")
                 }
                 refreshMaintenanceUiState()
+                refreshProductUi()
             }
-        }.apply {
-            name = "MainAlbumArtRefreshThread"
-            start()
         }
     }
 
@@ -1482,7 +1560,10 @@ class MainActivity : Activity() {
                 val albumArt = AlbumArtTestManager(
                     this,
                     ::appendThreadSafeLog
-                ).readCurrentNotificationAlbumArt()
+                ).readCurrentNotificationAlbumArt(
+                    expectedTitle = title,
+                    expectedArtist = artist
+                )
                 if (albumArt == null) {
                     appendThreadSafeLog("[ArtworkDiscovery] skipped reason=no notification artwork")
                     return@Thread
@@ -2032,10 +2113,14 @@ class MainActivity : Activity() {
     }
 
     private fun toggleLogs() {
-        logScrollView.visibility = if (logScrollView.visibility == View.VISIBLE) {
-            View.GONE
-        } else {
+        val show = logRecyclerView.visibility != View.VISIBLE
+        logRecyclerView.visibility = if (show) {
+            val logs = LogBuffer.getRecentLogs(PlayerLogAdapter.MAX_ROWS)
+            logAdapter.replace(logs)
+            if (logs.isNotEmpty()) logRecyclerView.scrollToPosition(logs.lastIndex)
             View.VISIBLE
+        } else {
+            View.GONE
         }
     }
 
@@ -2087,6 +2172,7 @@ class MainActivity : Activity() {
             enabled -> "通知读取权限：无障碍已授权，等待连接"
             else -> "通知读取权限：未授权"
         }
+        refreshProductUi()
     }
 
     private fun ensureLyricStorageAccess(): Boolean {
@@ -2136,7 +2222,7 @@ class MainActivity : Activity() {
 
     private fun clearLog() {
         LogBuffer.clear()
-        logTextView.text = ""
+        if (::logAdapter.isInitialized) logAdapter.replace(emptyList())
         appendLog("[PlayerAgent] Log cleared")
     }
 
@@ -2175,6 +2261,7 @@ class MainActivity : Activity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_PERMISSIONS) {
             maybeAutoStartControlService("permissions_result")
+            refreshProductUi()
         }
     }
 
@@ -2201,13 +2288,17 @@ class MainActivity : Activity() {
         if (storeInBuffer) {
             LogBuffer.append(message)
         }
-        if (!::logTextView.isInitialized || !::logScrollView.isInitialized) {
+        if (!::logRecyclerView.isInitialized || !::logAdapter.isInitialized) {
             android.util.Log.i("PlayerAgent", message)
             return
         }
-        logTextView.append("$message\n")
-        logScrollView.post {
-            logScrollView.fullScroll(View.FOCUS_DOWN)
+        if (logRecyclerView.visibility != View.VISIBLE) {
+            return
+        }
+        val logs = LogBuffer.getRecentLogs(PlayerLogAdapter.MAX_ROWS)
+        logAdapter.replace(logs)
+        logRecyclerView.post {
+            if (logs.isNotEmpty()) logRecyclerView.scrollToPosition(logs.lastIndex)
         }
     }
 

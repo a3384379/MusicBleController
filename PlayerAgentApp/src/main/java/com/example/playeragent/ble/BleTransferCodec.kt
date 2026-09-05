@@ -70,4 +70,26 @@ object BleTransferCodec {
             valid
         }
     }
+
+    /**
+     * Validates a retained transfer against the authoritative media identity.
+     *
+     * Album-art state must never participate in this decision: a song can have
+     * valid lyrics while artwork is unavailable, delayed, or disabled.
+     */
+    fun isCurrentTransfer(
+        transferTrackId: String,
+        transferGeneration: Long,
+        currentTrackId: String,
+        currentGeneration: Long,
+        trackIdsMatch: (String, String) -> Boolean = { left, right -> left == right }
+    ): Boolean {
+        if (transferTrackId.isBlank() || currentTrackId.isBlank()) {
+            return false
+        }
+        val generationMatches = transferGeneration <= 0L ||
+            currentGeneration <= 0L ||
+            transferGeneration == currentGeneration
+        return generationMatches && trackIdsMatch(transferTrackId, currentTrackId)
+    }
 }

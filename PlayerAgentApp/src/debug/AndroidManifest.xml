@@ -10,6 +10,7 @@
                 <action android:name="com.example.playeragent.debug.STOP_BLE_SERVICE" />
                 <action android:name="com.example.playeragent.debug.RECOVER_BLE_STACK" />
                 <action android:name="com.example.playeragent.debug.DUMP_BLE_DIAGNOSTICS" />
+                <action android:name="com.example.playeragent.debug.REFRESH_CURRENT_LYRIC" />
             </intent-filter>
         </receiver>
         <receiver

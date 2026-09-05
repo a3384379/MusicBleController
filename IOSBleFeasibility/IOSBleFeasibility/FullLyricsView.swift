@@ -6,8 +6,11 @@ struct FullLyricsView: View {
     let artist: String
     let albumArtImage: UIImage?
     let lyrics: [LyricLine]
+    let lyricsIdentity: String
     let currentIndex: Int
     let positionMs: Int64
+    let translationState: LyricSecondaryLoadState
+    let romanizationState: LyricSecondaryLoadState
     let isPlaying: Bool
     let isConnected: Bool
     let onDismiss: () -> Void
@@ -18,12 +21,13 @@ struct FullLyricsView: View {
     var showDiagnosticButton = true
     let onShowDiagnostic: () -> Void
 
-    @State private var isBrowsingLyrics = false
-    @State private var selectedLyricIndex: Int?
+    @State private var followState = FullLyricsFollowState()
     @State private var lastAutoScrolledIndex: Int?
     @State private var isProgrammaticScroll = false
-    @State private var browseResetWorkItem: DispatchWorkItem?
     @ObservedObject private var preferences = PreferencesStore.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var isBrowsingLyrics: Bool { followState.showsReturnToCurrent }
 
     var body: some View {
         ZStack {
@@ -68,11 +72,51 @@ struct FullLyricsView: View {
         guard !lyrics.isEmpty else { return nil }
         switch displayMode {
         case .originalTranslation:
-            return hasAnyTranslation ? nil : "该歌曲暂无翻译"
+            return secondaryMessage(
+                state: translationState,
+                hasContent: hasAnyTranslation,
+                title: "翻译"
+            )
         case .originalRomanization:
-            return hasAnyRomanization ? nil : "该歌曲暂无罗马音"
-        case .original, .originalTranslationRomanization:
+            return secondaryMessage(
+                state: romanizationState,
+                hasContent: hasAnyRomanization,
+                title: "罗马音"
+            )
+        case .originalTranslationRomanization:
+            return [
+                secondaryMessage(
+                    state: translationState,
+                    hasContent: hasAnyTranslation,
+                    title: "翻译"
+                ),
+                secondaryMessage(
+                    state: romanizationState,
+                    hasContent: hasAnyRomanization,
+                    title: "罗马音"
+                )
+            ]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+            .nilIfEmpty
+        case .original:
             return nil
+        }
+    }
+
+    private func secondaryMessage(
+        state: LyricSecondaryLoadState,
+        hasContent: Bool,
+        title: String
+    ) -> String? {
+        guard !hasContent else { return nil }
+        switch state {
+        case .idle, .loading:
+            return "正在获取\(title)…"
+        case .ready, .unavailable:
+            return "该歌曲暂无\(title)"
+        case .failed:
+            return "\(title)获取失败，可稍后切换模式重试"
         }
     }
 
@@ -133,19 +177,9 @@ struct FullLyricsView: View {
                             if lyrics.isEmpty {
                                 emptyLyricsView
                             } else {
-                                ForEach(Array(lyrics.enumerated()), id: \.element.id) { index, line in
-                                    lyricRow(index: index, line: line)
+                                ForEach(lyrics) { line in
+                                    lyricRow(index: line.index, line: line)
                                         .id(line.id)
-                                        .background(
-                                            GeometryReader { rowProxy in
-                                                Color.clear.preference(
-                                                    key: LyricLineCenterPreferenceKey.self,
-                                                    value: [
-                                                        index: rowProxy.frame(in: .named("lyricsScroll")).midY
-                                                    ]
-                                                )
-                                            }
-                                        )
                                 }
                             }
                             Color.clear
@@ -153,22 +187,12 @@ struct FullLyricsView: View {
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .coordinateSpace(name: "lyricsScroll")
                     .simultaneousGesture(
                         DragGesture(minimumDistance: 8)
                             .onChanged { _ in
                                 enterBrowseMode()
                             }
-                            .onEnded { _ in
-                                scheduleFollowModeRestore(proxy)
-                            }
                     )
-                    .onPreferenceChange(LyricLineCenterPreferenceKey.self) { centers in
-                        updateSelectedLine(
-                            centers: centers,
-                            viewportCenterY: viewport.size.height / 2
-                        )
-                    }
 
                     if isBrowsingLyrics, !lyrics.isEmpty {
                         Button {
@@ -195,9 +219,9 @@ struct FullLyricsView: View {
                     guard !isBrowsingLyrics else { return }
                     scrollToCurrent(proxy)
                 }
-                .onChange(of: lyrics) { _, _ in
+                .onChange(of: lyricsIdentity) { _, _ in
                     resetBrowseState()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    DispatchQueue.main.async {
                         scrollToCurrent(proxy)
                     }
                 }
@@ -232,44 +256,40 @@ struct FullLyricsView: View {
 
     private func lyricRow(index: Int, line: LyricLine) -> some View {
         let isCurrent = index == currentIndex
-        let isSelected = isBrowsingLyrics && index == selectedLyricIndex
-        return Group {
+        return Button {
+            guard isConnected else { return }
+            seekToLine(line)
+        } label: {
             HStack(alignment: .center, spacing: 14) {
                 lyricText(
                     index: index,
                     line: line,
-                    isCurrent: isCurrent,
-                    isSelected: isSelected
+                    isCurrent: isCurrent
                 )
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .animation(.easeInOut(duration: 0.18), value: currentIndex)
-                    .animation(.easeInOut(duration: 0.18), value: selectedLyricIndex)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .animation(
+                    reduceMotion ? nil : .easeInOut(duration: 0.18),
+                    value: currentIndex
+                )
 
-                if isSelected {
-                    seekTimeCapsule(line: line)
-                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                if isBrowsingLyrics {
+                    Image(systemName: "play.circle.fill")
+                        .font(.system(size: 25, weight: .semibold))
+                        .foregroundStyle(.white.opacity(isConnected ? 0.82 : 0.28))
+                        .transition(.opacity)
                 }
             }
             .contentShape(Rectangle())
         }
-        .onTapGesture {
-            guard isBrowsingLyrics, isConnected else {
-                selectedLyricIndex = index
-                enterBrowseMode()
-                return
-            }
-            seekToLine(line)
-        }
-        .opacity((!isConnected && isSelected) ? 0.58 : 1)
+        .buttonStyle(.plain)
+        .disabled(!isConnected)
         .accessibilityLabel("歌词 \(line.text)")
+        .accessibilityHint(isConnected ? "跳转到这句" : "Sony 未连接")
     }
 
-    private func lyricColor(isCurrent: Bool, isSelected: Bool) -> Color {
+    private func lyricColor(isCurrent: Bool) -> Color {
         if isCurrent {
-            return Color.green.opacity(0.98)
-        }
-        if isSelected {
-            return .white.opacity(0.92)
+            return PlayerDesignTokens.stableAccent
         }
         return .white.opacity(0.42)
     }
@@ -278,22 +298,21 @@ struct FullLyricsView: View {
     private func lyricText(
         index: Int,
         line: LyricLine,
-        isCurrent: Bool,
-        isSelected: Bool
+        isCurrent: Bool
     ) -> some View {
         if isCurrent {
             lyricStack(
                 line: line,
-                isCurrent: true,
-                isSelected: isSelected
+                isCurrent: true
             ) {
                 KaraokeLyricText(
                     text: line.text,
                     progress: lineProgress(index: index),
                     words: line.words,
                     positionMs: positionMs,
-                    highlightColor: Color.green.opacity(0.98),
-                    normalColor: Color.white.opacity(isSelected ? 0.58 : 0.36),
+                    isPlaying: isPlaying,
+                    highlightColor: PlayerDesignTokens.stableAccent,
+                    normalColor: Color.white.opacity(0.36),
                     font: .system(size: 28, weight: .bold, design: .rounded),
                     lineLimit: 3,
                     alignment: .leading
@@ -302,18 +321,17 @@ struct FullLyricsView: View {
         } else {
             lyricStack(
                 line: line,
-                isCurrent: false,
-                isSelected: isSelected
+                isCurrent: false
             ) {
                 Text(line.text)
                     .font(
                         .system(
-                            size: isSelected ? 23 : 21,
-                            weight: isSelected ? .semibold : .medium,
+                            size: 21,
+                            weight: .medium,
                             design: .rounded
                         )
                     )
-                    .foregroundStyle(lyricColor(isCurrent: false, isSelected: isSelected))
+                    .foregroundStyle(lyricColor(isCurrent: false))
                     .multilineTextAlignment(.leading)
                     .lineLimit(3)
             }
@@ -323,7 +341,6 @@ struct FullLyricsView: View {
     private func lyricStack<Original: View>(
         line: LyricLine,
         isCurrent: Bool,
-        isSelected: Bool,
         @ViewBuilder original: () -> Original
     ) -> some View {
         VStack(alignment: .leading, spacing: isCurrent ? 5 : 4) {
@@ -332,16 +349,14 @@ struct FullLyricsView: View {
                let translation = sanitizedSecondaryText(line.translation) {
                 auxiliaryLyricText(
                     translation,
-                    isCurrent: isCurrent,
-                    isSelected: isSelected
+                    isCurrent: isCurrent
                 )
             }
             if displayMode.showsRomanization,
                let romanization = sanitizedSecondaryText(line.romanization) {
                 auxiliaryLyricText(
                     romanization,
-                    isCurrent: isCurrent,
-                    isSelected: isSelected
+                    isCurrent: isCurrent
                 )
             }
         }
@@ -349,21 +364,20 @@ struct FullLyricsView: View {
 
     private func auxiliaryLyricText(
         _ text: String,
-        isCurrent: Bool,
-        isSelected: Bool
+        isCurrent: Bool
     ) -> some View {
         Text(text)
             .font(
                 .system(
                     size: isCurrent ? 17 : 15,
-                    weight: isSelected ? .semibold : .medium,
+                    weight: .medium,
                     design: .rounded
                 )
             )
             .foregroundStyle(
                 isCurrent
                     ? Color.white.opacity(0.70)
-                    : Color.white.opacity(isSelected ? 0.62 : 0.34)
+                    : Color.white.opacity(0.34)
             )
             .multilineTextAlignment(.leading)
             .fixedSize(horizontal: false, vertical: true)
@@ -375,29 +389,6 @@ struct FullLyricsView: View {
             index: index,
             positionMs: positionMs
         )
-    }
-
-    private func seekTimeCapsule(line: LyricLine) -> some View {
-        Button {
-            guard isConnected else { return }
-            seekToLine(line)
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "play.fill")
-                    .font(.system(size: 9, weight: .bold))
-                Text(formatTime(line.timeMs))
-                    .font(.caption.monospacedDigit().weight(.semibold))
-            }
-            .foregroundStyle(.white)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(.white.opacity(0.14), in: Capsule())
-            .overlay {
-                Capsule().stroke(.white.opacity(0.12), lineWidth: 1)
-            }
-        }
-        .buttonStyle(FullLyricsPressStyle(pressedScale: 0.94))
-        .disabled(!isConnected)
     }
 
     private var controls: some View {
@@ -412,10 +403,12 @@ struct FullLyricsView: View {
                     .shadow(color: .black.opacity(0.18), radius: 12, y: 7)
             }
             .buttonStyle(FullLyricsPressStyle(pressedScale: 0.92))
-            .accessibilityLabel("播放 / 暂停")
+            .accessibilityLabel(isPlaying ? "暂停" : "播放")
             controlButton(systemImage: "forward.fill", size: 52, action: onNext)
         }
         .padding(.top, 4)
+        .disabled(!isConnected)
+        .opacity(isConnected ? 1 : 0.42)
     }
 
     private func controlButton(
@@ -441,8 +434,12 @@ struct FullLyricsView: View {
         guard currentIndex != lastAutoScrolledIndex || !isProgrammaticScroll else { return }
         lastAutoScrolledIndex = currentIndex
         isProgrammaticScroll = true
-        withAnimation(.easeInOut(duration: 0.28)) {
+        if reduceMotion {
             proxy.scrollTo(lyrics[currentIndex].id, anchor: .center)
+        } else {
+            withAnimation(.easeInOut(duration: 0.28)) {
+                proxy.scrollTo(lyrics[currentIndex].id, anchor: .center)
+            }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
             isProgrammaticScroll = false
@@ -451,65 +448,30 @@ struct FullLyricsView: View {
 
     private func enterBrowseMode() {
         guard !isProgrammaticScroll else { return }
-        isBrowsingLyrics = true
-        browseResetWorkItem?.cancel()
-    }
-
-    private func scheduleFollowModeRestore(_ proxy: ScrollViewProxy) {
-        browseResetWorkItem?.cancel()
-        let workItem = DispatchWorkItem {
-            restoreFollowMode(proxy)
-        }
-        browseResetWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: workItem)
+        followState.userDidBrowse()
     }
 
     private func restoreFollowMode(_ proxy: ScrollViewProxy) {
-        browseResetWorkItem?.cancel()
-        isBrowsingLyrics = false
-        selectedLyricIndex = nil
+        followState.returnToCurrent()
         scrollToCurrent(proxy)
     }
 
     private func resetBrowseState() {
-        browseResetWorkItem?.cancel()
-        isBrowsingLyrics = false
-        selectedLyricIndex = nil
+        followState.trackDidChange()
         lastAutoScrolledIndex = nil
         isProgrammaticScroll = false
-    }
-
-    private func updateSelectedLine(
-        centers: [Int: CGFloat],
-        viewportCenterY: CGFloat
-    ) {
-        guard isBrowsingLyrics, !centers.isEmpty else { return }
-        selectedLyricIndex = centers.min {
-            abs($0.value - viewportCenterY) < abs($1.value - viewportCenterY)
-        }?.key
     }
 
     private func seekToLine(_ line: LyricLine) {
         onSeekToLine(line.timeMs)
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        isBrowsingLyrics = false
-        selectedLyricIndex = nil
-    }
-
-    private func formatTime(_ milliseconds: Int64) -> String {
-        let totalSeconds = max(milliseconds, 0) / 1_000
-        return String(format: "%02lld:%02lld", totalSeconds / 60, totalSeconds % 60)
+        followState.returnToCurrent()
     }
 }
 
-private struct LyricLineCenterPreferenceKey: PreferenceKey {
-    static var defaultValue: [Int: CGFloat] = [:]
-
-    static func reduce(
-        value: inout [Int: CGFloat],
-        nextValue: () -> [Int: CGFloat]
-    ) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
     }
 }
 

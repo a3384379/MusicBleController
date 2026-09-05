@@ -257,7 +257,7 @@ fi
 
 start="$(now_ms)"
 if "$SCRIPT_DIR/ios_settings_test.sh" >"$OUT_DIR/ios_settings_stdout.log" 2>"$OUT_DIR/ios_settings_stderr.log"; then
-  record_required "Preferences" "PASS" "$(elapsed_ms "$start")" "mode=debug size=200 offset=300 autoReconnect=true"
+  record_required "Preferences" "PASS" "$(elapsed_ms "$start")" "mode=debug size=184 offset=300 autoReconnect=true"
 else
   record_required "Preferences" "FAIL" "$(elapsed_ms "$start")" "smoke-test preference logs missing"
 fi

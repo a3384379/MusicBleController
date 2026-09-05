@@ -1,0 +1,88 @@
+name: Cross-platform build and tests
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - "codex/**"
+  pull_request:
+
+concurrency:
+  group: cross-platform-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    name: Android unit tests and debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - name: Test and assemble PlayerAgent
+        run: bash ./gradlew :PlayerAgentApp:testDebugUnitTest :PlayerAgentApp:assembleDebug
+      - name: Test and assemble Android Controller
+        run: bash ./gradlew :ControllerApp:testDebugUnitTest :ControllerApp:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PlayerAgent-debug-apk
+          path: PlayerAgentApp/build/outputs/apk/debug/*.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Controller-debug-apk
+          path: ControllerApp/build/outputs/apk/debug/*.apk
+
+  ios:
+    name: iOS simulator XCTest
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect Xcode and available simulators
+        run: |
+          xcodebuild -version
+          xcrun simctl list devices available
+      - name: Run unsigned simulator tests
+        run: |
+          set -euo pipefail
+          simulator_udid="$(
+            xcrun simctl list devices available -j |
+              python3 -c '
+          import json
+          import sys
+
+          runtimes = json.load(sys.stdin).get("devices", {})
+          devices = (
+              device
+              for runtime_devices in runtimes.values()
+              for device in runtime_devices
+          )
+          print(next(
+              device["udid"]
+              for device in devices
+              if device.get("isAvailable") and device.get("name", "").startswith("iPhone")
+          ))
+          '
+          )"
+          echo "Using iOS simulator: ${simulator_udid}"
+          run_ios_tests() {
+            local attempt="$1"
+            xcodebuild \
+              -project IOSBleFeasibility/IOSBleFeasibility.xcodeproj \
+              -scheme sonyMusic \
+              -destination "platform=iOS Simulator,id=${simulator_udid}" \
+              -derivedDataPath "${RUNNER_TEMP}/IOSBleFeasibilityDerivedData-${attempt}" \
+              -parallel-testing-enabled NO \
+              CODE_SIGNING_ALLOWED=NO \
+              test
+          }
+          if ! run_ios_tests 1; then
+            echo "::warning::iOS simulator test attempt 1 failed; restarting the simulator and retrying once"
+            xcrun simctl shutdown "${simulator_udid}" || true
+            run_ios_tests 2
+          fi

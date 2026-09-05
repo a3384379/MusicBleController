@@ -1,4 +1,4 @@
-import ActivityKit
+@preconcurrency import ActivityKit
 import Foundation
 
 @MainActor
@@ -212,7 +212,7 @@ final class LiveActivityManager {
         logger: ((String) -> Void)?
     ) -> SonyMusicActivityAttributes.ContentState {
         let cleanTitle = trimmed(
-            cleaned(title, fallback: "Sony Music"),
+            cleaned(title, fallback: "等待同步"),
             limit: 48,
             field: "title",
             logger: logger
@@ -368,30 +368,26 @@ final class LiveActivityManager {
             let startedAt = Date()
             logger?("[LiveActivityPerf] update start reason=\(reason)")
             logger?("[LiveActivityState] update start version=\(version)")
-            do {
-                let target = await self.ensureActivity(for: state, logger: logger)
-                if let target {
-                    let content = ActivityContent(
-                        state: state,
-                        staleDate: self.staleDate(for: state)
-                    )
-                    await target.update(content)
-                    await MainActor.run {
-                        self.activity = target
-                        self.lastSentState = state
-                        self.lastSentVersion = version
-                        self.lastCalibrationDate = Date()
-                        self.recordUpdateSent(logger: logger)
-                    }
-                    logger?(
-                        "[LiveActivity] update sent reason=\(reason) " +
-                            "title=\(state.title) lyric=\(state.lyric) " +
-                            "lineIndex=\(state.lyricLineIndex) position=\(state.positionAtAnchorMs)"
-                    )
-                    logger?("[LiveActivityState] update success version=\(version)")
+            let target = await self.ensureActivity(for: state, logger: logger)
+            if let target {
+                let content = ActivityContent(
+                    state: state,
+                    staleDate: self.staleDate(for: state)
+                )
+                await target.update(content)
+                await MainActor.run {
+                    self.activity = target
+                    self.lastSentState = state
+                    self.lastSentVersion = version
+                    self.lastCalibrationDate = Date()
+                    self.recordUpdateSent(logger: logger)
                 }
-            } catch {
-                logger?("[LiveActivity] error=\(error.localizedDescription)")
+                logger?(
+                    "[LiveActivity] update sent reason=\(reason) " +
+                        "title=\(state.title) lyric=\(state.lyric) " +
+                        "lineIndex=\(state.lyricLineIndex) position=\(state.positionAtAnchorMs)"
+                )
+                logger?("[LiveActivityState] update success version=\(version)")
             }
             let costMs = Int(Date().timeIntervalSince(startedAt) * 1_000)
             logger?("[LiveActivityPerf] update end costMs=\(costMs)")

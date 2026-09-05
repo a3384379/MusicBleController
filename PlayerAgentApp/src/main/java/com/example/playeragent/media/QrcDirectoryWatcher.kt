@@ -1,25 +1,31 @@
 package com.example.playeragent.media
 
+import android.content.Context
 import android.os.FileObserver
 import java.io.File
 import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 class QrcDirectoryWatcher(
+    context: Context,
     private val incrementalPrebuildManager: QrcIncrementalPrebuildManager,
     private val logger: (String) -> Unit,
-    private val statusListener: (QrcWatcherStatus) -> Unit
+    private val statusListener: (QrcWatcherStatus) -> Unit,
+    executionHub: PlayerAgentExecutionHub? = null
 ) {
 
+    private val appContext = context.applicationContext
     private val directory: File = QrcLyricUtils.qrcDirectory()
-    private val scheduler = ScheduledThreadPoolExecutor(1) { runnable ->
-        Thread(runnable, "QrcDirectoryWatcherThread").apply {
-            priority = Thread.MIN_PRIORITY
-        }
-    }.apply {
-        removeOnCancelPolicy = true
-    }
+    private val watermarkStore = QrcWatcherWatermarkStore(appContext)
+    private val ownsScheduler = executionHub == null
+    private val scheduler: ScheduledExecutorService = executionHub?.scheduled
+        ?: ScheduledThreadPoolExecutor(1) { runnable ->
+            Thread(runnable, "QrcDirectoryWatcherThread").apply {
+                priority = Thread.MIN_PRIORITY
+            }
+        }.apply { removeOnCancelPolicy = true }
     private val lock = Any()
     private val pendingGroups = linkedSetOf<String>()
     private var debounceFuture: ScheduledFuture<*>? = null
@@ -54,6 +60,7 @@ class QrcDirectoryWatcher(
             running = true
             logger("[QrcWatcher] started dir=${directory.absolutePath}")
             publishStatusLocked()
+            scheduler.execute(::enqueueStartupCatchup)
         }
     }
 
@@ -65,6 +72,7 @@ class QrcDirectoryWatcher(
             debounceFuture = null
             pendingGroups.clear()
             running = false
+            if (ownsScheduler) scheduler.shutdownNow()
             logger("[QrcWatcher] stopped")
             publishStatusLocked()
         }
@@ -116,6 +124,7 @@ class QrcDirectoryWatcher(
         }
         if (batch.isNotEmpty()) {
             incrementalPrebuildManager.processGroups(batch)
+            watermarkStore.advanceTo(System.currentTimeMillis())
         }
         synchronized(lock) {
             if (pendingGroups.isNotEmpty() && running) {
@@ -123,6 +132,45 @@ class QrcDirectoryWatcher(
             }
             publishStatusLocked()
         }
+    }
+
+    private fun enqueueStartupCatchup() {
+        if (!running) return
+        val previousWatermark = watermarkStore.read()
+        val signals = QrcLyricUtils.scanGroups().map { group ->
+            QrcGroupChangeSignal(
+                groupId = group.groupId,
+                changedAtMs = maxOf(
+                    group.lastModified,
+                    QrcLyricUtils.sidecarLastModified(group),
+                    QrcLyricUtils.readExSavingTime(group.exFile)
+                )
+            )
+        }
+        val changed = QrcWatcherCatchupPolicy.selectChanged(
+            signals = signals,
+            watermarkMs = previousWatermark,
+            limit = STARTUP_CATCHUP_GROUPS
+        )
+        if (changed.isEmpty()) {
+            watermarkStore.advanceTo(signals.maxOfOrNull(QrcGroupChangeSignal::changedAtMs) ?: 0L)
+            logger("[QrcWatcher] startup catchup none watermark=$previousWatermark")
+            return
+        }
+        synchronized(lock) {
+            changed.forEach { signal ->
+                if (pendingGroups.add(signal.groupId)) {
+                    QrcDirectoryGeneration.markChanged(signal.groupId, "STARTUP_CATCHUP", logger)
+                }
+            }
+            scheduleDebounceLocked()
+            publishStatusLocked()
+        }
+        watermarkStore.advanceTo(changed.maxOf(QrcGroupChangeSignal::changedAtMs))
+        logger(
+            "[QrcWatcher] startup catchup groups=${changed.size} " +
+                "watermark=$previousWatermark newest=${changed.first().changedAtMs}"
+        )
     }
 
     private fun publishStatusLocked() {
@@ -156,6 +204,7 @@ class QrcDirectoryWatcher(
     companion object {
         private const val DEBOUNCE_MS = 180L
         private const val MAX_BATCH_GROUPS = 20
+        private const val STARTUP_CATCHUP_GROUPS = 3
         private const val EVENT_MASK =
                 FileObserver.CREATE or
                 FileObserver.MOVED_TO or
@@ -165,5 +214,41 @@ class QrcDirectoryWatcher(
                 FileObserver.MODIFY
         private val GROUP_FILE_REGEX =
             Regex("""^(-?\d+)\.(qrc|producer|ex|translrc|romaqrc|lrc)$""")
+    }
+}
+
+internal data class QrcGroupChangeSignal(
+    val groupId: String,
+    val changedAtMs: Long
+)
+
+internal object QrcWatcherCatchupPolicy {
+    fun selectChanged(
+        signals: List<QrcGroupChangeSignal>,
+        watermarkMs: Long,
+        limit: Int
+    ): List<QrcGroupChangeSignal> {
+        if (limit <= 0) return emptyList()
+        return signals.asSequence()
+            .filter { it.groupId.isNotBlank() && it.changedAtMs > watermarkMs }
+            .sortedByDescending(QrcGroupChangeSignal::changedAtMs)
+            .take(limit)
+            .toList()
+    }
+}
+
+private class QrcWatcherWatermarkStore(context: Context) {
+    private val preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+
+    fun read(): Long = preferences.getLong(KEY_WATERMARK_MS, 0L)
+
+    fun advanceTo(value: Long) {
+        if (value <= read()) return
+        preferences.edit().putLong(KEY_WATERMARK_MS, value).apply()
+    }
+
+    companion object {
+        private const val PREFERENCES_NAME = "qrc_watcher_state"
+        private const val KEY_WATERMARK_MS = "last_processed_change_ms_v2"
     }
 }

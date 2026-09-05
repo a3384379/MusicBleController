@@ -168,17 +168,25 @@ object TrackCapabilityTracker {
         hasIconUri: Boolean,
         hasAlbumArtUri: Boolean
     ) {
+        var changed = false
         update(key(trackId, protocolId)) { previous ->
+            changed = previous != null && (
+                previous.metadataHasBitmap != hasBitmap ||
+                    previous.metadataHasIconUri != hasIconUri ||
+                    previous.metadataHasAlbumArtUri != hasAlbumArtUri
+                )
             previous?.copy(
                 metadataHasBitmap = hasBitmap,
                 metadataHasIconUri = hasIconUri,
                 metadataHasAlbumArtUri = hasAlbumArtUri
             )
         }
-        log(
-            "[TrackCapability] media metadata bitmap=$hasBitmap " +
-                "iconUri=$hasIconUri albumArtUri=$hasAlbumArtUri"
-        )
+        if (changed) {
+            log(
+                "[TrackCapability] media metadata bitmap=$hasBitmap " +
+                    "iconUri=$hasIconUri albumArtUri=$hasAlbumArtUri"
+            )
+        }
     }
 
     fun onLyricLookupStart(songKey: String, trackId: String = "") {

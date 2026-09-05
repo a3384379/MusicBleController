@@ -17,6 +17,8 @@ Thumbs.db
 
 # Logs
 *.log
+*.hprof
 
 # Local deploy state
 tools/deploy/last_deploy.json
+tools/deploy/last_successful_deploy.json

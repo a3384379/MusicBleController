@@ -1,6 +1,7 @@
 package com.example.playeragent.media
 
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
@@ -34,9 +35,11 @@ data class LyricRecoverySnapshot(
 
 class LyricRecoveryEngine(
     private val logger: (String) -> Unit,
-    private val retryCallback: (reason: String, bypassRetryableCooldown: Boolean) -> Boolean
+    private val retryCallback: (reason: String, bypassRetryableCooldown: Boolean) -> Boolean,
+    scheduledExecutor: ScheduledExecutorService? = null
 ) {
-    private val scheduler = Executors.newSingleThreadScheduledExecutor { runnable ->
+    private val ownsScheduler = scheduledExecutor == null
+    private val scheduler = scheduledExecutor ?: Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "LyricRecoveryThread")
     }
     private var session: RecoverySession? = null
@@ -248,7 +251,7 @@ class LyricRecoveryEngine(
     @Synchronized
     fun shutdown() {
         cancelTimersLocked()
-        scheduler.shutdownNow()
+        if (ownsScheduler) scheduler.shutdownNow()
     }
 
     private fun scheduleTimerRetryLocked() {

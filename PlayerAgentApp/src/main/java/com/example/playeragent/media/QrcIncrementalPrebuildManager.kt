@@ -12,7 +12,8 @@ class QrcIncrementalPrebuildManager(
     private val statusListener: (QrcWatcherStatus) -> Unit,
     private val currentTrackProvider: () -> CurrentTrackSnapshot? = { null },
     private val onIncrementalLyricsReady: (IncrementalLyricsReady) -> Unit = {},
-    private val onBatchProcessed: (Set<String>) -> Unit = {}
+    private val onBatchProcessed: (Set<String>) -> Unit = {},
+    executionHub: PlayerAgentExecutionHub? = null
 ) {
 
     private val appContext = context.applicationContext
@@ -28,11 +29,13 @@ class QrcIncrementalPrebuildManager(
         context = appContext,
         logger = logger
     )
-    private val executor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "QrcIncrementalPrebuildThread").apply {
-            priority = Thread.MIN_PRIORITY
+    private val ownsExecutor = executionHub == null
+    private val executor: ExecutorService = executionHub?.maintenance
+        ?: Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "QrcIncrementalPrebuildThread").apply {
+                priority = Thread.MIN_PRIORITY
+            }
         }
-    }
     private val stopped = AtomicBoolean(false)
     private val statusLock = Any()
     private var running = false
@@ -112,7 +115,7 @@ class QrcIncrementalPrebuildManager(
 
     fun stop() {
         stopped.set(true)
-        executor.shutdownNow()
+        if (ownsExecutor) executor.shutdownNow()
         setRunning(false)
         QrcMaintenanceCoordinator.finishCurrentIf(
             MaintenanceTaskType.QRC_INCREMENTAL_PREBUILD,
@@ -154,6 +157,11 @@ class QrcIncrementalPrebuildManager(
         if (!shouldTryCurrentTrack) {
             val validation = cacheManager.validateGroupCache(group, requireComplete = true)
             if (validation.valid) {
+                validation.cached?.let { cached ->
+                    cacheManager.registerValidatedCache(cached)?.let { indexed ->
+                        persistentIndexManager.updateParsedMetadata(groupId, indexed)
+                    }
+                }
                 logger("[QrcIncremental] skip cached groupId=$groupId")
                 logger("[QrcIndex] not marked dirty for skip cached groupId=$groupId")
                 incrementSkipped()
@@ -189,6 +197,7 @@ class QrcIncrementalPrebuildManager(
         var savedAny = false
         if (parsed.title.isNotBlank()) {
             cacheManager.save(parsed)
+            persistentIndexManager.updateParsedMetadata(groupId, parsed)
             negativeCacheManager.removeNegative(parsed.songKey)
             savedAny = true
         } else {
@@ -331,44 +340,37 @@ class QrcIncrementalPrebuildManager(
             logger("[QrcIncrementalMatch] rejected reason=current lyrics already available")
             return false
         }
-        if (!isRecentForCurrentTrack(group, currentTrack)) {
-            logger("[QrcIncrementalMatch] rejected reason=not recent for current track")
-            return false
-        }
-
-        val currentArtistTokens = QrcLyricUtils.splitArtists(currentTrack.artist)
-        val parsedArtistTokens = QrcLyricUtils.splitArtists(parsed.artist)
-        val rawNormalized = QrcLyricUtils.normalizeForMatch(parsed.rawText)
-        val artistMatches = currentArtistTokens.isNotEmpty() &&
-            (currentArtistTokens.any(parsedArtistTokens::contains) ||
-                currentArtistTokens.any { rawNormalized.contains(it) })
-        if (!artistMatches) {
-            logger("[QrcIncrementalMatch] rejected reason=artist mismatch")
-            return false
-        }
-
-        val currentTitle = QrcLyricUtils.normalizeForMatch(currentTrack.title)
-        val parsedTitle = QrcLyricUtils.normalizeForMatch(parsed.title)
-        if (currentTitle.isNotBlank() && parsedTitle == currentTitle) {
-            logger("[QrcIncrementalMatch] matched reason=title_exact")
-            return true
-        }
-        if (currentTitle.isNotBlank() && rawNormalized.contains(currentTitle)) {
-            logger("[QrcIncrementalMatch] matched reason=raw_contains_current_title")
-            return true
-        }
-        val parsedTitleUnreliable = parsed.title.isBlank() ||
-            QrcLyricUtils.isInvalidMetadataTitle(parsed.title)
-        if (parsedTitleUnreliable && batchSize == 1) {
-            logger("[QrcIncrementalMatch] matched reason=recent_single_group_artist_match")
-            return true
-        }
-        if (parsedTitleUnreliable && batchSize > 1) {
-            logger("[QrcIncrementalMatch] ambiguous groups=$batchSize skip alias")
-        } else {
-            logger("[QrcIncrementalMatch] rejected reason=title mismatch")
-        }
-        return false
+        val decision = QrcCurrentTrackMatchPolicy.evaluateRecent(
+            track = QrcCurrentTrackMatchPolicy.Track(
+                title = currentTrack.title,
+                artist = currentTrack.artist,
+                album = currentTrack.album,
+                durationMs = currentTrack.durationMs,
+                requestStillValid = currentTrack.trackId.isNotBlank()
+            ),
+            candidates = listOf(
+                QrcCurrentTrackMatchPolicy.Candidate(
+                    groupId = group.groupId,
+                    metadataTitle = parsed.title,
+                    metadataArtist = parsed.artist,
+                    lyricTitleCandidate = QrcCurrentTrackMatchPolicy.extractTitleCandidate(
+                        parsed.lines.map(QrcLyricLine::text)
+                    ),
+                    lastLineEndMs = QrcCurrentTrackMatchPolicy.lastLineEndMs(parsed.lines),
+                    effectiveModifiedAtMs = maxOf(
+                        group.lastModified,
+                        QrcLyricUtils.sidecarLastModified(group),
+                        QrcLyricUtils.readExSavingTime(group.exFile)
+                    )
+                )
+            ),
+            recentCandidateCount = batchSize
+        )
+        logger(
+            "[QrcIncrementalMatch] ${if (decision.matched) "matched" else "rejected"} " +
+                "reason=${decision.reason}"
+        )
+        return decision.matched
     }
 
     private fun findGroup(groupId: String): QrcFileGroup {

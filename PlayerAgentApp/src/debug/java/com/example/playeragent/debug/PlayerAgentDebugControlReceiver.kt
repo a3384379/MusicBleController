@@ -41,6 +41,13 @@ class PlayerAgentDebugControlReceiver : BroadcastReceiver() {
                     logAction = "DUMP_BLE_DIAGNOSTICS"
                 )
             }
+            ACTION_REFRESH_CURRENT_LYRIC -> {
+                forwardToService(
+                    context = context,
+                    serviceAction = PlayerAgentForegroundService.ACTION_REFRESH_CURRENT_LYRIC,
+                    logAction = "REFRESH_CURRENT_LYRIC"
+                )
+            }
             else -> Log.w(TAG, "[DebugControl] ignored action=$action")
         }
     }
@@ -74,6 +81,8 @@ class PlayerAgentDebugControlReceiver : BroadcastReceiver() {
             "com.example.playeragent.debug.RECOVER_BLE_STACK"
         const val ACTION_DUMP_BLE_DIAGNOSTICS =
             "com.example.playeragent.debug.DUMP_BLE_DIAGNOSTICS"
+        const val ACTION_REFRESH_CURRENT_LYRIC =
+            "com.example.playeragent.debug.REFRESH_CURRENT_LYRIC"
         private const val TAG = "PlayerAgent"
     }
 }

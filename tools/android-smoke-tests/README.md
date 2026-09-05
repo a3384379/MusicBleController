@@ -16,13 +16,15 @@ It is Android-only:
 - Android platform-tools `adb` available in `PATH`, `ADB_BIN`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`, or `~/Library/Android/sdk/platform-tools/adb`.
 - For full build, Gradle must be able to build `:PlayerAgentApp:assembleDebug`.
 
-If `JAVA_HOME` is not set, the build script uses Android Studio JBR when it exists:
+The build script prefers Android Studio JBR when it exists, including when the
+parent shell still exports an incompatible Java 8 runtime:
 
 ```text
 /Volumes/雷电/Android Studio.app/Contents/jbr/Contents/Home
 ```
 
-Existing `JAVA_HOME` always wins.
+On CI or machines without that local JBR path, the existing `JAVA_HOME` remains
+in effect.
 
 ## Commands
 
@@ -129,6 +131,10 @@ Then it waits briefly and checks logcat for:
 - `BLE advertising started`
 
 Release builds do not include this receiver. The formal `PlayerAgentForegroundService` remains `exported=false`.
+
+Sony-only歌词矩阵还会使用
+`com.example.playeragent.debug.REFRESH_CURRENT_LYRIC`，经同一个 Debug Receiver
+转发给非导出的前台服务；测试脚本不得直接从 shell 启动该服务。
 
 Use `--no-debug-control` to keep the previous passive behavior.
 

@@ -15,10 +15,10 @@ enum ArtworkDisplayQuality: Int, Comparable {
 
     var label: String {
         switch self {
-        case .placeholder: return "placeholder"
-        case .preview: return "preview"
-        case .hq: return "hq"
-        case .enhanced: return "enhanced"
+        case .placeholder: return AppLocalization.string("占位图")
+        case .preview: return AppLocalization.string("预览图")
+        case .hq: return AppLocalization.string("高清图")
+        case .enhanced: return AppLocalization.string("增强图")
         }
     }
 }
@@ -45,7 +45,7 @@ struct ArtworkEnhancementResult {
     let shouldAutoDisplay: Bool
 }
 
-struct ArtworkEnhancementDebugStatus {
+struct ArtworkEnhancementDebugStatus: Equatable {
     var enabled: Bool = true
     var currentSource: String = "-"
     var target: String = "-"

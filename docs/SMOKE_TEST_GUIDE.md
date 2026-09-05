@@ -5,6 +5,7 @@
 - iOS-only：只验证 iPhone 端，不控制 Sony，也不使用 adb。
 - Android/Sony-only：只验证 Sony `PlayerAgentApp`，使用 adb，不操作 iPhone。
 - Cross-device entry：编排 iOS-only 和 Android/Sony-only，并生成总报告。
+- CI：`.github/workflows/build.yml` 固定 JDK 17 跑 Android 单测/assembleDebug，并在无签名 iOS Simulator 上跑 XCTest。
 
 ## iOS-only 模块职责
 
@@ -75,6 +76,7 @@
 1. 选择 iPhone：`--device` > `IOS_DEVICE_ID` > 自动发现 available iPhone。
 2. 可选 build/install。
 3. `devicectl launch` 启动 App。
+   - 有 `--smoke-*` 参数时，`ios_ble_precheck.sh` 会先写入一次性 `Documents/SmokeLaunchArguments.txt`。即使 CoreBluetooth 状态恢复先在后台唤醒 App，测试参数也不会丢失；App 读取后立即删除。
 4. 从 App container 复制 `Documents/Logs/ios_ble.log`。
 5. DEBUG smoke preferences 写入并重启验证。
 6. 文件检查 App container 中日志、AlbumArtCache、Preferences。
@@ -179,6 +181,7 @@
 - `fullLyricsSendStart/End` 同时覆盖 A2 与 legacy，不能因协议升级造成 trace 缺失。
 - 冷测使用调试流程自然换歌，不删除用户真实 QRC/封面缓存。
 - 自动切歌必须通过 iOS BLE 控制或 Android `cmd media_session dispatch next`；不要向无焦点 PlayerAgent Activity 注入 `input keyevent`，否则系统可能产生与业务线程无关的 input-dispatch ANR。
+- Sony-only 模式的当前歌词刷新必须通过 Debug Receiver 的 `com.example.playeragent.debug.REFRESH_CURRENT_LYRIC` 转发；正式前台服务保持 `exported=false`，shell 不能直接启动。
 - iPhone 锁屏导致 `ios_app_launch_failed` 时测试不得执行动作，解锁后整项重跑。
 
 ## iOS BLE 硬前置校验
@@ -188,11 +191,24 @@
 硬性条件：
 
 - iOS App launched。
-- BLE connected。
+- BLE connected。新的 `didConnect` 或 `[BLE-Restore] restored ... state=connected` 都是有效连接证据。
 - notify subscribed。
 - 5 秒内收到至少 1 条 `playbackState`。
 
 如果前置校验失败，脚本必须立即 FAIL，`precheckFailReason=ios_ble_not_connected`，并且不得继续执行 `GET_FULL_LYRICS`、AlbumArt 请求、`NEXT`、`VOLUME`、`SEEK` 等动作。报告必须输出 `iosAppLaunched`、`iosBleConnected`、`notifySubscribed`、`firstPlaybackStateReceived`、`firstPlaybackStateLatencyMs`、`precheckResult`、`precheckFailReason`。
+
+## iOS XCTest
+
+```bash
+xcodebuild \
+  -project IOSBleFeasibility/IOSBleFeasibility.xcodeproj \
+  -scheme sonyMusic \
+  -destination 'platform=iOS Simulator,name=iPhone 16 Pro' \
+  CODE_SIGNING_ALLOWED=NO \
+  test
+```
+
+`PerformanceStabilityTests` 覆盖 A1/A2 分发、乱序/重复/缺包、CRC/zlib 固定向量、封面降采样和损坏数据、快照过期/损坏、状态切片去重及播放时钟暂停。新增协议或缓存行为时，应先增加确定性 XCTest，再跑真机 smoke。
 
 ## Source Capability V3.0 源可用性诊断
 

@@ -25,6 +25,10 @@
 5. Health timer 检查静默时间：播放中 15 秒、暂停中 30 秒才探测。
 6. V2 发送轻量 `PING/PONG`；旧 Sony 回退 `GET_PLAYBACK_STATE`。连续两次探测失败才 hard reconnect，明确断开回调仍立即处理。
 7. `connectionDisplayState` 给 UI，`connectionHealthState` 给诊断和控制保护。
+8. CoreBluetooth 状态恢复优先复用已连接 Sony 和已恢复 characteristic；iOS 17+ 同时启用系统自动重连，系统重连期间禁止自建 reconnect work item 竞争，前台超过连接超时后再回退主动扫描。进入 inactive/background 后暂停 health、订阅/写超时和时钟同步；回到前台先用单次探针验证，收到有效 notify 后才恢复状态、音量和歌词同步。
+9. 单次 `didWrite` 回调超时只标记 suspect 并延长等待，不移除 in-flight 请求、不推进写队列；连续两次写回调超时才 hard reconnect。
+10. Sony 端业务静默只触发按地址的轻量 notify 探针；只有真实 notify 失败达到阈值才隔离该地址，禁止用静默时间直接重建共享 GATT。
+11. Sony 对合法 command 保持即时 ATT response，随后按设备保留短 quiet window；业务命令继续异步执行。iOS 会取消已经过时的普通播放状态 fallback，但保护前台验证和 Health probe，避免频繁切歌把无用状态读取堆在真实控制之前。
 
 ## 关键状态
 
@@ -40,6 +44,7 @@
 - `connectionHealthState`：内部健康，如 `healthy`、`suspect`、`stale`、`disconnected`。
 - `autoReconnectState`：`idle`、`reconnectScheduled`、`scanning`、`connecting` 等。
 - `connectionAttemptId`：防止旧 scan/connect 回调污染当前状态。
+- `coreBluetoothRestoreInProgress`：隔离状态恢复和前台检查的竞态。
 
 ## 不允许随便修改的点
 
@@ -48,16 +53,23 @@
 - 不要让 retrieve connect 阻塞 scan 太久。
 - 不要在非 healthy/suspect 时发送播放控制命令。
 - 不要重连后补发旧控制命令。
+- 不要因为恢复连接尚未完成 health 初始化就主动取消已连接 peripheral。
 
 ## 常见问题排查入口
 
 - 打开 App 连接慢：看 `[BLE-Reconnect] foreground strategy=scanFirst`、`retrieve connect fast timeout`、`didDiscover`、`didConnect`。
 - 一直显示重连：看 `autoReconnectState`、`connectionAttemptId`、`ignore stale callback`、`scan timeout`。
 - 假连接：看 `[BLE-Health] suspect`、`probe sent`、`probe timeout`、`hard reconnect reason=...`。
+- 恢复竞态：看 `[BLE-Restore] restored`、`foreground restore skipped`、`reuse restored notifying characteristic`。
+- 写回调偶发丢失：看 `[CTRL-iOS] write timeout extended`；第一轮超时后 in-flight 序号应保持不变。
+- 高频切歌 write callback 缺失：同时检查 iOS `commandIntent/commandWriteStart/commandWriteCallback/commandRefreshSuperseded`、Sony `commandReceived`、notify callback 和 L2CAP failure。当前实现应即时响应 command，不应出现 `commandResponseDeferred/Released`。
+- 前后台恢复：看 `BLE watchdogs paused`、`foreground validation queued/success`，验证成功前不应出现状态/音量/歌词同步突发。
 - 胶囊闪烁：区分 `connectionDisplayState` 和 `connectionHealthState`，日常模式不应展示技术细节。
 
 ## 修改后必须跑哪些 smoke test
 
 - 改连接、重连、Health、UI 胶囊：quick smoke。
 - 改 `autoReconnectEnabled` 默认值/UserDefaults/Preferences：full smoke。
-- 真机建议测试：Sony 服务停止、恢复、App 前后台、Force Reconnect。
+- 真机建议测试：`reconnect_sync_v28_test.sh`、Sony 服务停止/恢复、App 前后台、Force Reconnect。
+
+第四阶段旧真机轮次曾在延迟 response 实验下观察到 90 次正常转换和 100 次压力中无 command failure，但该实验安装后又造成 iOS/Android 媒体与控制回归，已经回退，不能继续作为当前实现的验收结论。当前实现保持即时 ATT response，只合并 iOS 过期 fallback、让 Sony 在新身份确认前不广播旧 TrackInfo/封面，并把 Clock Sync 后台探针避让 FullLyrics/图片接收。回退后的 NEXT、PREVIOUS、Sony dispatch-next 各 30 次及 100 次压力均为 PASS；command timeout、hard reconnect、stale accepted 和 duplicate control 均为 0。修复边界见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。

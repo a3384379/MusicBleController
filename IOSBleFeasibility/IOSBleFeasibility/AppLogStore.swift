@@ -1,4 +1,6 @@
 import Foundation
+@preconcurrency import MetricKit
+import OSLog
 
 final class AppLogStore {
     static let shared = AppLogStore()
@@ -230,5 +232,57 @@ final class AppLogStore {
             return "\(timestamp) \(message)\n"
         }
         return "\(timestamp) [App] \(message)\n"
+    }
+}
+
+enum AppPerformanceLog {
+    private static let subsystem = Bundle.main.bundleIdentifier ?? "com.sqz.IOSBleFeasibility"
+
+    static let connection = Logger(subsystem: subsystem, category: "BLE.Connection")
+    static let protocolLog = Logger(subsystem: subsystem, category: "BLE.Protocol")
+    static let lyrics = Logger(subsystem: subsystem, category: "Media.Lyrics")
+    static let artwork = Logger(subsystem: subsystem, category: "Media.Artwork")
+    static let liveActivity = Logger(subsystem: subsystem, category: "LiveActivity")
+    static let ui = Logger(subsystem: subsystem, category: "UI.Responsiveness")
+
+    static let protocolSignposter = OSSignposter(logger: protocolLog)
+    static let artworkSignposter = OSSignposter(logger: artwork)
+    static let liveActivitySignposter = OSSignposter(logger: liveActivity)
+}
+
+final class MetricDiagnosticsSubscriber: NSObject, MXMetricManagerSubscriber, @unchecked Sendable {
+    static let shared = MetricDiagnosticsSubscriber()
+
+    private let lock = NSLock()
+    private var started = false
+
+    func start() {
+        lock.lock()
+        guard !started else {
+            lock.unlock()
+            return
+        }
+        started = true
+        lock.unlock()
+        MXMetricManager.shared.add(self)
+        AppPerformanceLog.ui.info("MetricKit subscriber started")
+    }
+
+    func didReceive(_ payloads: [MXMetricPayload]) {
+        AppLogStore.shared.append("[MetricKit] metric payloads=\(payloads.count)")
+        payloads.forEach { payload in
+            AppPerformanceLog.ui.info(
+                "MetricKit metric payload bytes=\(payload.jsonRepresentation().count)"
+            )
+        }
+    }
+
+    func didReceive(_ payloads: [MXDiagnosticPayload]) {
+        AppLogStore.shared.append("[MetricKit] diagnostic payloads=\(payloads.count)")
+        payloads.forEach { payload in
+            AppPerformanceLog.ui.error(
+                "MetricKit diagnostic payload bytes=\(payload.jsonRepresentation().count)"
+            )
+        }
     }
 }

@@ -121,12 +121,21 @@ def first(pattern: str):
             return line, parse_ios_ms(line)
     return "", None
 
-_, connected_at = first(r"\[BLE-iOS\]\s+didConnect|\[BLE\]\s+connected|\[Reconnect\]\s+connected")
+_, connected_at = first(
+    r"\[BLE-iOS\]\s+didConnect|"
+    r"\[BLE\]\s+connected|"
+    r"\[Reconnect\]\s+connected|"
+    r"\[BLE-Restore\]\s+restored\b.*\bstate=connected"
+)
 _, notify_at = first(r"status notify subscribed|notify subscribed|\[Reconnect\]\s+subscribed")
 _, playback_at = first(r'\{"type":"playbackState"|\[iOS\]\[Status\]\s+playbackState|\[Reconnect\]\s+playbackState accepted|notify received type=playbackState')
 
 display_state = "unknown"
-if re.search(r"didConnect|\[BLE\]\s+connected", window_text, re.I):
+if re.search(
+    r"didConnect|\[BLE\]\s+connected|\[BLE-Restore\]\s+restored\b.*\bstate=connected",
+    window_text,
+    re.I,
+):
     display_state = "connected_no_status"
 if re.search(r"notify subscribed", window_text, re.I):
     display_state = "subscribed_waiting_status"
@@ -194,6 +203,22 @@ if [[ "${#LAUNCH_ARGS[@]}" -gt 0 ]]; then
   launch_args_display="${LAUNCH_ARGS[*]}"
 fi
 log "launch app for BLE precheck timeout=${TIMEOUT_SEC}s args=${launch_args_display}"
+if [[ "${#LAUNCH_ARGS[@]}" -gt 0 ]]; then
+  LAUNCH_MARKER="$OUT_DIR/SmokeLaunchArguments.txt"
+  : > "$LAUNCH_MARKER"
+  for launch_arg in "${LAUNCH_ARGS[@]}"; do
+    printf '%s\n' "$launch_arg" >> "$LAUNCH_MARKER"
+  done
+  if ! xcrun devicectl device copy to \
+    --device "$IOS_DEVICE_ID" \
+    --domain-type appDataContainer \
+    --domain-identifier "$BUNDLE_ID" \
+    --source "$LAUNCH_MARKER" \
+    --destination "Documents/SmokeLaunchArguments.txt" \
+    >>"$PRECHECK_LOG" 2>&1; then
+    log "WARN unable to stage restoration-safe smoke launch marker; using process argument only"
+  fi
+fi
 LAUNCH_OK=true
 launch_cmd=(xcrun devicectl device process launch --device "$IOS_DEVICE_ID" --terminate-existing "$BUNDLE_ID")
 if [[ "${#LAUNCH_ARGS[@]}" -gt 0 ]]; then

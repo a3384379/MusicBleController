@@ -11,6 +11,8 @@
 - Sony `QrcDirectoryWatcher` / `QrcIncrementalPrebuildManager`：监听 QQMusic 文件后到并增量解析。
 - Sony `LyricRecoveryEngine`：当前歌曲无歌词后短期恢复窗口，处理 QQ音乐懒加载歌词缓存。
 - iOS `BLETestManager`：接收 `lyricWindow*`、legacy `fullLyrics*`、A2 zlib full lyrics、`lyricSecondary*` 和歌词诊断。
+- Sony `LyricsTransferCoordinator` / `CompressedLyricsCache`：独立持有歌词重传与最多 16 项/512KB 的 zlib 正文和 CRC，不受封面生命周期影响。
+- Sony `PredictiveMediaCoordinator`：最多两个候选的有界 Hot Set；只在低优先级线程验证现有 QRC parsed cache 和 fingerprint，不复制第二份完整歌词。
 - iOS `FullLyricsView`：显示原文、翻译、罗马音，逐字高亮只作用于原文。
 
 ## 核心文件
@@ -25,6 +27,8 @@
 - Sony recovery：[LyricRecoveryEngine.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/media/LyricRecoveryEngine.kt)
 - iOS full lyrics：[FullLyricsView.swift](/Volumes/雷电/project/MusicBleController/IOSBleFeasibility/IOSBleFeasibility/FullLyricsView.swift)
 - iOS 诊断：[LyricDiagnostic.swift](/Volumes/雷电/project/MusicBleController/IOSBleFeasibility/IOSBleFeasibility/LyricDiagnostic.swift)
+- Sony 压缩热缓存：[CompressedLyricsCache.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/ble/CompressedLyricsCache.kt)
+- Sony 歌词传输协调器：[MediaTransferCoordinators.kt](/Volumes/雷电/project/MusicBleController/PlayerAgentApp/src/main/java/com/example/playeragent/ble/MediaTransferCoordinators.kt)
 
 ## 数据流
 
@@ -35,8 +39,13 @@
 5. QRC 前台顺序为 L1、alias、exact L2、title+artist 唯一安全直达、内存索引 fuzzy；不再为当前歌曲 `listFiles` 或解析所有缓存 JSON。
 6. TrackInfo 后 iOS 优先请求最多 5 行的 `GET_LYRIC_WINDOW`，先构建可见 UI；完整歌词后台请求。
 7. V2 完整歌词为 zlib JSON + A2 binary + CRC32；协商/大小失败自动回退 legacy 逐行协议。
-8. 翻译/罗马音继续通过 `GET_LYRIC_SECONDARY mode=translation|romanization` 独立分片发送。
+   - `RETRY_TRANSFER` 使用歌词传输自己的 `trackId + generation + transferId`，与封面是否存在、是否完成无关。
+   - 重传结果仍受当前 generation 栅栏保护，旧歌曲不得覆盖新歌。
+8. 翻译/罗马音继续通过 `GET_LYRIC_SECONDARY mode=translation|romanization` 独立分片发送。iOS 分别维护开始、分包空闲和总传输超时；临时错误或缺包只重试一次，明确 unavailable 不重试，切歌/断线会取消旧连接代次的请求。
 9. QRC 就绪回调会立即恢复 currentWord 边界调度；暂停时无周期任务，seek/恢复/切歌重新计算，最长 500ms 漂移校正。
+10. iOS 主界面显示等待 QQ QRC、歌词窗口、完整歌词、完成或明确失败；“重试歌词”只清理当前歌曲 cooldown/失败状态，并用 `GET_FULL_LYRICS forceRefresh=true` 触发兼容刷新。
+11. V4 预测候选只有在真实 Track Identity、稳定 mediaId/trackId 和 QRC fingerprint 全部复验后才能晋升；WEAK 历史候选永不晋升，失败立即走步骤 3 的冷路径。
+12. `mediaCacheValidationV1` 启用时，iOS cache v3 分别保存 Sony QRC 远端 fingerprint 与 iOS 实际落盘正文的 local fingerprint，并附带 schema/主歌词、翻译和罗马音行数。远端 fingerprint 用于 not-modified 协商，local fingerprint 用于精确检测本地损坏；二者不能互相替代。精确命中返回 `fullLyricsNotModified`，不重复发送 FullLyrics；任一字段或正文不一致、cache 损坏或旧 cache v1/v2 都回退一次完整传输并迁移。新 descriptor 只随完整正文发布落盘，不能附着到旧正文。
 
 ## 关键状态
 
@@ -46,6 +55,9 @@
 - `QrcParsedCacheIndex.json`：只保存 songKey、标准化 metadata、groupId、文件名、行数、时间和 fingerprint；500ms 防抖、临时文件原子替换。
 - `LyricRecoveryState`：`WAITING_QQMUSIC_CACHE`、`WATCHING_RECENT_QRC`、`RETRY_SCHEDULED`、`RETRYING`、`RESOLVED`、`EXPIRED` 等。
 - iOS `LyricLine`：解析 fullLyrics 和 secondary 后合并，secondary 会清洗 `//`、`/`、`暂无翻译` 等占位。
+- iOS `FullLyricsCacheStore`：按精确 trackId 并复核标准化 title+artist，最多 80 首/8MB/30 天；缓存命中只做即时展示，仍请求 Sony 复验，远端主歌词刷新时保留已有翻译/罗马音直到新结果到达。
+- 压缩缓存 key 包含 songKey、fingerprint、generation、格式和逐字行集合；翻译/罗马音、fingerprint、generation 改变时不复用旧正文。
+- `PredictiveHotSet` 最多两个 metadata entry、TTL 2 分钟；大数据继续引用 QRC parsed cache 和 `CompressedLyricsCache`，没有第二份大缓存。
 
 ## 不允许随便修改的点
 
@@ -56,6 +68,7 @@
 - 不要把 translation/romanization 塞回基础 `fullLyricsChunk` 导致 MTU 裁剪。
 - 不要让 Live Activity 显示翻译/罗马音或携带完整歌词。
 - 不要删除 negative/cooldown/alias 策略，除非有日志证明它们错误。
+- 不要让歌词重传读取或比较 `currentAlbumArtId`。
 
 ## 常见问题排查入口
 
@@ -71,3 +84,16 @@
 - iOS UserDefaults 歌词显示模式/偏移：full smoke。
 - Sony QRC/Recovery/Cache：Android build `./gradlew :PlayerAgentApp:assembleDebug`，真机播放有/无歌词、懒加载、翻译/罗马音歌曲。
 - docs-only：`git diff --check`。
+
+V4 实时性观测使用 `trackId + generation` 关联 `lyricRequestQueued`、`lyricReady`、pending、LyricWindow、FullLyrics 和 CurrentWord 阶段。Trace 不读取歌词正文，也不改变 QRC 加载、pending flush、队列优先级或 stale fence；指标定义见 [REALTIME_SLO_V4.md](/Volumes/雷电/project/MusicBleController/docs/REALTIME_SLO_V4.md)。
+
+## V4 Cold-Path Current Lyric 与 CurrentWord
+
+- `LyricManager` 对 lookup requested/start、runtime/parsed cache hit/miss、load、ready 和 current line selected 输出 `handoffId/trackId/generation/positionAnchor/lineIndex/wordTimingStatus/cacheSource/failureReason`；不写歌词正文。
+- `lyricsReady` 先把精确匹配的行写入 `CurrentTrackRuntimeCache`，再通过 `LyricsReadyGateSnapshot` 触发 current PlaybackState 首包。只有当前 trackId、generation、非空 current line 和订阅状态完全匹配才发送，旧 Track 不会借 fast publish 回写。
+- CurrentWord eligibility 区分 `ELIGIBLE`、`INTRO_WAIT`、`LINE_ONLY/NO_WORD_TIMING`、`LYRIC_NOT_READY`、`PAUSED`、`CLOCK_UNTRUSTED` 和 `NO_ACTIVE_LINE`。前奏/逐行/无歌词样本不冒充系统延迟失败。
+- CurrentWord 使用独立 scheduled executor；匹配 generation 的 `lyricsReady` 是首包事件屏障，250ms 仅作 bounded fallback。若 position 已在词内立即发送 snapshot，否则按真实下一边界调度；暂停时 suspended，seek/恢复时重算。
+- generation、sequence、position 和 anchor fence 全部保留。iOS 明确记录 `TRACK_MISMATCH/GENERATION_MISMATCH/SEQUENCE_OLD/POSITION_STALE/ANCHOR_STALE/DUPLICATE`，只有 accepted 后才发布。
+- 第四阶段没有修改 QRC Triple DES、parser、index schema、fuzzy、negative、alias 或 Recovery Engine。当前复测中 `lyrics ready → current line enqueue` p95 为 21.8～69.5ms，三场景均满足 100ms；Sony dispatch-next 的有效 Track → current lyric p95 为 112.4ms。NEXT/PREVIOUS 原始 p95 被 `WAITING_QQMUSIC_CACHE/NO_QRC_FILE` 样本拉到约 3.8～3.9 秒，报告已按原因单独分类，不能归因于 parser 或首包 enqueue。
+
+详细状态机、样本覆盖和未达标项见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。

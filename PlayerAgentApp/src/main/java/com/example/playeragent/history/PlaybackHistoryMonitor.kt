@@ -2,7 +2,9 @@ package com.example.playeragent.history
 
 import android.content.Context
 import android.os.SystemClock
+import com.example.playeragent.media.PlayerAgentExecutionHub
 import com.example.playeragent.media.PlaybackStateReader
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
@@ -11,7 +13,8 @@ import java.util.concurrent.atomic.AtomicReference
 
 class PlaybackHistoryMonitor(
     context: Context,
-    private val logger: (String) -> Unit
+    private val logger: (String) -> Unit,
+    executionHub: PlayerAgentExecutionHub? = null
 ) {
     private val appContext = context.applicationContext
     private val repository = PlaybackHistoryRepository(appContext)
@@ -20,12 +23,14 @@ class PlaybackHistoryMonitor(
         logger = logger,
         includeLyric = false
     )
-    private val executor: ScheduledExecutorService =
-        Executors.newSingleThreadScheduledExecutor { runnable ->
+    private val ownsExecutor = executionHub == null
+    private val scheduler: ScheduledExecutorService =
+        executionHub?.scheduled ?: Executors.newSingleThreadScheduledExecutor { runnable ->
             Thread(runnable, "PlaybackHistoryMonitorThread").apply {
                 isDaemon = true
             }
         }
+    private val worker: ExecutorService = executionHub?.maintenance ?: scheduler
 
     @Volatile
     private var running = false
@@ -34,6 +39,8 @@ class PlaybackHistoryMonitor(
     private var lastTickElapsedMs: Long = 0L
     private var lastTickPlaying = false
     private var missingSinceElapsedMs: Long? = null
+    private var nextTickDelayMs: Long = PlaybackHistorySamplingPolicy.IDLE_INTERVAL_MS
+    private var lastUpsertSignature: TrackUpsertSignature? = null
 
     fun start() {
         if (running) {
@@ -41,12 +48,7 @@ class PlaybackHistoryMonitor(
         }
         running = true
         updateStatus()
-        scheduledFuture = executor.scheduleWithFixedDelay(
-            { safeTick() },
-            0L,
-            MONITOR_INTERVAL_MS,
-            TimeUnit.MILLISECONDS
-        )
+        scheduleTick(0L)
         logger("[History] monitor started")
     }
 
@@ -57,7 +59,7 @@ class PlaybackHistoryMonitor(
         running = false
         scheduledFuture?.cancel(false)
         scheduledFuture = null
-        executor.execute {
+        worker.execute {
             runCatching {
                 endActiveSession(EndReason.SERVICE_STOPPED)
                 updateStatus()
@@ -65,16 +67,33 @@ class PlaybackHistoryMonitor(
                 logger("[History] stop flush failed error=${it.message}")
             }
         }
-        executor.shutdown()
+        if (ownsExecutor) scheduler.shutdown()
         reader.close()
         logger("[History] monitor stopped")
     }
 
+    private fun scheduleTick(delayMs: Long) {
+        scheduledFuture = scheduler.schedule(
+            {
+                runCatching { worker.execute(::safeTick) }
+                    .onFailure { logger("[History] schedule failed error=${it.message}") }
+            },
+            delayMs,
+            TimeUnit.MILLISECONDS
+        )
+    }
+
     private fun safeTick() {
-        runCatching {
-            tick()
-        }.onFailure {
-            logger("[History] tick failed error=${it.message}")
+        try {
+            runCatching {
+                tick()
+            }.onFailure {
+                logger("[History] tick failed error=${it.message}")
+            }
+        } finally {
+            if (running) {
+                scheduleTick(nextTickDelayMs)
+            }
         }
     }
 
@@ -85,6 +104,10 @@ class PlaybackHistoryMonitor(
         val nowWallMs = System.currentTimeMillis()
         val nowElapsedMs = SystemClock.elapsedRealtime()
         val snapshot = reader.readFastPlaybackSnapshot()
+        nextTickDelayMs = PlaybackHistorySamplingPolicy.intervalMs(
+            snapshot = snapshot,
+            hasActiveSession = activeSession != null
+        )
         if (snapshot == null || snapshot.title.isBlank()) {
             handleMissingSnapshot(nowElapsedMs, nowWallMs)
             return
@@ -98,7 +121,18 @@ class PlaybackHistoryMonitor(
         } else {
             proposedTrackKey
         }
-        repository.upsertTrackForSnapshot(trackKey, snapshot, nowWallMs)
+        val upsertSignature = TrackUpsertSignature(
+            trackKey = trackKey,
+            title = snapshot.title.trim(),
+            artist = snapshot.artist.trim(),
+            album = snapshot.album.trim(),
+            packageName = snapshot.packageName.trim(),
+            durationBucketMs = snapshot.durationMs.coerceAtLeast(0L) / 1_000L
+        )
+        if (upsertSignature != lastUpsertSignature) {
+            repository.upsertTrackForSnapshot(trackKey, snapshot, nowWallMs)
+            lastUpsertSignature = upsertSignature
+        }
 
         if (snapshot.stopped) {
             endActiveSession(EndReason.STOPPED)
@@ -371,6 +405,15 @@ class PlaybackHistoryMonitor(
         }
     }
 
+    private data class TrackUpsertSignature(
+        val trackKey: String,
+        val title: String,
+        val artist: String,
+        val album: String,
+        val packageName: String,
+        val durationBucketMs: Long
+    )
+
     private enum class EndReason {
         TRACK_CHANGED,
         MEDIA_SESSION_MISSING,
@@ -380,7 +423,6 @@ class PlaybackHistoryMonitor(
     }
 
     companion object {
-        private const val MONITOR_INTERVAL_MS = 1_000L
         private const val MAX_LISTEN_DELTA_MS = 5_000L
         private const val ACTIVE_PERSIST_INTERVAL_MS = 5_000L
         private const val MEDIA_SESSION_MISSING_TIMEOUT_MS = 10_000L

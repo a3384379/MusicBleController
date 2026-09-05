@@ -2,6 +2,7 @@ package com.example.playeragent.ble
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
@@ -54,6 +55,42 @@ class BleTransferCodecTest {
         assertEquals(
             (0 until 40).toList(),
             BleTransferCodec.retryChunkIndexes(40, (0 until 33).toList(), false)
+        )
+    }
+
+    @Test
+    fun lyricRetryIdentityDoesNotDependOnArtworkAvailability() {
+        assertTrue(
+            BleTransferCodec.isCurrentTransfer(
+                transferTrackId = "qq-track-1",
+                transferGeneration = 7,
+                currentTrackId = "qq-track-1",
+                currentGeneration = 7
+            )
+        )
+        assertTrue(
+            BleTransferCodec.isCurrentTransfer(
+                transferTrackId = "qq-track-1",
+                transferGeneration = 0,
+                currentTrackId = "qq-track-1",
+                currentGeneration = 9
+            )
+        )
+        assertFalse(
+            BleTransferCodec.isCurrentTransfer(
+                transferTrackId = "qq-track-1",
+                transferGeneration = 7,
+                currentTrackId = "qq-track-2",
+                currentGeneration = 8
+            )
+        )
+        assertFalse(
+            BleTransferCodec.isCurrentTransfer(
+                transferTrackId = "qq-track-1",
+                transferGeneration = 7,
+                currentTrackId = "qq-track-1",
+                currentGeneration = 8
+            )
         )
     }
 
