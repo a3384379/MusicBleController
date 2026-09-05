@@ -1,75 +1,93 @@
 # MusicBleController
 
-> **V4 阶段性交付，不代表性能验收完成：** 本次将 V4 开发成果提前接入 `master`，
-> 保留切歌与冷封面长尾、首字样本不足、Sony 蓝牙栈长时间稳定性失败等未闭环项。
-> 具体目标、实测数值与后续验收见 [V4 验收状态与未达标指标](docs/V4_ACCEPTANCE_STATUS.md)。
-
 <p align="center">
   <a href="README.md">English</a> ·
   <a href="README.zh-CN.md"><strong>简体中文</strong></a>
 </p>
 
 <p align="center">
-  <strong>让 iPhone 与 Android 控制端实时获取 Sony Walkman 上的 QQ 音乐歌词、封面和播放状态。</strong><br>
-  <strong>一个不依赖云端中转的 Sony 播放器跨平台蓝牙音乐伴侣。</strong>
+  <strong>音乐留在 Walkman，歌词和控制来到手机。</strong><br>
+  在 iPhone 灵动岛看 QQ 音乐歌词，用 iPhone 或 Android 遥控 Sony 播放器。<br>
+  Your Walkman plays. Your phone takes control.
 </p>
 
 <p align="center">
+  <a href="https://github.com/a3384379/MusicBleController/actions/workflows/build.yml"><img alt="master 构建与测试" src="https://github.com/a3384379/MusicBleController/actions/workflows/build.yml/badge.svg?branch=master"></a>
   <img alt="iOS 18+" src="https://img.shields.io/badge/iOS-18%2B-000000?logo=apple">
   <img alt="Android 6+" src="https://img.shields.io/badge/Android-6%2B-3DDC84?logo=android&logoColor=white">
   <img alt="SwiftUI" src="https://img.shields.io/badge/SwiftUI-ActivityKit-F05138?logo=swift&logoColor=white">
   <img alt="Kotlin" src="https://img.shields.io/badge/Kotlin-BLE-7F52FF?logo=kotlin&logoColor=white">
 </p>
 
-MusicBleController 是一个面向 Sony Android Walkman、iPhone 和 Android 手机的
-QQ 音乐状态同步与远程控制项目。运行在 Sony 播放器上的轻量 Android 服务负责读取
-QQ 音乐的 MediaSession、通知封面和本地 QRC 歌词，再通过低功耗蓝牙（BLE）传输到
-原生 SwiftUI iPhone App 或 Jetpack Compose Android App。两种控制端都可以显示
-逐字歌词、歌曲封面和播放进度，也可以控制播放、切歌、进度和音量；iPhone 还支持
-锁屏实时活动与灵动岛。
+<p align="center">
+  <a href="#安装与使用">开始使用</a> ·
+  <a href="#你能用它做什么">功能亮点</a> ·
+  <a href="#兼容性">支持设备</a> ·
+  <a href="docs/V4_ACCEPTANCE_STATUS.md">V4 进度与限制</a> ·
+  <a href="https://github.com/a3384379/MusicBleController/issues/new/choose">反馈设备兼容性</a>
+</p>
+
+喜欢用 Walkman 听歌，却总要拿出播放器才能看歌词、切歌？MusicBleController
+让 **Sony Android Walkman 上的 QQ 音乐**通过低功耗蓝牙连接到你的手机。
+你可以在 iPhone 或 Android 上跟着逐字歌词唱、查看封面、调音量和拖动进度；
+在 iPhone 上，还能使用**灵动岛和锁屏实时活动**查看与控制播放。
+
+**这是播放遥控与信息同步工具，不是音频串流工具。** 音频仍由 Walkman 原有输出播放，
+BLE 只传输控制命令、歌词、封面与状态。伴侣应用不需要云端中转；QQ 音乐本身的联网、
+账号及内容访问条件不因此改变。
+
+> [!NOTE]
+> **V4 已作为阶段性成果合入 `master`，不代表性能验收完成。** 切歌和冷封面仍有长尾，
+> 首字样本与长时间稳定性仍需闭环。[查看真实指标和未完成清单](docs/V4_ACCEPTANCE_STATUS.md)。
 
 > [!IMPORTANT]
 > 当前版本只支持 **Android 版 QQ 音乐**，不支持 Apple Music、Spotify、网易云音乐
 > 或其他播放器。本项目是非官方社区项目，与 Sony、Apple、腾讯或 QQ 音乐没有隶属、
 > 授权或合作关系。
 
-> [!NOTE]
-> 项目代码目前可公开查看，但仓库所有者尚未选择项目级许可证。在许可证明确之前，
-> 请不要假定代码具备自由复制、修改或再分发授权。
-
-## 界面预览
+如果你也想让 Walkman 和手机这样配合，欢迎 **Star 收藏项目**。
+已经试用？一份[设备兼容性反馈](https://github.com/a3384379/MusicBleController/issues/new/choose)
+或一条[使用体验讨论](https://github.com/a3384379/MusicBleController/discussions)同样有帮助。
 
 <p align="center">
-  <img src="docs/assets/ios_main_player_ui_from_code.svg" width="720" alt="MusicBleController iPhone 主播放器界面">
+  <img src="docs/assets/github-social-preview.png" width="960" alt="项目概念插画：Sony Walkman 与 iPhone 通过 BLE 同步 QQ 音乐歌词、封面和控制">
+  <br><sub>项目概念插画，非真机截图。</sub>
 </p>
 
+## 你能用它做什么
+
+| 功能 | 日常使用体验 | 支持端 |
+|---|---|---|
+| QRC 逐字歌词 | 跟随当前字高亮，浏览完整歌词，以及源文件中已有的翻译、罗马音 | iPhone / Android |
+| 灵动岛与实时活动 | 在 iPhone 系统界面查看当前播放，并使用支持的播放控制 | iPhone |
+| 随手遥控 | 播放/暂停、上一首/下一首、调整音量、拖动进度 | iPhone / Android |
+| 封面与歌词缓存 | 预览封面优先、高清图后台升级；iPhone/Sony 校验命中时跳过完整歌词重传 | iPhone / Android；V4 歌词校验协商用于 iPhone |
+| 播放历史 | 查看之前听过的歌曲与收听记录 | iPhone / Android |
+| 本机诊断 | 遇到不同步时，检查连接、歌词、封面与日志 | Sony / iPhone / Android |
+
+逐字高亮需要本地 QRC 包含逐字时间；没有的翻译或罗马音不会自动生成。
+灵动岛需要支持该功能的 iPhone 机型。
+
 <details>
-  <summary>查看更多 iOS 设置、诊断和 Sony 端界面</summary>
+  <summary>早期 UI 结构示意（不是当前 V4 的真机截图）</summary>
   <p align="center">
+    <img src="docs/assets/ios_main_player_ui_from_code.svg" width="720" alt="早期 iPhone 主播放器布局参考">
     <img src="docs/assets/ios_preferences_diagnostics_ui_from_code.svg" width="720" alt="iOS 设置与诊断界面">
     <img src="docs/assets/sony_playeragent_debug_ui_from_code.svg" width="720" alt="Sony PlayerAgent 调试界面">
   </p>
 </details>
 
-## 为什么做这个项目？
+## 为 Walkman 使用场景设计
 
-Sony 的 Android Walkman 可以安装 QQ 音乐，但它的播放状态、QRC 逐字歌词和封面
-无法自然同步到 iPhone。本项目让两台设备在附近直接通信，不需要搭建服务器，也不需要
-把播放信息上传到第三方云端。
-
-项目重点不只是“能够连接”，还包括在 Sony 播放器性能有限、BLE 带宽较低的情况下，
-尽可能及时和稳定地展示当前歌曲：
-
-- **QQ 音乐逐字歌词**：解析本地加密 QRC 歌词，支持逐字时间、翻译和罗马音数据；
-- **自动歌词校时**：使用 Sony/iPhone 单调时钟映射补偿 BLE 排队和传输延迟，并保留人工微调；
-- **快速封面显示**：优先发送小型预览图，再在后台升级高清封面；
-- **完整播放控制**：支持播放、暂停、上一首、下一首、进度和音量；
-- **双原生控制端**：iPhone 使用 SwiftUI，Android 使用 Jetpack Compose，均支持
-  主播放器、完整歌词、历史、设置与诊断；
-- **iPhone 专属能力**：使用 ActivityKit 提供锁屏实时活动和灵动岛；
-- **弱性能设备优化**：使用可抢占 BLE 队列、压缩歌词、索引缓存和分级封面；
-- **兼容与恢复**：支持新旧协议协商、健康探测、有限重试和自动重连；
-- **可诊断与可测试**：两端均提供诊断日志，并包含 Android、iOS 和跨端冒烟测试。
+- **本地连接，原生体验：** Sony 使用 Kotlin，iPhone 使用 SwiftUI/CoreBluetooth，
+  Android 控制端使用 Jetpack Compose，不需要部署伴侣服务器。
+- **让缓存真正省传输：** 本地 QRC 索引、歌词压缩和封面复用；V4 的 iPhone/Sony
+  歌词校验可在内容未变时跳过完整正文重传。
+- **新歌曲身份优先：** 通过 identity、generation 和 transfer 栅栏拒绝迟到的旧结果，
+  不提前展示猜测的下一首歌曲。
+- **先处理控制，再处理大图：** 播放状态和当前字可抢占大媒体任务，并提供健康检查与恢复路径。
+- **可追溯的性能进展：** 提供 CI、真机 Smoke、Trace 和
+  [未达标指标](docs/V4_ACCEPTANCE_STATUS.md)，不宣称零延迟或全机型兼容。
 
 ## 工作原理
 
@@ -95,6 +113,9 @@ Sony 端是播放状态、歌词和封面的权威数据源，iPhone 与 Android
 5. 控制端合并传输结果并更新播放器、歌词和缓存；iPhone 同时更新 Live Activity。
 
 固定 BLE UUID、已有控制命令和旧协议兼容路径会被保留，新功能只在双方确认能力后启用。
+
+以上是实现能力，不等于 V4 双控制器验收已完成。当前真机优化优先 **单 iPhone + 单 Sony**，
+混合控制器的 V4 产品验收仍在延期清单中。
 
 ## 歌词、封面与连接性能
 
@@ -137,10 +158,14 @@ Sony 端是播放状态、歌词和封面的权威数据源，iPhone 与 Android
 
 ## 安装与使用
 
+准备 **一台运行 QQ 音乐的 Sony + 一个手机控制端**，iPhone 与 Android 选其一即可，
+不需要两个都装。体验当前 V4 请构建 `master`；iPhone 需要 Xcode 和自己的签名配置，
+不是下载通用 IPA 后直接安装。
+
 ### 1. 安装 Sony 端 PlayerAgent
 
-可以从 [v0.1.0 Preview](https://github.com/a3384379/MusicBleController/releases/tag/v0.1.0)
-下载用于体验的 Android APK，也可以自行构建：
+[v0.1.0 Preview](https://github.com/a3384379/MusicBleController/releases/tag/v0.1.0)
+保留了早期体验 APK，**不包含当前 V4 成果**。建议从当前主干自行构建：
 
 ```bash
 git clone https://github.com/a3384379/MusicBleController.git
@@ -255,7 +280,21 @@ bash gradlew \
 ## 项目状态与参与贡献
 
 这是一个持续开发中的设备型项目，不是已经上架 App Store 的成品。安装目前仍需要
-Android 侧载和 Xcode 签名经验。欢迎反馈：
+Android 侧载和 Xcode 签名经验。
+
+| 方向 | V4 当前状态 |
+|---|---|
+| iPhone / Sony 产品化 UI | 已实现 |
+| Trace、SLO 工具与精确缓存校验 | 已实现，不代表全部性能指标达标 |
+| 冷切歌与首字长尾 | 持续优化、验收未完成 |
+| 跨端预测预取 | 未开启：当前实测 QQ 音乐不提供可靠队列 |
+| 双控制器与长时间稳定性 | 验收仍未闭环 |
+
+具体数值见[验收清单](docs/V4_ACCEPTANCE_STATUS.md)；合并后的
+[验证补充记录](https://github.com/a3384379/MusicBleController/pull/7#issuecomment-5548822515)
+还保留了快照存储 XCTest 首轮失败、重试通过的 CI 稳定性问题。
+
+欢迎反馈：
 
 - 其他 Sony Android Walkman 型号与地区固件的兼容结果；
 - 可以稳定复现的 BLE 延迟、断连或重连日志；
