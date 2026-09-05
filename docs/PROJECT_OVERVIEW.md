@@ -43,8 +43,9 @@
 12. 高频切歌与封面传输并发时，Sony 对合法 command 保持即时 ATT response，并在 response 后按设备保留 25ms quiet window；封面 binary 最小 pacing 固定为 15ms。健康链路不会仅因歌曲 generation 变化显示“正在连接”。
 13. V4 第四阶段以本地 `handoffId` 关联 command、MediaSession、PlaybackState、歌词和 CurrentWord；该 ID 只用于 Trace，不进入 BLE payload。
 14. 歌词 ready 后，Sony 通过精确 trackId/generation 屏障立即发布包含 current line 的 PlaybackState，并立即恢复独立 CurrentWord boundary scheduler，不再等待下一轮 AutoPush。
-15. iOS 控制写会取消尚未执行的普通 `GET_PLAYBACK_STATE` fallback，并把 NEXT/PREVIOUS 的兜底读取合并到播放器身份切换窗之后；前台验证和 Health 探针不参与丢弃。Sony 的 220ms 控制后广播始终发布轻量 PlaybackState，但只有实际 `trackId` 已变化才附带 TrackInfo/封面，避免旧身份和旧图占用正式新歌曲通道。
+15. iOS 控制写会取消尚未执行的普通 `GET_PLAYBACK_STATE` fallback，并把 NEXT/PREVIOUS 的兜底读取合并到播放器身份切换窗之后；前台验证和 Health 探针不参与丢弃。Sony 的 220ms 控制后广播保留轻量 PlaybackState 兜底；新身份和精确封面由权威 MediaSession 确认后的 fast lane 发布，避免旧身份和旧图占用正式新歌曲通道。
 16. Sony TrackInfo 始终进入既有 P0 实时队列并在长媒体任务包边界抢占；latest-only interleaved 槽只保留可替换的 volumeState。iOS Clock Sync 后台探针在 FullLyrics/图片接收期间有界延后，媒体空闲后事件化恢复，不新增 Timer。
+17. Sony BLE 主 `PlaybackStateReader` 在权威 MediaSession 确认新身份后先原子建立 runtime generation，立即同步 Sony UI 和 iOS TrackInfo，再继续歌词、capability 和诊断路径；该 fast lane 不使用通知猜测、不改协议，也不向非 BLE Reader 重复发布。
 
 ## 关键状态
 

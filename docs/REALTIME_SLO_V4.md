@@ -240,3 +240,7 @@ Sony scheduler 段已经收敛：eligible → scheduler p95 0ms、scheduler → 
 回退后的当前提交又完成 NEXT、PREVIOUS、Sony dispatch-next 各 30 次：三轮 Handoff 均 30/30 PASS，Track publish p95 分别为 1026.0ms、640.0ms、145.0ms；`lyrics ready → current line enqueue` p95 为 69.5ms、21.8ms、43.8ms。TrackInfo 现始终走普通 P0 队列，Clock Sync 探针在大媒体接收时有界延后并成对恢复。100 次快速压力中 100/100 写回调，stale accepted、duplicate control、command timeout、hard reconnect 均为 0。
 
 完整状态机、当前/历史修改前后数据、资源与未完成项见 [COLD_PATH_HANDOFF_V4.md](/Volumes/雷电/project/MusicBleController/docs/COLD_PATH_HANDOFF_V4.md)。120 分钟自然播放完成 30 次真实转换，但约第 97 分钟出现 4 次 L2CAP write failure、1 次 Sony 系统 Bluetooth HCI timeout/process death；PlayerAgent 在约 4.4 秒内恢复连接，但 Soak 仍为 FAIL。当前逐字测试歌单每场景仅产生 2 个立即 eligible 样本，双控制器矩阵也按当前优先级延期，因此第四阶段仍不能标记完整完成。
+
+后续 authority-acceptance fast lane 在 Sony 已确认 MediaSession 新身份时先建立正式 runtime generation 并发布现有 TrackInfo，再继续歌词、capability 和诊断工作；没有新增协议、UUID、持续轮询或预测展示。NEXT/PREVIOUS 30 次的 command → Track p95 分别为 546.4ms/391.8ms，metadata observed → Track accepted p95 为 30.5ms/14.0ms；前者仍受 QQ 音乐暴露 metadata 时机限制。带逐字 QRC 的 90 秒专用窗口记录到 27 条 iOS accepted，日志派生 CurrentWord latency p95=114ms、stale=0、main stall=0；该稳态结果不替代统一 Trace 的切歌首字验收。100 次快速交替切歌以 `STALE_CONTENT=0/duplicate_control=0` PASS。
+
+2026-09-05 最终安装版 NEXT 5 次的 Trace 完整性仍为 PASS，但 command → Track p95=3153.6ms（dispatch → metadata p95=2838.2ms），Preview p95=2643.2ms，无 word eligible 样本。小样本保留为长尾反例，不能仅引用前一日 30 次数据宣称整体稳定达标；详见第四阶段报告第 21 节。

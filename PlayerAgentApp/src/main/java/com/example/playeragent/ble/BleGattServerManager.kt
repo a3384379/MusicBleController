@@ -111,7 +111,9 @@ class BleGattServerManager(
         logger = logger,
         reactiveMediaController = reactiveMediaController,
         executionHub = executionHub,
-        onLyricsReady = ::handleLyricsReady
+        onLyricsReady = ::handleLyricsReady,
+        enableTrackIdentityFastLane = true,
+        onTrackIdentityReady = ::handleTrackIdentityReady
     )
     private val albumArtTestManager = AlbumArtTestManager(
         context = appContext,
@@ -861,6 +863,26 @@ class BleGattServerManager(
                 }
             }
         }
+    }
+
+    private fun handleTrackIdentityReady(source: JSONObject) {
+        if (!started) return
+        onPlaybackUiState(source)
+        if (subscribedDevices.isEmpty()) return
+        val trackId = buildAlbumArtProtocolId(source)
+        val generation = mediaWireGeneration(trackId)
+        sendTrackInfo(source)
+        sendAlbumArtIfSongChanged(source)
+        val handoffTrace = TrackHandoffTraceCoordinator.contextFor(trackId)
+        RealtimeTrace.record(
+            stage = "trackFastLanePublished",
+            trackId = trackId.takeIf { it.isNotBlank() },
+            generation = generation.takeIf { it > 0L },
+            payloadType = "trackInfo",
+            result = "published",
+            handoffId = handoffTrace?.handoffId,
+            triggerType = handoffTrace?.triggerType?.name
+        )
     }
 
     private fun publishLyricsReadyPlaybackIfCurrent(ready: LyricsReadyGateSnapshot) {

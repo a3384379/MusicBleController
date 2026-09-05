@@ -17,13 +17,25 @@ import com.example.playeragent.service.PlayerNotificationListenerService
 import org.json.JSONObject
 import java.security.MessageDigest
 
+internal object TrackIdentityFastLanePolicy {
+    fun shouldPublish(
+        trackChanged: Boolean,
+        trackId: String,
+        title: String
+    ): Boolean {
+        return trackChanged && trackId.isNotBlank() && title.isNotBlank()
+    }
+}
+
 class PlaybackStateReader(
     context: Context,
     private val logger: (String) -> Unit,
     private val includeLyric: Boolean = true,
     private val reactiveMediaController: ReactiveMediaController = ReactiveMediaController(logger),
     private val onLyricsReady: (LyricsReadyGateSnapshot) -> Unit = {},
-    private val executionHub: PlayerAgentExecutionHub? = null
+    private val executionHub: PlayerAgentExecutionHub? = null,
+    private val enableTrackIdentityFastLane: Boolean = false,
+    private val onTrackIdentityReady: (JSONObject) -> Unit = {}
 ) {
 
     private val appContext = context.applicationContext
@@ -167,6 +179,103 @@ class PlaybackStateReader(
             )
         }
         lastTrackId = currentTrack.trackId
+        val songKey = buildLyricSongKey(title, artist, album)
+        val mediaDecision = reactiveMediaController.onPlaybackObserved(
+            trackId = lastTrackId,
+            songKey = songKey,
+            title = title,
+            artist = artist,
+            album = album,
+            positionMs = position,
+            durationMs = duration,
+            isPlaying = playing
+        )
+        val fastIdentityPublished = enableTrackIdentityFastLane &&
+            TrackIdentityFastLanePolicy.shouldPublish(
+                trackChanged = mediaDecision.trackChanged,
+                trackId = lastTrackId,
+                title = title
+            )
+        if (fastIdentityPublished) {
+            val identityResponse = JSONObject()
+                .put("type", "playbackState")
+                .put("playing", playing)
+                .put("title", title)
+                .put("artist", artist)
+                .put("album", album)
+                .put("position", position)
+                .put("positionSampleElapsedMs", positionSampleElapsedMs)
+                .put("positionSampleUnixMs", positionSampleUnixMs)
+                .put("speed", playbackSpeed.toDouble())
+                .put("duration", duration)
+                .put("lyric", "")
+                .put("lyricStatus", "LOADING")
+                .put("lyricReason", "TRACK_IDENTITY_READY")
+                .put("lyricSuggestion", "")
+            val runtimeTrack = CurrentTrackRuntimeCache.updatePlaybackState(
+                trackId = lastTrackId,
+                songKey = songKey,
+                title = title,
+                artist = artist,
+                album = album,
+                positionMs = position,
+                positionSampleElapsedMs = positionSampleElapsedMs,
+                durationMs = duration,
+                isPlaying = playing,
+                playbackSpeed = playbackSpeed,
+                currentLine = "",
+                lyricSource = "NONE",
+                lastPlaybackState = identityResponse,
+                diagnosticSnapshot = "",
+                logger = logger
+            )
+            val acceptedAtMs = SystemClock.elapsedRealtime()
+            val handoffTrace = TrackHandoffTraceCoordinator.contextFor(runtimeTrack.trackId)
+            RealtimeTrace.record(
+                stage = "trackIdentityAccepted",
+                monoMs = acceptedAtMs,
+                trackId = runtimeTrack.trackId,
+                generation = runtimeTrack.currentTrackGeneration,
+                payloadType = "mediaSession",
+                result = "accepted",
+                reason = "fast_lane",
+                handoffId = handoffTrace?.handoffId,
+                triggerType = handoffTrace?.triggerType?.name,
+                positionAnchorMs = runtimeTrack.positionAnchorElapsedMs
+            )
+            RealtimeTrace.record(
+                stage = "mediaGenerationCreated",
+                monoMs = acceptedAtMs,
+                trackId = runtimeTrack.trackId,
+                generation = runtimeTrack.currentTrackGeneration,
+                payloadType = "trackIdentity",
+                result = "created",
+                reason = "fast_lane",
+                handoffId = handoffTrace?.handoffId,
+                triggerType = handoffTrace?.triggerType?.name,
+                positionAnchorMs = runtimeTrack.positionAnchorElapsedMs
+            )
+            RealtimeTrace.record(
+                stage = "trackIdentityFastReady",
+                monoMs = acceptedAtMs,
+                trackId = runtimeTrack.trackId,
+                generation = runtimeTrack.currentTrackGeneration,
+                payloadType = "trackInfo",
+                processingMs = (acceptedAtMs - startedAtMs).coerceAtLeast(0L),
+                result = "ready",
+                handoffId = handoffTrace?.handoffId,
+                triggerType = handoffTrace?.triggerType?.name,
+                positionAnchorMs = runtimeTrack.positionAnchorElapsedMs
+            )
+            runCatching {
+                onTrackIdentityReady(identityResponse)
+            }.onFailure { exception ->
+                logger(
+                    "[PlaybackState] track identity fast lane callback failed: " +
+                        exception.message
+                )
+            }
+        }
         TrackCapabilityTracker.onTrackSeen(
             trackId = lastTrackId,
             protocolId = lastTrackId,
@@ -195,17 +304,6 @@ class PlaybackStateReader(
                     .isNotBlank()
         )
         observeTrackTransition(currentTrack)
-        val songKey = buildLyricSongKey(title, artist, album)
-        val mediaDecision = reactiveMediaController.onPlaybackObserved(
-            trackId = lastTrackId,
-            songKey = songKey,
-            title = title,
-            artist = artist,
-            album = album,
-            positionMs = position,
-            durationMs = duration,
-            isPlaying = playing
-        )
         if (mediaDecision.trackChanged) {
             LyricTraceLogger.stage(
                 runId = "unknown",
@@ -369,7 +467,7 @@ class PlaybackStateReader(
         observeQueueCandidates(selected, currentTrack)
         val readyAtMs = SystemClock.elapsedRealtime()
         val handoffTrace = TrackHandoffTraceCoordinator.contextFor(runtimeTrack.trackId)
-        if (mediaDecision.trackChanged) {
+        if (mediaDecision.trackChanged && !fastIdentityPublished) {
             RealtimeTrace.record(
                 stage = "trackIdentityAccepted",
                 monoMs = readyAtMs,

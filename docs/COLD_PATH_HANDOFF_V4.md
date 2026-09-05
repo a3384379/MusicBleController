@@ -58,11 +58,17 @@ MediaSession metadata 是正式身份来源；QQ 音乐通知 metadata 仅作为
 
 第一份身份不等待 FullLyrics、translation、romanization、Preview、HQ、history 或 diagnostics。iOS 仍在正式 trackId/generation 被接受后发布 metadata，缓存快照不计作新歌发布。
 
+后续真机 Trace 发现，`PlaybackStateReader` 在已经从权威 MediaSession 观察到新 metadata 后，仍会先执行 capability、预测历史、歌词状态和诊断工作，最后才建立 runtime generation 并发布 TrackInfo。新的 authority-acceptance fast lane 只在 BLE 主 Reader 中开启：当 `ReactiveMediaController` 确认 trackId 变化、trackId 和 title 均非空时，先原子创建正式 generation，发布不含旧歌词的轻量身份状态，再继续原有歌词和诊断路径。
+
+Sony 本机 UI 与 iOS 在同一回调中接收新身份。Sony 先进入新曲的封面 LOADING，并复用 title/artist 精确校验和 generation/songKey fence 请求新图，不再继续显示上一首封面。其他用于历史、诊断和临时查询的 Reader 默认不开启 fast lane，避免重复 generation 或重复发布。
+
 ## 7. 有界 Handoff Probe
 
 本阶段没有增加 Handoff Probe。真机 Trace 已观察到 MediaSession metadata callback，且 dispatch → metadata 长尾发生在 QQ 音乐/MediaSession 真正切换之前；增加 0/80/160/320ms 读取只会重复读旧身份，不能缩短播放器内部切歌时间，还会引入额外 Binder 和媒体读取竞争。
 
 因此新增持续轮询为 0，现有 AutoPush 周期也没有调快。若未来设备出现“播放器已经切换但 callback 丢失”的独立证据，再单独打开固定次数、可取消的 Probe Gate。
+
+本轮曾试验 120/200/280/360ms 的命令触发轻量 Probe。该轮 NEXT 30 次总 p95 为 734.3ms，且有 1 个 UI consume Trace 不完整；其 MTU 为 185，而保留实现的正常轮次为 515，不能把差异单独归因于 Probe 或 Handler 排队。由于没有证明稳定收益，该实现已在提交前完整删除，最终代码仍使用通知事件与原 220ms 冷路径 fallback。
 
 ## 8. Current Lyric 首包路径
 
@@ -100,7 +106,7 @@ P0 仍包括控制状态、TrackInfo、PlaybackState 和 CurrentWord；P1 lyricW
 
 提交 `3596804` 曾把 ATT response 串行化到同设备 notify callback 边界。它在一轮压力 Trace 中消除了 write timeout，但安装后出现 iOS 和 Android Controller 同时拿不到部分歌词、进度和图片的产品回归，因此由 `1154397` 完整回退。旧轮次的 `commandResponseDeferred/Released/Rejected` 数据只能解释实验，不再描述当前协议路径。
 
-当前跟进优化避免再改 ATT 生命周期：iOS 在串行写队列中合并过期的普通 `GET_PLAYBACK_STATE`，NEXT/PREVIOUS fallback 从 500ms 调整为 1 秒，并在正式新 trackId 到达时取消；前台验证和 Health probe 不参与丢弃。Sony 的 220ms 控制后 fallback 始终发送轻量 PlaybackState，但只有读取到与控制前不同的非空 `trackId` 才附带 TrackInfo/AlbumArt。这样既保留冷路径兜底，也避免用旧歌曲媒体抢占新身份、歌词、CurrentWord 和封面。
+当前跟进优化避免再改 ATT 生命周期：iOS 在串行写队列中合并过期的普通 `GET_PLAYBACK_STATE`，NEXT/PREVIOUS fallback 从 500ms 调整为 1 秒，并在正式新 trackId 到达时取消；前台验证和 Health probe 不参与丢弃。Sony 的 220ms 控制后 fallback 保留轻量 PlaybackState 兜底；新身份、TrackInfo 和精确封面由权威 MediaSession 确认后的 fast lane 独立发布。这样避免用旧歌曲媒体抢占新身份、歌词、CurrentWord 和封面。
 
 新增 Trace 为 iOS `commandRefreshSuperseded` 与 Sony `postControlMediaDeferred/postControlMediaPublished`。该策略先通过纯策略单测、Sony unit/assemble 和 Swift 源码解析，本轮再由下述 iPhone + Sony 正常与压力场景完成真机复核。
 
@@ -172,6 +178,22 @@ Sony dispatch-next 是 `adb shell cmd media_session dispatch next` 的自动等�
 
 100 次 650ms 快速压力完成 100 个控制意图和 100 个写回调，播放器实际产生 55 次 Track change；报告按压力口径 PASS。`stale accepted`、`duplicate control`、command timeout、hard reconnect、CurrentWord reject 均为 0。30 个被取消的媒体任务全部是切歌触发的 `track_changed/stale_generation` 主动取消，没有队列永久卡住；快速压力数据不计入正常 SLO。
 
+加入 authority-acceptance fast lane 后的当前 iPhone + Sony 正常场景：
+
+| metric | NEXT p95 | PREVIOUS p95 | 对比上一当前轮次 |
+|---|---:|---:|---:|
+| command → Track publish | 546.4ms | 391.8ms | NEXT -46.7%；PREVIOUS -38.8% |
+| metadata observed → Track accepted | 30.5ms | 14.0ms | NEXT -89.9%；PREVIOUS -84.6% |
+| Track → current lyric | 426.8ms（28） | 566.6ms（25） | QRC 可用性仍影响覆盖 |
+| word eligible → publish | 189.0ms（4） | 149.6ms（13） | 样本 p95 满足 ≤250ms，覆盖仍不足 |
+| Track → Preview | 1338.5ms | 92.2ms | NEXT 冷图仍 FAIL；PREVIOUS PASS |
+
+NEXT/PREVIOUS 均完成 30/30 转换，`trackIdentityFastReady/trackFastLanePublished` 均为 30/30，没有 command timeout、hard reconnect、duplicate control 或 stale accepted。NEXT 主要剩余段是 dispatch 结束到 QQ 音乐/MediaSession 暴露新 metadata，fast lane 不提前猜测歌曲，因此不能消除这段外部等待。
+
+最终 100 次 650ms 快速交替压力报告 PASS：100 个控制意图、53 次播放器实际身份切换、53/53 fast lane 发布；`STALE_CONTENT=0`、`duplicate_control=0`、`malformed=0`。一条旧身份被 generation fence 正确拒绝，2 个在途 Preview 被新曲抢占取消，都没有被 iOS 接受为当前内容。
+
+专用逐字 QRC 90 秒窗口的旧版日志报告统计到 27 条 iOS CurrentWord accepted，stale discard=0、main stall=0、execution gap=0，日志派生 latency p95=114ms，CurrentWord 与 Live Activity 检查均 PASS。日志可能节流，该结果仅说明这一稳态窗口表现，不能替代统一 Trace 下切歌 → 首字的完整 SLO 验收。另一首只有逐行歌词的样本明确返回 `LINE_ONLY/NO_WORD_TIMING`，不伪造 CurrentWord。
+
 ## 18. 两小时 Soak
 
 最终真机轮次实际观察 120 分钟。Sony Trace 有 33 条 track-change 事件；按精确 trackId 的相邻状态去除 2 条同曲刷新后，为 31 个顺序唯一状态、30 次真实自然转换。该轮没有发送 dispatch-next；测试工具仅依据明确的 `mode=natural` 测量场景在报告层标为 `NATURAL_AUTOPLAY`，设备原始 Trace 的 `triggerType` 仍为 `UNKNOWN`，不能表述成 QQ 音乐主动提供了自然播放来源标签。
@@ -192,13 +214,26 @@ Sony 新增一个 CurrentWord 单线程 scheduler，替代共享 executor 上的
 
 ## 20. 未完成问题
 
-- 远程 NEXT/PREVIOUS command → Track publish p95 分别为 1026.0ms 和 640.0ms，均未达到 350ms；当前主要剩余段仍是播放器切换/metadata 暴露及其波动。
-- 当前轮 NEXT/PREVIOUS/Sony dispatch-next 的 word eligible → publish 只有 2/2/2 个样本，分别为 407.7ms、445.2ms、81.1ms；覆盖不足，不能形成正式 p95 结论。
-- 当前轮每场景只有 2 个立即 eligible Track → first word 样本，未达到各 30 个覆盖目标；需要换用确实含逐字 QRC 的测试歌单再验收。
+- 远程 NEXT/PREVIOUS command → Track publish p95 已下降到 546.4ms 和 391.8ms，但仍未达到 350ms；当前主要剩余段是播放器切换/metadata 暴露及其波动。
+- 专用逐字 QRC 90 秒窗口的日志派生 CurrentWord latency p95=114ms 且未观察到 stale，但 NEXT/PREVIOUS 切歌场景仍只有 4/13 个 word eligible 样本，未达到每场景 30 个覆盖目标。
+- NEXT 冷图 Track → Preview p95 仍为 1338.5ms，未达 800ms；PREVIOUS 的缓存/重用路径为 92.2ms。
 - 120 分钟自然播放虽完成 30 次真实转换，但 Sony 系统 Bluetooth stack 在约第 97 分钟发生 1 次 HCI timeout/process death；4 次 L2CAP write failure，Soak 为 FAIL。
 - iOS 滚动日志只恢复到 19 次 Track change、7 个完整 UI Handoff；Clock Sync 又因 Bluetooth 重启不可信，自然场景跨端 p95 为 `NOT APPLICABLE`。
 - Android Controller 与双控制器矩阵按当前优先级延期，为 `SKIPPED（当前范围）`。
-- 回退后的 iPhone + Sony NEXT、PREVIOUS、Sony dispatch-next 各 30 次和 100 次快速压力已执行并 PASS；远程 Track、部分 QRC 冷路径和 NEXT 冷图片仍未达到目标。
+- authority-acceptance fast lane 的 iPhone + Sony NEXT/PREVIOUS 各 30 次、CurrentWord 90 秒和 100 次快速压力已执行；保留实现的这些轮次均 PASS。远程 Track、部分 QRC 冷路径和 NEXT 冷图片仍未达到目标。
 - 历史快速压力曾发生 Clock Sync reset；本轮 100 次压力 Clock Sync 可信且无 hard reconnect，但仍只按正确性口径验收，不作为正常 SLO。
 
 在上述项闭环前，第四阶段结论只能是“未完成，存在阻断项”。
+
+## 21. Fast lane 提交前复核（2026-09-05）
+
+- Sony `testDebugUnitTest` / `assembleDebug`：PASS；新增身份变化与不完整 metadata 的策略测试。最终 APK 已覆盖安装，未清除应用数据。
+- Sony quick smoke：PASS，Required 8/8，Optional pass=5、warn=0、skipped=2；无订阅者窗口的 PlaybackDiff / CurrentWord 为 SKIPPED，不能算作链路通过。
+- iOS quick smoke：PASS，Required 6/6，Optional pass=4、warn=4、skipped=1；Notify、PlaybackState、Healthy 与封面链路 PASS。没有新扫描/发现/连接事件及 CurrentWord 样本的项目保留 WARN。
+- 最终安装版补测 NEXT 5 次：Trace 完整性 PASS（5/5，MTU 515、Clock Sync 可信、fast lane 5/5），不等于性能通过。command → Track p50/p95/max 为 938/3153.6/3591ms，其中 dispatch → metadata p95/max 为 2838.2/3425ms，metadata → accepted p95 为 45.4ms。冷图 Preview p95 为 2643.2ms；本轮无 word eligible 样本，一首缺少本地 QRC。该小样本不能替代前述 30 次对照，也不能忽略：它显示播放器 metadata 等待及冷图长尾仍不稳定，尚不能宣称端到端性能稳定改善。
+- 两个 quick 脚本均跳过构建/安装；上述 Sony 构建与安装是单独执行的。iOS 本批无源码改动，本地 XCTest、全量 smoke 与重新安装为 SKIPPED；提交后的 XCTest 以对应 GitHub Actions 结果为准。
+- Sony lint：FAIL（历史基线），修改前后均为 20 errors / 33 warnings，没有增加；未使用 suppress 或关闭 abortOnError。Android Controller 本地构建/lint 及双控制器真机测试为 SKIPPED（当前范围）。
+- BLE UUID、既有 command/status 语义、A1/A2 固定 Header、ATT response 生命周期与 pacing 均未修改；没有新增 Timer 或持续轮询。可选身份回调异常被隔离，后续正常歌词/冷路径继续执行。
+- `git diff --check`：PASS。图谱已完整重建且不落盘；当前工具未提供 `detect_changes`，影响范围由源代码 diff、调用路径和上述测试交叉核实。
+
+原始报告仅保留在本机 `/tmp/musicble_phase4/`、`/tmp/music_ble_ios_smoke/` 与 `/tmp/music_ble_android_smoke/`，不提交真实歌曲名、设备标识或完整日志。
