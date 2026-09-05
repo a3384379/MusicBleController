@@ -1,5 +1,9 @@
 # MusicBleController
 
+> **V4 阶段性交付，不代表性能验收完成：** 本次将 V4 开发成果提前接入 `master`，
+> 保留切歌与冷封面长尾、首字样本不足、Sony 蓝牙栈长时间稳定性失败等未闭环项。
+> 具体目标、实测数值与后续验收见 [V4 验收状态与未达标指标](docs/V4_ACCEPTANCE_STATUS.md)。
+
 <p align="center">
   <a href="README.md">English</a> ·
   <a href="README.zh-CN.md"><strong>简体中文</strong></a>

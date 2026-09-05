@@ -1,5 +1,10 @@
 # MusicBleController
 
+> **V4 milestone, not full SLO acceptance:** the V4 work is being accepted into
+> `master` with known track-switch/artwork latency tails, incomplete first-word
+> coverage, and an unresolved long-run Sony Bluetooth-stack failure.
+> See [V4 acceptance status and open metrics](docs/V4_ACCEPTANCE_STATUS.md).
+
 <p align="center">
   <a href="README.md"><strong>English</strong></a> ·
   <a href="README.zh-CN.md">简体中文</a>
