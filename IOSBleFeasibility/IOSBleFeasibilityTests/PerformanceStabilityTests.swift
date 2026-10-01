@@ -1466,8 +1466,351 @@ final class PerformanceStabilityTests: XCTestCase {
             1,
             accuracy: 0.001
         )
-        XCTAssertLessThan(CompactSliderPresentation.thumbDiameter, 16)
-        XCTAssertGreaterThanOrEqual(CompactSliderPresentation.interactionHeight, 28)
+        XCTAssertGreaterThanOrEqual(CompactSliderPresentation.interactionHeight, 44)
+    }
+
+    @MainActor
+    func testPlayerSliderParticipatesInHitTesting() throws {
+        var value = 5.0
+        try withHostedPlayerSlider(value: Binding(get: { value }, set: { value = $0 })) { slider, window in
+            var effectiveAlpha: CGFloat = 1
+            var ancestor: UIView? = slider
+            while let view = ancestor {
+                effectiveAlpha *= view.alpha
+                ancestor = view.superview
+            }
+            XCTAssertGreaterThan(effectiveAlpha, 0.01, "The real control must stay in the hit-test tree")
+            let point = slider.convert(CGPoint(x: slider.bounds.midX, y: slider.bounds.midY), to: window)
+            let hitView = try XCTUnwrap(window.hitTest(point, with: nil))
+            XCTAssertTrue(hitView === slider || hitView.isDescendant(of: slider), "Visible track must hit the actual slider")
+            XCTAssertGreaterThanOrEqual(slider.bounds.height, 44)
+        }
+    }
+
+    @MainActor
+    func testPlayerSliderDragUpdatesAndFinishesOnce() throws {
+        for step: Double? in [1, nil] {
+            var value = 5.0
+            var edits: [Bool] = []
+            try withHostedPlayerSlider(
+                value: Binding(get: { value }, set: { value = $0 }),
+                step: step,
+                onEditingChanged: { edits.append($0) }
+            ) { slider, _ in
+                slider.sendActions(for: .touchDown)
+                slider.value = 8
+                slider.sendActions(for: .valueChanged)
+                slider.value = 12
+                slider.sendActions(for: .valueChanged)
+                XCTAssertEqual(value, 12, accuracy: 0.001)
+                XCTAssertEqual(edits, [true], "Dragging must keep one edit open until release")
+                slider.sendActions(for: .touchUpInside)
+                XCTAssertEqual(edits, [true, false])
+            }
+        }
+    }
+
+    @MainActor
+    func testPlayerSliderAccessibilityAdjustmentCompletesEdit() throws {
+        for step: Double? in [1, nil] {
+            var value = 5.0
+            var edits: [Bool] = []
+            try withHostedPlayerSlider(
+                value: Binding(get: { value }, set: { value = $0 }),
+                step: step,
+                onEditingChanged: { edits.append($0) }
+            ) { slider, _ in
+                slider.accessibilityIncrement()
+                XCTAssertGreaterThan(value, 5)
+                XCTAssertEqual(edits, [true, false], "A non-touch adjustment must commit seek/volume state")
+            }
+        }
+    }
+
+    @MainActor
+    func testDisabledPlayerSliderDoesNotChangeValueOrStartEditing() throws {
+        var value = 5.0
+        var edits: [Bool] = []
+        try withHostedPlayerSlider(
+            value: Binding(get: { value }, set: { value = $0 }),
+            isEnabled: false,
+            onEditingChanged: { edits.append($0) }
+        ) { slider, _ in
+            XCTAssertFalse(slider.isEnabled)
+            slider.sendActions(for: .touchDown)
+            slider.value = 12
+            slider.sendActions(for: .valueChanged)
+            slider.sendActions(for: .touchUpInside)
+            slider.accessibilityIncrement()
+            XCTAssertEqual(value, 5)
+            XCTAssertTrue(edits.isEmpty)
+        }
+    }
+
+    @MainActor
+    private func withHostedPlayerSlider(
+        value: Binding<Double>,
+        step: Double? = 1,
+        isEnabled: Bool = true,
+        onEditingChanged: @escaping (Bool) -> Void = { _ in },
+        assertions: (UISlider, UIWindow) throws -> Void
+    ) throws {
+        let host = UIHostingController(rootView: CompactPlayerSlider(
+            value: value,
+            range: 0...15,
+            step: step,
+            accentColor: .green,
+            isEnabled: isEnabled,
+            accessibilityLabel: "Volume",
+            accessibilityValue: "5 of 15",
+            onEditingChanged: onEditingChanged
+        ).frame(width: 280, height: 44))
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        let previousKeyWindow = scene?.windows.first(where: \.isKeyWindow)
+        let window = scene.map(UIWindow.init(windowScene:)) ?? UIWindow(frame: CGRect(x: 0, y: 0, width: 320, height: 160))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+            previousKeyWindow?.makeKeyAndVisible()
+        }
+        host.view.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        host.view.layoutIfNeeded()
+
+        func findSlider(in view: UIView) -> UISlider? {
+            if let slider = view as? UISlider { return slider }
+            return view.subviews.lazy.compactMap { findSlider(in: $0) }.first
+        }
+        let slider = try XCTUnwrap(findSlider(in: host.view))
+        try assertions(slider, window)
+    }
+
+    @MainActor
+    func testLiveActivityArtworkWriterPublishesReadableRevisionAndRejectsOversizedData() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let writer = LiveActivityArtworkFileWriter(directoryOverride: directory)
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 80, height: 80)).image { context in
+            UIColor.green.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 80, height: 80))
+        }
+        let data = try XCTUnwrap(image.jpegData(compressionQuality: 0.78))
+        let result = await writer.write(data: data, key: "fixture", revision: 1)
+        XCTAssertTrue(result.succeeded)
+        let url = directory.appendingPathComponent(LiveActivitySharedConstants.artworkFileName(key: "fixture", revision: 1))
+        XCTAssertEqual(try Data(contentsOf: url), data)
+        XCTAssertNotNil(UIImage(contentsOfFile: url.path))
+        let oversized = await writer.write(data: Data(repeating: 0, count: 20_000), key: "fixture", revision: 2)
+        XCTAssertFalse(oversized.succeeded)
+        XCTAssertEqual(try Data(contentsOf: url), data, "A failed write must retain the last published revision")
+        await writer.removeAll()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testBackgroundCommandPolicyAllowsCurrentPreviewWithoutUnfreezingHeavyWork() {
+        func allowed(_ command: String, quality: String? = nil, id: String? = nil, control: Bool = false) -> Bool {
+            CommandWriteQueuePolicy.canRun(
+                appIsActive: false, isControl: control, command: command,
+                artworkID: id, artworkQuality: quality, currentArtworkID: "current"
+            )
+        }
+        XCTAssertTrue(allowed("ALBUM_ART_REQUEST", quality: "preview", id: "current"))
+        XCTAssertFalse(allowed("ALBUM_ART_REQUEST", quality: "hq", id: "current"))
+        XCTAssertFalse(allowed("ALBUM_ART_REQUEST", quality: "preview", id: "old"))
+        XCTAssertFalse(allowed("GET_PLAY_HISTORY_SINCE"))
+        XCTAssertFalse(allowed("GET_LYRIC_DIAGNOSTIC"))
+        XCTAssertTrue(allowed("NEXT", control: true))
+        let requests = [("GET_PLAY_HISTORY_SINCE", ""), ("ALBUM_ART_REQUEST", "hq"), ("ALBUM_ART_REQUEST", "preview")]
+        XCTAssertEqual(requests.firstIndex { allowed($0.0, quality: $0.1, id: "current") }, 2)
+    }
+
+    @MainActor
+    func testHistorySuccessfulPaginationStatsAndLoadMoreReleaseBusyState() async throws {
+        let store = PlaybackHistoryStore.shared
+        await clearPlaybackHistory(store)
+        let manager = BLETestManager(automaticallyStartBluetooth: false)
+        manager.configureResponseTests()
+        defer { manager.disconnectResponseTests() }
+        var requests: [(command: String, payload: [String: Any])] = []
+        let secondPageRequested = expectation(description: "next history page requested")
+        let statsRequested = expectation(description: "statistics requested after history completes")
+        manager.commandSenderForTesting = { command, payload in
+            requests.append((command, payload))
+            if command == "GET_PLAY_HISTORY_SINCE",
+               requests.filter({ $0.command == command }).count == 2 {
+                secondPageRequested.fulfill()
+            }
+            if command == "GET_PLAY_STATS", payload["range"] as? String == "TODAY" {
+                statsRequested.fulfill()
+            }
+            return true
+        }
+
+        manager.syncPlaybackHistory()
+        let firstID = try XCTUnwrap(requests.last?.payload["requestId"] as? String)
+        manager.receiveStatusForTesting(["type": "playHistorySince", "requestId": firstID,
+            "items": [["sessionId": 1, "title": "First"]], "hasMore": true, "lastSessionId": 1])
+        await fulfillment(of: [secondPageRequested], timeout: 2)
+        XCTAssertTrue(manager.isPlaybackHistorySyncing)
+        XCTAssertEqual(requests.last?.payload["afterSessionId"] as? Int64, 1)
+        let secondID = try XCTUnwrap(requests.last?.payload["requestId"] as? String)
+        XCTAssertNotEqual(firstID, secondID)
+        manager.receiveStatusForTesting(["type": "playHistorySince", "requestId": secondID,
+            "items": [["sessionId": 2, "title": "Second"]], "hasMore": false, "lastSessionId": 2])
+        await fulfillment(of: [statsRequested], timeout: 2)
+        XCTAssertFalse(manager.isPlaybackHistorySyncing)
+        XCTAssertEqual(manager.playbackHistorySessions.map(\.sessionId), [2, 1])
+        let savedSyncState = await loadPlaybackSyncState(store)
+        XCTAssertEqual(savedSyncState.lastSyncedSessionId, 2)
+
+        for range in ["TODAY", "WEEK", "MONTH"] {
+            XCTAssertEqual(requests.last?.payload["range"] as? String, range)
+            let requestID = try XCTUnwrap(requests.last?.payload["requestId"] as? String)
+            manager.receiveStatusForTesting(["type": "playStats", "requestId": requestID,
+                "range": range, "playCount": 2])
+        }
+        XCTAssertEqual(Set(manager.playbackStats.keys), Set(["TODAY", "WEEK", "MONTH"]))
+        XCTAssertEqual(manager.playbackStats["WEEK"]?.playCount, 2)
+
+        manager.loadMorePlaybackHistory()
+        XCTAssertEqual(requests.last?.command, "GET_PLAY_HISTORY_PAGE")
+        XCTAssertEqual(requests.last?.payload["beforeSessionId"] as? Int64, 1)
+        let requestsWhileLoading = requests.count
+        manager.loadMorePlaybackHistory()
+        XCTAssertEqual(requests.count, requestsWhileLoading, "Loading must prevent a duplicate page request")
+        let olderID = try XCTUnwrap(requests.last?.payload["requestId"] as? String)
+        manager.receiveStatusForTesting(["type": "playHistoryPage", "requestId": olderID,
+            "items": [], "hasMore": false])
+        let pageComplete = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in manager.playbackHistoryStatus == "没有更多历史" }, object: nil
+        )
+        await fulfillment(of: [pageComplete], timeout: 2)
+        XCTAssertEqual(manager.playbackHistorySessions.map(\.sessionId), [2, 1])
+        manager.loadMorePlaybackHistory()
+        XCTAssertEqual(requests.count, requestsWhileLoading + 1, "A completed page must allow another request")
+        await clearPlaybackHistory(store)
+    }
+
+    @MainActor
+    func testHistoryMissingChunksAndDisconnectReleaseBusyStateAndIgnoreOldResponses() throws {
+        let manager = BLETestManager(automaticallyStartBluetooth: false)
+        manager.configureResponseTests()
+        var requests: [[String: Any]] = []
+        manager.commandSenderForTesting = { _, payload in requests.append(payload); return true }
+        defer { manager.disconnectResponseTests() }
+        manager.syncPlaybackHistory()
+        let firstID = try XCTUnwrap(requests.last?["requestId"] as? String)
+        XCTAssertTrue(manager.isPlaybackHistorySyncing)
+        manager.receiveStatusForTesting(["type": "historyPayloadStart", "requestId": firstID,
+            "responseType": "playHistorySince", "size": 10, "chunks": 2])
+        manager.receiveStatusForTesting(["type": "historyPayloadEnd", "requestId": firstID])
+        XCTAssertFalse(manager.isPlaybackHistorySyncing)
+        manager.syncPlaybackHistory()
+        XCTAssertTrue(manager.isPlaybackHistorySyncing)
+        manager.disconnectResponseTests()
+        XCTAssertFalse(manager.isPlaybackHistorySyncing)
+        manager.configureResponseTests()
+        manager.syncPlaybackHistory()
+        let newID = try XCTUnwrap(requests.last?["requestId"] as? String)
+        XCTAssertNotEqual(firstID, newID)
+        manager.receiveStatusForTesting(["type": "playHistorySince", "requestId": firstID,
+            "items": [], "hasMore": false, "lastSessionId": 0])
+        XCTAssertTrue(manager.isPlaybackHistorySyncing, "An old response must not finish a new request")
+    }
+
+    @MainActor
+    func testHistoryMalformedPayloadFailsAndAllowsRetry() async throws {
+        let manager = BLETestManager(automaticallyStartBluetooth: false)
+        manager.configureResponseTests()
+        var requestID = ""
+        manager.commandSenderForTesting = { _, payload in requestID = payload["requestId"] as? String ?? ""; return true }
+        defer { manager.disconnectResponseTests() }
+        manager.syncPlaybackHistory()
+        manager.receiveStatusForTesting(["type": "historyPayloadStart", "requestId": requestID,
+            "responseType": "playHistorySince", "size": 4, "chunks": 1])
+        manager.receiveStatusForTesting(["type": "historyPayloadChunk", "requestId": requestID,
+            "index": 0, "data": Data("nope".utf8).base64EncodedString()])
+        manager.receiveStatusForTesting(["type": "historyPayloadEnd", "requestId": requestID])
+        let failed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !manager.isPlaybackHistorySyncing }, object: nil)
+        await fulfillment(of: [failed], timeout: 2)
+        manager.syncPlaybackHistory()
+        XCTAssertTrue(manager.isPlaybackHistorySyncing)
+    }
+
+    @MainActor
+    func testHistoryTimeoutAndSendFailureAllowRetry() async {
+        let manager = BLETestManager(automaticallyStartBluetooth: false)
+        manager.configureResponseTests()
+        manager.commandSenderForTesting = { _, _ in false }
+        defer { manager.disconnectResponseTests() }
+        manager.syncPlaybackHistory()
+        XCTAssertFalse(manager.isPlaybackHistorySyncing)
+        manager.commandSenderForTesting = { _, _ in true }
+        manager.responseTimeoutForTesting = 0.05
+        manager.syncPlaybackHistory()
+        XCTAssertTrue(manager.isPlaybackHistorySyncing)
+        let timedOut = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !manager.isPlaybackHistorySyncing }, object: nil)
+        await fulfillment(of: [timedOut], timeout: 2)
+        manager.syncPlaybackHistory()
+        XCTAssertTrue(manager.isPlaybackHistorySyncing)
+    }
+
+    @MainActor
+    func testStatsFailureAdvancesQueueAndDisconnectAllowsFreshRefresh() throws {
+        let manager = BLETestManager(automaticallyStartBluetooth: false)
+        manager.configureResponseTests()
+        var requests: [[String: Any]] = []
+        manager.commandSenderForTesting = { _, payload in requests.append(payload); return true }
+        defer { manager.disconnectResponseTests() }
+        manager.refreshPlaybackStats()
+        XCTAssertEqual(requests.last?["range"] as? String, "TODAY")
+        let requestID = try XCTUnwrap(requests.last?["requestId"] as? String)
+        manager.receiveStatusForTesting(["type": "playHistoryError", "requestId": requestID, "message": "failure"])
+        XCTAssertEqual(requests.last?["range"] as? String, "WEEK")
+        manager.disconnectResponseTests()
+        manager.configureResponseTests()
+        manager.refreshPlaybackStats()
+        XCTAssertEqual(requests.last?["range"] as? String, "TODAY")
+    }
+
+    @MainActor
+    func testDiagnosticSendFailureAndDisconnectedRefreshDoNotStayLoading() {
+        let manager = BLETestManager(automaticallyStartBluetooth: false)
+        manager.configureResponseTests()
+        var attempts = 0
+        manager.commandSenderForTesting = { _, _ in attempts += 1; return false }
+        manager.requestLyricDiagnostic(manual: true)
+        XCTAssertFalse(manager.lyricDiagnosticLoading)
+        XCTAssertNotNil(manager.lyricDiagnosticRequestError)
+        XCTAssertEqual(attempts, 1)
+        manager.disconnectResponseTests()
+        manager.requestLyricDiagnostic(manual: true)
+        XCTAssertFalse(manager.lyricDiagnosticLoading)
+        XCTAssertEqual(attempts, 1, "A cached song must not trigger an offline request")
+    }
+
+    @MainActor
+    func testDiagnosticDeadlineIsCancelledByNewRequestAndSuccessfulResponse() async {
+        let manager = BLETestManager(automaticallyStartBluetooth: false)
+        manager.configureResponseTests()
+        manager.commandSenderForTesting = { _, _ in true }
+        defer { manager.disconnectResponseTests() }
+        manager.responseTimeoutForTesting = 0.05
+        manager.requestLyricDiagnostic(manual: true)
+        manager.responseTimeoutForTesting = 1
+        manager.requestLyricDiagnostic(manual: true)
+        try? await Task.sleep(nanoseconds: 120_000_000)
+        XCTAssertTrue(manager.lyricDiagnosticLoading, "The cancelled old deadline must not finish the new request")
+        manager.receiveStatusForTesting(["type": "lyricDiagnostic", "trackId": "fixture-track", "status": "loaded"])
+        XCTAssertFalse(manager.lyricDiagnosticLoading)
+        XCTAssertNil(manager.lyricDiagnosticRequestError)
+        manager.responseTimeoutForTesting = 0.05
+        manager.requestLyricDiagnostic(manual: true)
+        let timedOut = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !manager.lyricDiagnosticLoading }, object: nil)
+        await fulfillment(of: [timedOut], timeout: 2)
+        XCTAssertEqual(manager.lyricDiagnosticRequestError, "诊断请求超时，请重试")
     }
 
     func testA1AndA2DispatchAndOutOfOrderAssembly() {

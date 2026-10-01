@@ -362,8 +362,10 @@ final class LiveActivityManager {
             return
         }
         updateInFlight = true
+        let backgroundTask = BoundedBackgroundTask(name: "Live Activity update")
 
         Task { [weak self] in
+            defer { backgroundTask.end() }
             guard let self else { return }
             let startedAt = Date()
             logger?("[LiveActivityPerf] update start reason=\(reason)")
@@ -489,16 +491,13 @@ final class LiveActivityManager {
             for await state in activity.activityStateUpdates {
                 await MainActor.run {
                     logger?("[LiveActivity] state changed state=\(state)")
-                    switch state {
-                    case .active, .stale:
+                    if state == .active || state == .stale {
                         self?.activity = activity
-                    case .ended, .dismissed:
+                    } else if state == .ended || state == .dismissed {
                         if self?.activity?.id == activity.id {
                             self?.activity = nil
                         }
                         self?.startCooldownUntil = Date().addingTimeInterval(5)
-                    @unknown default:
-                        break
                     }
                 }
             }

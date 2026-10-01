@@ -21,13 +21,12 @@ class QrcLyricCacheManager(
         context = appContext,
         logger = logger
     )
-    private val parsedIndexStore = sharedParsedIndexStores.computeIfAbsent(
-        QrcLyricUtils.cacheDirectory(appContext).absolutePath
-    ) { path ->
-        QrcParsedCacheIndexStore(
+    private val parsedIndexStore = synchronized(sharedParsedIndexStores) {
+        val path = QrcLyricUtils.cacheDirectory(appContext).absolutePath
+        sharedParsedIndexStores[path] ?: QrcParsedCacheIndexStore(
             cacheDirectory = File(path),
             logger = logger
-        )
+        ).also { sharedParsedIndexStores[path] = it }
     }
     private val memoryCache =
         object : LinkedHashMap<String, ParsedLyric>(MAX_MEMORY_CACHE, 0.75f, true) {

@@ -325,10 +325,14 @@ object CurrentLyricProbe {
         )
     }
 
-    private fun containsChinese(value: String): Boolean {
+    internal fun containsChinese(value: String): Boolean {
         return value.any { character ->
-            Character.UnicodeScript.of(character.code) ==
-                Character.UnicodeScript.HAN
+            when (Character.UnicodeBlock.of(character)) {
+                Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS,
+                Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS_EXTENSION_A,
+                Character.UnicodeBlock.CJK_COMPATIBILITY_IDEOGRAPHS -> true
+                else -> character == '\u3007'
+            }
         }
     }
 

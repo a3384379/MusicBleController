@@ -65,14 +65,20 @@ struct LyricDiagnosticView: View {
 
             Divider().overlay(.white.opacity(0.12))
 
-            Text(diagnostic?.statusTitle ?? "正在获取诊断")
+            Text(diagnostic?.statusTitle ?? (bleManager.lyricDiagnosticLoading
+                ? "正在获取诊断"
+                : AppLocalization.string("诊断暂不可用，请确认连接后重试")))
                 .font(.headline.weight(.semibold))
                 .foregroundStyle(.white)
-            Text(diagnostic?.humanReadableReason ?? "正在向 Sony 读取当前歌词状态。")
+            Text(bleManager.lyricDiagnosticRequestError.map { AppLocalization.string($0) }
+                ?? diagnostic?.humanReadableReason
+                ?? "正在向 Sony 读取当前歌词状态。")
                 .font(.subheadline)
                 .foregroundStyle(.white.opacity(0.72))
                 .fixedSize(horizontal: false, vertical: true)
-            Text(diagnostic?.suggestionText ?? "请稍等片刻。")
+            Text(diagnostic?.suggestionText ?? (bleManager.lyricDiagnosticLoading
+                ? "请稍等片刻。"
+                : AppLocalization.string("刷新诊断")))
                 .font(.callout.weight(.medium))
                 .foregroundStyle(.white.opacity(0.84))
                 .fixedSize(horizontal: false, vertical: true)

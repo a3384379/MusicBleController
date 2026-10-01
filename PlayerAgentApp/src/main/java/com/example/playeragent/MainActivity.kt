@@ -27,6 +27,7 @@ import android.widget.GridLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.content.ContextCompat
 import com.example.playeragent.ble.ControllerScannerManager
 import com.example.playeragent.ble.BleHealthState
 import com.example.playeragent.classicbluetooth.RfcommClientManager
@@ -252,11 +253,7 @@ class MainActivity : Activity() {
             addAction(PlayerAgentForegroundService.ACTION_PLAYER_UI_STATE)
             addAction(PlayerAgentForegroundService.ACTION_QRC_WATCHER_STATUS)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(logReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(logReceiver, filter)
-        }
+        ContextCompat.registerReceiver(this, logReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         PlayerNotificationListenerService.removeQqMusicArtworkListener(
             qqMusicArtworkListener
         )
@@ -2272,6 +2269,7 @@ class MainActivity : Activity() {
             permissions += Manifest.permission.BLUETOOTH_ADVERTISE
             permissions += Manifest.permission.BLUETOOTH_CONNECT
         } else {
+            permissions += Manifest.permission.ACCESS_COARSE_LOCATION
             permissions += Manifest.permission.ACCESS_FINE_LOCATION
             permissions += Manifest.permission.READ_EXTERNAL_STORAGE
         }

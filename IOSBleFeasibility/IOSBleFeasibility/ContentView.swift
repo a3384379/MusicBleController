@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 private final class BLETestManagerOwner: ObservableObject {
     let manager: BLETestManager
@@ -19,6 +20,7 @@ struct ContentView: View {
     @State private var showSystemHealthOverview = false
     @State private var showPreferences = false
     @State private var showDeviceDetails = false
+    @State private var deferredDiagnostic: DeferredPlayerDiagnostic?
 
     private var manager: BLETestManager { managerOwner.manager }
 
@@ -54,11 +56,12 @@ struct ContentView: View {
             .sheet(isPresented: $showPreferences) {
                 PreferencesView(bleManager: manager, onDismiss: { showPreferences = false })
             }
-            .sheet(isPresented: $showDeviceDetails) {
+            .sheet(isPresented: $showDeviceDetails, onDismiss: presentDeferredDiagnostic) {
                 DeviceDetailView(
                     manager: manager,
                     onShowAdvancedDiagnostics: {
-                        showNowPlayingDiagnostic = true
+                        deferredDiagnostic = .nowPlaying
+                        showDeviceDetails = false
                     }
                 )
             }
@@ -80,13 +83,13 @@ struct ContentView: View {
                     onDismiss: { showSystemHealthOverview = false }
                 )
             }
-            .fullScreenCover(isPresented: $showFullLyrics) {
+            .fullScreenCover(isPresented: $showFullLyrics, onDismiss: presentDeferredDiagnostic) {
                 FullLyricsStoreHost(
                     manager: manager,
                     onDismiss: { showFullLyrics = false },
                     onShowDiagnostic: {
+                        deferredDiagnostic = .lyrics
                         showFullLyrics = false
-                        showLyricDiagnostic = true
                     }
                 )
             }
@@ -102,6 +105,7 @@ struct ContentView: View {
             }
             .onChange(of: preferences.appExperienceMode) { _, mode in
                 if mode == .daily {
+                    deferredDiagnostic = nil
                     showDebugPage = false
                     showLyricDiagnostic = false
                     showNowPlayingDiagnostic = false
@@ -110,6 +114,21 @@ struct ContentView: View {
             }
         }
     }
+
+    private func presentDeferredDiagnostic() {
+        let diagnostic = deferredDiagnostic
+        deferredDiagnostic = nil
+        switch diagnostic {
+        case .nowPlaying: showNowPlayingDiagnostic = true
+        case .lyrics: showLyricDiagnostic = true
+        case nil: break
+        }
+    }
+}
+
+private enum DeferredPlayerDiagnostic {
+    case nowPlaying
+    case lyrics
 }
 
 private struct PlayerBackgroundHost: View {
@@ -340,7 +359,7 @@ private struct PlayerHeaderStoreView: View {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 22, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.86))
-                    .frame(width: 42, height: 42)
+                    .frame(width: 44, height: 44)
                     .background(.white.opacity(0.05), in: Circle())
                     .overlay { Circle().stroke(.white.opacity(0.08), lineWidth: 1) }
             }
@@ -858,7 +877,7 @@ private struct PlaybackProgressStoreView: View {
     }
 }
 
-private struct CompactPlayerSlider: View {
+struct CompactPlayerSlider: View {
     let value: Binding<Double>
     let range: ClosedRange<Double>
     let step: Double?
@@ -869,74 +888,137 @@ private struct CompactPlayerSlider: View {
     let onEditingChanged: (Bool) -> Void
 
     var body: some View {
-        GeometryReader { proxy in
-            let thumbDiameter = CompactSliderPresentation.thumbDiameter
-            let trackWidth = max(proxy.size.width - thumbDiameter, 0)
-            let progress = CGFloat(
-                CompactSliderPresentation.normalizedProgress(
-                    value: value.wrappedValue,
-                    lowerBound: range.lowerBound,
-                    upperBound: range.upperBound
-                )
-            )
-            let fillWidth = trackWidth * progress
-            let centerY = proxy.size.height / 2
-            let thumbX = thumbDiameter / 2 + fillWidth
+        CompactNativePlayerSlider(configuration: self)
+            .disabled(!isEnabled)
+            .frame(height: CompactSliderPresentation.interactionHeight)
+    }
+}
 
-            ZStack(alignment: .topLeading) {
-                Capsule()
-                    .fill(.white.opacity(0.18))
-                    .frame(width: trackWidth, height: CompactSliderPresentation.trackHeight)
-                    .position(x: proxy.size.width / 2, y: centerY)
+private struct CompactNativePlayerSlider: UIViewRepresentable {
+    let configuration: CompactPlayerSlider
 
-                Capsule()
-                    .fill(accentColor)
-                    .frame(width: fillWidth, height: CompactSliderPresentation.trackHeight)
-                    .position(x: thumbDiameter / 2 + fillWidth / 2, y: centerY)
+    func makeCoordinator() -> Coordinator { Coordinator(parent: configuration) }
 
-                Circle()
-                    .fill(.white)
-                    .frame(width: thumbDiameter, height: thumbDiameter)
-                    .overlay {
-                        Circle().strokeBorder(accentColor.opacity(0.72), lineWidth: 1)
-                    }
-                    .shadow(color: .black.opacity(0.24), radius: 2, y: 1)
-                    .position(x: thumbX, y: centerY)
-                    .allowsHitTesting(false)
+    func makeUIView(context: Context) -> CompactSliderControl {
+        let slider = CompactSliderControl()
+        slider.addTarget(context.coordinator, action: #selector(Coordinator.beginEditing), for: .touchDown)
+        slider.addTarget(context.coordinator, action: #selector(Coordinator.valueChanged(_:)), for: .valueChanged)
+        slider.addTarget(
+            context.coordinator,
+            action: #selector(Coordinator.endEditing),
+            for: [.touchUpInside, .touchUpOutside, .touchCancel]
+        )
+        slider.onAccessibilityAdjustment = { [weak coordinator = context.coordinator] control, direction in
+            coordinator?.adjustAccessibility(control, direction: direction)
+        }
+        return slider
+    }
 
-                interactiveSlider
-                    .frame(width: proxy.size.width, height: proxy.size.height)
-                    .opacity(0.001)
+    func updateUIView(_ slider: CompactSliderControl, context: Context) {
+        context.coordinator.parent = configuration
+        slider.minimumValue = Float(configuration.range.lowerBound)
+        slider.maximumValue = Float(configuration.range.upperBound)
+        slider.isEnabled = configuration.isEnabled
+        if !configuration.isEnabled, context.coordinator.isEditing {
+            let coordinator = context.coordinator
+            DispatchQueue.main.async { [weak coordinator] in
+                guard let coordinator, !coordinator.parent.isEnabled else { return }
+                coordinator.endEditing()
             }
         }
-        .frame(height: CompactSliderPresentation.interactionHeight)
-        .contentShape(Rectangle())
-        .opacity(isEnabled ? 1 : 0.45)
+        if !context.coordinator.isEditing {
+            slider.value = Float(min(
+                max(configuration.value.wrappedValue, configuration.range.lowerBound),
+                configuration.range.upperBound
+            ))
+        }
+        slider.applyTint(UIColor(configuration.accentColor))
+        slider.alpha = configuration.isEnabled ? 1 : 0.45
+        slider.accessibilityLabel = AppLocalization.string(configuration.accessibilityLabel)
+        slider.accessibilityValue = configuration.accessibilityValue
     }
 
-    @ViewBuilder
-    private var interactiveSlider: some View {
-        if let step {
-            Slider(
-                value: value,
-                in: range,
-                step: step,
-                onEditingChanged: onEditingChanged
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: CompactSliderControl, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? 160, height: CompactSliderPresentation.interactionHeight)
+    }
+
+    final class Coordinator: NSObject {
+        var parent: CompactPlayerSlider
+        private(set) var isEditing = false
+
+        init(parent: CompactPlayerSlider) { self.parent = parent }
+
+        @objc func beginEditing() {
+            guard parent.isEnabled, !isEditing else { return }
+            isEditing = true
+            parent.onEditingChanged(true)
+        }
+
+        @objc func valueChanged(_ slider: UISlider) {
+            guard parent.isEnabled else { return }
+            // Non-touch changes must commit as one complete edit, too.
+            let completesImmediately = !isEditing
+            beginEditing()
+            var newValue = Double(slider.value)
+            if let step = parent.step, step > 0 {
+                newValue = parent.range.lowerBound +
+                    ((newValue - parent.range.lowerBound) / step).rounded() * step
+            }
+            newValue = min(max(newValue, parent.range.lowerBound), parent.range.upperBound)
+            slider.value = Float(newValue)
+            parent.value.wrappedValue = newValue
+            if completesImmediately { endEditing() }
+        }
+
+        @objc func endEditing() {
+            guard isEditing else { return }
+            isEditing = false
+            parent.onEditingChanged(false)
+        }
+
+        func adjustAccessibility(_ slider: UISlider, direction: Double) {
+            guard parent.isEnabled else { return }
+            let increment = parent.step ?? (parent.range.upperBound - parent.range.lowerBound) / 20
+            let newValue = min(
+                max(parent.value.wrappedValue + direction * increment, parent.range.lowerBound),
+                parent.range.upperBound
             )
-            .disabled(!isEnabled)
-            .accessibilityLabel(accessibilityLabel)
-            .accessibilityValue(accessibilityValue)
-        } else {
-            Slider(
-                value: value,
-                in: range,
-                onEditingChanged: onEditingChanged
-            )
-            .disabled(!isEnabled)
-            .accessibilityLabel(accessibilityLabel)
-            .accessibilityValue(accessibilityValue)
+            guard newValue != parent.value.wrappedValue else { return }
+            slider.value = Float(newValue)
+            valueChanged(slider)
         }
     }
+}
+
+final class CompactSliderControl: UISlider {
+    var onAccessibilityAdjustment: ((CompactSliderControl, Double) -> Void)?
+    private var appliedTint: UIColor?
+
+    override func trackRect(forBounds bounds: CGRect) -> CGRect {
+        let track = super.trackRect(forBounds: bounds)
+        return CGRect(x: track.minX, y: bounds.midY - 1.5, width: track.width, height: 3)
+    }
+
+    func applyTint(_ color: UIColor) {
+        guard appliedTint != color else { return }
+        appliedTint = color
+        minimumTrackTintColor = color
+        maximumTrackTintColor = UIColor.white.withAlphaComponent(0.18)
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 11, height: 11)).image { _ in
+            let circle = UIBezierPath(ovalIn: CGRect(x: 0.5, y: 0.5, width: 10, height: 10))
+            UIColor.white.setFill()
+            circle.fill()
+            color.withAlphaComponent(0.72).setStroke()
+            circle.lineWidth = 1
+            circle.stroke()
+        }
+        setThumbImage(image, for: .normal)
+        setThumbImage(image, for: .highlighted)
+        setThumbImage(image, for: .disabled)
+    }
+
+    override func accessibilityIncrement() { onAccessibilityAdjustment?(self, 1) }
+    override func accessibilityDecrement() { onAccessibilityAdjustment?(self, -1) }
 }
 
 private struct PlaybackControlsStoreView: View {
@@ -1024,7 +1106,7 @@ private struct VolumeControlStoreView: View {
             .frame(height: CompactSliderPresentation.interactionHeight)
         }
         .padding(.horizontal, 11)
-        .frame(height: 36)
+        .frame(height: CompactSliderPresentation.interactionHeight)
         .background(.black.opacity(0.13), in: RoundedRectangle(cornerRadius: 16))
         .overlay { RoundedRectangle(cornerRadius: 16).strokeBorder(.white.opacity(0.06)) }
         .opacity(isAvailable ? 1 : 0.48)
@@ -1236,9 +1318,7 @@ struct CompactVolumePresentation {
 }
 
 struct CompactSliderPresentation {
-    static let trackHeight: CGFloat = 3
-    static let thumbDiameter: CGFloat = 11
-    static let interactionHeight: CGFloat = 32
+    static let interactionHeight: CGFloat = 44
 
     static func normalizedProgress(
         value: Double,

@@ -1,6 +1,8 @@
 {
   "sourceLanguage" : "zh-Hans",
   "strings" : {
+    "诊断暂不可用，请确认连接后重试" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Diagnostics unavailable. Check the connection and try again."}}}},
+    "诊断请求超时，请重试" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Diagnostics request timed out. Try again."}}}},
     "Sony 已连接" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Sony connected" } } } },
     "上一次" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Previous" } } } },
     "上一首" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Previous track" } } } },
