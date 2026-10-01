@@ -4,8 +4,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
+import java.io.IOException
 import java.util.LinkedHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
@@ -17,6 +16,7 @@ class QrcParsedCacheIndexStore(
     private val logger: (String) -> Unit
 ) {
     private val lock = Any()
+    private val writeLock = Any()
     private val entries = LinkedHashMap<String, Entry>()
     private val executor = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "QrcParsedIndexWriteThread").apply {
@@ -111,8 +111,9 @@ class QrcParsedCacheIndexStore(
         )
     }
 
-    private fun writeSnapshot() {
+    private fun writeSnapshot() = synchronized(writeLock) {
         val snapshot = synchronized(lock) { entries.values.toList() }
+        var temp: File? = null
         try {
             cacheDirectory.mkdirs()
             val value = JSONObject()
@@ -125,28 +126,19 @@ class QrcParsedCacheIndexStore(
                     }
                 )
                 .toString()
-            val temp = File(cacheDirectory, ".$INDEX_FILE_NAME.${System.nanoTime()}.tmp")
+            temp = File(cacheDirectory, ".$INDEX_FILE_NAME.${System.nanoTime()}.tmp")
             FileOutputStream(temp).use { output ->
                 output.write(value.toByteArray(Charsets.UTF_8))
                 output.fd.sync()
             }
-            runCatching {
-                Files.move(
-                    temp.toPath(),
-                    indexFile.toPath(),
-                    StandardCopyOption.ATOMIC_MOVE,
-                    StandardCopyOption.REPLACE_EXISTING
-                )
-            }.recoverCatching {
-                Files.move(
-                    temp.toPath(),
-                    indexFile.toPath(),
-                    StandardCopyOption.REPLACE_EXISTING
-                )
-            }.getOrThrow()
+            // Android's same-directory rename atomically replaces the file and
+            // is available on API 23. Never delete the previous index first.
+            if (!temp.renameTo(indexFile)) throw IOException("Index rename failed")
             logger("[QrcParsedIndex] saved entries=${snapshot.size}")
         } catch (exception: Exception) {
             logger("[QrcParsedIndex] save failed error=${exception.message}")
+        } finally {
+            temp?.delete()
         }
     }
 

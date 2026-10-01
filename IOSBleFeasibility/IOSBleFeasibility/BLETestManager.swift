@@ -76,6 +76,19 @@ enum CommandWriteTimeoutPolicy {
 }
 
 enum CommandWriteQueuePolicy {
+    static func canRun(
+        appIsActive: Bool,
+        isControl: Bool,
+        command: String,
+        artworkID: String?,
+        artworkQuality: String?,
+        currentArtworkID: String
+    ) -> Bool {
+        if appIsActive || isControl { return true }
+        return command == "ALBUM_ART_REQUEST" && artworkQuality == "preview" &&
+            !currentArtworkID.isEmpty && artworkID == currentArtworkID
+    }
+
     static func shouldDropPending(
         existingCommand: String,
         existingIsProtected: Bool,
@@ -301,6 +314,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         didSet { syncDiagnosticsStore() }
     }
     @Published private(set) var lyricDiagnosticLastUpdatedAt: Date?
+    @Published private(set) var lyricDiagnosticRequestError: String?
     @Published private(set) var isPlaying = false {
         didSet { syncPlaybackTimelineStore() }
     }
@@ -596,6 +610,33 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private var mediaFieldDumpChunks: [Int: Data] = [:]
     private var historyPayloads: [String: HistoryPayloadAssembly] = [:]
     private var pendingHistoryRequests: [String: HistoryRequestKind] = [:]
+    private var historyRequestTimeouts: [String: DispatchWorkItem] = [:]
+    private var historyRequestSequences: [String: UInt64] = [:]
+    private var historyTransferToken = UUID()
+    private var lyricDiagnosticRequestToken = UUID()
+    private var lyricDiagnosticTimeout: DispatchWorkItem?
+    private var lyricDiagnosticRequestSequence: UInt64?
+    private var backgroundArtworkTask: BoundedBackgroundTask?
+    private var backgroundArtworkID = ""
+    #if DEBUG
+    var commandSenderForTesting: ((String, [String: Any]) -> Bool)?
+    var responseTimeoutForTesting: TimeInterval?
+
+    func configureResponseTests(trackID: String = "fixture-track") {
+        currentTrackID = trackID
+        connectionStatus = "已连接"
+        appLifecycleState = "active"
+    }
+
+    func receiveStatusForTesting(_ object: [String: Any]) {
+        parseStatus(object, type: object["type"] as? String ?? "", recordTransportActivity: false)
+    }
+
+    func disconnectResponseTests() {
+        clearConnectionTransports(reason: "test disconnect")
+        connectionStatus = "未连接"
+    }
+    #endif
     private var pendingPlaybackStatsRanges: [String] = []
     private var refreshStatsAfterHistorySync = false
     private var lastSyncedHistorySessionId: Int64 = 0
@@ -705,6 +746,8 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         let isControl: Bool
         let volumeValue: Int?
         let volumeReason: String?
+        var artworkID: String? = nil
+        var artworkQuality: String? = nil
     }
 
     private struct TrackInfoTransferPayload: Decodable, Sendable {
@@ -754,10 +797,15 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         var chunks: [Int: LyricLine] = [:]
     }
 
-    override init() {
+    override convenience init() {
+        self.init(automaticallyStartBluetooth: true)
+    }
+
+    init(automaticallyStartBluetooth: Bool) {
         super.init()
         syncAllStores()
         syncPreferencesStateFromStore()
+        guard automaticallyStartBluetooth else { return }
         logAppExperienceModeLoaded()
         log("[BLE-iOS] app log store ready")
         LiveActivityCommandBridge.shared.register(self, logger: { [weak self] message in
@@ -1745,6 +1793,9 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         subscribeNotifyTimeoutWorkItem?.cancel()
         foregroundValidationTimeoutWorkItem?.cancel()
         foregroundInflightSettleWorkItem?.cancel()
+        historyRequestTimeouts.values.forEach { $0.cancel() }
+        lyricDiagnosticTimeout?.cancel()
+        backgroundArtworkTask?.end()
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -1927,8 +1978,9 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
 
     func requestLyricDiagnostic(manual: Bool = false) {
         let trackID = currentTrackID
-        guard !trackID.isEmpty else {
-            log("[LyricsDiag-iOS] request skipped reason=no track")
+        guard !trackID.isEmpty, connectionStatus == "已连接", appLifecycleState == "active" else {
+            finishLyricDiagnosticRequest(error: "诊断暂不可用，请确认连接后重试")
+            log("[LyricsDiag-iOS] request skipped reason=not ready")
             return
         }
         if !manual,
@@ -1940,15 +1992,53 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         if !manual {
             lastAutomaticLyricDiagnosticRequestAt[trackID] = Date()
         }
+        finishLyricDiagnosticRequest()
         lyricDiagnosticLoading = true
+        let token = UUID()
+        lyricDiagnosticRequestToken = token
+        let sequence = nextCommandSeq()
+        lyricDiagnosticRequestSequence = sequence
         log("[LyricsDiag-iOS] request trackId=\(trackID) manual=\(manual)")
-        sendCommand(
+        guard sendCommand(
             cmd: "GET_LYRIC_DIAGNOSTIC",
             extra: [
                 "trackId": trackID,
                 "time": Int64(Date().timeIntervalSince1970 * 1_000)
-            ]
-        )
+            ],
+            seq: sequence
+        ) else {
+            finishLyricDiagnosticRequest(error: "诊断暂不可用，请确认连接后重试")
+            return
+        }
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, self.lyricDiagnosticRequestToken == token else { return }
+            self.finishLyricDiagnosticRequest(error: "诊断请求超时，请重试")
+        }
+        lyricDiagnosticTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + responseTimeout(default: 10), execute: timeout)
+    }
+
+    private func responseTimeout(default seconds: TimeInterval) -> TimeInterval {
+        #if DEBUG
+        return responseTimeoutForTesting ?? seconds
+        #else
+        return seconds
+        #endif
+    }
+
+    private func finishLyricDiagnosticRequest(error: String? = nil) {
+        lyricDiagnosticTimeout?.cancel()
+        lyricDiagnosticTimeout = nil
+        lyricDiagnosticRequestToken = UUID()
+        if let sequence = lyricDiagnosticRequestSequence {
+            pendingCommandWrites.removeAll { $0.seq == sequence }
+        }
+        lyricDiagnosticRequestSequence = nil
+        lyricDiagnosticLoading = false
+        lyricDiagnosticRequestError = error
+        if error != nil {
+            lastAutomaticLyricDiagnosticRequestAt.removeValue(forKey: currentTrackID)
+        }
     }
 
     func refreshNowPlayingDiagnostics() {
@@ -2457,7 +2547,6 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
             playbackHistoryStatus = "同步中..."
             return
         }
-        isPlaybackHistorySyncing = true
         refreshStatsAfterHistorySync = true
         playbackHistoryStatus = "同步播放历史..."
         requestPlaybackHistorySince(afterSessionId: lastSyncedHistorySessionId)
@@ -2474,11 +2563,11 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
             syncPlaybackHistory()
             return
         }
-        isLoadingMoreHistory = true
-        let requestId = "history-page-\(currentTimeMs())"
-        pendingHistoryRequests[requestId] = .page
+        let requestId = "history-page-\(UUID().uuidString.prefix(8))"
         log("[HistorySync] request page requestId=\(requestId) before=\(beforeSessionId)")
-        sendCommand(
+        sendHistoryRequest(
+            requestId: requestId,
+            kind: .page,
             cmd: "GET_PLAY_HISTORY_PAGE",
             extra: [
                 "requestId": requestId,
@@ -2503,10 +2592,11 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         guard connectionStatus == "已连接",
               !pendingPlaybackStatsRanges.isEmpty else { return }
         let range = pendingPlaybackStatsRanges.removeFirst()
-        let requestId = "stats-\(range)-\(currentTimeMs())"
-        pendingHistoryRequests[requestId] = .stats(range)
+        let requestId = "stats-\(range)-\(UUID().uuidString.prefix(8))"
         log("[HistorySync] request stats requestId=\(requestId) range=\(range)")
-        sendCommand(
+        sendHistoryRequest(
+            requestId: requestId,
+            kind: .stats(range),
             cmd: "GET_PLAY_STATS",
             extra: [
                 "requestId": requestId,
@@ -2516,6 +2606,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     func clearLocalPlaybackHistory() {
+        resetHistoryRequests(reason: "local cache cleared")
         PlaybackHistoryStore.shared.clear { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -2529,10 +2620,11 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private func requestPlaybackHistorySince(afterSessionId: Int64) {
-        let requestId = "history-since-\(currentTimeMs())"
-        pendingHistoryRequests[requestId] = .since
+        let requestId = "history-since-\(UUID().uuidString.prefix(8))"
         log("[HistorySync] request since requestId=\(requestId) after=\(afterSessionId)")
-        sendCommand(
+        sendHistoryRequest(
+            requestId: requestId,
+            kind: .since,
             cmd: "GET_PLAY_HISTORY_SINCE",
             extra: [
                 "requestId": requestId,
@@ -2540,6 +2632,70 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
                 "limit": 20
             ]
         )
+    }
+
+    private func sendHistoryRequest(
+        requestId: String,
+        kind: HistoryRequestKind,
+        cmd: String,
+        extra: [String: Any]
+    ) {
+        pendingHistoryRequests[requestId] = kind
+        switch kind {
+        case .since: isPlaybackHistorySyncing = true
+        case .page: isLoadingMoreHistory = true
+        case .stats: break
+        }
+        let sequence = nextCommandSeq()
+        historyRequestSequences[requestId] = sequence
+        guard appLifecycleState == "active", sendCommand(cmd: cmd, extra: extra, seq: sequence) else {
+            failHistoryRequest(requestId, reason: "请求未发送，请确认 Sony 连接")
+            return
+        }
+        let token = historyTransferToken
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, self.historyTransferToken == token else { return }
+            self.failHistoryRequest(requestId, reason: "请求超时，请重试")
+        }
+        historyRequestTimeouts[requestId] = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + responseTimeout(default: 30), execute: timeout)
+    }
+
+    private func removeHistoryRequest(_ requestId: String) -> HistoryRequestKind? {
+        historyRequestTimeouts.removeValue(forKey: requestId)?.cancel()
+        historyPayloads.removeValue(forKey: requestId)
+        if let sequence = historyRequestSequences.removeValue(forKey: requestId) {
+            pendingCommandWrites.removeAll { $0.seq == sequence }
+        }
+        return pendingHistoryRequests.removeValue(forKey: requestId)
+    }
+
+    private func failHistoryRequest(_ requestId: String, reason: String) {
+        guard let kind = removeHistoryRequest(requestId) else { return }
+        playbackHistoryStatus = "同步失败：\(reason)"
+        log("[HistorySync] failed requestId=\(requestId) reason=\(reason)")
+        switch kind {
+        case .since:
+            isPlaybackHistorySyncing = false
+            refreshStatsAfterHistorySync = false
+        case .page:
+            isLoadingMoreHistory = false
+        case .stats:
+            requestNextPlaybackStats()
+        }
+    }
+
+    private func resetHistoryRequests(reason: String) {
+        historyTransferToken = UUID()
+        let hadRequests = !pendingHistoryRequests.isEmpty
+        for requestId in Array(pendingHistoryRequests.keys) { _ = removeHistoryRequest(requestId) }
+        historyPayloads.removeAll()
+        pendingPlaybackStatsRanges.removeAll()
+        isPlaybackHistorySyncing = false
+        isLoadingMoreHistory = false
+        refreshStatsAfterHistorySync = false
+        if hadRequests { playbackHistoryStatus = "同步已取消，请重试" }
+        log("[HistorySync] reset reason=\(reason)")
     }
 
     private func sendUserCommand(cmd: String, extra: [String: Any] = [:]) {
@@ -2565,11 +2721,13 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         sendCommand(cmd: cmd, extra: extra, seq: seq)
     }
 
-    func sendCommand(cmd: String, extra: [String: Any] = [:]) {
-        sendCommand(cmd: cmd, extra: extra, seq: nil)
+    @discardableResult
+    func sendCommand(cmd: String, extra: [String: Any] = [:]) -> Bool {
+        return sendCommand(cmd: cmd, extra: extra, seq: nil)
     }
 
-    private func sendCommand(cmd: String, extra: [String: Any] = [:], seq providedSeq: UInt64?) {
+    @discardableResult
+    private func sendCommand(cmd: String, extra: [String: Any] = [:], seq providedSeq: UInt64?) -> Bool {
         let seq = providedSeq ?? nextCommandSeq()
         let startMs = currentTimeMs()
         var payload = extra
@@ -2581,6 +2739,10 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
             payload["time"] = startMs
         }
         payload["seq"] = seq
+
+        #if DEBUG
+        if let sender = commandSenderForTesting { return sender(cmd, payload) }
+        #endif
 
         let connected = sonyPeripheral?.state == .connected
         let characteristicReady = sonyCommandCharacteristic != nil
@@ -2599,7 +2761,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
                     "reason=unhealthy health=\(connectionHealthState)"
             )
             log("[Command] send failed \(cmd): unhealthy \(connectionHealthState)")
-            return
+            return false
         }
 
         guard JSONSerialization.isValidJSONObject(payload),
@@ -2607,7 +2769,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
               let text = String(data: data, encoding: .utf8) else {
             ctrlLog("[CTRL-iOS] write skipped seq=\(seq) cmd=\(cmd) reason=encode_failed")
             log("[Command] encode failed \(cmd)")
-            return
+            return false
         }
 
         guard let sonyPeripheral,
@@ -2619,7 +2781,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
             if connected, sonyCommandCharacteristic == nil {
                 performHardReconnect(reason: "command characteristic nil while connected", manual: false)
             }
-            return
+            return false
         }
 
         enqueueCommandWrite(
@@ -2632,9 +2794,12 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
                 enqueuedMonoMs: monotonicTimeMs(),
                 isControl: isControlCommand(cmd),
                 volumeValue: nil,
-                volumeReason: nil
+                volumeReason: nil,
+                artworkID: cmd == "ALBUM_ART_REQUEST" ? extra["id"] as? String : nil,
+                artworkQuality: cmd == "ALBUM_ART_REQUEST" ? extra["quality"] as? String : nil
             )
         )
+        return true
     }
 
     private func enqueueCommandWrite(_ request: PendingCommandWrite) {
@@ -2694,22 +2859,30 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private func flushCommandWriteQueue() {
-        // Background execution is opportunistic. Keep queued synchronization
-        // work frozen until foreground, while still allowing a user initiated
-        // Live Activity control (which is ordered ahead of background work).
-        if appLifecycleState != "active",
-           pendingCommandWrites.first?.isControl != true {
-            return
+        let artworkID = albumArtReceiver.currentAlbumArtID
+        pendingCommandWrites.removeAll {
+            $0.cmd == "ALBUM_ART_REQUEST" && $0.artworkID != artworkID
         }
+        // A BLE wake-up may fetch the current preview for the Island. HQ,
+        // history, diagnostics and periodic synchronization wait for foreground.
         guard commandWriteInflight.isEmpty,
-              !pendingCommandWrites.isEmpty,
+              let requestIndex = pendingCommandWrites.firstIndex(where: {
+                  CommandWriteQueuePolicy.canRun(
+                      appIsActive: appLifecycleState == "active",
+                      isControl: $0.isControl,
+                      command: $0.cmd,
+                      artworkID: $0.artworkID,
+                      artworkQuality: $0.artworkQuality,
+                      currentArtworkID: artworkID
+                  )
+              }),
               let sonyPeripheral,
               sonyPeripheral.state == .connected,
               let sonyCommandCharacteristic else {
             return
         }
 
-        let request = pendingCommandWrites.removeFirst()
+        let request = pendingCommandWrites.remove(at: requestIndex)
         let writeBeginMs = currentTimeMs()
         let writeBeginMonoMs = monotonicTimeMs()
         commandWriteInflight.append(
@@ -4460,6 +4633,10 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
 
     private func clearConnectionTransports(reason: String) {
         log("[BLE-Reconnect] clear characteristics reason=\(reason)")
+        resetHistoryRequests(reason: reason)
+        finishLyricDiagnosticRequest(error: lyricDiagnosticLoading ? "诊断暂不可用，请确认连接后重试" : nil)
+        backgroundArtworkTask?.end()
+        backgroundArtworkTask = nil
         resetClockSync(reason: reason)
         coreBluetoothRestoreTimeoutWorkItem?.cancel()
         coreBluetoothRestoreTimeoutWorkItem = nil
@@ -4649,6 +4826,8 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
 
     @objc private func appDidBecomeActive() {
         updateAppLifecycleState(.active, emitLog: true)
+        backgroundArtworkTask?.end()
+        backgroundArtworkTask = nil
         handleAppForegroundReconnectCheck()
     }
 
@@ -5922,9 +6101,9 @@ extension BLETestManager: CBPeripheralDelegate {
         }
     }
 
-    private func parseStatus(_ object: [String: Any], type: String) {
+    private func parseStatus(_ object: [String: Any], type: String, recordTransportActivity: Bool = true) {
         let apply: () -> Void = {
-            self.markStatusNotifyReceived(type: type)
+            if recordTransportActivity { self.markStatusNotifyReceived(type: type) }
             self.observeV3StatusMetadata(object, type: type)
             switch type {
             case "link":
@@ -6280,6 +6459,7 @@ extension BLETestManager: CBPeripheralDelegate {
 
             case "albumArtOffer":
                 let id = object["id"] as? String ?? ""
+                self.beginBackgroundArtworkTask(id: id)
                 self.albumArtReceiver.handleOffer(id: id)
 
             case "albumArtStart":
@@ -6445,15 +6625,7 @@ extension BLETestManager: CBPeripheralDelegate {
             case "playHistoryError":
                 let requestId = object["requestId"] as? String ?? ""
                 let message = object["message"] as? String ?? "unknown"
-                let failedKind = self.pendingHistoryRequests.removeValue(forKey: requestId)
-                if case .some(.stats) = failedKind {
-                    self.requestNextPlaybackStats()
-                } else {
-                    self.isPlaybackHistorySyncing = false
-                }
-                self.isLoadingMoreHistory = false
-                self.playbackHistoryStatus = "同步失败：\(message)"
-                self.log("[HistorySync] error requestId=\(requestId) message=\(message)")
+                self.failHistoryRequest(requestId, reason: message)
 
             default:
                 self.log("[Status] unsupported type=\(type)")
@@ -6533,6 +6705,14 @@ extension BLETestManager: CBPeripheralDelegate {
             ? "，可重试\(payload.retryAfterMs.map { "（\($0)ms 后）" } ?? "")"
             : ""
         lastCommandErrorSummary = "\(correlatedCommand)：\(payload.code)\(retryText)"
+        if let sequence = payload.sequence {
+            if let requestId = historyRequestSequences.first(where: { $0.value == sequence })?.key {
+                failHistoryRequest(requestId, reason: payload.code)
+            }
+            if lyricDiagnosticRequestSequence == sequence {
+                finishLyricDiagnosticRequest(error: "诊断暂不可用，请确认连接后重试")
+            }
+        }
         log(
             "[BLE-V3] commandError seq=\(payload.sequence.map { String($0) } ?? "-") " +
                 "cmd=\(correlatedCommand) domain=\(payload.domain.rawValue) " +
@@ -6631,8 +6811,10 @@ extension BLETestManager: CBPeripheralDelegate {
         let responseType = object["responseType"] as? String ?? ""
         let size = Self.intValue(object["size"])
         let chunks = Self.intValue(object["chunks"])
-        guard !requestId.isEmpty, !responseType.isEmpty, size > 0, chunks > 0 else {
+        guard pendingHistoryRequests[requestId] != nil else { return }
+        guard !responseType.isEmpty, size > 0, chunks > 0 else {
             log("[HistorySync] invalid payload start")
+            failHistoryRequest(requestId, reason: "无效的历史分包信息")
             return
         }
         historyPayloads[requestId] = HistoryPayloadAssembly(
@@ -6652,6 +6834,7 @@ extension BLETestManager: CBPeripheralDelegate {
               let base64 = object["data"] as? String,
               let chunk = Data(base64Encoded: base64) else {
             log("[HistorySync] invalid payload chunk requestId=\(requestId) index=\(index)")
+            failHistoryRequest(requestId, reason: "无效的历史分包")
             return
         }
         assembly.chunks[index] = chunk
@@ -6663,8 +6846,10 @@ extension BLETestManager: CBPeripheralDelegate {
         guard let assembly = historyPayloads.removeValue(forKey: requestId),
               assembly.chunks.count == assembly.expectedChunks else {
             log("[HistorySync] payload end missing chunks requestId=\(requestId)")
+            failHistoryRequest(requestId, reason: "历史分包不完整，请重试")
             return
         }
+        let token = historyTransferToken
         protocolDecodeQueue.async { [weak self] in
             guard let self else { return }
             let signpost = AppPerformanceLog.protocolSignposter.beginInterval("History Payload Decode")
@@ -6674,7 +6859,8 @@ extension BLETestManager: CBPeripheralDelegate {
                 guard let chunk = assembly.chunks[index] else {
                     AppPerformanceLog.protocolSignposter.endInterval("History Payload Decode", signpost)
                     DispatchQueue.main.async { [weak self] in
-                        self?.log("[HistorySync] payload missing chunk requestId=\(requestId) index=\(index)")
+                        guard let self, self.historyTransferToken == token else { return }
+                        self.failHistoryRequest(requestId, reason: "历史分包不完整，请重试")
                     }
                     return
                 }
@@ -6685,9 +6871,13 @@ extension BLETestManager: CBPeripheralDelegate {
                 : nil
             AppPerformanceLog.protocolSignposter.endInterval("History Payload Decode", signpost)
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                guard let decoded else {
+                guard let self, self.historyTransferToken == token,
+                      self.pendingHistoryRequests[requestId] != nil else { return }
+                guard let decoded,
+                      decoded["requestId"] as? String == requestId,
+                      decoded["type"] as? String == assembly.responseType else {
                     self.log("[HistorySync] payload decode failed requestId=\(requestId)")
+                    self.failHistoryRequest(requestId, reason: "历史数据解析失败，请重试")
                     return
                 }
                 self.log("[HistorySync] payload decoded requestId=\(requestId) bytes=\(data.count)")
@@ -6699,12 +6889,25 @@ extension BLETestManager: CBPeripheralDelegate {
     private func handleHistoryPayload(_ object: [String: Any]) {
         let type = object["type"] as? String ?? ""
         let requestId = object["requestId"] as? String ?? ""
+        guard let kind = pendingHistoryRequests[requestId] else { return }
+        let expectedType: String
+        switch kind {
+        case .since: expectedType = "playHistorySince"
+        case .page: expectedType = "playHistoryPage"
+        case .stats: expectedType = "playStats"
+        }
+        guard type == expectedType else {
+            failHistoryRequest(requestId, reason: "历史响应类型不匹配")
+            return
+        }
+        let token = historyTransferToken
         switch type {
         case "playHistoryPage", "playHistorySince":
             let sessions = decodeHistorySessions(object["items"] as? [[String: Any]] ?? [])
             PlaybackHistoryStore.shared.mergeSessions(sessions) { [weak self] merged in
                 DispatchQueue.main.async {
-                    guard let self else { return }
+                    guard let self, self.historyTransferToken == token,
+                          self.pendingHistoryRequests[requestId] != nil else { return }
                     self.playbackHistorySessions = merged
                     self.handleHistoryRequestCompletion(
                         type: type,
@@ -6717,15 +6920,12 @@ extension BLETestManager: CBPeripheralDelegate {
 
         case "playStats":
             guard let stats = decodePlaybackStats(object) else {
-                pendingHistoryRequests.removeValue(forKey: requestId)
-                playbackHistoryStatus = "统计解析失败"
-                log("[HistorySync] stats decode failed requestId=\(requestId)")
-                requestNextPlaybackStats()
+                failHistoryRequest(requestId, reason: "统计解析失败")
                 return
             }
             playbackStats[stats.range] = stats
             PlaybackHistoryStore.shared.saveStats(stats)
-            pendingHistoryRequests.removeValue(forKey: requestId)
+            _ = removeHistoryRequest(requestId)
             playbackHistoryStatus = "统计已更新"
             log("[HistorySync] stats updated range=\(stats.range)")
             requestNextPlaybackStats()
@@ -6741,8 +6941,13 @@ extension BLETestManager: CBPeripheralDelegate {
         received: Int,
         response: [String: Any]
     ) {
-        let kind = pendingHistoryRequests.removeValue(forKey: requestId)
         let hasMore = response["hasMore"] as? Bool ?? false
+        if type == "playHistorySince", hasMore,
+           Self.int64Value(response["lastSessionId"]) <= lastSyncedHistorySessionId {
+            failHistoryRequest(requestId, reason: "历史同步游标未推进")
+            return
+        }
+        guard removeHistoryRequest(requestId) != nil else { return }
         if type == "playHistorySince" {
             let lastSessionId = Self.int64Value(response["lastSessionId"])
             if lastSessionId > lastSyncedHistorySessionId {
@@ -6769,8 +6974,6 @@ extension BLETestManager: CBPeripheralDelegate {
             isLoadingMoreHistory = false
             playbackHistoryStatus = received == 0 ? "没有更多历史" : "已加载更多"
             log("[HistorySync] page received=\(received) hasMore=\(hasMore)")
-        } else if kind == nil {
-            log("[HistorySync] response without pending requestId=\(requestId)")
         }
     }
 
@@ -6899,7 +7102,7 @@ extension BLETestManager: CBPeripheralDelegate {
             translationLyricsState = .idle
             romanizationLyricsState = .idle
             lyricDiagnostic = nil
-            lyricDiagnosticLoading = false
+            finishLyricDiagnosticRequest()
             lyricDiagnosticLastUpdatedAt = nil
             mediaLoadingState.lyric = .waitingQqQrc
             mediaLoadingState.artwork = .preview(received: 0, expected: 0)
@@ -7018,7 +7221,7 @@ extension BLETestManager: CBPeripheralDelegate {
         fullLyricsTrackId = ""
         isFullLyricsCurrent = false
         lyricDiagnostic = nil
-        lyricDiagnosticLoading = false
+        finishLyricDiagnosticRequest()
         lyricDiagnosticLastUpdatedAt = nil
         isPlaying = false
         updateProgressTimerState()
@@ -7074,8 +7277,10 @@ extension BLETestManager: CBPeripheralDelegate {
         )
         lastLiveActivityRequestAt = Date()
         lastLiveActivityRequestTrackID = snapshotTrackID
+        let backgroundTask = BoundedBackgroundTask(name: "Live Activity publication")
 
         Task { @MainActor in
+            defer { backgroundTask.end() }
             LiveActivityManager.shared.update(
                 title: snapshotTitle,
                 artist: snapshotArtist,
@@ -7958,7 +8163,7 @@ extension BLETestManager: CBPeripheralDelegate {
             return
         }
         lyricDiagnostic = parseLyricDiagnostic(object)
-        lyricDiagnosticLoading = false
+        finishLyricDiagnosticRequest()
         lyricDiagnosticLastUpdatedAt = Date()
         if let diagnostic = lyricDiagnostic {
             if diagnostic.status == "waiting_qqmusic_cache" ||
@@ -7977,7 +8182,7 @@ extension BLETestManager: CBPeripheralDelegate {
     }
 
     private func handleLyricDiagnosticUnavailable(_ object: [String: Any]) {
-        lyricDiagnosticLoading = false
+        finishLyricDiagnosticRequest(error: "诊断暂不可用，请确认连接后重试")
         let reason = object["reason"] as? String ?? "unavailable"
         log("[LyricsDiag-iOS] unavailable reason=\(reason)")
     }
@@ -9213,6 +9418,7 @@ extension BLETestManager: CBPeripheralDelegate {
         key: String,
         reason: String
     ) {
+        beginBackgroundArtworkTask(id: key)
         let trackAtStart = currentTrackID
         let revision = currentLiveArtworkRevision + 1
         let writeRequest = liveArtworkRevisionFence.begin()
@@ -9245,6 +9451,10 @@ extension BLETestManager: CBPeripheralDelegate {
                         "revision=\(revision) source=\(reason)"
                 )
                 self.updateLiveActivity(force: true, reason: "artworkReady")
+                if self.backgroundArtworkID == key {
+                    self.backgroundArtworkTask?.end()
+                    self.backgroundArtworkTask = nil
+                }
             }
         )
     }
@@ -9258,6 +9468,14 @@ extension BLETestManager: CBPeripheralDelegate {
         if shouldUpdate {
             updateLiveActivity(force: true, reason: "artworkUnavailable")
         }
+    }
+
+    private func beginBackgroundArtworkTask(id: String) {
+        guard appLifecycleState != "active", !id.isEmpty else { return }
+        if backgroundArtworkID == id, backgroundArtworkTask?.isActive == true { return }
+        backgroundArtworkTask?.end()
+        backgroundArtworkID = id
+        backgroundArtworkTask = BoundedBackgroundTask(name: "Current artwork preview")
     }
 
     private func finishRemoteLogTransfer() {
@@ -9466,6 +9684,10 @@ extension BLETestManager: AlbumArtReceiverDelegate {
     }
 
     func albumArtSendCommand(cmd: String, extra: [String: Any]) {
+        if cmd == "ALBUM_ART_REQUEST", extra["quality"] as? String == "preview",
+           let id = extra["id"] as? String {
+            beginBackgroundArtworkTask(id: id)
+        }
         sendCommand(cmd: cmd, extra: extra)
     }
 

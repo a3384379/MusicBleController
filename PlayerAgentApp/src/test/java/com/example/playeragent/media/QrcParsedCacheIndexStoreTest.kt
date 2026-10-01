@@ -55,6 +55,34 @@ class QrcParsedCacheIndexStoreTest {
         recovered.close()
     }
 
+    @Test
+    fun failedRenameRetainsDestinationCleansTemporaryFileAndCanRetry() {
+        val directory = temporaryFolder.newFolder("blocked-index")
+        val destination = File(directory, QrcParsedCacheIndexStore.INDEX_FILE_NAME)
+        destination.mkdir()
+        val retained = File(destination, "retained.txt").apply { writeText("retain") }
+        val logs = mutableListOf<String>()
+        val store = QrcParsedCacheIndexStore(directory) { logs += it }
+        try {
+            store.upsert(entry("song-a", "a.json", 30))
+            store.flushNow()
+            assertEquals("retain", retained.readText())
+            assertTrue(logs.any { it.contains("save failed") })
+            assertFalse(directory.listFiles().orEmpty().any { it.name.endsWith(".tmp") })
+            destination.deleteRecursively()
+            store.flushNow()
+            assertTrue(destination.isFile)
+            val restored = QrcParsedCacheIndexStore(directory) { }
+            try {
+                assertEquals(listOf("song-a"), restored.snapshot().map { it.songKey })
+            } finally {
+                restored.close()
+            }
+        } finally {
+            store.close()
+        }
+    }
+
     private fun entry(songKey: String, fileName: String, lines: Int) =
         QrcParsedCacheIndexStore.Entry(
             songKey = songKey,

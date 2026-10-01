@@ -1,29 +1,62 @@
 import Foundation
 import UIKit
 
+/// A finite lease for BLE wake-up work and its asynchronous publication.
+final class BoundedBackgroundTask {
+    private var identifier: UIBackgroundTaskIdentifier = .invalid
+    private var deadline: DispatchWorkItem?
+    var isActive: Bool { identifier != .invalid }
+
+    init(name: String) {
+        guard UIApplication.shared.applicationState != .active else { return }
+        identifier = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            self?.end()
+        }
+        guard isActive else { return }
+        let item = DispatchWorkItem { [weak self] in self?.end() }
+        deadline = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: item)
+    }
+
+    func end() {
+        deadline?.cancel()
+        deadline = nil
+        guard isActive else { return }
+        let task = identifier
+        identifier = .invalid
+        UIApplication.shared.endBackgroundTask(task)
+    }
+
+    deinit { end() }
+}
+
 struct LiveActivityArtworkWriteResult: Sendable {
     let succeeded: Bool
     let messages: [String]
 }
 
-private actor LiveActivityArtworkFileWriter {
+actor LiveActivityArtworkFileWriter {
     private let maxCachedFiles = 50
+    private let directoryOverride: URL?
+
+    init(directoryOverride: URL? = nil) { self.directoryOverride = directoryOverride }
+
+    private func directoryURL(fileManager: FileManager) -> URL? {
+        if let directoryOverride { return directoryOverride }
+        return fileManager.containerURL(
+            forSecurityApplicationGroupIdentifier: LiveActivitySharedConstants.appGroupIdentifier
+        )?.appendingPathComponent(LiveActivitySharedConstants.artworkDirectoryName, isDirectory: true)
+    }
 
     func write(data: Data, key: String, revision: Int) -> LiveActivityArtworkWriteResult {
         var messages = ["[LiveArtwork] write start key=\(key) revision=\(revision)"]
         let fileManager = FileManager.default
-        guard let containerURL = fileManager.containerURL(
-            forSecurityApplicationGroupIdentifier: LiveActivitySharedConstants.appGroupIdentifier
-        ) else {
+        guard let directoryURL = directoryURL(fileManager: fileManager) else {
             messages.append("[LiveArtwork] file validation failed reason=container unavailable")
             return LiveActivityArtworkWriteResult(succeeded: false, messages: messages)
         }
 
-        let directoryURL = containerURL.appendingPathComponent(
-            LiveActivitySharedConstants.artworkDirectoryName,
-            isDirectory: true
-        )
-        messages.append("[LiveArtwork] group container=\(containerURL.path)")
+        messages.append("[LiveArtwork] group container=\(directoryURL.deletingLastPathComponent().path)")
 
         do {
             try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
@@ -35,7 +68,7 @@ private actor LiveActivityArtworkFileWriter {
             let fileURL = directoryURL.appendingPathComponent(
                 LiveActivitySharedConstants.artworkFileName(key: key, revision: revision)
             )
-            try data.write(to: fileURL, options: .atomic)
+            try data.write(to: fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
             guard fileManager.fileExists(atPath: fileURL.path) else {
                 messages.append("[LiveArtwork] file validation failed reason=file missing")
                 return LiveActivityArtworkWriteResult(succeeded: false, messages: messages)
@@ -52,13 +85,7 @@ private actor LiveActivityArtworkFileWriter {
 
     func removeAll() {
         let fileManager = FileManager.default
-        guard let containerURL = fileManager.containerURL(
-            forSecurityApplicationGroupIdentifier: LiveActivitySharedConstants.appGroupIdentifier
-        ) else { return }
-        let directoryURL = containerURL.appendingPathComponent(
-            LiveActivitySharedConstants.artworkDirectoryName,
-            isDirectory: true
-        )
+        guard let directoryURL = directoryURL(fileManager: fileManager) else { return }
         guard let urls = try? fileManager.contentsOfDirectory(
             at: directoryURL,
             includingPropertiesForKeys: nil

@@ -69,6 +69,10 @@ CoreBluetooth 使用 `com.musicblecontroller.sony.central.v1` 做状态恢复，
 
 用户控制与播放状态 fallback 共用串行 command write 队列，但普通 `GET_PLAYBACK_STATE` 会被更新的 fallback 或新的用户控制合并；前台恢复验证与 Health probe 的请求序列受保护。NEXT/PREVIOUS fallback 等待 1 秒，优先让 Sony 的正式 TrackInfo/PlaybackState 主动推送完成；新 trackId 一旦被接受即取消剩余 fallback。该策略不新增 Timer、不重发控制命令，也不改变 BLE 协议。
 
+后台队列允许用户控制和当前 artworkId 的 preview，请求可越过冻结的 HQ/历史/诊断项；旧封面请求会被清理。封面 offer 到 App Group 缩略图及 ActivityKit 发布使用有限后台任务，最多 15 秒或系统提前到期；不增加后台轮询。缩略图使用原子写入及首次解锁后可读的文件保护，完整边界见 [ALBUM_ART_ARCHITECTURE.md](ALBUM_ART_ARCHITECTURE.md)。
+
+`sendCommand` 返回能否入队，业务请求继续等待 Sony 响应。历史/统计请求有 30 秒完成期限，歌词诊断有 10 秒期限；发送失败、错误响应、缺包、解析失败、超时和断线清理请求及忙碌状态。断线或清空历史缓存使历史 transfer token 失效，旧异步回调不能写回新连接的界面；统计失败继续下一项，切歌或新的诊断请求取消旧诊断期限。
+
 ## 关键状态
 
 - 连接：`connectionStatus`、`connectionDisplayState`、`connectionHealthState`、`autoReconnectState`。

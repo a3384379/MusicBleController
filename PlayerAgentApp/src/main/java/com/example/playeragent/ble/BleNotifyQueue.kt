@@ -5,6 +5,7 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattServer
+import android.bluetooth.BluetoothStatusCodes
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -1406,7 +1407,7 @@ class BleNotifyQueue(
                     characteristic,
                     false,
                     value
-                ) == BluetoothGatt.GATT_SUCCESS
+                ) == BluetoothStatusCodes.SUCCESS
             } else {
                 @Suppress("DEPRECATION")
                 characteristic.value = value

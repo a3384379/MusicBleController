@@ -43,6 +43,7 @@
 12. V4 第三阶段的预测模型可以记录“已有精确 artwork cache”这一 readiness，但当前 QQ 音乐不暴露高置信下一/上一首 identity，因此没有执行候选图片预编码、跨端 Preview/HQ 预取或猜测式图片晋升。正式封面仍只按当前 trackId/generation 发布。
 13. TrackInfo、PlaybackState、Preview/HQ A1 和 CurrentWord 使用同一个经过 identity 复核的 wire generation；Sony 捕获一次传输 generation 后贯穿 Start/Chunk/End，迟到旧 generation 不能覆盖 iOS 或 Sony PlayerAgent 当前封面。
 14. Android notify callback 不能等同 L2CAP 已排空。封面 binary 使用 15ms 最小 pacing；command write 到达时同步预留 response quiet window，避免频繁切歌与 HQ 并发时写响应被 L2CAP hold queue 挤掉。该节流不作用于 JSON、歌词或 CurrentWord。
+15. iOS 在 inactive/background 收到当前歌曲 offer 后可请求 preview，命令队列跳过冻结的 HQ/同步请求并移除旧 artworkId 请求。offer、缓存命中、缩略图写入及 ActivityKit 发布使用有限后台任务，完成或系统到期结束，每个任务最多 15 秒；HQ 等重任务继续等待前台。共享缩略图原子写入并使用首次解锁后可读的文件保护，ContentState 仍只传 key/revision。此链路依赖系统提供 BLE 事件执行机会，后台调度及锁屏显示的本次验证边界见 [CONTROL_INTERACTION_AUDIT.md](CONTROL_INTERACTION_AUDIT.md)。
 
 ## 关键状态
 

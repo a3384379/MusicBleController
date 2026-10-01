@@ -150,6 +150,8 @@ struct FullLyricsView: View {
                     .overlay {
                         Circle().stroke(.white.opacity(0.10), lineWidth: 1)
                     }
+                    .padding(5)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(FullLyricsPressStyle())
             .accessibilityLabel("关闭歌词")
@@ -203,6 +205,7 @@ struct FullLyricsView: View {
                                 .foregroundStyle(.white)
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 8)
+                                .frame(minHeight: 44)
                                 .background(.white.opacity(0.12), in: Capsule())
                                 .overlay {
                                     Capsule().stroke(.white.opacity(0.10), lineWidth: 1)
@@ -240,7 +243,7 @@ struct FullLyricsView: View {
                         .font(.callout.weight(.bold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 16)
-                        .frame(height: 36)
+                        .frame(height: 44)
                         .background(.white.opacity(0.12), in: Capsule())
                 }
                 .buttonStyle(.plain)
@@ -279,6 +282,7 @@ struct FullLyricsView: View {
                         .transition(.opacity)
                 }
             }
+            .frame(minHeight: 44)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -393,7 +397,7 @@ struct FullLyricsView: View {
 
     private var controls: some View {
         HStack(spacing: 32) {
-            controlButton(systemImage: "backward.fill", size: 52, action: onPrevious)
+            controlButton("上一首", systemImage: "backward.fill", size: 52, action: onPrevious)
             Button(action: onPlayPause) {
                 Image(systemName: isPlaying ? "pause.fill" : "play.fill")
                     .font(.system(size: 30, weight: .bold))
@@ -404,7 +408,7 @@ struct FullLyricsView: View {
             }
             .buttonStyle(FullLyricsPressStyle(pressedScale: 0.92))
             .accessibilityLabel(isPlaying ? "暂停" : "播放")
-            controlButton(systemImage: "forward.fill", size: 52, action: onNext)
+            controlButton("下一首", systemImage: "forward.fill", size: 52, action: onNext)
         }
         .padding(.top, 4)
         .disabled(!isConnected)
@@ -412,6 +416,7 @@ struct FullLyricsView: View {
     }
 
     private func controlButton(
+        _ title: String,
         systemImage: String,
         size: CGFloat,
         action: @escaping () -> Void
@@ -427,6 +432,7 @@ struct FullLyricsView: View {
                 }
         }
         .buttonStyle(FullLyricsPressStyle(pressedScale: 0.92))
+        .accessibilityLabel(AppLocalization.string(title))
     }
 
     private func scrollToCurrent(_ proxy: ScrollViewProxy) {

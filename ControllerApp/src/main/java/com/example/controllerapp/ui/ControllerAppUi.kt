@@ -825,14 +825,15 @@ private fun VolumeControl(
     enabled: Boolean,
     onVolume: (Int) -> Unit
 ) {
-    var value by remember(playback.volumeCurrent, playback.volumeMax) {
-        mutableFloatStateOf(playback.volumeCurrent.toFloat())
+    val sliderState = remember { VolumeSliderState() }
+    val value = sliderState.displayedValue(playback.volumeCurrent, playback.volumeMax)
+    LaunchedEffect(enabled, playback.volumeMax) {
+        if (!enabled || playback.volumeMax <= 0) sliderState.cancel()
     }
-    var dragging by remember { mutableStateOf(false) }
-    LaunchedEffect(value, dragging) {
-        if (dragging) {
+    LaunchedEffect(sliderState.draggedValue, enabled, playback.volumeMax) {
+        if (sliderState.draggedValue != null && enabled && playback.volumeMax > 0) {
             delay(90L)
-            onVolume(value.toInt())
+            onVolume(sliderState.displayedValue(playback.volumeCurrent, playback.volumeMax).toInt())
         }
     }
     Row(
@@ -845,12 +846,14 @@ private fun VolumeControl(
             valueRange = 0f..playback.volumeMax.coerceAtLeast(1).toFloat(),
             enabled = enabled && playback.volumeMax > 0,
             onValueChange = {
-                dragging = true
-                value = it
+                sliderState.drag(it)
             },
             onValueChangeFinished = {
-                onVolume(value.toInt())
-                dragging = false
+                if (enabled && playback.volumeMax > 0) {
+                    sliderState.finish(playback.volumeCurrent, playback.volumeMax)?.let(onVolume)
+                } else {
+                    sliderState.cancel()
+                }
             },
             modifier = Modifier.weight(1f)
         )

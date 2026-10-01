@@ -7,6 +7,7 @@ import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.content.Context
 import android.os.Build
 import android.os.Handler
@@ -216,7 +217,7 @@ class ControllerGattClientManager(
                 gatt.writeDescriptor(
                     descriptor,
                     BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                ) == BluetoothGatt.GATT_SUCCESS
+                ) == BluetoothStatusCodes.SUCCESS
             } else {
                 @Suppress("DEPRECATION")
                 descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
@@ -271,7 +272,7 @@ class ControllerGattClientManager(
                     characteristic,
                     value,
                     BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                ) == BluetoothGatt.GATT_SUCCESS
+                ) == BluetoothStatusCodes.SUCCESS
             } else {
                 @Suppress("DEPRECATION")
                 characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
