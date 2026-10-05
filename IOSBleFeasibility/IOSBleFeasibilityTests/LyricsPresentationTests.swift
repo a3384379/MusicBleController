@@ -170,6 +170,52 @@ final class LyricsPresentationTests: XCTestCase {
         XCTAssertNil(queue.begin())
     }
 
+    func testBlockedFrameRetriesWithoutWaitingForAnotherLyricLine() throws {
+        var queue = LatestLyricsFrameQueue()
+        let current = snapshot()
+        XCTAssertTrue(queue.offer(current, force: false))
+        let first = try XCTUnwrap(queue.begin())
+        XCTAssertTrue(queue.finish(first.token, currentKey: current.key, retryIfCurrent: true))
+        XCTAssertFalse(queue.offer(current, force: false))
+        XCTAssertTrue(queue.hasPending)
+        let retry = try XCTUnwrap(queue.begin())
+        XCTAssertEqual(retry.snapshot, current)
+        XCTAssertNotEqual(retry.token, first.token)
+        XCTAssertTrue(queue.finish(retry.token, currentKey: current.key))
+        XCTAssertFalse(queue.hasPending)
+        XCTAssertNil(queue.begin())
+    }
+
+    func testBlockedRetryPreservesNewerHeartbeatSnapshot() throws {
+        var queue = LatestLyricsFrameQueue()
+        let first = snapshot(validUntil: 100)
+        let refreshed = snapshot(validUntil: 200)
+        XCTAssertEqual(first.key, refreshed.key)
+        XCTAssertTrue(queue.offer(first, force: false))
+        let request = try XCTUnwrap(queue.begin())
+        XCTAssertTrue(queue.offer(refreshed, force: true))
+        XCTAssertTrue(queue.finish(request.token, currentKey: refreshed.key, retryIfCurrent: true))
+        let retry = try XCTUnwrap(queue.begin())
+        XCTAssertEqual(retry.snapshot.validUntilUptime, 200)
+        XCTAssertTrue(queue.finish(retry.token, currentKey: refreshed.key))
+        XCTAssertNil(queue.begin())
+    }
+
+    func testBlockedOldFrameCannotReplaceNewLyricsOrSurviveStop() throws {
+        var queue = LatestLyricsFrameQueue()
+        XCTAssertTrue(queue.offer(snapshot(), force: false))
+        let old = try XCTUnwrap(queue.begin())
+        let changed = snapshot(lineIndex: 2, generation: 2, timeline: 2)
+        XCTAssertTrue(queue.offer(changed, force: false))
+        XCTAssertFalse(queue.finish(old.token, currentKey: changed.key, retryIfCurrent: true))
+        let latest = try XCTUnwrap(queue.begin())
+        XCTAssertEqual(latest.snapshot, changed)
+        queue.invalidate()
+        XCTAssertFalse(queue.finish(latest.token, currentKey: changed.key, retryIfCurrent: true))
+        XCTAssertFalse(queue.hasPending)
+        XCTAssertNil(queue.begin())
+    }
+
     func testDisabledOrChangedAuthorityRejectsLatePixelFrames() throws {
         var queue = LatestLyricsFrameQueue()
         XCTAssertTrue(queue.offer(snapshot(), force: false))
@@ -225,6 +271,23 @@ final class LyricsPresentationTests: XCTestCase {
         let bytes = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
         let length = CVPixelBufferGetBytesPerRow(buffer) * CVPixelBufferGetHeight(buffer)
         XCTAssertTrue(stride(from: 0, to: length, by: 4).contains { bytes[$0] > 180 && bytes[$0 + 1] > 180 })
+    }
+
+    func testPixelBufferPressureIsRecoverableAfterHeldFramesAreReleased() throws {
+        let renderer = LyricsSampleBufferRenderer()
+        var held: [CMSampleBuffer] = []
+        try autoreleasepool {
+            for index in 0..<3 { held.append(try renderer.render(snapshot(lineIndex: index))) }
+            XCTAssertThrowsError(try renderer.render(snapshot(lineIndex: 3))) { error in
+                XCTAssertEqual(error as? LyricsSampleBufferRenderer.RenderError, .bufferPoolExhausted)
+            }
+        }
+        let previousTime = CMSampleBufferGetPresentationTimeStamp(held[0])
+        autoreleasepool { held.removeSubrange((held.count - 1)..<held.count) }
+        let recovered = try renderer.render(snapshot(lineIndex: 4))
+        XCTAssertNotNil(CMSampleBufferGetImageBuffer(recovered))
+        XCTAssertGreaterThan(CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(recovered), previousTime), 0)
+        XCTAssertEqual(held.count, 2)
     }
 
     @MainActor
@@ -309,11 +372,12 @@ final class LyricsPresentationTests: XCTestCase {
     }
 
     private func snapshot(lineIndex: Int = 1, generation: Int64 = 1, timeline: UInt64 = 1,
-                          playing: Bool = true, status: LyricsPresentationSnapshot.Status = .ready) -> LyricsPresentationSnapshot {
+                          playing: Bool = true, status: LyricsPresentationSnapshot.Status = .ready,
+                          validUntil: TimeInterval = 100) -> LyricsPresentationSnapshot {
         LyricsPresentationSnapshot(trackID: "fixture", trackGeneration: generation, revision: 1,
                                    timelineRevision: timeline, lineIndex: lineIndex, text: "同一句歌词 · Lyrics 🎵",
                                    title: "测试歌曲", artist: "Artist", isPlaying: playing, status: status,
-                                   validUntilUptime: 100)
+                                   validUntilUptime: validUntil)
     }
 
     private func makeContent() -> SonyMusicActivityAttributes.ContentState {

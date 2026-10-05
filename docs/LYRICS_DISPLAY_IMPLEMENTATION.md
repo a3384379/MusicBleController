@@ -116,3 +116,40 @@ full smoke 之后的关窗保护修订已重新执行上表的模拟器测试和
 2026-10-05，在已告知 smoke 失败与真机验收缺口后，用户明确要求「提交合并到 github」。
 本次按该明确授权继续提交与 PR 合并流程；以下真机项目仍保持未验收状态，CI 结果不会替代设备验收。
 跨应用 PiP、iPhone 音频兼容、后台歌词、蓝牙设备链路和灵动岛多活动布局仍需按矩阵做真机验收，不能用模拟器结果代替。
+
+## 2026-10-05 源码审计补修
+
+基线为 PR #9 合并后的 `4c6eb6129666e0cc929da71b4795756ab18f39d3`，
+分支为 `codex/ios-lyrics-audit-fixes`。再次读取分享页时，公开的最后一条仍是上述设计方案，
+正文注明未完成源码审计，未提供针对 PR #9 的新问题清单。
+以下三项来自按方案风险检查当前 master 的实际源码，不冒充分享页新增的审计结论。
+
+| 问题 | 修复与边界 |
+|---|---|
+| 显示队列暂时不可写，或绘制期间变为不可写，最新帧会被去重或提前消耗 | 最新快照保留到实际可入队；一次 readiness 请求唤醒后立即配对停止请求。同行事件仍不创建额外帧，但可以推进已有待处理快照。停止会取消请求，旧会话回调不能影响新会话。 |
+| 达到三个像素缓冲的分配上限，被当成永久绘制失败并关闭 PiP | 单独识别 `kCVReturnWouldExceedAllocationThreshold`，保留最新待处理快照。清理待显示帧但保留当前画面，等待 flush 完成后重试一次；再次耗尽时等待下一次有效内容变化或已有 active 心跳，不增加轮询定时器。显式再次显示也刷新快照。 |
+| 系统关窗只改状态并取消心跳，未复用用户停止的超时清理 | `willStop` 同步封锁播放控制，再进入公共停止清理路径；缺失 `didStop` 时沿用两秒兜底，释放控制器、渲染资源与音频租约。不会再次请求系统停止，也不会向 Sony 发送暂停。 |
+
+绘制的临时 UIKit/CoreVideo 对象在 utility 队列的 autorelease pool 内释放。
+异步 flush 使用弱引用并复核会话 generation 和 renderer 身份；停止或重开后到达的完成回调无效。
+队列仍限制为一帧在途、一个最新待处理快照，像素缓冲上限仍为三个。
+永久的像素创建、上下文、格式或 sample-buffer 错误仍走原有失败提示与资源清理。
+
+缓冲池回收通知在本次模拟器回归中未按预期到达，因此最终恢复路径使用显示队列的 flush 完成回调。
+相关 API 依据：[分配阈值](https://developer.apple.com/documentation/corevideo/kcvreturnwouldexceedallocationthreshold)、
+[显示队列清理](https://developer.apple.com/documentation/avfoundation/avsamplebuffervideorenderer/flush(removingdisplayedimage:completionhandler:))、
+[readiness 请求](https://developer.apple.com/documentation/avfoundation/avsamplebuffervideorenderer/requestmediadatawhenready(on:using:))。
+
+本次仅修改 PiP 控制器、最新帧队列、像素绘制器、对应测试及本记录。
+BLE 管理、命令、Sony/Android、偏好格式、Widget 布局和项目配置均未修改。
+
+| 检查 | 本次结果与证据 |
+|---|---|
+| 模拟器完整 XCTest | **PASS 91/91**，新增四项回归：不可写重试、较新心跳快照保留、旧身份/停止后不得重试、实际三个缓冲耗尽并释放后恢复；`/private/tmp/musicble-lyrics-audit-tests-close.xcresult`、`/private/tmp/musicble-lyrics-audit-tests-close.log` |
+| generic iOS App / Widget 构建 | **BUILD SUCCEEDED**，无 Swift 编译警告；`/private/tmp/musicble-lyrics-audit-device-build-final.log` |
+| quick smoke | **overall FAIL，Required 2/6**，两项 PASS 实际为跳过 build/install；设备仍为 unavailable，启动、日志、偏好与容器无法验证；`/private/tmp/musicble-lyrics-audit-quick-smoke/report.json` |
+| 源码与结构影响复核 | 最终差异、调用位置及 `git diff --check` 通过；工作树完整索引仍 worker crash，`detect_changes` 仍返回主目录原有六项修改，不能作为本次影响验证证据 |
+| 系统关窗、跨应用 PiP、后台/BLE/锁屏与音频兼容 | **未完成真机验收**；状态机与清理路径经测试/源码复核，但不替代实际 AVKit 系统回调及设备测试 |
+
+用户本轮明确要求修改后提交并合并 GitHub，按该授权执行 PR 和 CI 流程。
+本次 quick smoke 的设备限制与既有真机缺口继续保留；原主工作目录的六项未提交修改不纳入本次提交。

@@ -25,6 +25,10 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
     private var renderer: LyricsSampleBufferRenderer?
     private let renderQueue = DispatchQueue(label: "musicble.lyrics.pip.render", qos: .utility)
     private var frameQueue = LatestLyricsFrameQueue()
+    private var waitingForBuffer = false
+    private var waitingForDisplayRenderer = false
+    private var flushingDisplayRenderer = false
+    private var bufferRecoveryAttempted = false
     private var latestKey: LyricsPresentationSnapshot.Key?
     nonisolated private let playbackStatus = LyricsPiPPlaybackStatus()
 
@@ -65,6 +69,7 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
         reason = ""
         startRequested = true
         prepareIfNeeded()
+        if let snapshot = snapshotProvider?() { update(snapshot, force: true) }
         do {
             if audioLease == nil {
                 let lease = LyricsPiPAudioLease()
@@ -138,24 +143,53 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
             latestKey = key
             controller?.invalidatePlaybackState()
         }
-        guard frameQueue.offer(snapshot, force: force) else { return }
+        if frameQueue.offer(snapshot, force: force) {
+            waitingForBuffer = false
+            bufferRecoveryAttempted = false
+        }
         renderNext()
     }
 
     private func renderNext() {
-        guard let renderer, let displayRenderer = displayLayer?.sampleBufferRenderer else { return }
+        guard lifecycle.enabled, !waitingForBuffer, !flushingDisplayRenderer, frameQueue.hasPending,
+              let renderer, let displayRenderer = displayLayer?.sampleBufferRenderer else { return }
         if displayRenderer.status == .failed || displayRenderer.requiresFlushToResumeDecoding {
-            displayRenderer.flush()
+            flushDisplayRenderer(displayRenderer)
+            return
         }
-        guard displayRenderer.isReadyForMoreMediaData,
-              let request = frameQueue.begin() else { return }
+        guard displayRenderer.isReadyForMoreMediaData else {
+            waitForDisplayRenderer(displayRenderer)
+            return
+        }
+        cancelDisplayRendererWait()
+        guard let request = frameQueue.begin() else { return }
         let snapshot = request.snapshot
         renderQueue.async { [self] in
-            let frame = LyricsRenderedFrame(result: Result { try renderer.render(snapshot) })
+            let frame = autoreleasepool { LyricsRenderedFrame(result: Result { try renderer.render(snapshot) }) }
             DispatchQueue.main.async { [self] in
+                guard self.lifecycle.enabled, self.renderer === renderer,
+                      let displayRenderer = self.displayLayer?.sampleBufferRenderer else { return }
                 let current = self.snapshotProvider?()
-                let accepted = self.frameQueue.finish(request.token, currentKey: current?.key)
-                guard self.lifecycle.enabled else { return }
+                let bufferPressure: Bool
+                let needsRetry: Bool
+                switch frame.result {
+                case .success:
+                    bufferPressure = false
+                    needsRetry = !displayRenderer.isReadyForMoreMediaData || displayRenderer.status == .failed ||
+                        displayRenderer.requiresFlushToResumeDecoding
+                case .failure(let error):
+                    bufferPressure = (error as? LyricsSampleBufferRenderer.RenderError) == .bufferPoolExhausted
+                    needsRetry = bufferPressure
+                }
+                let accepted = self.frameQueue.finish(request.token, currentKey: current?.key,
+                                                      retryIfCurrent: needsRetry)
+                if bufferPressure {
+                    self.waitingForBuffer = true
+                    if !self.bufferRecoveryAttempted {
+                        self.bufferRecoveryAttempted = true
+                        self.flushDisplayRenderer(displayRenderer)
+                    }
+                }
                 guard accepted else {
                     if let current { self.update(current) }
                     self.renderNext()
@@ -165,31 +199,85 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
                 // generation/line/timeline identity, not just the lyric string.
                 switch frame.result {
                 case .success(let sample):
-                    if let layer = self.displayLayer {
-                        let displayRenderer = layer.sampleBufferRenderer
-                        if displayRenderer.status == .failed { displayRenderer.flush() }
-                        if displayRenderer.isReadyForMoreMediaData { displayRenderer.enqueue(sample) }
+                    if !needsRetry {
+                        self.bufferRecoveryAttempted = false
+                        displayRenderer.enqueue(sample)
                     }
                 case .failure:
-                    self.fail(AppLocalization.string("无法绘制悬浮歌词"))
+                    if !bufferPressure { self.fail(AppLocalization.string("无法绘制悬浮歌词")) }
                 }
                 self.renderNext()
             }
         }
     }
 
+    private func flushDisplayRenderer(_ displayRenderer: AVSampleBufferVideoRenderer) {
+        guard !flushingDisplayRenderer, let renderer else { return }
+        flushingDisplayRenderer = true
+        cancelDisplayRendererWait()
+        let generation = callbackGeneration
+        // Keep the visible image. Retry only after pending buffers are discarded;
+        // a second pool exhaustion waits for the next line or active heartbeat.
+        displayRenderer.flush(removingDisplayedImage: false) { [weak self, weak displayRenderer, weak renderer] in
+            Task { @MainActor [weak self, weak displayRenderer, weak renderer] in
+                guard let self, let displayRenderer, let renderer, self.lifecycle.enabled,
+                      self.callbackGeneration == generation, self.renderer === renderer,
+                      self.displayLayer?.sampleBufferRenderer === displayRenderer else { return }
+                self.flushingDisplayRenderer = false
+                self.waitingForBuffer = false
+                if displayRenderer.status == .failed || displayRenderer.requiresFlushToResumeDecoding {
+                    self.fail(AppLocalization.string("无法绘制悬浮歌词"))
+                    return
+                }
+                if let snapshot = self.snapshotProvider?() { self.update(snapshot) }
+                self.renderNext()
+            }
+        }
+    }
+
+    private func waitForDisplayRenderer(_ displayRenderer: AVSampleBufferVideoRenderer) {
+        guard !waitingForDisplayRenderer else { return }
+        waitingForDisplayRenderer = true
+        let generation = callbackGeneration
+        displayRenderer.requestMediaDataWhenReady(on: .main) { [weak self, weak displayRenderer] in
+            MainActor.assumeIsolated {
+                guard let self, let displayRenderer, self.callbackGeneration == generation,
+                      self.displayLayer?.sampleBufferRenderer === displayRenderer,
+                      self.waitingForDisplayRenderer else { return }
+                // One wakeup per wait; never leave a repeating producer installed.
+                self.cancelDisplayRendererWait()
+                if let snapshot = self.snapshotProvider?() { self.update(snapshot) }
+                self.renderNext()
+            }
+        }
+    }
+
+    private func cancelDisplayRendererWait() {
+        guard waitingForDisplayRenderer else { return }
+        displayLayer?.sampleBufferRenderer.stopRequestingMediaData()
+        waitingForDisplayRenderer = false
+    }
+
     func stop() {
+        stop(requestSystemStop: true)
+    }
+
+    private func stop(requestSystemStop: Bool) {
         playbackStatus.blockControls(owner: controller.map(ObjectIdentifier.init))
         startRequested = false
         startTimeout?.cancel()
         startTimeout = nil
         heartbeat?.invalidate()
         heartbeat = nil
+        cancelDisplayRendererWait()
+        waitingForBuffer = false
+        flushingDisplayRenderer = false
+        bufferRecoveryAttempted = false
         frameQueue.invalidate()
         renderer = nil
-        if let controller, controller.isPictureInPictureActive || state == .starting || state == .stopping {
+        if let controller, controller.isPictureInPictureActive || state == .active || state == .starting || state == .stopping {
             if state != .stopping { lifecycle.stop() }
-            controller.stopPictureInPicture()
+            if requestSystemStop { controller.stopPictureInPicture() }
             // Retain the delegate through a late start/stop callback.
             stopTimeout?.cancel()
             stopTimeout = Task { [weak self, weak controller] in
@@ -211,6 +299,10 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
         startTimeout = nil
         heartbeat?.invalidate()
         heartbeat = nil
+        cancelDisplayRendererWait()
+        waitingForBuffer = false
+        flushingDisplayRenderer = false
+        bufferRecoveryAttempted = false
         possibleObservation = nil
         if !preserveDelegate { controller?.delegate = nil }
         controller = nil
@@ -262,9 +354,7 @@ extension LyricsPictureInPictureController: AVPictureInPictureControllerDelegate
         playbackStatus.blockControls(owner: ObjectIdentifier(pip))
         Task { @MainActor [weak self] in
             guard let self, self.controller === pip else { return }
-            if self.state == .active || self.state == .starting { self.lifecycle.stop() }
-            self.heartbeat?.invalidate()
-            self.heartbeat = nil
+            if self.state == .active || self.state == .starting { self.stop(requestSystemStop: false) }
         }
     }
 
