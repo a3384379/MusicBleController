@@ -142,24 +142,70 @@ struct LyricsPiPStateMachine {
     }
 }
 
-/// The wire protocol exposes toggle. Suppress repeated target-state requests
-/// until Sony confirms the first request, rather than toggling for each callback.
+/// The wire protocol exposes toggle. Keep desired, confirmed and in-flight
+/// states separate: elapsed time alone cannot prove a toggle was not executed.
 struct LyricsPlaybackTargetPolicy {
-    private var pending: (trackID: String, generation: Int64, target: Bool, deadline: TimeInterval)?
+    private var identity: (trackID: String, generation: Int64)?
+    private var desired: Bool?
+    private var confirmed: Bool?
+    private var confirmedRevision: UInt64 = 0
+    private var inFlight: (target: Bool, confirmationRevision: UInt64)?
 
-    mutating func shouldSend(target: Bool, snapshot: LyricsPresentationSnapshot, now: TimeInterval) -> Bool {
-        if let pending,
-           pending.trackID != snapshot.trackID || pending.generation != snapshot.trackGeneration ||
-            pending.target == snapshot.isPlaying || now >= pending.deadline {
-            self.pending = nil
-        }
-        guard snapshot.hasAuthoritativePlayback, now < snapshot.validUntilUptime,
-              snapshot.isPlaying != target, pending == nil else { return false }
-        pending = (snapshot.trackID, snapshot.trackGeneration, target, now + 3)
-        return true
+    mutating func request(target: Bool, snapshot: LyricsPresentationSnapshot,
+                          confirmationRevision: UInt64, now: TimeInterval) -> Bool {
+        guard snapshot.hasAuthoritativePlayback, now < snapshot.validUntilUptime else { return false }
+        adoptIdentity(snapshot)
+        desired = target
+        acceptConfirmation(snapshot, revision: confirmationRevision)
+        return reserveCommand()
     }
 
-    mutating func clear() { pending = nil }
+    mutating func reconcile(snapshot: LyricsPresentationSnapshot,
+                            confirmationRevision: UInt64, now: TimeInterval) -> Bool {
+        guard snapshot.hasAuthoritativePlayback, now < snapshot.validUntilUptime else { return false }
+        adoptIdentity(snapshot)
+        acceptConfirmation(snapshot, revision: confirmationRevision)
+        return reserveCommand()
+    }
+
+    /// Only a command rejected before sending may release the reservation.
+    mutating func commandNotSent() { inFlight = nil }
+
+    mutating func cancelDesired() { desired = nil }
+
+    mutating func clear() {
+        identity = nil
+        desired = nil
+        confirmed = nil
+        confirmedRevision = 0
+        inFlight = nil
+    }
+
+    private mutating func adoptIdentity(_ snapshot: LyricsPresentationSnapshot) {
+        if identity?.trackID != snapshot.trackID || identity?.generation != snapshot.trackGeneration {
+            clear()
+            identity = (snapshot.trackID, snapshot.trackGeneration)
+        }
+    }
+
+    private mutating func acceptConfirmation(_ snapshot: LyricsPresentationSnapshot, revision: UInt64) {
+        guard confirmed == nil || revision > confirmedRevision else { return }
+        confirmed = snapshot.isPlaying
+        confirmedRevision = revision
+        if let inFlight, revision > inFlight.confirmationRevision, snapshot.isPlaying == inFlight.target {
+            self.inFlight = nil
+        }
+    }
+
+    private mutating func reserveCommand() -> Bool {
+        guard let desired, let confirmed, inFlight == nil else { return false }
+        guard desired != confirmed else {
+            self.desired = nil
+            return false
+        }
+        inFlight = (desired, confirmedRevision)
+        return true
+    }
 }
 
 /// Bounded render scheduling: one in-flight request and one replaceable latest

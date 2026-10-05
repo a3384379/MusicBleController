@@ -231,24 +231,327 @@ final class LyricsPresentationTests: XCTestCase {
 
     func testPlaybackTargetRequestsDoNotToggleTwiceBeforeConfirmation() {
         var policy = LyricsPlaybackTargetPolicy()
-        XCTAssertTrue(policy.shouldSend(target: false, snapshot: snapshot(), now: 10))
-        XCTAssertFalse(policy.shouldSend(target: false, snapshot: snapshot(), now: 10.1))
-        XCTAssertFalse(policy.shouldSend(target: true, snapshot: snapshot(), now: 10.2))
+        XCTAssertTrue(policy.request(target: false, snapshot: snapshot(), confirmationRevision: 1, now: 10))
+        XCTAssertFalse(policy.request(target: false, snapshot: snapshot(), confirmationRevision: 1, now: 10.1))
+        XCTAssertFalse(policy.request(target: true, snapshot: snapshot(), confirmationRevision: 1, now: 10.2))
         let paused = snapshot(playing: false)
-        XCTAssertFalse(policy.shouldSend(target: false, snapshot: paused, now: 11))
-        XCTAssertTrue(policy.shouldSend(target: true, snapshot: paused, now: 11.1))
-        XCTAssertFalse(policy.shouldSend(target: true, snapshot: paused, now: 11.2))
+        // No new request: the already recorded final play intent is reconciled.
+        XCTAssertTrue(policy.reconcile(snapshot: paused, confirmationRevision: 2, now: 11))
+        XCTAssertFalse(policy.reconcile(snapshot: paused, confirmationRevision: 2, now: 11.1))
+        XCTAssertFalse(policy.reconcile(snapshot: snapshot(), confirmationRevision: 3, now: 12))
+        XCTAssertFalse(policy.reconcile(snapshot: paused, confirmationRevision: 4, now: 13))
     }
 
     func testStaleDisconnectedAndUnsynchronizedPlaybackRejectCommands() {
         for status in [LyricsPresentationSnapshot.Status.stale, .disconnected, .syncing] {
             var policy = LyricsPlaybackTargetPolicy()
-            XCTAssertFalse(policy.shouldSend(target: false, snapshot: snapshot(status: status), now: 10))
+            XCTAssertFalse(policy.request(target: false, snapshot: snapshot(status: status), confirmationRevision: 1, now: 10))
         }
         var policy = LyricsPlaybackTargetPolicy()
-        XCTAssertFalse(policy.shouldSend(target: false, snapshot: snapshot(), now: 101))
-        XCTAssertTrue(policy.shouldSend(target: false, snapshot: snapshot(), now: 10))
-        XCTAssertTrue(policy.shouldSend(target: false, snapshot: snapshot(generation: 2), now: 10.1))
+        XCTAssertFalse(policy.request(target: false, snapshot: snapshot(), confirmationRevision: 1, now: 101))
+        XCTAssertTrue(policy.request(target: false, snapshot: snapshot(), confirmationRevision: 1, now: 10))
+        XCTAssertTrue(policy.request(target: false, snapshot: snapshot(generation: 2), confirmationRevision: 2, now: 10.1))
+    }
+
+    @MainActor
+    func testLiveActivityRapidSwitchReversalPublishesFinalChoiceAfterInFlightCompletion() async throws {
+        let preferences = PreferencesStore.shared
+        let original = preferences.compactLyricsEnabled
+        defer { preferences.compactLyricsEnabled = original }
+        let sink = ActivityPublicationRecorder(suspended: true)
+        let manager = activityManager(sink)
+        preferences.compactLyricsEnabled = false
+        publishFixture(manager)
+        try await waitUntil { sink.states.count == 1 }
+        sink.completeNext()
+        try await Task.sleep(nanoseconds: 20_000_000)
+        preferences.compactLyricsEnabled = true
+        publishFixture(manager)
+        try await waitUntil { sink.states.count == 2 }
+        preferences.compactLyricsEnabled = false
+        publishFixture(manager)
+        XCTAssertEqual(sink.states.count, 2)
+        sink.completeNext()
+        try await waitUntil { sink.states.count == 3 }
+        XCTAssertEqual(sink.states.map(\.compactLyricsEnabled), [false, true, false])
+        sink.completeNext()
+    }
+
+    @MainActor
+    func testDebouncedSwitchReversalDoesNotPublishSupersededChoice() async throws {
+        let preferences = PreferencesStore.shared
+        let original = preferences.compactLyricsEnabled
+        defer { preferences.compactLyricsEnabled = original }
+        let sink = ActivityPublicationRecorder()
+        let manager = activityManager(sink)
+        preferences.compactLyricsEnabled = false
+        publishFixture(manager)
+        try await waitUntil { sink.states.count == 1 }
+        preferences.compactLyricsEnabled = true
+        publishFixture(manager, force: false)
+        preferences.compactLyricsEnabled = false
+        publishFixture(manager, force: false)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(sink.states.map(\.compactLyricsEnabled), [false])
+    }
+
+    @MainActor
+    func testLiveActivityBurstPublishesOnlyFinalPendingContent() async throws {
+        let sink = ActivityPublicationRecorder(suspended: true)
+        let manager = activityManager(sink)
+        publishFixture(manager)
+        try await waitUntil { sink.states.count == 1 }
+        for index in 1...100 { publishFixture(manager, lyric: "line \(index)") }
+        sink.completeNext()
+        try await waitUntil { sink.states.count == 2 }
+        XCTAssertEqual(sink.states.last?.lyric, "line 100")
+        sink.completeNext()
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(sink.states.count, 2)
+    }
+
+    @MainActor
+    func testEndedActivityRejectsLateCompletionAndPendingContent() async throws {
+        let sink = ActivityPublicationRecorder(suspended: true)
+        let manager = activityManager(sink)
+        publishFixture(manager)
+        try await waitUntil { sink.states.count == 1 }
+        publishFixture(manager, lyric: "cancelled pending line")
+        manager.end()
+        publishFixture(manager, lyric: "new session")
+        try await waitUntil { sink.states.count == 2 }
+        sink.completeNext()
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(sink.states.count, 2)
+        sink.completeNext()
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(sink.states.map(\.lyric), ["fixture lyric", "new session"])
+    }
+
+    @MainActor
+    func testIntroFirstLineAndInterludeTransitionsPublishActualActivityContent() async throws {
+        let preferences = PreferencesStore.shared
+        let originalOffset = preferences.lyricOffsetMs
+        let originalSync = preferences.automaticLyricSyncEnabled
+        defer {
+            preferences.lyricOffsetMs = originalOffset
+            preferences.automaticLyricSyncEnabled = originalSync
+        }
+        preferences.lyricOffsetMs = 0
+        preferences.automaticLyricSyncEnabled = true
+        let sink = ActivityPublicationRecorder()
+        let manager = BLETestManager(automaticallyStartBluetooth: false, liveActivityPublisher: activityManager(sink))
+        let id = "lyrics-publication-\(UUID().uuidString)"
+        manager.configureResponseTests(trackID: id)
+        manager.commandSenderForTesting = { _, _ in true }
+        manager.receiveStatusForTesting(["type": "fullLyricsStart", "trackId": id, "count": 2])
+        for (index, start) in [(0, 1_000), (1, 5_000)] {
+            manager.receiveStatusForTesting(["type": "fullLyricsChunk", "trackId": id, "index": index,
+                                             "timeMs": start, "durationMs": 1_000, "text": "相同的歌词"])
+        }
+        manager.receiveStatusForTesting(["type": "fullLyricsEnd", "trackId": id])
+        receivePlayback(manager, playing: false, position: 0)
+        try await waitUntil { sink.states.last?.lyric == AppLocalization.string("前奏") }
+        XCTAssertEqual(sink.states.last?.lyricLineIndex, -1)
+        // Both raw resolutions select line 0, but the actual projection changes.
+        receivePlayback(manager, playing: false, position: 700)
+        try await waitUntil { sink.states.last?.lyric == "相同的歌词" }
+        XCTAssertEqual(sink.states.last?.lyricLineIndex, 0)
+        receivePlayback(manager, playing: false, position: 1_500)
+        try await waitUntil { sink.states.last?.lyric == AppLocalization.string("间奏") }
+        XCTAssertEqual(sink.states.last?.lyricLineIndex, 0)
+        let firstLinePublicationCount = sink.states.count
+        receivePlayback(manager, playing: false, position: 4_700)
+        try await waitUntil { sink.states.count > firstLinePublicationCount && sink.states.last?.lyric == "相同的歌词" }
+        XCTAssertEqual(sink.states.last?.lyricLineIndex, 1)
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testStalePlaybackSamplesCannotRenewAuthorityOrAcknowledgeToggle() {
+        let preferences = PreferencesStore.shared
+        let originalSync = preferences.automaticLyricSyncEnabled
+        defer { preferences.automaticLyricSyncEnabled = originalSync }
+        preferences.automaticLyricSyncEnabled = true
+        var now: TimeInterval = 10
+        var commands: [LiveActivityControlCommand] = []
+        let manager = BLETestManager(automaticallyStartBluetooth: false,
+                                    lyricsPresentationUptime: { now }, remoteClock: synchronizedClock(),
+                                    floatingPlaybackCommandSender: { command, _, _ in commands.append(command); return .sent })
+        manager.configureResponseTests(trackID: "lyrics-stale-\(UUID().uuidString)")
+        receivePlayback(manager, playing: true)
+        let original = manager.makeLyricsPresentationSnapshot()
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(true))
+        now = 40
+        let oldSample = Int64((ProcessInfo.processInfo.systemUptime * 1_000).rounded()) - 5_000
+        manager.receiveStatusForTesting(["type": "playbackState", "playing": false, "position": 29_000,
+                                         "duration": 30_000, "lyric": "陈旧内容", "sampleMono": oldSample])
+        let rejected = manager.makeLyricsPresentationSnapshot()
+        XCTAssertEqual(rejected.validUntilUptime, original.validUntilUptime)
+        XCTAssertEqual(rejected.text, original.text)
+        XCTAssertTrue(rejected.isPlaying)
+        XCTAssertEqual(commands, [.playPause])
+        now = 56
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().status, .stale)
+        XCTAssertFalse(manager.requestFloatingLyricsPlayback(false))
+        // A legitimate legacy packet has a position but no clock fields.
+        receivePlayback(manager, playing: false)
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().validUntilUptime, 356)
+        XCTAssertEqual(commands, [.playPause, .playPause])
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testSkippedSeekAnchorAndMissingPositionCannotExtendAuthority() {
+        var now: TimeInterval = 10
+        let manager = BLETestManager(automaticallyStartBluetooth: false, lyricsPresentationUptime: { now })
+        manager.configureResponseTests(trackID: "lyrics-seeking-clock-\(UUID().uuidString)")
+        receivePlayback(manager, playing: true)
+        let deadline = manager.makeLyricsPresentationSnapshot().validUntilUptime
+        manager.beginSeeking()
+        now = 20
+        receivePlayback(manager, playing: false, position: 2_000)
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().validUntilUptime, deadline)
+        XCTAssertFalse(manager.requestFloatingLyricsPlayback(true))
+        now = 30
+        manager.receiveStatusForTesting(["type": "playbackState", "playing": false, "duration": 30_000])
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().validUntilUptime, deadline)
+        now = 56
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().status, .stale)
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testFinalPlaybackIntentAutomaticallySendsAfterAcceptedPauseReport() {
+        var commands: [LiveActivityControlCommand] = []
+        let manager = BLETestManager(automaticallyStartBluetooth: false,
+                                    floatingPlaybackCommandSender: { command, _, _ in commands.append(command); return .sent })
+        manager.configureResponseTests(trackID: "lyrics-final-target-\(UUID().uuidString)")
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        for _ in 0..<10 { XCTAssertTrue(manager.requestFloatingLyricsPlayback(true)) }
+        XCTAssertEqual(commands, [.playPause])
+        receivePlayback(manager, playing: false)
+        XCTAssertEqual(commands, [.playPause, .playPause])
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.makeLyricsPresentationSnapshot().isPlaying)
+        // Once fulfilled, the intent must not fight later Sony-side controls.
+        receivePlayback(manager, playing: false)
+        XCTAssertEqual(commands, [.playPause, .playPause])
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testElapsedTimeoutAndUnchangedReportsNeverResendAnUnconfirmedToggle() {
+        var now: TimeInterval = 10
+        var sent = 0
+        let manager = BLETestManager(automaticallyStartBluetooth: false, lyricsPresentationUptime: { now },
+                                    floatingPlaybackCommandSender: { _, _, _ in sent += 1; return .sent })
+        manager.configureResponseTests(trackID: "lyrics-timeout-target-\(UUID().uuidString)")
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        now = 14
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertEqual(sent, 1)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(true))
+        receivePlayback(manager, playing: false)
+        XCTAssertEqual(sent, 2)
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testAutomaticFollowUpRespectsDebounceThenReconcilesWithoutAnotherRequest() async throws {
+        var attempts = 0
+        var sent = 0
+        let manager = BLETestManager(automaticallyStartBluetooth: false,
+                                    floatingPlaybackCommandSender: { _, _, _ in
+            attempts += 1
+            if attempts == 2 { return .debounced }
+            sent += 1
+            return .sent
+        })
+        manager.configureResponseTests(trackID: "lyrics-deferred-target-\(UUID().uuidString)")
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(true))
+        receivePlayback(manager, playing: false)
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(sent, 1)
+        try await waitUntil { sent == 2 }
+        XCTAssertEqual(attempts, 3)
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testTrackGenerationAndDisconnectDiscardUnfulfilledPlaybackIntent() {
+        var sent = 0
+        let manager = BLETestManager(automaticallyStartBluetooth: false,
+                                    floatingPlaybackCommandSender: { _, _, _ in sent += 1; return .sent })
+        let id = "lyrics-target-identity-\(UUID().uuidString)"
+        manager.configureResponseTests(trackID: id)
+        manager.commandSenderForTesting = { _, _ in true }
+        manager.receiveStatusForTesting(["type": "trackInfo", "trackId": id, "generation": 1,
+                                         "title": "Fixture", "artist": "Artist"])
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(true))
+        manager.receiveStatusForTesting(["type": "trackInfo", "trackId": id, "generation": 2,
+                                         "title": "Fixture", "artist": "Artist"])
+        receivePlayback(manager, playing: false)
+        XCTAssertEqual(sent, 1)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(true))
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        manager.disconnectResponseTests()
+        manager.configureResponseTests(trackID: id)
+        receivePlayback(manager, playing: true)
+        XCTAssertEqual(sent, 2)
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testStoppingPiPCancelsUnsentFinalIntentWithoutSendingPause() {
+        var sent = 0
+        let manager = BLETestManager(automaticallyStartBluetooth: false,
+                                    floatingPlaybackCommandSender: { _, _, _ in sent += 1; return .sent })
+        manager.configureResponseTests(trackID: "lyrics-stop-target-\(UUID().uuidString)")
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(true))
+        let controller = LyricsPictureInPictureController()
+        let view = LyricsPictureInPictureSourceUIView()
+        controller.attach(view, snapshot: { manager.makeLyricsPresentationSnapshot() },
+                          setPlaying: { manager.requestFloatingLyricsPlayback($0) },
+                          controlsStopped: { manager.cancelFloatingLyricsPlaybackIntent() })
+        controller.stop()
+        XCTAssertEqual(sent, 1)
+        // A new window's request still cannot blindly repeat the unresolved toggle.
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertEqual(sent, 1)
+        manager.cancelFloatingLyricsPlaybackIntent()
+        receivePlayback(manager, playing: false)
+        XCTAssertEqual(sent, 1)
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testRejectedCommandDoesNotBecomeAnUnconfirmedToggle() {
+        var attempts = 0
+        let manager = BLETestManager(automaticallyStartBluetooth: false,
+                                    floatingPlaybackCommandSender: { _, _, _ in
+            attempts += 1
+            return attempts == 1 ? .bluetoothUnavailable : .sent
+        })
+        manager.configureResponseTests(trackID: "lyrics-command-failure-\(UUID().uuidString)")
+        receivePlayback(manager, playing: true)
+        XCTAssertFalse(manager.requestFloatingLyricsPlayback(false))
+        receivePlayback(manager, playing: true)
+        XCTAssertEqual(attempts, 1)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertEqual(attempts, 2)
+        manager.disconnectResponseTests()
     }
 
     func testSampleBufferPixelsAndTimestampsRemainValidAcrossBackwardSeek() throws {
@@ -386,4 +689,61 @@ final class LyricsPresentationTests: XCTestCase {
                                                 positionAtAnchorMs: 1_000, anchorDate: Date(), durationMs: 30_000,
                                                 connectionState: "connected", artworkKey: nil, artworkRevision: 0)
     }
+
+    @MainActor
+    private func activityManager(_ sink: ActivityPublicationRecorder) -> LiveActivityManager {
+        LiveActivityManager(activitiesEnabled: { true }, statePublisher: { await sink.publish($0) })
+    }
+
+    @MainActor
+    private func publishFixture(_ manager: LiveActivityManager, lyric: String = "fixture lyric", force: Bool = true) {
+        manager.update(title: "Fixture", artist: "Artist", lyric: lyric, lyricLineIndex: 0,
+                       isPlaying: false, positionMs: 1_000, durationMs: 30_000, trackId: "fixture",
+                       artworkKey: nil, artworkRevision: 0, reason: "preferences", force: force)
+    }
+
+    private func receivePlayback(_ manager: BLETestManager, playing: Bool, position: Int64 = 1_000) {
+        manager.receiveStatusForTesting(["type": "playbackState", "playing": playing, "position": position,
+                                         "duration": 30_000, "lyric": "fixture lyric"])
+    }
+
+    private func synchronizedClock() -> MonotonicClockSynchronizer {
+        var clock = MonotonicClockSynchronizer()
+        let base = Int64((ProcessInfo.processInfo.systemUptime * 1_000).rounded()) - 100
+        for index in 0..<3 {
+            let send = base + Int64(index * 10)
+            clock.record(clientSendElapsedMs: send, serverReceiveElapsedMs: send + 1,
+                         serverSendElapsedMs: send + 1, clientReceiveElapsedMs: send + 2)
+        }
+        return clock
+    }
+
+    @MainActor
+    private func waitUntil(_ condition: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        while !condition(), ProcessInfo.processInfo.systemUptime < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        guard condition() else {
+            XCTFail("Expected publication or command did not arrive", file: file, line: line)
+            throw NSError(domain: "LyricsPresentationTests", code: 1)
+        }
+    }
+}
+
+@MainActor
+private final class ActivityPublicationRecorder {
+    private(set) var states: [SonyMusicActivityAttributes.ContentState] = []
+    private var completions: [CheckedContinuation<Bool, Never>] = []
+    private let suspended: Bool
+
+    init(suspended: Bool = false) { self.suspended = suspended }
+
+    func publish(_ state: SonyMusicActivityAttributes.ContentState) async -> Bool {
+        states.append(state)
+        guard suspended else { return true }
+        return await withCheckedContinuation { completions.append($0) }
+    }
+
+    func completeNext() { completions.removeFirst().resume(returning: true) }
 }

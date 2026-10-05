@@ -26,6 +26,8 @@ private struct LyricsPictureInPictureSourceView: UIViewRepresentable {
             manager?.makeLyricsPresentationSnapshot() ?? .disconnected
         }, setPlaying: { [weak manager] target in
             manager?.requestFloatingLyricsPlayback(target) ?? false
+        }, controlsStopped: { [weak manager] in
+            manager?.cancelFloatingLyricsPlaybackIntent()
         })
         return view
     }

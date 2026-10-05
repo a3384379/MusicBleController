@@ -4,6 +4,7 @@ import Foundation
 @MainActor
 final class LiveActivityManager {
     static let shared = LiveActivityManager()
+    typealias StatePublisher = (SonyMusicActivityAttributes.ContentState) async -> Bool
 
     private enum DynamicIslandVisualStateReducer {
         static let minimumPlaybackStateDuration: TimeInterval = 0.8
@@ -14,11 +15,14 @@ final class LiveActivityManager {
     private var activity: Activity<SonyMusicActivityAttributes>?
     private var activityStateTask: Task<Void, Never>?
     private var latestState: SonyMusicActivityAttributes.ContentState?
+    private var latestReason = "unknown"
+    private var latestForce = false
     private var stateVersion: UInt64 = 0
     private var lastSentState: SonyMusicActivityAttributes.ContentState?
     private var lastSentVersion: UInt64 = 0
     private var lastCalibrationDate = Date.distantPast
     private var updateInFlight = false
+    private var publicationEpoch: UInt64 = 0
     private var pendingLatestState: SonyMusicActivityAttributes.ContentState?
     private var pendingLatestVersion: UInt64 = 0
     private var pendingLatestReason = "unknown"
@@ -33,7 +37,16 @@ final class LiveActivityManager {
     private var pendingIslandState: IslandState?
     private var pendingIslandStateStartedAt = Date.distantPast
 
-    private init() {}
+    private let activitiesEnabled: () -> Bool
+    private let statePublisher: StatePublisher?
+
+    init(
+        activitiesEnabled: @escaping () -> Bool = { ActivityAuthorizationInfo().areActivitiesEnabled },
+        statePublisher: StatePublisher? = nil
+    ) {
+        self.activitiesEnabled = activitiesEnabled
+        self.statePublisher = statePublisher
+    }
 
     func update(
         title: String,
@@ -52,7 +65,7 @@ final class LiveActivityManager {
         force: Bool = false,
         logger: ((String) -> Void)? = nil
     ) {
-        guard ActivityAuthorizationInfo().areActivitiesEnabled else {
+        guard activitiesEnabled() else {
             logger?("[LiveActivity] unsupported")
             return
         }
@@ -78,6 +91,8 @@ final class LiveActivityManager {
             logger?("[LiveActivityPerf] payload rejected bytes=\(payloadBytes)")
             return
         }
+        latestReason = reason
+        latestForce = force
         logger?(
             "[LiveActivity] update request reason=\(reason) " +
                 "appState=\(appState) title=\(merged.title) lyric=\(merged.lyric) " +
@@ -89,6 +104,13 @@ final class LiveActivityManager {
             logger?("[LiveActivityPerf] payload warning bytes=\(payloadBytes)")
         }
 
+        // A duplicate of the last completed publication may still supersede an
+        // in-flight or debounced change. Keep that final intent before filtering.
+        if updateInFlight || pendingLatestState != nil {
+            pendingLatestState = merged
+            pendingLatestVersion = stateVersion
+            pendingLatestReason = mergedReason(existing: pendingLatestReason, incoming: reason)
+        }
         guard shouldUpdate(
             candidate: merged,
             reason: reason,
@@ -104,10 +126,11 @@ final class LiveActivityManager {
             pendingLatestReason = mergedReason(existing: pendingLatestReason, incoming: reason)
             if debounceTask == nil {
                 logger?("[LiveActivityPerf] update queued reason=\(reason)")
+                let epoch = publicationEpoch
                 debounceTask = Task { [weak self] in
                     try? await Task.sleep(nanoseconds: 200_000_000)
                     await MainActor.run {
-                        guard let self else { return }
+                        guard !Task.isCancelled, let self, self.publicationEpoch == epoch else { return }
                         self.debounceTask = nil
                         self.flushPending(logger: logger)
                     }
@@ -123,6 +146,8 @@ final class LiveActivityManager {
     }
 
     func end(logger: ((String) -> Void)? = nil) {
+        publicationEpoch &+= 1
+        updateInFlight = false
         debounceTask?.cancel()
         debounceTask = nil
         transitionResetTask?.cancel()
@@ -130,8 +155,13 @@ final class LiveActivityManager {
         pendingLatestState = nil
         pendingLatestVersion = 0
         pendingLatestReason = "unknown"
-        guard let activity else { return }
+        latestState = nil
+        latestReason = "unknown"
+        latestForce = false
         let state = lastSentState
+        lastSentState = nil
+        lastSentVersion = 0
+        guard let activity else { return }
         self.activity = nil
         activityStateTask?.cancel()
         activityStateTask = nil
@@ -368,6 +398,7 @@ final class LiveActivityManager {
             return
         }
         updateInFlight = true
+        let epoch = publicationEpoch
         let backgroundTask = BoundedBackgroundTask(name: "Live Activity update")
 
         Task { [weak self] in
@@ -376,20 +407,13 @@ final class LiveActivityManager {
             let startedAt = Date()
             logger?("[LiveActivityPerf] update start reason=\(reason)")
             logger?("[LiveActivityState] update start version=\(version)")
-            let target = await self.ensureActivity(for: state, logger: logger)
-            if let target {
-                let content = ActivityContent(
-                    state: state,
-                    staleDate: self.staleDate(for: state)
-                )
-                await target.update(content)
-                await MainActor.run {
-                    self.activity = target
-                    self.lastSentState = state
-                    self.lastSentVersion = version
-                    self.lastCalibrationDate = Date()
-                    self.recordUpdateSent(logger: logger)
-                }
+            let published = await self.publish(state, epoch: epoch, logger: logger)
+            guard self.publicationEpoch == epoch else { return }
+            if published {
+                self.lastSentState = state
+                self.lastSentVersion = version
+                self.lastCalibrationDate = Date()
+                self.recordUpdateSent(logger: logger)
                 logger?(
                     "[LiveActivity] update sent reason=\(reason) " +
                         "title=\(state.title) lyric=\(state.lyric) " +
@@ -399,11 +423,31 @@ final class LiveActivityManager {
             }
             let costMs = Int(Date().timeIntervalSince(startedAt) * 1_000)
             logger?("[LiveActivityPerf] update end costMs=\(costMs)")
-            await MainActor.run {
-                self.updateInFlight = false
-                self.processNext(logger: logger)
+            self.updateInFlight = false
+            // Completion changes the comparison baseline. Reconcile against the
+            // latest desired state, including a reversal to the previous state.
+            if published, self.stateVersion > version, let latest = self.latestState,
+               self.shouldUpdate(candidate: latest, reason: self.latestReason,
+                                 force: self.latestForce, logger: logger) {
+                self.pendingLatestState = latest
+                self.pendingLatestVersion = self.stateVersion
+                self.pendingLatestReason = self.latestReason
             }
+            self.processNext(logger: logger)
         }
+    }
+
+    private func publish(
+        _ state: SonyMusicActivityAttributes.ContentState,
+        epoch: UInt64,
+        logger: ((String) -> Void)?
+    ) async -> Bool {
+        if let statePublisher { return await statePublisher(state) }
+        guard let target = await ensureActivity(for: state, logger: logger) else { return false }
+        await target.update(ActivityContent(state: state, staleDate: staleDate(for: state)))
+        guard publicationEpoch == epoch else { return false }
+        activity = target
+        return true
     }
 
     private func ensureActivity(
@@ -451,9 +495,6 @@ final class LiveActivityManager {
             )
             activity = requested
             observeStateUpdates(for: requested, logger: logger)
-            lastSentState = state
-            lastSentVersion = stateVersion
-            lastCalibrationDate = Date()
             logger?("[LiveActivity] start id=\(requested.id)")
             return requested
         } catch {
@@ -643,10 +684,12 @@ final class LiveActivityManager {
         transitionResetTask?.cancel()
         let trackId = state.trackId
         let transientState = state.islandState
+        let epoch = publicationEpoch
         transitionResetTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 350_000_000)
             await MainActor.run {
-                self?.finishTransientIslandState(
+                guard !Task.isCancelled, let self, self.publicationEpoch == epoch else { return }
+                self.finishTransientIslandState(
                     trackId: trackId,
                     transientState: transientState,
                     logger: logger
