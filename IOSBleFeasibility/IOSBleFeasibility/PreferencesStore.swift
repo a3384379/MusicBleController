@@ -119,6 +119,14 @@ final class PreferencesStore: ObservableObject {
         didSet { persistDynamicIslandStyle(oldValue: oldValue) }
     }
 
+    @Published var compactLyricsEnabled: Bool {
+        didSet { persistBool(compactLyricsEnabled, oldValue: oldValue, key: LyricsDisplayPreferences.compactKey) }
+    }
+
+    @Published var floatingLyricsEnabled: Bool {
+        didSet { persistBool(floatingLyricsEnabled, oldValue: oldValue, key: LyricsDisplayPreferences.floatingKey) }
+    }
+
     @Published var playbackPerformanceMode: PlaybackPerformanceMode {
         didSet { persistPlaybackPerformanceMode(oldValue: oldValue) }
     }
@@ -157,6 +165,9 @@ final class PreferencesStore: ObservableObject {
         )
         artworkDisplaySize = Self.loadArtworkDisplaySize(defaults: defaults)
         dynamicIslandStyle = Self.loadDynamicIslandStyle(defaults: defaults)
+        let lyricsDisplay = LyricsDisplayPreferences(defaults: defaults)
+        compactLyricsEnabled = lyricsDisplay.compactEnabled
+        floatingLyricsEnabled = lyricsDisplay.floatingEnabled
         playbackPerformanceMode = Self.loadPlaybackPerformanceMode(defaults: defaults)
         forceProtocolV2 = Self.loadBool(
             defaults: defaults,
@@ -192,6 +203,9 @@ final class PreferencesStore: ObservableObject {
         )
         artworkDisplaySize = Self.loadArtworkDisplaySize(defaults: defaults)
         dynamicIslandStyle = Self.loadDynamicIslandStyle(defaults: defaults)
+        let lyricsDisplay = LyricsDisplayPreferences(defaults: defaults)
+        compactLyricsEnabled = lyricsDisplay.compactEnabled
+        floatingLyricsEnabled = lyricsDisplay.floatingEnabled
         playbackPerformanceMode = Self.loadPlaybackPerformanceMode(defaults: defaults)
         forceProtocolV2 = Self.loadBool(
             defaults: defaults,
@@ -211,6 +225,8 @@ final class PreferencesStore: ObservableObject {
         artworkEnhancementEnabled = true
         artworkDisplaySize = .defaultOption
         dynamicIslandStyle = .defaultStyle
+        compactLyricsEnabled = false
+        floatingLyricsEnabled = false
         playbackPerformanceMode = .defaultMode
         forceProtocolV2 = false
     }

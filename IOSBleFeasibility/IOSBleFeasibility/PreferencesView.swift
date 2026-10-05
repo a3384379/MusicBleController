@@ -146,6 +146,21 @@ struct PreferencesView: View {
 
     private var lyricSection: some View {
         PreferencesCard(title: "歌词", systemImage: "text.quote") {
+            Toggle("灵动岛显示歌词", isOn: $preferences.compactLyricsEnabled)
+                .tint(PlayerDesignTokens.stableAccent)
+            Text("在紧凑态优先显示当前歌词；长句会截断，多活动时由系统选择最小态。")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.58))
+
+            Toggle("悬浮歌词", isOn: $preferences.floatingLyricsEnabled)
+                .tint(PlayerDesignTokens.stableAccent)
+            Text("通过系统画中画在其他应用上方显示歌词。关闭窗口不暂停 Sony 播放。")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.58))
+            if preferences.floatingLyricsEnabled {
+                FloatingLyricsStatusView()
+            }
+
             VStack(alignment: .leading, spacing: 10) {
                 Toggle("自动同步歌词时间", isOn: automaticLyricSyncBinding)
                     .tint(PlayerDesignTokens.stableAccent)

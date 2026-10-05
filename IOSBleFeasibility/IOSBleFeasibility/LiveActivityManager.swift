@@ -74,6 +74,10 @@ final class LiveActivityManager {
         )
         let merged = mergeLatestState(candidate: state, reason: reason, logger: logger)
         let payloadBytes = payloadSize(merged)
+        guard payloadBytes > 0, payloadBytes < 4_096 else {
+            logger?("[LiveActivityPerf] payload rejected bytes=\(payloadBytes)")
+            return
+        }
         logger?(
             "[LiveActivity] update request reason=\(reason) " +
                 "appState=\(appState) title=\(merged.title) lyric=\(merged.lyric) " +
@@ -175,6 +179,7 @@ final class LiveActivityManager {
             merged.islandState = candidate.islandState
             merged.islandStateChangedAt = candidate.islandStateChangedAt
             merged.dynamicIslandStyle = candidate.dynamicIslandStyle
+            merged.compactLyricsEnabled = candidate.compactLyricsEnabled
             merged.artworkKey = candidate.artworkKey
             merged.artworkRevision = candidate.artworkRevision
         }
@@ -269,6 +274,7 @@ final class LiveActivityManager {
             islandState: reducedIslandState.rawValue,
             islandStateChangedAt: stableIslandStateChangedAt,
             dynamicIslandStyle: PreferencesStore.shared.dynamicIslandStyle.rawValue,
+            compactLyricsEnabled: PreferencesStore.shared.compactLyricsEnabled,
             artworkKey: cleanArtworkKey,
             artworkRevision: max(artworkRevision, 0)
         )
@@ -518,6 +524,7 @@ final class LiveActivityManager {
             previous.connectionState != current.connectionState ||
             previous.islandState != current.islandState ||
             previous.dynamicIslandStyle != current.dynamicIslandStyle ||
+            previous.compactLyricsEnabled != current.compactLyricsEnabled ||
             previous.artworkKey != current.artworkKey ||
             previous.artworkRevision != current.artworkRevision
     }
@@ -705,9 +712,9 @@ final class LiveActivityManager {
         field: String,
         logger: ((String) -> Void)?
     ) -> String {
-        if value.count <= limit { return value }
-        logger?("[LiveActivityPerf] payload trimmed field=\(field)")
-        return String(value.prefix(limit))
+        let result = LiveActivityPayloadPolicy.boundedText(value, characterLimit: limit)
+        if result != value { logger?("[LiveActivityPerf] payload trimmed field=\(field)") }
+        return result
     }
 
     private func normalizedReason(_ reason: String) -> String {

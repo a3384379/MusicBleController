@@ -52,6 +52,17 @@ enum IslandState: String, Codable, Hashable {
     }
 }
 
+enum LiveActivityPayloadPolicy {
+    static func boundedText(_ value: String, characterLimit: Int) -> String {
+        let clean = value.unicodeScalars.map {
+            CharacterSet.controlCharacters.contains($0) ? " " : String($0)
+        }.joined()
+        var result = String(clean.prefix(characterLimit))
+        while result.utf8.count > characterLimit * 4 { result.removeLast() }
+        return result
+    }
+}
+
 enum DynamicIslandStyle: String, Codable, CaseIterable, Identifiable {
     case compactDefault
     case lyricFocused
@@ -89,6 +100,7 @@ struct SonyMusicActivityAttributes: ActivityAttributes {
         var islandState: String
         var islandStateChangedAt: Date
         var dynamicIslandStyle: String
+        var compactLyricsEnabled: Bool
         var artworkKey: String?
         var artworkRevision: Int
 
@@ -106,6 +118,7 @@ struct SonyMusicActivityAttributes: ActivityAttributes {
             islandState: String = IslandState.paused.rawValue,
             islandStateChangedAt: Date = Date(),
             dynamicIslandStyle: String = DynamicIslandStyle.defaultStyle.rawValue,
+            compactLyricsEnabled: Bool = false,
             artworkKey: String?,
             artworkRevision: Int
         ) {
@@ -122,6 +135,7 @@ struct SonyMusicActivityAttributes: ActivityAttributes {
             self.islandState = islandState
             self.islandStateChangedAt = islandStateChangedAt
             self.dynamicIslandStyle = dynamicIslandStyle
+            self.compactLyricsEnabled = compactLyricsEnabled
             self.artworkKey = artworkKey
             self.artworkRevision = artworkRevision
         }
@@ -144,6 +158,7 @@ struct SonyMusicActivityAttributes: ActivityAttributes {
                 anchorDate
             dynamicIslandStyle = try container.decodeIfPresent(String.self, forKey: .dynamicIslandStyle) ??
                 DynamicIslandStyle.defaultStyle.rawValue
+            compactLyricsEnabled = try container.decodeIfPresent(Bool.self, forKey: .compactLyricsEnabled) ?? false
             artworkKey = try container.decodeIfPresent(String.self, forKey: .artworkKey)
             artworkRevision = try container.decode(Int.self, forKey: .artworkRevision)
         }
