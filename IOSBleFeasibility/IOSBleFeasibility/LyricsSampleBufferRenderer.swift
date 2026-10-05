@@ -9,7 +9,7 @@ final class LyricsSampleBufferRenderer: @unchecked Sendable {
     private var pool: CVPixelBufferPool?
     private var lastPresentationTime = CMTime.invalid
 
-    enum RenderError: Error { case pixelBuffer, context, format, sampleBuffer }
+    enum RenderError: Error { case bufferPoolExhausted, pixelBuffer, context, format, sampleBuffer }
 
     func render(_ snapshot: LyricsPresentationSnapshot) throws -> CMSampleBuffer {
         if pool == nil {
@@ -28,8 +28,9 @@ final class LyricsSampleBufferRenderer: @unchecked Sendable {
         guard let pool else { throw RenderError.pixelBuffer }
         var output: CVPixelBuffer?
         let allocation = [kCVPixelBufferPoolAllocationThresholdKey as String: 3] as CFDictionary
-        guard CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, pool, allocation, &output) == kCVReturnSuccess,
-              let buffer = output else { throw RenderError.pixelBuffer }
+        let allocationResult = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, pool, allocation, &output)
+        if allocationResult == kCVReturnWouldExceedAllocationThreshold { throw RenderError.bufferPoolExhausted }
+        guard allocationResult == kCVReturnSuccess, let buffer = output else { throw RenderError.pixelBuffer }
         CVPixelBufferLockBaseAddress(buffer, [])
         defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
         guard let context = CGContext(

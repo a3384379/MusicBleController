@@ -179,8 +179,10 @@ struct LatestLyricsFrameQueue {
     private var epoch: UInt64 = 0
     private var sequence: UInt64 = 0
     private var latestKey: LyricsPresentationSnapshot.Key?
-    private var inFlight: Token?
+    private var inFlight: Request?
     private var pending: LyricsPresentationSnapshot?
+
+    var hasPending: Bool { inFlight == nil && pending != nil }
 
     mutating func offer(_ snapshot: LyricsPresentationSnapshot, force: Bool) -> Bool {
         guard force || snapshot.key != latestKey else { return false }
@@ -194,14 +196,18 @@ struct LatestLyricsFrameQueue {
         pending = nil
         sequence &+= 1
         let token = Token(epoch: epoch, sequence: sequence, key: snapshot.key)
-        inFlight = token
-        return Request(snapshot: snapshot, token: token)
+        let request = Request(snapshot: snapshot, token: token)
+        inFlight = request
+        return request
     }
 
-    mutating func finish(_ token: Token, currentKey: LyricsPresentationSnapshot.Key?) -> Bool {
-        guard token == inFlight else { return false }
+    mutating func finish(_ token: Token, currentKey: LyricsPresentationSnapshot.Key?,
+                         retryIfCurrent: Bool = false) -> Bool {
+        guard let request = inFlight, token == request.token else { return false }
         inFlight = nil
-        return token.epoch == epoch && token.key == latestKey && token.key == currentKey
+        let current = token.epoch == epoch && token.key == latestKey && token.key == currentKey
+        if current && retryIfCurrent && pending == nil { pending = request.snapshot }
+        return current
     }
 
     mutating func invalidate() {
