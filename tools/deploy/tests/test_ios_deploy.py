@@ -121,6 +121,19 @@ class IOSDeployTests(unittest.TestCase):
                 self.assertIn("Multiple connected/available iPhones", result.stderr)
                 self.assertFalse(any(name == "xcodebuild" or "apps" in args for name, args in calls))
 
+    def test_device_fallback_accepts_udid_and_ecid_identifiers(self):
+        for identifier in ["00008103-000D585C36D0801E", "7402849150631964", "ecid_7402849150631964"]:
+            for script in ["ios_deploy.sh", "ios_reinstall_if_needed.sh"]:
+                with self.subTest(identifier=identifier, script=script):
+                    result, calls, root = self.run_script(script, {"rows": self.row(identifier, "connected")},
+                                                           "--device", REQUESTED)
+                    if script == "ios_deploy.sh":
+                        self.assertEqual(result.returncode, 17, result.stderr)
+                        self.assertIn(f"device={identifier}", result.stdout)
+                    else:
+                        self.assertEqual(json.loads((root / "state.json").read_text())["deviceId"], identifier)
+                    self.assertTrue(any(name == "xcodebuild" or "apps" in args for name, args in calls))
+
     def test_failed_device_listing_cannot_select_a_partial_output(self):
         for script in ["ios_deploy.sh", "ios_reinstall_if_needed.sh"]:
             with self.subTest(script=script):

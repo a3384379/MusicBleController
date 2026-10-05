@@ -211,17 +211,16 @@ import sys
 from pathlib import Path
 
 rows = []
-uuid_re = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
 for raw in Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines():
-    match = uuid_re.search(raw)
-    if not match or "iPhone" not in raw:
+    columns = re.split(r"\s{2,}", raw.strip())
+    if len(columns) < 4:
         continue
-    right = raw[match.end():].strip()
-    state = right.split("  ")[0].strip() if right else ""
-    if state.lower() not in {"available", "connected"}:
+    # devicectl may show a UDID, ECID or CoreDevice UUID in Identifier.
+    identifier, state, model = columns[-3:]
+    if state.lower() not in {"available", "connected"} or not model.startswith("iPhone"):
         continue
-    name = raw[:match.start()].strip().split("  ")[0].strip() or "iPhone"
-    rows.append((name, match.group(0), state))
+    name = columns[0] or "iPhone"
+    rows.append((name, identifier, state))
 
 if len(rows) == 1:
     print(rows[0][1])
