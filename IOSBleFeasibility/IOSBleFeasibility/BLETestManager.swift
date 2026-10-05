@@ -554,13 +554,20 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private var lastLiveActivityLyricTrackID = ""
     private var lastLiveActivityLyricLineIndex = Int.min
     private var lastLiveActivityLyricText = ""
+    private var lastLiveActivityLyricsKey: LyricsPresentationSnapshot.Key?
     private var lyricsPresentationRevision: UInt64 = 0
     private var lyricsTimelineRevision: UInt64 = 0
     private var lastLyricsPresentationKey: LyricsPresentationSnapshot.Key?
     private var lyricsConfirmedTrackID = ""
     private var lyricsConfirmedGeneration: Int64 = 0
     private var lyricsConfirmedUptime: TimeInterval = 0
+    private var lyricsConfirmedWasPlaying = false
+    private var lyricsPlaybackConfirmationRevision: UInt64 = 0
     private var floatingPlaybackTargetPolicy = LyricsPlaybackTargetPolicy()
+    private var floatingPlaybackReconciliationTask: Task<Void, Never>?
+    private let liveActivityPublisher: LiveActivityManager?
+    private let lyricsPresentationUptime: () -> TimeInterval
+    private let floatingPlaybackCommandSender: (@MainActor (LiveActivityControlCommand, UInt64, Date) -> LiveActivityControlResult)?
     private var lastLiveActivityCurrentWordSkipLogAtMs: Int64 = 0
     private var requestedFullLyricsTrackIDs: Set<String> = []
     private var lastSnapshotQueuedAtMs: Int64 = 0
@@ -809,7 +816,17 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         self.init(automaticallyStartBluetooth: true)
     }
 
-    init(automaticallyStartBluetooth: Bool) {
+    init(
+        automaticallyStartBluetooth: Bool,
+        liveActivityPublisher: LiveActivityManager? = nil,
+        lyricsPresentationUptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        remoteClock: MonotonicClockSynchronizer = MonotonicClockSynchronizer(),
+        floatingPlaybackCommandSender: (@MainActor (LiveActivityControlCommand, UInt64, Date) -> LiveActivityControlResult)? = nil
+    ) {
+        self.liveActivityPublisher = liveActivityPublisher
+        self.lyricsPresentationUptime = lyricsPresentationUptime
+        self.clockSynchronizer = remoteClock
+        self.floatingPlaybackCommandSender = floatingPlaybackCommandSender
         super.init()
         syncAllStores()
         syncPreferencesStateFromStore()
@@ -2245,8 +2262,8 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     func makeLyricsPresentationSnapshot() -> LyricsPresentationSnapshot {
-        let now = ProcessInfo.processInfo.systemUptime
-        let deadline = lyricsConfirmedUptime + (isPlaying ? 45 : 300)
+        let now = lyricsPresentationUptime()
+        let deadline = lyricsConfirmedUptime + (lyricsConfirmedWasPlaying ? 45 : 300)
         let confirmed = lyricsConfirmedTrackID == currentTrackID &&
             lyricsConfirmedGeneration == currentTrackGeneration && lyricsConfirmedUptime > 0
         let fresh = confirmed && now < deadline
@@ -2304,20 +2321,66 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private func confirmLyricsPresentationClock() {
         lyricsConfirmedTrackID = currentTrackID
         lyricsConfirmedGeneration = currentTrackGeneration
-        lyricsConfirmedUptime = ProcessInfo.processInfo.systemUptime
+        lyricsConfirmedUptime = lyricsPresentationUptime()
+        lyricsConfirmedWasPlaying = isPlaying
     }
 
     @MainActor
     func requestFloatingLyricsPlayback(_ target: Bool) -> Bool {
         let snapshot = makeLyricsPresentationSnapshot()
-        guard snapshot.hasAuthoritativePlayback else { return false }
-        if snapshot.isPlaying == target { return true }
-        guard floatingPlaybackTargetPolicy.shouldSend(
-            target: target, snapshot: snapshot, now: ProcessInfo.processInfo.systemUptime
+        guard !isSeeking, snapshot.hasAuthoritativePlayback,
+              lyricsPresentationUptime() < snapshot.validUntilUptime else { return false }
+        guard floatingPlaybackTargetPolicy.request(
+            target: target, snapshot: snapshot,
+            confirmationRevision: lyricsPlaybackConfirmationRevision, now: lyricsPresentationUptime()
         ) else { return true }
-        let result = sendLiveActivityCommand(.playPause, seq: nextCommandSeq(), issuedAt: Date())
-        if result != .sent { floatingPlaybackTargetPolicy.clear() }
-        return result == .sent
+        return sendFloatingLyricsPlaybackCommand(allowDeferredRetry: true)
+    }
+
+    @MainActor
+    private func reconcileFloatingLyricsPlayback(allowDeferredRetry: Bool = true) {
+        guard !isSeeking else { return }
+        let snapshot = makeLyricsPresentationSnapshot()
+        guard floatingPlaybackTargetPolicy.reconcile(
+            snapshot: snapshot, confirmationRevision: lyricsPlaybackConfirmationRevision,
+            now: lyricsPresentationUptime()
+        ) else { return }
+        _ = sendFloatingLyricsPlaybackCommand(allowDeferredRetry: allowDeferredRetry)
+    }
+
+    @MainActor
+    private func sendFloatingLyricsPlaybackCommand(allowDeferredRetry: Bool) -> Bool {
+        let sequence = nextCommandSeq()
+        let issuedAt = Date()
+        let result = floatingPlaybackCommandSender?(.playPause, sequence, issuedAt) ??
+            sendLiveActivityCommand(.playPause, seq: sequence, issuedAt: issuedAt)
+        guard result != .sent else { return true }
+        floatingPlaybackTargetPolicy.commandNotSent()
+        // The next toggle was not sent. Respect the existing transport gate, then
+        // recheck current authority and the last intent once, without blind retries.
+        let transportBusy = result == .debounced || result == .writeInFlight
+        if allowDeferredRetry, transportBusy {
+            floatingPlaybackReconciliationTask?.cancel()
+            let delayMs = result == .debounced
+                ? LIVE_ACTIVITY_PLAY_PAUSE_DEBOUNCE_MS + 50
+                : LIVE_ACTIVITY_WRITE_STALL_MS + 50
+            floatingPlaybackReconciliationTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+                guard !Task.isCancelled, let self else { return }
+                self.floatingPlaybackReconciliationTask = nil
+                self.reconcileFloatingLyricsPlayback(allowDeferredRetry: false)
+            }
+            return true
+        }
+        if !transportBusy { floatingPlaybackTargetPolicy.cancelDesired() }
+        log("[Lyrics-PiP] playback target command not sent result=\(result)")
+        return false
+    }
+
+    func cancelFloatingLyricsPlaybackIntent() {
+        floatingPlaybackReconciliationTask?.cancel()
+        floatingPlaybackReconciliationTask = nil
+        floatingPlaybackTargetPolicy.cancelDesired()
     }
 
     func copyIOSLogs() {
@@ -2408,7 +2471,8 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         object: [String: Any],
         remotePositionMs: Int64,
         timestampMs: Int64 = 0,
-        isPlaying: Bool
+        isPlaying: Bool,
+        durationMs: Int64? = nil
     ) -> RemotePlaybackAnchorResolution {
         guard automaticLyricSyncEnabled else {
             return .unavailable
@@ -2417,6 +2481,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         let speed = parsedSpeed.isFinite && parsedSpeed > 0
             ? parsedSpeed
             : remotePlaybackSpeed
+        let durationMs = durationMs ?? self.durationMs
         let sampleElapsedMs = Self.int64Value(object["sampleMono"])
         if sampleElapsedMs > 0 {
             let resolved = RemotePlaybackAnchorPolicy.resolve(
@@ -4718,6 +4783,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private func clearConnectionTransports(reason: String) {
         lyricsConfirmedTrackID = ""
         lyricsConfirmedUptime = 0
+        cancelFloatingLyricsPlaybackIntent()
         floatingPlaybackTargetPolicy.clear()
         log("[BLE-Reconnect] clear characteristics reason=\(reason)")
         resetHistoryRequests(reason: reason)
@@ -6260,6 +6326,17 @@ extension BLETestManager: CBPeripheralDelegate {
                 }
 
             case "playbackState":
+                guard let incomingIsPlaying = object["playing"] as? Bool,
+                      let remotePositionMs = Self.optionalInt64Value(object["position"]),
+                      remotePositionMs >= 0 else { break }
+                let incomingDurationMs = Self.int64Value(object["duration"])
+                let resolution = self.resolveRemotePlaybackAnchor(
+                    object: object, remotePositionMs: remotePositionMs,
+                    isPlaying: incomingIsPlaying, durationMs: incomingDurationMs
+                )
+                guard let calibratedPositionMs = self.calibratedRemotePosition(
+                    from: resolution, remotePositionMs: remotePositionMs, source: "playbackState"
+                ) else { break }
                 let oldLyric = self.lyric
                 let oldIsPlaying = self.isPlaying
                 let oldPositionMs = self.positionMs
@@ -6269,8 +6346,8 @@ extension BLETestManager: CBPeripheralDelegate {
                     ? Int64(Double(max(self.monotonicTimeMs() - self.playbackAnchorElapsedMs, 0)) * max(self.remotePlaybackSpeed, 0))
                     : 0)
                 let reconnectSyncWindow = self.isInReconnectStateSyncWindow()
-                self.isPlaying = object["playing"] as? Bool ?? false
-                self.durationMs = Self.int64Value(object["duration"])
+                self.isPlaying = incomingIsPlaying
+                self.durationMs = incomingDurationMs
                 let parsedSpeed = Self.doubleValue(object["speed"])
                 self.remotePlaybackSpeed = parsedSpeed.isFinite && parsedSpeed > 0
                     ? parsedSpeed
@@ -6349,23 +6426,14 @@ extension BLETestManager: CBPeripheralDelegate {
                     }
                 }
                 if !self.isSeeking {
-                    let remotePositionMs = Self.int64Value(object["position"])
-                    let resolution = self.resolveRemotePlaybackAnchor(
-                        object: object,
-                        remotePositionMs: remotePositionMs,
-                        isPlaying: self.isPlaying
-                    )
-                    if let calibratedPositionMs = self.calibratedRemotePosition(
-                        from: resolution,
-                        remotePositionMs: remotePositionMs,
-                        source: "playbackState"
-                    ) {
-                        self.positionMs = calibratedPositionMs
-                        self.displayPositionMs = calibratedPositionMs
-                        self.seekPositionMs = calibratedPositionMs
-                        self.basePlaybackPositionMs = calibratedPositionMs
-                        self.playbackAnchorElapsedMs = self.monotonicTimeMs()
-                    }
+                    self.positionMs = calibratedPositionMs
+                    self.displayPositionMs = calibratedPositionMs
+                    self.seekPositionMs = calibratedPositionMs
+                    self.basePlaybackPositionMs = calibratedPositionMs
+                    self.playbackAnchorElapsedMs = self.monotonicTimeMs()
+                    self.confirmLyricsPresentationClock()
+                    self.lyricsPlaybackConfirmationRevision &+= 1
+                    MainActor.assumeIsolated { self.reconcileFloatingLyricsPlayback() }
                 }
                 self.log(
                     "[iOS][Status] playbackState " +
@@ -6387,7 +6455,6 @@ extension BLETestManager: CBPeripheralDelegate {
                             "position=\(self.positionMs) lyric=\(self.lyric)"
                     )
                 }
-                self.confirmLyricsPresentationClock()
                 let remoteSeek = hadConfirmedClock &&
                     (abs(self.positionMs - predictedPosition) > 1_500 || self.positionMs < oldPositionMs - 400)
                 if remoteSeek {
@@ -7170,7 +7237,9 @@ extension BLETestManager: CBPeripheralDelegate {
             lastLiveActivityLyricTrackID = ""
             lastLiveActivityLyricLineIndex = Int.min
             lastLiveActivityLyricText = ""
+            lastLiveActivityLyricsKey = nil
             lyricsConfirmedTrackID = ""
+            cancelFloatingLyricsPlaybackIntent()
             floatingPlaybackTargetPolicy.clear()
             playbackStateRefreshWorkItem?.cancel()
             playbackStateRefreshWorkItem = nil
@@ -7346,9 +7415,10 @@ extension BLETestManager: CBPeripheralDelegate {
         updateLiveActivity(force: true, reason: "noActiveTrack")
     }
 
-    private func updateLiveActivity(force: Bool, reason: String) {
+    private func updateLiveActivity(force: Bool, reason: String,
+                                    presentation suppliedPresentation: LyricsPresentationSnapshot? = nil) {
         if reason == "seek" || reason == "playState" { lyricsTimelineRevision &+= 1 }
-        let presentation = makeLyricsPresentationSnapshot()
+        let presentation = suppliedPresentation ?? makeLyricsPresentationSnapshot()
         if preferences.floatingLyricsEnabled {
             Task { @MainActor [weak self] in
                 guard let self, self.preferences.floatingLyricsEnabled else { return }
@@ -7394,7 +7464,7 @@ extension BLETestManager: CBPeripheralDelegate {
             guard self.currentTrackID == snapshotTrackID,
                   self.currentTrackGeneration == snapshotGeneration,
                   self.lyricsPresentationRevision == presentation.revision else { return }
-            LiveActivityManager.shared.update(
+            (self.liveActivityPublisher ?? LiveActivityManager.shared).update(
                 title: snapshotTitle,
                 artist: snapshotArtist,
                 lyric: presentation.displayText,
@@ -7428,14 +7498,13 @@ extension BLETestManager: CBPeripheralDelegate {
     }
 
     private func updateLiveActivityForCurrentLyricIfNeeded(reason: String) -> Bool {
+        let presentation = makeLyricsPresentationSnapshot()
         let resolved = resolveCurrentLyric(
             positionMs: displayPositionMs,
             fullLyrics: fullLyrics,
             playbackStateLyric: lyric
         )
-        let lineChanged = resolved.trackId != lastLiveActivityLyricTrackID ||
-            resolved.lineIndex != lastLiveActivityLyricLineIndex ||
-            resolved.text != lastLiveActivityLyricText
+        let lineChanged = presentation.key != lastLiveActivityLyricsKey
 
         guard lineChanged else {
             if reason == "currentWord" {
@@ -7447,9 +7516,11 @@ extension BLETestManager: CBPeripheralDelegate {
         lastLiveActivityLyricTrackID = resolved.trackId
         lastLiveActivityLyricLineIndex = resolved.lineIndex
         lastLiveActivityLyricText = resolved.text
+        lastLiveActivityLyricsKey = presentation.key
         log(
-            "[Lyrics-Live] line changed trackId=\(resolved.trackId) " +
-                "appState=\(appLifecycleState) index=\(resolved.lineIndex) text=\(resolved.text)"
+            "[Lyrics-Live] presentation changed trackId=\(presentation.trackID) " +
+                "appState=\(appLifecycleState) status=\(presentation.status.rawValue) " +
+                "index=\(presentation.lineIndex) text=\(presentation.displayText)"
         )
         log(
             "[Lyrics-Live] source=\(resolved.source) " +
@@ -7457,7 +7528,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 "effectivePositionMs=\(karaokePositionMs(rawPositionMs: displayPositionMs)) " +
                 "reason=\(reason)"
         )
-        updateLiveActivity(force: false, reason: "lyricChanged")
+        updateLiveActivity(force: false, reason: "lyricChanged", presentation: presentation)
         return true
     }
 
@@ -7536,6 +7607,7 @@ extension BLETestManager: CBPeripheralDelegate {
     }
 
     private func updateLiveActivityDisconnected() {
+        cancelFloatingLyricsPlaybackIntent()
         floatingPlaybackTargetPolicy.clear()
         if preferences.floatingLyricsEnabled {
             Task { @MainActor [weak self] in
@@ -7552,7 +7624,7 @@ extension BLETestManager: CBPeripheralDelegate {
         let snapshotArtworkRevision = currentLiveArtworkRevision
 
         Task { @MainActor in
-            LiveActivityManager.shared.update(
+            (self.liveActivityPublisher ?? LiveActivityManager.shared).update(
                 title: snapshotTitle,
                 artist: snapshotArtist,
                 lyric: "连接已断开",
@@ -9313,7 +9385,6 @@ extension BLETestManager: CBPeripheralDelegate {
             }
         }
         lastCurrentWordReceivedAtMs = nowMs
-        confirmLyricsPresentationClock()
         currentWordLastLatencyMs = transportAgeMs
         let shouldLogDiagnostic = effectiveLineIndex != lastCurrentWordLoggedLineIndex ||
             nowMs - lastCurrentWordDiagnosticLogAtMs >= 5_000
@@ -9346,6 +9417,7 @@ extension BLETestManager: CBPeripheralDelegate {
             seekPositionMs = calibratedPositionMs
             basePlaybackPositionMs = calibratedPositionMs
             playbackAnchorElapsedMs = monotonicTimeMs()
+            confirmLyricsPresentationClock()
         }
 
         if shouldLogDiagnostic {

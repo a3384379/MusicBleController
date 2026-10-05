@@ -13,6 +13,7 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
     private var displayLayer: AVSampleBufferDisplayLayer?
     private var snapshotProvider: (() -> LyricsPresentationSnapshot)?
     private var setPlaying: ((Bool) -> Bool)?
+    private var controlsStopped: (() -> Void)?
     private var controller: AVPictureInPictureController?
     private var possibleObservation: NSKeyValueObservation?
     private var callbackGeneration: UInt64 = 0
@@ -42,11 +43,13 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
     func attach(
         _ view: LyricsPictureInPictureSourceUIView,
         snapshot: @escaping () -> LyricsPresentationSnapshot,
-        setPlaying: @escaping (Bool) -> Bool
+        setPlaying: @escaping (Bool) -> Bool,
+        controlsStopped: @escaping () -> Void
     ) {
         sourceView = view
         snapshotProvider = snapshot
         self.setPlaying = setPlaying
+        self.controlsStopped = controlsStopped
         prepareIfNeeded()
     }
 
@@ -264,6 +267,7 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
 
     private func stop(requestSystemStop: Bool) {
         playbackStatus.blockControls(owner: controller.map(ObjectIdentifier.init))
+        controlsStopped?()
         startRequested = false
         startTimeout?.cancel()
         startTimeout = nil
@@ -293,6 +297,7 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
     }
 
     private func releaseResources(preserveDelegate: Bool = false) {
+        controlsStopped?()
         stopTimeout?.cancel()
         stopTimeout = nil
         startTimeout?.cancel()
