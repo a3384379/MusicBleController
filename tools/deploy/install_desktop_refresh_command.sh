@@ -77,6 +77,7 @@ export OUT_ROOT=/tmp/music_ble_deploy
 export APP_NAME=sonyMusic.app
 export DERIVED_DATA_PATH="$HOME/Library/Developer/Xcode/DerivedData/MusicBleControllerAutoDeploy"
 export RENEW_PROFILE_WAIT_SECONDS="${{RENEW_PROFILE_WAIT_SECONDS:-90}}"
+export DEVICETL_WAIT_SECONDS="${{DEVICETL_WAIT_SECONDS:-120}}"
 
 mkdir -p /tmp/music_ble_deploy
 
