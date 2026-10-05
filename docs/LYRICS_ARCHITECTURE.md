@@ -2,6 +2,9 @@
 
 本文记录 QRC 原文、逐字、翻译、罗马音、懒加载恢复和 iOS 显示链路。
 
+iOS 紧凑态歌词与画中画悬浮歌词使用两项独立、默认关闭的设置，并消费既有权威播放/歌词状态的薄投影。
+实际接入文件、资源生命周期、26 项验收与尚未通过的真机验证见 [LYRICS_DISPLAY_IMPLEMENTATION.md](LYRICS_DISPLAY_IMPLEMENTATION.md)。
+
 ## 模块职责
 
 - Sony `PlaybackStateReader`：读取 MediaSession，调用 `LyricManager` 获取当前行，返回 `playbackState.lyric` 和轻量诊断字段。

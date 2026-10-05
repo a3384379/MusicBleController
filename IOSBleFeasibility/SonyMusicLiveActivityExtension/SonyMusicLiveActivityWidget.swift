@@ -32,14 +32,17 @@ struct SonyMusicLiveActivityWidget: Widget {
                     ExpandedBottomView(state: context.state)
                 }
             } compactLeading: {
-                CompactStyleLeadingView(
-                    state: context.state
-                )
+                if context.state.compactLyricsEnabled {
+                    CompactPlaybackGlyphView(visualState: visualState, size: 12)
+                } else {
+                    CompactStyleLeadingView(state: context.state)
+                }
             } compactTrailing: {
-                CompactPlaybackGlyphView(
-                    visualState: visualState,
-                    size: 18
-                )
+                if context.state.compactLyricsEnabled {
+                    CompactLyricView(state: context.state, isStale: context.isStale)
+                } else {
+                    CompactPlaybackGlyphView(visualState: visualState, size: 18)
+                }
             } minimal: {
                 LiveActivityArtworkView(
                     artworkKey: context.state.artworkKey,
@@ -50,6 +53,21 @@ struct SonyMusicLiveActivityWidget: Widget {
             .keylineTint(visualState.accentColor)
             .widgetURL(URL(string: "sonymusic://nowplaying"))
         }
+    }
+}
+
+private struct CompactLyricView: View {
+    let state: SonyMusicActivityAttributes.ContentState
+    let isStale: Bool
+
+    var body: some View {
+        Text(isStale ? AppLocalization.string("等待同步") : state.lyric)
+            .font(.system(size: 13, weight: .medium))
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: 160, alignment: .leading)
+            .layoutPriority(1)
+            .foregroundStyle(.white)
     }
 }
 

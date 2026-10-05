@@ -46,6 +46,11 @@ struct ContentView: View {
                     )
                 }
             }
+            .safeAreaInset(edge: .bottom) {
+                if preferences.floatingLyricsEnabled {
+                    FloatingLyricsPanel(manager: manager)
+                }
+            }
             .toolbar(.hidden, for: .navigationBar)
             .sheet(isPresented: $showDebugPage) {
                 DebugToolsView(bleManager: manager)
@@ -95,6 +100,13 @@ struct ContentView: View {
             }
             .onChange(of: preferences.lyricDisplayMode) { _, mode in
                 manager.requestFullLyricsOptionalFieldsIfNeeded(displayMode: mode)
+            }
+            .onChange(of: preferences.compactLyricsEnabled) { _, _ in
+                manager.refreshLiveActivityAppearance()
+            }
+            .onChange(of: preferences.floatingLyricsEnabled) { _, enabled in
+                LyricsPictureInPictureController.shared.setEnabled(enabled)
+                if enabled { LyricsPictureInPictureController.shared.requestStart() }
             }
             .onChange(of: showFullLyrics) { _, presented in
                 if presented {
