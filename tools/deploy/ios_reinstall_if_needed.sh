@@ -13,6 +13,7 @@ STATE_FILE="${STATE_FILE:-$SCRIPT_DIR/last_deploy.json}"
 LAST_SUCCESS_FILE="${LAST_SUCCESS_FILE:-$(dirname "$STATE_FILE")/last_successful_deploy.json}"
 OUT_ROOT="${OUT_ROOT:-/tmp/music_ble_deploy}"
 IOS_DEVICE_ID="${IOS_DEVICE_ID:-}"
+DEVICETL_WAIT_SECONDS="${DEVICETL_WAIT_SECONDS:-120}"
 THRESHOLD_HOURS=24
 FORCE=false
 FORCE_REINSTALL=false
@@ -41,7 +42,7 @@ Options:
   -h, --help              Show this help.
 
 Environment overrides:
-  ROOT_DIR PROJECT_PATH SCHEME CONFIGURATION BUNDLE_ID APP_NAME DERIVED_DATA_PATH STATE_FILE LAST_SUCCESS_FILE OUT_ROOT IOS_DEVICE_ID
+  ROOT_DIR PROJECT_PATH SCHEME CONFIGURATION BUNDLE_ID APP_NAME DERIVED_DATA_PATH STATE_FILE LAST_SUCCESS_FILE OUT_ROOT IOS_DEVICE_ID DEVICETL_WAIT_SECONDS
 EOF
 }
 
@@ -176,6 +177,8 @@ PY
 }
 
 find_device() {
+  local list_file="$RUN_DIR/devices.txt"
+
   if [[ -n "$IOS_DEVICE_ID" ]]; then
     local details_json="$RUN_DIR/device_details.json"
     if xcrun devicectl --timeout 20 device info details \
@@ -184,12 +187,20 @@ find_device() {
       echo "$IOS_DEVICE_ID"
       return 0
     fi
-    echo "Requested iPhone is not available: $IOS_DEVICE_ID" >&2
-    return 2
+    echo "Requested iPhone is not available: $IOS_DEVICE_ID; trying current connected iPhone." >&2
   fi
 
-  local list_file="$RUN_DIR/devices.txt"
-  if ! xcrun devicectl --timeout 20 list devices >"$list_file" 2>"$RUN_DIR/devices.err"; then
+  local deadline=$((SECONDS + DEVICETL_WAIT_SECONDS))
+  local list_succeeded=false
+  while (( SECONDS <= deadline )); do
+    if xcrun devicectl --timeout 30 list devices >"$list_file" 2>"$RUN_DIR/devices.err"; then
+      list_succeeded=true
+      break
+    fi
+    sleep 5
+  done
+
+  if [[ "$list_succeeded" != true || ! -s "$list_file" ]]; then
     echo "Unable to list iOS devices." >&2
     return 2
   fi
@@ -200,17 +211,16 @@ import sys
 from pathlib import Path
 
 rows = []
-uuid_re = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
 for raw in Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines():
-    match = uuid_re.search(raw)
-    if not match or "iPhone" not in raw:
+    columns = re.split(r"\s{2,}", raw.strip())
+    if len(columns) < 4:
         continue
-    right = raw[match.end():].strip()
-    state = right.split("  ")[0].strip() if right else ""
-    if "available" not in state and "connected" not in state:
+    # devicectl may show a UDID, ECID or CoreDevice UUID in Identifier.
+    identifier, state, model = columns[-3:]
+    if state.lower() not in {"available", "connected"} or not model.startswith("iPhone"):
         continue
-    name = raw[:match.start()].strip().split("  ")[0].strip() or "iPhone"
-    rows.append((name, match.group(0), state))
+    name = columns[0] or "iPhone"
+    rows.append((name, identifier, state))
 
 if len(rows) == 1:
     print(rows[0][1])
@@ -448,7 +458,9 @@ fi
 
 RESULT="FAIL"
 failure_reason="deploy failed; see $RUN_DIR/deploy"
-if grep -R "No Accounts" "$RUN_DIR/deploy" >/dev/null 2>&1; then
+if grep -R "is not installed. Please download and install the platform from Xcode > Settings > Components" "$RUN_DIR/deploy" >/dev/null 2>&1; then
+  failure_reason="Xcode is missing the required iOS platform; open Xcode > Settings > Components and install it; see $RUN_DIR/deploy"
+elif grep -R "No Accounts" "$RUN_DIR/deploy" >/dev/null 2>&1; then
   failure_reason="xcodebuild cannot access an Apple ID account; see $RUN_DIR/deploy"
 elif grep -R "No profiles for" "$RUN_DIR/deploy" >/dev/null 2>&1; then
   failure_reason="xcodebuild could not create or find renewed provisioning profiles; see $RUN_DIR/deploy"

@@ -62,13 +62,13 @@ tools/deploy/last_deploy.json
 推荐使用桌面 `.command` 手动触发，避免 Xcode 账号失效时后台定时任务静默失败：
 
 ```bash
-./tools/deploy/install_desktop_refresh_command.sh --device <IOS_DEVICE_ID>
+./tools/deploy/install_desktop_refresh_command.sh
 ```
 
-当前设备可以用下面的命令查看：
+如果同时连接多台 iPhone，再固定设备：
 
 ```bash
-xcrun devicectl list devices
+./tools/deploy/install_desktop_refresh_command.sh --device <IOS_DEVICE_ID>
 ```
 
 安装后双击桌面的 `刷新 MusicBle iOS 签名.command`。它会先打开 Xcode 工程，让 Xcode 有机会加载账号状态或生成新 profile，然后执行：
@@ -77,9 +77,11 @@ xcrun devicectl list devices
 tools/deploy/ios_reinstall_if_needed.sh --force --refresh-only --renew-profiles --require-renewed-profile --threshold-hours 48
 ```
 
-如果 Xcode 账号失效，Terminal 会保留失败原因；重新在 Xcode 里登录 Apple ID 后，再双击一次即可。脚本默认 `--refresh-only`，所以只负责刷新 profile、build 和覆盖安装，不会额外 launch/smoke。
+如果 Xcode 账号失效，Terminal 会保留失败原因；重新在 Xcode 里登录 Apple ID 后，再双击一次即可。脚本默认 `--refresh-only`，所以只负责刷新 profile、build 和覆盖安装，不会额外 launch/smoke。Xcode 升级后 `devicectl` 里的设备 Identifier 可能变化；脚本会在固定 ID 不可用时自动回退到当前唯一连接的 iPhone。自动选择只接受 `connected` 或 `available` 状态，多台可用设备时需要指定 `--device`；设备列表命令失败时不会使用其残留输出。设备列表查询默认允许重试 120 秒，可用 `DEVICETL_WAIT_SECONDS` 调整；单次查询超时和重试间隔可能使实际等待略长于该值。
 
-注意：App 里显示的签名到期时间来自 `embedded.mobileprovision`。覆盖安装本身不会把这个时间顺延；只有 Xcode/Apple 重新签发了新的 provisioning profile，7 天窗口才会更新。脚本会先备份并删除当前 App 匹配的本地 profile，让 `xcodebuild -allowProvisioningUpdates` 重新生成 profile。如果命令行 Xcode 暂时先报 `No Accounts` 但随后异步写出新的 profile，脚本会等待最多 90 秒，检测到主 App 和扩展的新 profile 后先重试 build，再安装。如果最终 build/install 完成但 profile UUID 和到期时间没有变化，本次会记录为 `FAIL`，不会写入 `last_successful_deploy.json`。
+设备列表按列读取 Identifier，兼容 UDID、ECID 和 CoreDevice UUID；[Apple 的 Xcode 27 发行说明](https://developer.apple.com/documentation/xcode-release-notes/xcode-27-release-notes)说明了这三种标识在设备列表中的优先顺序。
+
+注意：App 里显示的签名到期时间来自 `embedded.mobileprovision`。覆盖安装本身不会把这个时间顺延；只有 Xcode/Apple 重新签发了新的 provisioning profile，7 天窗口才会更新。脚本会先备份并删除当前 App 匹配的本地 profile，让 `xcodebuild -allowProvisioningUpdates` 重新生成 profile。如果命令行 Xcode 暂时先报 `No Accounts` 但随后异步写出新的 profile，脚本会等待最多 90 秒，检测到主 App 和扩展的新 profile 后先重试 build，再安装。即使没有可备份的旧 profile，也会打开 Xcode 并等待新 profile；检测到的新 profile 会保留，只有未检测到新 profile 时才恢复旧备份。指定 `--require-renewed-profile` 时，续签构建失败就停止，不会继续安装。如果最终 build/install 完成但 profile UUID 和到期时间没有变化，本次会记录为 `FAIL`，不会写入 `last_successful_deploy.json`。
 
 ## launchd 定时任务
 
@@ -128,10 +130,18 @@ stdout/stderr 日志写到：
 
 ## 验证
 
+部署入口的自动化测试会替换子进程中的外部命令，不会连接真实设备或改动签名文件。CI 的 iOS job 会运行同一组测试：
+
+```bash
+python3 -m unittest discover -s tools/deploy/tests -v
+```
+
+真机验证仍需在满足上述前提的 Mac 上运行：
+
 ```bash
 ./tools/deploy/ios_reinstall_if_needed.sh --force
 cat tools/deploy/last_deploy.json
-./tools/deploy/install_desktop_refresh_command.sh --device <IOS_DEVICE_ID>
+./tools/deploy/install_desktop_refresh_command.sh
 ```
 
 确认点：

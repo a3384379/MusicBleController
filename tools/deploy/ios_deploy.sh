@@ -12,6 +12,7 @@ DERIVED_DATA_PATH="${DERIVED_DATA_PATH:-$HOME/Library/Developer/Xcode/DerivedDat
 OUT_DIR="${OUT_DIR:-/tmp/music_ble_deploy/$(date +%Y%m%d_%H%M%S)}"
 SMOKE_CHECK="${SMOKE_CHECK:-$ROOT_DIR/tools/ios-smoke-tests/codex_check.sh}"
 RENEW_PROFILE_WAIT_SECONDS="${RENEW_PROFILE_WAIT_SECONDS:-90}"
+DEVICETL_WAIT_SECONDS="${DEVICETL_WAIT_SECONDS:-120}"
 IOS_DEVICE_ID="${IOS_DEVICE_ID:-}"
 XCODE_DESTINATION="${XCODE_DESTINATION:-}"
 XCODE_DESTINATION_ID="${XCODE_DESTINATION_ID:-}"
@@ -20,6 +21,7 @@ FORCE_REINSTALL=false
 REFRESH_ONLY=false
 RENEW_PROFILES=false
 REQUIRE_RENEWED_PROFILE=false
+RENEWED_PROFILES_FOUND=false
 
 usage() {
   cat <<'EOF'
@@ -33,11 +35,11 @@ Options:
   --force-reinstall         If install fails, uninstall once and retry install.
   --refresh-only            Build and install only; skip launch and smoke.
   --renew-profiles          Back up and remove local matching provisioning profiles before build.
-  --require-renewed-profile Stop after restoring backups if profile renewal build fails.
+  --require-renewed-profile Do not install if profile renewal build fails.
   -h, --help                Show this help.
 
 Environment overrides:
-  ROOT_DIR PROJECT_PATH SCHEME CONFIGURATION BUNDLE_ID APP_NAME DERIVED_DATA_PATH OUT_DIR SMOKE_CHECK RENEW_PROFILE_WAIT_SECONDS IOS_DEVICE_ID XCODE_DESTINATION XCODE_DESTINATION_ID XCODE_WARM_AFTER_PROFILE_REMOVAL
+  ROOT_DIR PROJECT_PATH SCHEME CONFIGURATION BUNDLE_ID APP_NAME DERIVED_DATA_PATH OUT_DIR SMOKE_CHECK RENEW_PROFILE_WAIT_SECONDS DEVICETL_WAIT_SECONDS IOS_DEVICE_ID XCODE_DESTINATION XCODE_DESTINATION_ID XCODE_WARM_AFTER_PROFILE_REMOVAL
 EOF
 }
 
@@ -81,35 +83,37 @@ done
 
 mkdir -p "$OUT_DIR"
 
-find_device() {
-  if [[ -n "$IOS_DEVICE_ID" ]]; then
-    echo "$IOS_DEVICE_ID"
-    return 0
-  fi
+list_devices_with_retry() {
+  local list_file="$1"
+  local err_file="$2"
+  local deadline=$((SECONDS + DEVICETL_WAIT_SECONDS))
+  while (( SECONDS <= deadline )); do
+    if xcrun devicectl --timeout 30 list devices >"$list_file" 2>"$err_file"; then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
 
-  local list_file="$OUT_DIR/devices.txt"
-  if ! xcrun devicectl list devices >"$list_file" 2>"$OUT_DIR/devices.err"; then
-    echo "Unable to list iOS devices. See $OUT_DIR/devices.err" >&2
-    return 1
-  fi
-
+select_connected_iphone() {
+  local list_file="$1"
   python3 - "$list_file" <<'PY'
 import re
 import sys
 from pathlib import Path
 
 rows = []
-uuid_re = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
 for raw in Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines():
-    match = uuid_re.search(raw)
-    if not match or "iPhone" not in raw:
+    columns = re.split(r"\s{2,}", raw.strip())
+    if len(columns) < 4:
         continue
-    right = raw[match.end():].strip()
-    state = right.split("  ")[0].strip() if right else ""
-    if "available" not in state and "connected" not in state:
+    # devicectl may show a UDID, ECID or CoreDevice UUID in Identifier.
+    identifier, state, model = columns[-3:]
+    if state.lower() not in {"available", "connected"} or not model.startswith("iPhone"):
         continue
-    name = raw[:match.start()].strip().split("  ")[0].strip() or "iPhone"
-    rows.append((name, match.group(0), state))
+    name = columns[0] or "iPhone"
+    rows.append((name, identifier, state))
 
 if len(rows) == 1:
     print(rows[0][1])
@@ -123,6 +127,27 @@ for name, identifier, state in rows:
     print(f"- name={name} id={identifier} state={state}", file=sys.stderr)
 sys.exit(3)
 PY
+}
+
+find_device() {
+  local list_file="$OUT_DIR/devices.txt"
+
+  if [[ -n "$IOS_DEVICE_ID" ]]; then
+    if xcrun devicectl --timeout 30 device info details \
+      --device "$IOS_DEVICE_ID" \
+      >"$OUT_DIR/requested_device_details.log" 2>"$OUT_DIR/requested_device_details.err"; then
+      echo "$IOS_DEVICE_ID"
+      return 0
+    fi
+    echo "[Deploy] requested iPhone id is not available: $IOS_DEVICE_ID; trying current connected iPhone" >&2
+  fi
+
+  if ! list_devices_with_retry "$list_file" "$OUT_DIR/devices.err"; then
+    echo "Unable to list iOS devices. See $OUT_DIR/devices.err" >&2
+    return 1
+  fi
+
+  select_connected_iphone "$list_file"
 }
 
 sync_xcode_profiles() {
@@ -304,6 +329,7 @@ warm_xcode_after_profile_removal() {
   echo "[Deploy] waiting up to ${RENEW_PROFILE_WAIT_SECONDS}s for Xcode to regenerate profiles" | tee -a "$OUT_DIR/xcodebuild.log"
   if wait_for_matching_profiles 2>&1 | tee -a "$OUT_DIR/xcodebuild.log"; then
     echo "[Deploy] regenerated profiles found before xcodebuild" | tee -a "$OUT_DIR/xcodebuild.log"
+    RENEWED_PROFILES_FOUND=true
     sync_xcode_profiles
   else
     echo "[Deploy] Xcode did not regenerate profiles before xcodebuild; continuing" | tee -a "$OUT_DIR/xcodebuild.log"
@@ -347,9 +373,7 @@ if [[ "$RENEW_PROFILES" == true ]]; then
     rm -f "$profile"
   done < <(renew_matching_profiles)
 
-  if [[ -s "$backup_manifest" ]]; then
-    warm_xcode_after_profile_removal
-  fi
+  warm_xcode_after_profile_removal
 fi
 
 set +e
@@ -361,6 +385,7 @@ if [[ "$build_rc" -ne 0 && "$RENEW_PROFILES" == true ]]; then
   echo "[Deploy] xcodebuild failed after profile renewal; waiting up to ${RENEW_PROFILE_WAIT_SECONDS}s for regenerated profiles" | tee -a "$OUT_DIR/xcodebuild.log"
   if wait_for_matching_profiles 2>&1 | tee -a "$OUT_DIR/xcodebuild.log"; then
     echo "[Deploy] regenerated profiles found; retrying build before restoring backups" | tee -a "$OUT_DIR/xcodebuild.log"
+    RENEWED_PROFILES_FOUND=true
     sync_xcode_profiles
     set +e
     run_xcodebuild | tee "$OUT_DIR/xcodebuild_retry_renewed.log"
@@ -370,14 +395,19 @@ if [[ "$build_rc" -ne 0 && "$RENEW_PROFILES" == true ]]; then
 fi
 
 if [[ "$build_rc" -ne 0 && "$RENEW_PROFILES" == true ]]; then
-  echo "[Deploy] xcodebuild still failed after profile renewal; restoring previous profiles" | tee -a "$OUT_DIR/xcodebuild.log"
-  restore_profile_backup
-  sync_xcode_profiles
+  if [[ "$RENEWED_PROFILES_FOUND" == true ]]; then
+    echo "[Deploy] xcodebuild still failed, but renewed profiles were found; keeping renewed profiles" | tee -a "$OUT_DIR/xcodebuild.log"
+    sync_xcode_profiles
+  else
+    echo "[Deploy] xcodebuild still failed after profile renewal; restoring previous profiles" | tee -a "$OUT_DIR/xcodebuild.log"
+    restore_profile_backup
+    sync_xcode_profiles
+  fi
   if [[ "$REQUIRE_RENEWED_PROFILE" == true ]]; then
-    echo "[Deploy] renewed profile is required; not reinstalling with restored profiles" | tee -a "$OUT_DIR/xcodebuild.log"
+    echo "[Deploy] renewed profile is required; not installing after failed build" | tee -a "$OUT_DIR/xcodebuild.log"
     exit "$build_rc"
   fi
-  echo "[Deploy] retrying once with restored profiles" | tee -a "$OUT_DIR/xcodebuild.log"
+  echo "[Deploy] retrying once with current profiles" | tee -a "$OUT_DIR/xcodebuild.log"
   set +e
   run_xcodebuild | tee "$OUT_DIR/xcodebuild_retry.log"
   build_rc="${PIPESTATUS[0]}"

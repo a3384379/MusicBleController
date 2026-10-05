@@ -43,6 +43,8 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
+      - name: Test iOS deployment entrypoints
+        run: python3 -m unittest discover -s tools/deploy/tests -v
       - name: Inspect Xcode and available simulators
         run: |
           xcodebuild -version
