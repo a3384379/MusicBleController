@@ -219,6 +219,7 @@ BLE 协议、Sony/Android、偏好持久化格式、Widget 布局及工程配置
 `LiveActivityManager` 持有可取消的 publication Task，`end` 先失效 epoch 并取消任务和 observer。
 Task 启动、`publish` 入口、查找/恢复/创建活动前，以及 await 返回后下一次系统 update 前均检查 epoch 与取消状态。
 完成后仅当前 epoch 可以回写或推进队列；旧 observer 还必须匹配当前活动 ID。
+系统 update 前后也复核当前活动 ID 与 active/stale 状态，系统已结束的目标不能被迟到 update 恢复为当前活动。
 正在结束的活动 ID 不参与恢复，也不恢复 ended/dismissed 活动，旧重复活动清理任务不能结束新会话选中的活动。
 已经提交给 ActivityKit 的系统调用无法强制撤回，此修复保证旧任务不会继续产生下一项副作用或污染新会话。
 关闭紧凑歌词仍仅恢复原布局，不调用 `end`；关闭 PiP 不发送 Sony 暂停。
@@ -231,13 +232,13 @@ Task 启动、`publish` 入口、查找/恢复/创建活动前，以及 await �
 
 | 检查 | 最终结果与证据 |
 |---|---|
-| 完整 iPhone 16 Pro / iOS 18.3 模拟器 XCTest | **首轮 PASS 117/117**：50 项歌词展示、67 项原稳定性测试。本轮新增 13 项，覆盖明确拒绝恢复、20 次同状态回报/请求、无回报期限、未知错误保护、旧 seq/代际/会话/连接隔离、停止重开与重连恢复、意图过期、实际提示像素，以及未启动/重开/在途完成生命周期。`/private/tmp/musicble-n1-n2-all.xcresult`、`/private/tmp/musicble-n1-n2-all.log` |
+| 完整 iPhone 16 Pro / iOS 18.3 模拟器 XCTest | **首轮 PASS 117/117**：50 项歌词展示、67 项原稳定性测试。本轮新增 13 项，覆盖明确拒绝恢复、20 次同状态回报/请求、无回报期限、未知错误保护、旧 seq/代际/会话/连接隔离、停止重开与重连恢复、意图过期、实际提示像素，以及未启动/重开/在途完成生命周期。最终活动 ID/state 补强后重新验证该版本，仍首轮 117/117；`/private/tmp/musicble-n1-n2-final.xcresult`、`/private/tmp/musicble-n1-n2-final.log` |
 | R3 与意图期限共同回归 | 陈旧采样仍不续期或确认 toggle，合法旧协议仍能恢复。46 秒后到达的合法确认只释放原命令；旧后续意图已过期，新的显式播放请求才发送第二条命令。这是增加过期语义，不放宽 R3 断言。 |
-| generic iOS App / Widget 构建 | **BUILD SUCCEEDED**，无 Swift 源码编译警告；`/private/tmp/musicble-n1-n2-device-build.log` |
+| generic iOS App / Widget 构建 | **BUILD SUCCEEDED**，无 Swift 源码编译警告；`/private/tmp/musicble-n1-n2-device-build-final.log` |
 | 真实渲染器附件 | 新 unknown 提示确实进入 640×360 像素缓冲，已导出并目视检查；文字、背景和原歌词区域正常。附件名 `floating-lyrics-unknown-control-feedback`，不是系统 PiP 窗口验收。 |
-| quick smoke | **overall FAIL，Required 2/6**；两个 PASS 是 quick 跳过构建/安装。`Tm iPhone` 仍 unavailable，CoreDevice 无法定位设备，启动、日志、偏好和容器未验证；三个可选链路 SKIPPED。`/private/tmp/musicble-n1-n2-quick-smoke/report.json`、`ios_launch_stderr.log` |
+| quick smoke | **overall FAIL，Required 2/6**；两个 PASS 是 quick 跳过构建/安装。`Tm iPhone` 仍 unavailable，CoreDevice 无法定位设备，启动、日志、偏好和容器未验证；三个可选链路 SKIPPED。最终版本记录 `/private/tmp/musicble-n1-n2-final-quick-smoke/report.json`、`ios_launch_stderr.log` |
 | full smoke / 本地 Android build | 本轮未触及启动、安装、UserDefaults、日志系统或工程设置，**不要求 full smoke**；没有 Android/Sony 改动，**不要求本地 Android build**。GitHub iOS/Android CI 应按实际提交另外核对，不能以旧 master CI 代替。 |
-| 图谱与差异 | 修改前核对索引、精确符号、调用路径并读取真实源码。修改后完整索引成功（8231 nodes / 43869 edges），调用图显示错误入口接入策略；当前接口未暴露 `list_projects/index_status/detect_changes`，使用完整索引、实际差异与调用位置复核。`git diff --check`、String Catalog JSON 检查通过；未生成仓库内图谱文件。 |
+| 图谱与差异 | 修改前核对索引、精确符号、调用路径并读取真实源码。修改后完整索引成功（8235 nodes / 43895 edges），调用图显示错误入口接入策略；当前接口未暴露 `list_projects/index_status/detect_changes`，使用完整索引、实际差异与调用位置复核。`git diff --check`、String Catalog JSON 检查通过；未生成仓库内图谱文件。 |
 | 首轮/重试口径 | 本次最终本地 117 项首轮通过，没有为通过而重复执行完整测试。原快照存储 `load == nil` 的历史 CI 间歇失败未在本次最终本地轮次出现，也未在本轮修复；后续 CI 首轮与自动重试须分别报告。 |
 
 两项设置仍独立默认关闭；默认关闭不会启动 PiP/音频/渲染心跳，也不会创建控制结果期限任务或状态查询。

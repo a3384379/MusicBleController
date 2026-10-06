@@ -451,9 +451,11 @@ final class LiveActivityManager {
         guard !Task.isCancelled, publicationEpoch == epoch else { return false }
         if let statePublisher { return await statePublisher(state) }
         guard let target = await ensureActivity(for: state, epoch: epoch, logger: logger),
-              !Task.isCancelled, publicationEpoch == epoch else { return false }
+              !Task.isCancelled, publicationEpoch == epoch, activity?.id == target.id,
+              target.activityState == .active || target.activityState == .stale else { return false }
         await target.update(ActivityContent(state: state, staleDate: staleDate(for: state)))
-        guard !Task.isCancelled, publicationEpoch == epoch else { return false }
+        guard !Task.isCancelled, publicationEpoch == epoch, activity?.id == target.id,
+              target.activityState == .active || target.activityState == .stale else { return false }
         activity = target
         return true
     }
