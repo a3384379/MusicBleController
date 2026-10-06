@@ -1,6 +1,25 @@
 @preconcurrency import ActivityKit
 import Foundation
 
+/// Ending resources is independent of the publication epoch: an end() must
+/// finish already scheduled cleanup, while a newly selected target is protected.
+@MainActor
+final class LiveActivityCleanupQueue {
+    private var activityIDs: Set<String> = []
+
+    func contains(_ id: String) -> Bool { activityIDs.contains(id) }
+
+    func enqueue(id: String, canEnd: @escaping () -> Bool = { true },
+                 end: @escaping () async -> Void) {
+        guard activityIDs.insert(id).inserted else { return }
+        Task {
+            defer { activityIDs.remove(id) }
+            guard canEnd() else { return }
+            await end()
+        }
+    }
+}
+
 @MainActor
 final class LiveActivityManager {
     static let shared = LiveActivityManager()
@@ -15,7 +34,7 @@ final class LiveActivityManager {
     private var activity: Activity<SonyMusicActivityAttributes>?
     private var activityStateTask: Task<Void, Never>?
     private var publicationTask: Task<Void, Never>?
-    private var endingActivityIDs: Set<String> = []
+    private let activityCleanup = LiveActivityCleanupQueue()
     private var latestState: SonyMusicActivityAttributes.ContentState?
     private var latestReason = "unknown"
     private var latestForce = false
@@ -169,8 +188,7 @@ final class LiveActivityManager {
         activityStateTask = nil
         guard let activity else { return }
         self.activity = nil
-        endingActivityIDs.insert(activity.id)
-        Task {
+        activityCleanup.enqueue(id: activity.id) {
             if let state {
                 await activity.end(
                     ActivityContent(state: state, staleDate: nil),
@@ -179,7 +197,6 @@ final class LiveActivityManager {
             } else {
                 await activity.end(nil, dismissalPolicy: .immediate)
             }
-            endingActivityIDs.remove(activity.id)
             logger?("[LiveActivity] end")
         }
     }
@@ -525,7 +542,7 @@ final class LiveActivityManager {
         guard !Task.isCancelled, publicationEpoch == epoch else { return nil }
         let activities = Activity<SonyMusicActivityAttributes>.activities
         guard let existing = activities.first(where: {
-            !endingActivityIDs.contains($0.id) && ($0.activityState == .active || $0.activityState == .stale)
+            !activityCleanup.contains($0.id) && ($0.activityState == .active || $0.activityState == .stale)
         }) else { return nil }
         activity = existing
         observeStateUpdates(for: existing, epoch: epoch, logger: logger)
@@ -541,14 +558,11 @@ final class LiveActivityManager {
     ) {
         guard !Task.isCancelled, publicationEpoch == epoch else { return }
         for duplicate in Activity<SonyMusicActivityAttributes>.activities
-            where duplicate.id != activityID && !endingActivityIDs.contains(duplicate.id) {
+            where duplicate.id != activityID && !activityCleanup.contains(duplicate.id) {
             logger?("[LiveActivity] duplicate activity ending id=\(duplicate.id)")
-            endingActivityIDs.insert(duplicate.id)
-            Task { [weak self] in
-                guard let self else { return }
-                defer { self.endingActivityIDs.remove(duplicate.id) }
-                guard !Task.isCancelled, self.publicationEpoch == epoch,
-                      self.activity?.id != duplicate.id else { return }
+            activityCleanup.enqueue(id: duplicate.id, canEnd: { [weak self] in
+                self?.activity?.id != duplicate.id
+            }) {
                 await duplicate.end(nil, dismissalPolicy: .immediate)
             }
         }

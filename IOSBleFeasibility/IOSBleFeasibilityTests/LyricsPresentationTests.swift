@@ -311,6 +311,49 @@ final class LyricsPresentationTests: XCTestCase {
     }
 
     @MainActor
+    func testScheduledDuplicateCleanupFinishesAfterCurrentSessionEnds() async throws {
+        let cleanup = LiveActivityCleanupQueue()
+        var currentID: String? = "current"
+        var ended = 0
+        cleanup.enqueue(id: "duplicate", canEnd: { currentID != "duplicate" }) { ended += 1 }
+        XCTAssertTrue(cleanup.contains("duplicate"))
+        // The session ends in the same MainActor slice, before cleanup starts.
+        currentID = nil
+        try await waitUntil { ended == 1 }
+        XCTAssertFalse(cleanup.contains("duplicate"))
+    }
+
+    @MainActor
+    func testScheduledDuplicateCleanupCannotEndNewlySelectedActivity() async throws {
+        let cleanup = LiveActivityCleanupQueue()
+        var currentID = "old current"
+        var ended = 0
+        cleanup.enqueue(id: "duplicate", canEnd: { currentID != "duplicate" }) { ended += 1 }
+        currentID = "duplicate"
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(ended, 0)
+        XCTAssertFalse(cleanup.contains("duplicate"))
+    }
+
+    @MainActor
+    func testActivityRemainsExcludedUntilItsSingleCleanupCompletes() async throws {
+        let cleanup = LiveActivityCleanupQueue()
+        var ends = 0
+        var completion: CheckedContinuation<Void, Never>?
+        cleanup.enqueue(id: "ending") {
+            ends += 1
+            await withCheckedContinuation { completion = $0 }
+        }
+        cleanup.enqueue(id: "ending") { ends += 1 }
+        try await waitUntil { completion != nil }
+        XCTAssertEqual(ends, 1)
+        XCTAssertTrue(cleanup.contains("ending"))
+        completion?.resume()
+        try await waitUntil { !cleanup.contains("ending") }
+        XCTAssertEqual(ends, 1)
+    }
+
+    @MainActor
     func testEndBeforePublicationTaskStartsNeverEntersPublisher() async throws {
         let sink = ActivityPublicationRecorder()
         let manager = activityManager(sink)
