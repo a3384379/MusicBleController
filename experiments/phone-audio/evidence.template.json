@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "artifact_sha256": null,
+  "operator": null,
+  "effort_days": 0,
+  "iphone": {
+    "model": "iPhone 16 Pro Max (development inventory; currently unavailable)",
+    "ios_version": null
+  },
+  "sony": {
+    "model": "NW-WM1AM2 (repository reference device)",
+    "android_version": null
+  },
+  "normal_phone_speaker_silent": null,
+  "screen_remains_on_iphone": null,
+  "manual_start_and_pairing_acceptable": null,
+  "network_loss_fallback_observed": null,
+  "network_loss_fallback_acceptable": null,
+  "stop_fallback_observed": null,
+  "stop_fallback_acceptable": null,
+  "qq_music_manually_paused": null,
+  "sony_music_not_automatically_resumed": null,
+  "sony_screen_off_stable": null,
+  "existing_ble_lyrics_controls_unchanged": null,
+  "source_apps": [],
+  "evidence_files": []
+}
