@@ -70,6 +70,16 @@ final class LyricsSampleBufferRenderer: @unchecked Sendable {
             withAttributes: attributes
         )
 
+        if snapshot.playbackControlState != .idle {
+            let feedbackParagraph = NSMutableParagraphStyle()
+            feedbackParagraph.alignment = .center
+            (snapshot.playbackControlState.message as NSString).draw(
+                in: CGRect(x: 36, y: 312, width: 568, height: 42),
+                withAttributes: [.font: UIFont.systemFont(ofSize: 16),
+                                 .foregroundColor: UIColor.lightGray, .paragraphStyle: feedbackParagraph]
+            )
+        }
+
         var format: CMVideoFormatDescription?
         guard CMVideoFormatDescriptionCreateForImageBuffer(
             allocator: kCFAllocatorDefault, imageBuffer: buffer, formatDescriptionOut: &format

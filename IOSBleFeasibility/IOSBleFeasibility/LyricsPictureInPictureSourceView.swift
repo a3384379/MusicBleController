@@ -56,6 +56,13 @@ struct FloatingLyricsPanel: View {
                 if !controller.reason.isEmpty {
                     Text(controller.reason).font(.caption2).foregroundStyle(.secondary)
                 }
+                let controlState = manager.lyricsStore.floatingPlaybackControlState
+                if controlState != .idle {
+                    Text(controlState.message).font(.caption2).foregroundStyle(.secondary)
+                }
+                if controlState == .unknown {
+                    Button("重新连接") { manager.forceReconnect() }
+                }
             }
             Spacer(minLength: 0)
         }

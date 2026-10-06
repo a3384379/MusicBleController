@@ -42,6 +42,7 @@ struct LyricsPresentationSnapshot: Equatable, Sendable {
     let isPlaying: Bool
     let status: Status
     let validUntilUptime: TimeInterval
+    var playbackControlState: LyricsPlaybackControlState = .idle
 
     var key: Key {
         Key(trackID: trackID, trackGeneration: trackGeneration,
@@ -144,47 +145,162 @@ struct LyricsPiPStateMachine {
 
 /// The wire protocol exposes toggle. Keep desired, confirmed and in-flight
 /// states separate: elapsed time alone cannot prove a toggle was not executed.
+enum LyricsPlaybackControlState: Equatable, Sendable {
+    case idle, pending, unknown, failed, unavailable
+
+    var message: String {
+        switch self {
+        case .idle: return ""
+        case .pending: return AppLocalization.string("播放控制已发送，等待确认")
+        case .unknown: return AppLocalization.string("播放控制结果未知，请回到应用重新连接后重试")
+        case .failed: return AppLocalization.string("播放控制未执行，状态同步后可重试")
+        case .unavailable: return AppLocalization.string("播放状态未同步，无法执行控制")
+        }
+    }
+}
+
 struct LyricsPlaybackTargetPolicy {
-    private var identity: (trackID: String, generation: Int64)?
+    struct CommandReceipt: Equatable {
+        let sequence: UInt64
+        let trackID: String
+        let generation: Int64
+        let connectionEpoch: UInt64
+        let serverSessionID: String
+        let sentAt: TimeInterval
+    }
+
+    private struct InFlight {
+        let target: Bool
+        let confirmationRevision: UInt64
+        var receipt: CommandReceipt?
+    }
+
+    let confirmationTimeout: TimeInterval
+    private var identity: (trackID: String, generation: Int64, connectionEpoch: UInt64, serverSessionID: String)?
     private var desired: Bool?
+    private var desiredExpiresAt: TimeInterval?
     private var confirmed: Bool?
     private var confirmedRevision: UInt64 = 0
-    private var inFlight: (target: Bool, confirmationRevision: UInt64)?
+    private var inFlight: InFlight?
+    private var rejectedAtRevision: UInt64?
+    private var stateQueryNeeded = false
+    private(set) var controlState: LyricsPlaybackControlState = .idle
+
+    var receipt: CommandReceipt? { inFlight?.receipt }
+
+    init(confirmationTimeout: TimeInterval = 8) {
+        self.confirmationTimeout = confirmationTimeout
+    }
 
     mutating func request(target: Bool, snapshot: LyricsPresentationSnapshot,
-                          confirmationRevision: UInt64, now: TimeInterval) -> Bool {
+                          confirmationRevision: UInt64, now: TimeInterval,
+                          connectionEpoch: UInt64 = 0, serverSessionID: String = "-") -> Bool {
+        expire(now: now)
         guard snapshot.hasAuthoritativePlayback, now < snapshot.validUntilUptime else { return false }
-        adoptIdentity(snapshot)
-        desired = target
+        adoptIdentity(snapshot, connectionEpoch: connectionEpoch, serverSessionID: serverSessionID)
         acceptConfirmation(snapshot, revision: confirmationRevision)
+        guard controlState != .unknown, rejectedAtRevision == nil else { return false }
+        desired = target
+        desiredExpiresAt = now + confirmationTimeout
+        controlState = .pending
         return reserveCommand()
     }
 
     mutating func reconcile(snapshot: LyricsPresentationSnapshot,
-                            confirmationRevision: UInt64, now: TimeInterval) -> Bool {
+                            confirmationRevision: UInt64, now: TimeInterval,
+                            connectionEpoch: UInt64 = 0, serverSessionID: String = "-") -> Bool {
+        expire(now: now)
         guard snapshot.hasAuthoritativePlayback, now < snapshot.validUntilUptime else { return false }
-        adoptIdentity(snapshot)
+        adoptIdentity(snapshot, connectionEpoch: connectionEpoch, serverSessionID: serverSessionID)
         acceptConfirmation(snapshot, revision: confirmationRevision)
         return reserveCommand()
     }
 
-    /// Only a command rejected before sending may release the reservation.
+    mutating func commandSent(sequence: UInt64, now: TimeInterval) {
+        guard let identity, inFlight != nil else { return }
+        inFlight?.receipt = CommandReceipt(
+            sequence: sequence, trackID: identity.trackID, generation: identity.generation,
+            connectionEpoch: identity.connectionEpoch, serverSessionID: identity.serverSessionID, sentAt: now
+        )
+    }
+
+    /// A transport refusal before sending is safe to release. A timeout is not.
     mutating func commandNotSent() { inFlight = nil }
 
-    mutating func cancelDesired() { desired = nil }
+    mutating func commandSendFailed() {
+        commandNotSent()
+        cancelDesired()
+        controlState = .failed
+    }
+
+    @discardableResult
+    mutating func receiveCommandError(_ payload: BLECommandErrorPayload,
+                                     connectionEpoch: UInt64, serverSessionID: String) -> Bool {
+        guard let receipt, payload.sequence == receipt.sequence, payload.command == "PLAY_PAUSE",
+              connectionEpoch == receipt.connectionEpoch, serverSessionID == receipt.serverSessionID,
+              payload.trackId == nil || payload.trackId == receipt.trackID,
+              payload.generation == nil || payload.generation == receipt.generation,
+              payload.metadata == nil || payload.metadata?.sessionId == receipt.serverSessionID else { return false }
+        // Sony's protocol dispatcher returns before executing an unknown command.
+        // ATT errors, retryable flags and arbitrary business errors prove nothing
+        // about a non-idempotent toggle's execution and must keep the reservation.
+        if payload.domain == .protocol, payload.code == "unknown_command" {
+            inFlight = nil
+            cancelDesired()
+            rejectedAtRevision = confirmedRevision
+            controlState = .failed
+            stateQueryNeeded = true
+        } else {
+            markUnknown()
+        }
+        return true
+    }
+
+    mutating func expire(now: TimeInterval) {
+        if let receipt, now >= receipt.sentAt + confirmationTimeout { markUnknown() }
+        if let desiredExpiresAt, now >= desiredExpiresAt {
+            cancelDesired()
+            if inFlight == nil { controlState = .failed }
+        }
+    }
+
+    mutating func takeStateQuery() -> Bool {
+        let needed = stateQueryNeeded
+        stateQueryNeeded = false
+        return needed
+    }
+
+    mutating func cancelDesired() {
+        desired = nil
+        desiredExpiresAt = nil
+        if inFlight == nil, rejectedAtRevision == nil { controlState = .idle }
+    }
+
+    private mutating func markUnknown() {
+        guard controlState != .unknown else { return }
+        cancelDesired()
+        controlState = .unknown
+        stateQueryNeeded = true
+    }
 
     mutating func clear() {
         identity = nil
         desired = nil
+        desiredExpiresAt = nil
         confirmed = nil
         confirmedRevision = 0
         inFlight = nil
+        rejectedAtRevision = nil
+        stateQueryNeeded = false
+        controlState = .idle
     }
 
-    private mutating func adoptIdentity(_ snapshot: LyricsPresentationSnapshot) {
-        if identity?.trackID != snapshot.trackID || identity?.generation != snapshot.trackGeneration {
+    private mutating func adoptIdentity(_ snapshot: LyricsPresentationSnapshot,
+                                       connectionEpoch: UInt64, serverSessionID: String) {
+        if identity?.trackID != snapshot.trackID || identity?.generation != snapshot.trackGeneration ||
+            identity?.connectionEpoch != connectionEpoch || identity?.serverSessionID != serverSessionID {
             clear()
-            identity = (snapshot.trackID, snapshot.trackGeneration)
+            identity = (snapshot.trackID, snapshot.trackGeneration, connectionEpoch, serverSessionID)
         }
     }
 
@@ -192,18 +308,21 @@ struct LyricsPlaybackTargetPolicy {
         guard confirmed == nil || revision > confirmedRevision else { return }
         confirmed = snapshot.isPlaying
         confirmedRevision = revision
+        if let rejectedAtRevision, revision > rejectedAtRevision { self.rejectedAtRevision = nil }
         if let inFlight, revision > inFlight.confirmationRevision, snapshot.isPlaying == inFlight.target {
             self.inFlight = nil
+            controlState = .idle
         }
     }
 
     private mutating func reserveCommand() -> Bool {
         guard let desired, let confirmed, inFlight == nil else { return false }
         guard desired != confirmed else {
-            self.desired = nil
+            cancelDesired()
             return false
         }
-        inFlight = (desired, confirmedRevision)
+        inFlight = InFlight(target: desired, confirmationRevision: confirmedRevision)
+        controlState = .pending
         return true
     }
 }

@@ -386,10 +386,16 @@ extension LyricsPictureInPictureController: AVPictureInPictureSampleBufferPlayba
         Task { @MainActor [weak self] in
             guard let self, self.controller === pip, self.state == .active, self.lifecycle.enabled,
                   self.playbackStatus.acceptsControls(owner: ObjectIdentifier(pip)) else { return }
-            if self.setPlaying?(playing) != true {
-                self.reason = AppLocalization.string("播放状态未同步，无法执行控制")
+            let accepted = self.setPlaying?(playing) == true
+            if !accepted {
+                // A known control failure/unknown result is displayed in the
+                // snapshot. Keep the fallback for an unavailable source only.
+                if self.snapshotProvider?().playbackControlState == .idle {
+                    self.reason = AppLocalization.string("播放状态未同步，无法执行控制")
+                }
                 pip.invalidatePlaybackState()
             }
+            if let snapshot = self.snapshotProvider?() { self.update(snapshot, force: true) }
         }
     }
 

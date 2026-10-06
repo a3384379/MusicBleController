@@ -1,6 +1,25 @@
 @preconcurrency import ActivityKit
 import Foundation
 
+/// Ending resources is independent of the publication epoch: an end() must
+/// finish already scheduled cleanup, while a newly selected target is protected.
+@MainActor
+final class LiveActivityCleanupQueue {
+    private var activityIDs: Set<String> = []
+
+    func contains(_ id: String) -> Bool { activityIDs.contains(id) }
+
+    func enqueue(id: String, canEnd: @escaping () -> Bool = { true },
+                 end: @escaping () async -> Void) {
+        guard activityIDs.insert(id).inserted else { return }
+        Task {
+            defer { activityIDs.remove(id) }
+            guard canEnd() else { return }
+            await end()
+        }
+    }
+}
+
 @MainActor
 final class LiveActivityManager {
     static let shared = LiveActivityManager()
@@ -14,6 +33,8 @@ final class LiveActivityManager {
 
     private var activity: Activity<SonyMusicActivityAttributes>?
     private var activityStateTask: Task<Void, Never>?
+    private var publicationTask: Task<Void, Never>?
+    private let activityCleanup = LiveActivityCleanupQueue()
     private var latestState: SonyMusicActivityAttributes.ContentState?
     private var latestReason = "unknown"
     private var latestForce = false
@@ -147,6 +168,8 @@ final class LiveActivityManager {
 
     func end(logger: ((String) -> Void)? = nil) {
         publicationEpoch &+= 1
+        publicationTask?.cancel()
+        publicationTask = nil
         updateInFlight = false
         debounceTask?.cancel()
         debounceTask = nil
@@ -161,11 +184,11 @@ final class LiveActivityManager {
         let state = lastSentState
         lastSentState = nil
         lastSentVersion = 0
-        guard let activity else { return }
-        self.activity = nil
         activityStateTask?.cancel()
         activityStateTask = nil
-        Task {
+        guard let activity else { return }
+        self.activity = nil
+        activityCleanup.enqueue(id: activity.id) {
             if let state {
                 await activity.end(
                     ActivityContent(state: state, staleDate: nil),
@@ -399,16 +422,16 @@ final class LiveActivityManager {
         }
         updateInFlight = true
         let epoch = publicationEpoch
-        let backgroundTask = BoundedBackgroundTask(name: "Live Activity update")
-
-        Task { [weak self] in
+        publicationTask = Task { [weak self] in
+            guard !Task.isCancelled, let self, self.publicationEpoch == epoch else { return }
+            let backgroundTask = BoundedBackgroundTask(name: "Live Activity update")
             defer { backgroundTask.end() }
-            guard let self else { return }
             let startedAt = Date()
             logger?("[LiveActivityPerf] update start reason=\(reason)")
             logger?("[LiveActivityState] update start version=\(version)")
             let published = await self.publish(state, epoch: epoch, logger: logger)
-            guard self.publicationEpoch == epoch else { return }
+            guard !Task.isCancelled, self.publicationEpoch == epoch else { return }
+            self.publicationTask = nil
             if published {
                 self.lastSentState = state
                 self.lastSentVersion = version
@@ -442,36 +465,44 @@ final class LiveActivityManager {
         epoch: UInt64,
         logger: ((String) -> Void)?
     ) async -> Bool {
+        guard !Task.isCancelled, publicationEpoch == epoch else { return false }
         if let statePublisher { return await statePublisher(state) }
-        guard let target = await ensureActivity(for: state, logger: logger) else { return false }
+        guard let target = await ensureActivity(for: state, epoch: epoch, logger: logger),
+              !Task.isCancelled, publicationEpoch == epoch, activity?.id == target.id,
+              target.activityState == .active || target.activityState == .stale else { return false }
         await target.update(ActivityContent(state: state, staleDate: staleDate(for: state)))
-        guard publicationEpoch == epoch else { return false }
+        guard !Task.isCancelled, publicationEpoch == epoch, activity?.id == target.id,
+              target.activityState == .active || target.activityState == .stale else { return false }
         activity = target
         return true
     }
 
     private func ensureActivity(
         for state: SonyMusicActivityAttributes.ContentState,
+        epoch: UInt64,
         logger: ((String) -> Void)?
     ) async -> Activity<SonyMusicActivityAttributes>? {
+        guard !Task.isCancelled, publicationEpoch == epoch else { return nil }
         if let activity {
-            endDuplicateActivities(keeping: activity.id, logger: logger)
+            endDuplicateActivities(keeping: activity.id, epoch: epoch, logger: logger)
             return activity
         }
 
         logger?("[LiveActivity] activity missing, lookup existing")
-        if let existing = restoreExistingActivity(logger: logger) {
+        if let existing = restoreExistingActivity(epoch: epoch, logger: logger) {
             return existing
         }
 
-        return await start(state: state, logger: logger)
+        return await start(state: state, epoch: epoch, logger: logger)
     }
 
     private func start(
         state: SonyMusicActivityAttributes.ContentState,
+        epoch: UInt64,
         logger: ((String) -> Void)?
     ) async -> Activity<SonyMusicActivityAttributes>? {
-        if let existing = restoreExistingActivity(logger: logger) {
+        guard !Task.isCancelled, publicationEpoch == epoch else { return nil }
+        if let existing = restoreExistingActivity(epoch: epoch, logger: logger) {
             return existing
         }
         if startInFlight {
@@ -494,7 +525,7 @@ final class LiveActivityManager {
                 pushType: nil
             )
             activity = requested
-            observeStateUpdates(for: requested, logger: logger)
+            observeStateUpdates(for: requested, epoch: epoch, logger: logger)
             logger?("[LiveActivity] start id=\(requested.id)")
             return requested
         } catch {
@@ -505,25 +536,33 @@ final class LiveActivityManager {
     }
 
     private func restoreExistingActivity(
+        epoch: UInt64,
         logger: ((String) -> Void)?
     ) -> Activity<SonyMusicActivityAttributes>? {
+        guard !Task.isCancelled, publicationEpoch == epoch else { return nil }
         let activities = Activity<SonyMusicActivityAttributes>.activities
-        guard let existing = activities.first else { return nil }
+        guard let existing = activities.first(where: {
+            !activityCleanup.contains($0.id) && ($0.activityState == .active || $0.activityState == .stale)
+        }) else { return nil }
         activity = existing
-        observeStateUpdates(for: existing, logger: logger)
-        endDuplicateActivities(keeping: existing.id, logger: logger)
+        observeStateUpdates(for: existing, epoch: epoch, logger: logger)
+        endDuplicateActivities(keeping: existing.id, epoch: epoch, logger: logger)
         logger?("[LiveActivity] existing restored id=\(existing.id)")
         return existing
     }
 
     private func endDuplicateActivities(
         keeping activityID: String?,
+        epoch: UInt64,
         logger: ((String) -> Void)?
     ) {
+        guard !Task.isCancelled, publicationEpoch == epoch else { return }
         for duplicate in Activity<SonyMusicActivityAttributes>.activities
-            where duplicate.id != activityID {
+            where duplicate.id != activityID && !activityCleanup.contains(duplicate.id) {
             logger?("[LiveActivity] duplicate activity ending id=\(duplicate.id)")
-            Task {
+            activityCleanup.enqueue(id: duplicate.id, canEnd: { [weak self] in
+                self?.activity?.id != duplicate.id
+            }) {
                 await duplicate.end(nil, dismissalPolicy: .immediate)
             }
         }
@@ -531,20 +570,21 @@ final class LiveActivityManager {
 
     private func observeStateUpdates(
         for activity: Activity<SonyMusicActivityAttributes>,
+        epoch: UInt64,
         logger: ((String) -> Void)?
     ) {
         activityStateTask?.cancel()
         activityStateTask = Task { [weak self] in
             for await state in activity.activityStateUpdates {
                 await MainActor.run {
+                    guard !Task.isCancelled, let self, self.publicationEpoch == epoch,
+                          self.activity?.id == activity.id else { return }
                     logger?("[LiveActivity] state changed state=\(state)")
                     if state == .active || state == .stale {
-                        self?.activity = activity
+                        self.activity = activity
                     } else if state == .ended || state == .dismissed {
-                        if self?.activity?.id == activity.id {
-                            self?.activity = nil
-                        }
-                        self?.startCooldownUntil = Date().addingTimeInterval(5)
+                        self.activity = nil
+                        self.startCooldownUntil = Date().addingTimeInterval(5)
                     }
                 }
             }

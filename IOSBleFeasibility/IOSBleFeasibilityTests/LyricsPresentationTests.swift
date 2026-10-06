@@ -311,6 +311,118 @@ final class LyricsPresentationTests: XCTestCase {
     }
 
     @MainActor
+    func testScheduledDuplicateCleanupFinishesAfterCurrentSessionEnds() async throws {
+        let cleanup = LiveActivityCleanupQueue()
+        var currentID: String? = "current"
+        var ended = 0
+        cleanup.enqueue(id: "duplicate", canEnd: { currentID != "duplicate" }) { ended += 1 }
+        XCTAssertTrue(cleanup.contains("duplicate"))
+        // The session ends in the same MainActor slice, before cleanup starts.
+        currentID = nil
+        try await waitUntil { ended == 1 }
+        XCTAssertFalse(cleanup.contains("duplicate"))
+    }
+
+    @MainActor
+    func testScheduledDuplicateCleanupCannotEndNewlySelectedActivity() async throws {
+        let cleanup = LiveActivityCleanupQueue()
+        var currentID = "old current"
+        var ended = 0
+        cleanup.enqueue(id: "duplicate", canEnd: { currentID != "duplicate" }) { ended += 1 }
+        currentID = "duplicate"
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(ended, 0)
+        XCTAssertFalse(cleanup.contains("duplicate"))
+    }
+
+    @MainActor
+    func testActivityRemainsExcludedUntilItsSingleCleanupCompletes() async throws {
+        let cleanup = LiveActivityCleanupQueue()
+        var ends = 0
+        var completion: CheckedContinuation<Void, Never>?
+        cleanup.enqueue(id: "ending") {
+            ends += 1
+            await withCheckedContinuation { completion = $0 }
+        }
+        cleanup.enqueue(id: "ending") { ends += 1 }
+        try await waitUntil { completion != nil }
+        XCTAssertEqual(ends, 1)
+        XCTAssertTrue(cleanup.contains("ending"))
+        completion?.resume()
+        try await waitUntil { !cleanup.contains("ending") }
+        XCTAssertEqual(ends, 1)
+    }
+
+    @MainActor
+    func testEndBeforePublicationTaskStartsNeverEntersPublisher() async throws {
+        let sink = ActivityPublicationRecorder()
+        let manager = activityManager(sink)
+        publishFixture(manager)
+        manager.end()
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(sink.states.count, 0)
+    }
+
+    @MainActor
+    func testSentPlaybackRejectionRequiresFreshStateAndExplicitRetry() {
+        var sequences: [UInt64] = []
+        let manager = BLETestManager(automaticallyStartBluetooth: false,
+                                    floatingPlaybackCommandSender: { _, sequence, _ in
+            sequences.append(sequence)
+            return .sent
+        })
+        let id = "lyrics-terminal-error-\(UUID().uuidString)"
+        manager.configureResponseTests(trackID: id)
+        manager.commandSenderForTesting = { _, _ in true }
+        manager.receiveStatusForTesting(["type": "clientCapabilitiesAck", "protocolVersion": 3,
+                                         "f2": 0, "f3": 2, "sid": "1234abcd"])
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertEqual(manager.lyricsStore.floatingPlaybackControlState, .pending)
+        manager.receiveStatusForTesting(["type": "commandError", "cmd": "PLAY_PAUSE",
+                                         "seq": String(sequences[0]), "domain": "protocol",
+                                         "code": "unknown_command", "retryable": false, "trackId": id])
+        XCTAssertEqual(manager.lyricsStore.floatingPlaybackControlState, .failed)
+        XCTAssertFalse(manager.requestFloatingLyricsPlayback(false), "A report from before the rejection is insufficient")
+        receivePlayback(manager, playing: true)
+        XCTAssertEqual(sequences.count, 1, "Failure must not automatically repeat the toggle")
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertEqual(sequences.count, 2, "A proved rejection must allow an explicit retry after fresh state")
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testImmediateEndAndRestartOnlyPublishesNewSession() async throws {
+        let sink = ActivityPublicationRecorder()
+        let manager = activityManager(sink)
+        publishFixture(manager, lyric: "obsolete")
+        manager.end()
+        publishFixture(manager, lyric: "new session")
+        try await waitUntil { !sink.states.isEmpty }
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(sink.states.map(\.lyric), ["new session"])
+    }
+
+    @MainActor
+    func testOldCompletionCannotReleaseNewSessionPublication() async throws {
+        let sink = ActivityPublicationRecorder(suspended: true)
+        let manager = activityManager(sink)
+        publishFixture(manager, lyric: "old")
+        try await waitUntil { sink.states.count == 1 }
+        manager.end()
+        publishFixture(manager, lyric: "new")
+        try await waitUntil { sink.states.count == 2 }
+        publishFixture(manager, lyric: "new latest")
+        sink.completeNext()
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(sink.states.map(\.lyric), ["old", "new"])
+        sink.completeNext()
+        try await waitUntil { sink.states.count == 3 }
+        XCTAssertEqual(sink.states.map(\.lyric), ["old", "new", "new latest"])
+        sink.completeNext()
+    }
+
+    @MainActor
     func testEndedActivityRejectsLateCompletionAndPendingContent() async throws {
         let sink = ActivityPublicationRecorder(suspended: true)
         let manager = activityManager(sink)
@@ -398,6 +510,10 @@ final class LyricsPresentationTests: XCTestCase {
         // A legitimate legacy packet has a position but no clock fields.
         receivePlayback(manager, playing: false)
         XCTAssertEqual(manager.makeLyricsPresentationSnapshot().validUntilUptime, 356)
+        // The accepted legacy sample releases the first reservation, but a
+        // 46-second-old unsent intent must not be executed automatically.
+        XCTAssertEqual(commands, [.playPause])
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(true))
         XCTAssertEqual(commands, [.playPause, .playPause])
         manager.disconnectResponseTests()
     }
@@ -459,6 +575,201 @@ final class LyricsPresentationTests: XCTestCase {
         XCTAssertTrue(manager.requestFloatingLyricsPlayback(true))
         receivePlayback(manager, playing: false)
         XCTAssertEqual(sent, 2)
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testUnexecutedToggleBecomesUnknownWithOneQueryAndNoBlindRetry() {
+        var now: TimeInterval = 10
+        var sent = 0
+        var queries = 0
+        let manager = BLETestManager(automaticallyStartBluetooth: false, lyricsPresentationUptime: { now },
+                                    floatingPlaybackCommandSender: { _, _, _ in sent += 1; return .sent })
+        manager.configureResponseTests(trackID: "lyrics-unknown-\(UUID().uuidString)")
+        manager.commandSenderForTesting = { command, _ in
+            if command == "GET_PLAYBACK_STATE" { queries += 1 }
+            return true
+        }
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(true))
+        now = 19
+        for _ in 0..<20 {
+            receivePlayback(manager, playing: true)
+            XCTAssertFalse(manager.requestFloatingLyricsPlayback(false))
+        }
+        XCTAssertEqual(sent, 1)
+        XCTAssertEqual(queries, 1)
+        XCTAssertEqual(manager.lyricsStore.floatingPlaybackControlState, .unknown)
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().playbackControlState, .unknown)
+        XCTAssertFalse(manager.lyricsStore.floatingPlaybackControlState.message.isEmpty)
+        // A late confirmation can resolve the sent command, but not revive the
+        // expired final play intent. Later Sony-side changes remain authoritative.
+        receivePlayback(manager, playing: false)
+        XCTAssertEqual(manager.lyricsStore.floatingPlaybackControlState, .idle)
+        receivePlayback(manager, playing: true)
+        XCTAssertEqual(sent, 1)
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testMissingReportsReachUnknownWithoutAnotherUserRequest() async throws {
+        var sent = 0
+        var queries = 0
+        let manager = BLETestManager(automaticallyStartBluetooth: false,
+                                    floatingPlaybackCommandSender: { _, _, _ in sent += 1; return .sent },
+                                    floatingPlaybackConfirmationTimeout: 0.06)
+        manager.configureResponseTests(trackID: "lyrics-missing-report-\(UUID().uuidString)")
+        manager.commandSenderForTesting = { command, _ in
+            if command == "GET_PLAYBACK_STATE" { queries += 1 }
+            return true
+        }
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        try await waitUntil { manager.lyricsStore.floatingPlaybackControlState == .unknown }
+        XCTAssertEqual(queries, 1)
+        XCTAssertEqual(sent, 1)
+        receivePlayback(manager, playing: true)
+        XCTAssertFalse(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertEqual(queries, 1)
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testUnclassifiedCommandErrorKeepsToggleReservation() {
+        var sequences: [UInt64] = []
+        let manager = playbackErrorFixture { sequences.append($0) }
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        receivePlaybackError(manager, sequence: sequences[0], code: "execution_failed", domain: "connection")
+        XCTAssertEqual(manager.lyricsStore.floatingPlaybackControlState, .unknown)
+        receivePlayback(manager, playing: true)
+        XCTAssertFalse(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertEqual(sequences.count, 1)
+        // Only a correlated error with known pre-execution semantics can release
+        // the ambiguous command, and then a fresh report is still required.
+        receivePlaybackError(manager, sequence: sequences[0])
+        XCTAssertFalse(manager.requestFloatingLyricsPlayback(false))
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertEqual(sequences.count, 2)
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testOldSequencesGenerationsAndSessionsCannotFailCurrentCommand() {
+        var sequences: [UInt64] = []
+        let manager = playbackErrorFixture { sequences.append($0) }
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        receivePlaybackError(manager, sequence: sequences[0] + 100)
+        receivePlaybackError(manager, sequence: sequences[0], generation: 2)
+        receivePlaybackError(manager, sequence: sequences[0], sessionID: "8765dcba")
+        XCTAssertEqual(manager.serverSessionId, "1234abcd")
+        XCTAssertEqual(manager.lyricsStore.floatingPlaybackControlState, .pending)
+        receivePlayback(manager, playing: false)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(true))
+        receivePlaybackError(manager, sequence: sequences[0])
+        XCTAssertEqual(manager.lyricsStore.floatingPlaybackControlState, .pending)
+        manager.disconnectResponseTests()
+        manager.configureResponseTests(trackID: "error-fixture")
+        manager.receiveStatusForTesting(["type": "clientCapabilitiesAck", "protocolVersion": 3,
+                                         "f2": 0, "f3": 3, "sid": "1234abcd"])
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        receivePlaybackError(manager, sequence: sequences[1])
+        XCTAssertEqual(manager.lyricsStore.floatingPlaybackControlState, .pending)
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertEqual(sequences.count, 3)
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testOldServerSessionReportCannotConfirmCurrentToggle() {
+        var sequences: [UInt64] = []
+        let manager = playbackErrorFixture { sequences.append($0) }
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(true))
+        manager.receiveStatusForTesting(["type": "playbackState", "playing": false, "position": 1_000,
+                                         "duration": 30_000, "sid": "8765dcba", "es": 1])
+        XCTAssertEqual(sequences.count, 1)
+        XCTAssertFalse(manager.makeLyricsPresentationSnapshot().hasAuthoritativePlayback)
+        manager.receiveStatusForTesting(["type": "playbackState", "playing": true, "position": 1_000,
+                                         "duration": 30_000, "sid": "1234abcd", "es": 2])
+        XCTAssertEqual(sequences.count, 1)
+        XCTAssertEqual(manager.lyricsStore.floatingPlaybackControlState, .pending)
+        receivePlayback(manager, playing: false)
+        XCTAssertEqual(sequences.count, 2)
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testOldConnectionQueuedReportCannotConfirmNewCommand() async throws {
+        var sequences: [UInt64] = []
+        let manager = playbackErrorFixture { sequences.append($0) }
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        let queued = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            manager.receiveStatusForTesting(["type": "playbackState", "playing": false,
+                                             "position": 1_000, "duration": 30_000])
+            queued.signal()
+        }
+        XCTAssertEqual(queued.wait(timeout: .now() + 2), .success)
+        manager.disconnectResponseTests()
+        manager.configureResponseTests(trackID: "error-fixture")
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(true))
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertTrue(manager.makeLyricsPresentationSnapshot().isPlaying)
+        XCTAssertEqual(sequences.count, 2)
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testStopAndReopenPreserveUnknownProtectionAndReconnectAllowsExplicitRecovery() {
+        var now: TimeInterval = 10
+        var sent = 0
+        let manager = BLETestManager(automaticallyStartBluetooth: false, lyricsPresentationUptime: { now },
+                                    floatingPlaybackCommandSender: { _, _, _ in sent += 1; return .sent })
+        manager.commandSenderForTesting = { _, _ in true }
+        manager.configureResponseTests(trackID: "lyrics-reopen-\(UUID().uuidString)")
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(true))
+        manager.cancelFloatingLyricsPlaybackIntent()
+        XCTAssertEqual(sent, 1)
+        now = 20
+        receivePlayback(manager, playing: true)
+        XCTAssertFalse(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertEqual(manager.lyricsStore.floatingPlaybackControlState, .unknown)
+        manager.disconnectResponseTests()
+        manager.configureResponseTests(trackID: "lyrics-reconnected")
+        XCTAssertFalse(manager.requestFloatingLyricsPlayback(false))
+        receivePlayback(manager, playing: true)
+        XCTAssertEqual(sent, 1, "Reconnect must not replay an old intent")
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        XCTAssertEqual(sent, 2)
+        manager.disconnectResponseTests()
+    }
+
+    @MainActor
+    func testDeferredUnsentIntentExpiresInsteadOfExecutingMuchLater() async throws {
+        var now: TimeInterval = 10
+        var attempts = 0
+        let manager = BLETestManager(automaticallyStartBluetooth: false, lyricsPresentationUptime: { now },
+                                    floatingPlaybackCommandSender: { _, _, _ in attempts += 1; return .debounced })
+        manager.configureResponseTests(trackID: "lyrics-expired-unsent-\(UUID().uuidString)")
+        receivePlayback(manager, playing: true)
+        XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
+        now = 20
+        receivePlayback(manager, playing: true)
+        try await Task.sleep(nanoseconds: 800_000_000)
+        XCTAssertEqual(attempts, 1)
+        XCTAssertEqual(manager.lyricsStore.floatingPlaybackControlState, .failed)
         manager.disconnectResponseTests()
     }
 
@@ -552,6 +863,38 @@ final class LyricsPresentationTests: XCTestCase {
         XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
         XCTAssertEqual(attempts, 2)
         manager.disconnectResponseTests()
+    }
+
+    func testUnknownControlFeedbackIsRenderedWithoutChangingLyricIdentity() throws {
+        let renderer = LyricsSampleBufferRenderer()
+        let normal = snapshot()
+        var unknown = normal
+        unknown.playbackControlState = .unknown
+        XCTAssertEqual(normal.key, unknown.key, "Control feedback must not increase ActivityKit lyric publication")
+        let plain = try renderer.render(normal)
+        let feedback = try renderer.render(unknown)
+        func brightFooterPixels(_ sample: CMSampleBuffer) throws -> Int {
+            let buffer = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
+            CVPixelBufferLockBaseAddress(buffer, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+            let bytes = try XCTUnwrap(CVPixelBufferGetBaseAddress(buffer)).assumingMemoryBound(to: UInt8.self)
+            let stride = CVPixelBufferGetBytesPerRow(buffer)
+            return (312..<360).reduce(0) { count, row in
+                count + (36..<604).filter { column in
+                    let index = row * stride + column * 4
+                    return bytes[index] > 100 && bytes[index + 1] > 100 && bytes[index + 2] > 100
+                }.count
+            }
+        }
+        XCTAssertEqual(try brightFooterPixels(plain), 0)
+        XCTAssertGreaterThan(try brightFooterPixels(feedback), 100)
+        let buffer = try XCTUnwrap(CMSampleBufferGetImageBuffer(feedback))
+        let image = CIImage(cvPixelBuffer: buffer)
+        let cgImage = try XCTUnwrap(CIContext().createCGImage(image, from: image.extent))
+        let attachment = XCTAttachment(image: UIImage(cgImage: cgImage))
+        attachment.name = "floating-lyrics-unknown-control-feedback"
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     func testSampleBufferPixelsAndTimestampsRemainValidAcrossBackwardSeek() throws {
@@ -705,6 +1048,31 @@ final class LyricsPresentationTests: XCTestCase {
     private func receivePlayback(_ manager: BLETestManager, playing: Bool, position: Int64 = 1_000) {
         manager.receiveStatusForTesting(["type": "playbackState", "playing": playing, "position": position,
                                          "duration": 30_000, "lyric": "fixture lyric"])
+    }
+
+    @MainActor
+    private func playbackErrorFixture(recordSequence: @escaping (UInt64) -> Void) -> BLETestManager {
+        let manager = BLETestManager(automaticallyStartBluetooth: false,
+                                    floatingPlaybackCommandSender: { _, sequence, _ in
+            recordSequence(sequence)
+            return .sent
+        })
+        manager.configureResponseTests(trackID: "error-fixture")
+        manager.commandSenderForTesting = { _, _ in true }
+        manager.receiveStatusForTesting(["type": "clientCapabilitiesAck", "protocolVersion": 3,
+                                         "f2": 0, "f3": 3, "sid": "1234abcd"])
+        manager.receiveStatusForTesting(["type": "trackInfo", "trackId": "error-fixture", "generation": 1,
+                                         "title": "Fixture", "artist": "Artist"])
+        return manager
+    }
+
+    private func receivePlaybackError(_ manager: BLETestManager, sequence: UInt64,
+                                      generation: Int = 1, sessionID: String = "1234abcd",
+                                      code: String = "unknown_command", domain: String = "protocol") {
+        manager.receiveStatusForTesting(["type": "commandError", "cmd": "PLAY_PAUSE", "seq": String(sequence),
+                                         "domain": domain, "code": code, "retryable": false,
+                                         "trackId": "error-fixture", "generation": generation,
+                                         "sid": sessionID, "es": sequence])
     }
 
     private func synchronizedClock() -> MonotonicClockSynchronizer {
