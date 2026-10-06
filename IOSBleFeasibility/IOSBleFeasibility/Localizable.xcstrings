@@ -1,6 +1,9 @@
 {
   "sourceLanguage" : "zh-Hans",
   "strings" : {
+    "播放控制已发送，等待确认" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Playback control sent. Waiting for confirmation."}}}},
+    "播放控制结果未知，请回到应用重新连接后重试" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Playback result unknown. Return to the app, reconnect, then try again."}}}},
+    "播放控制未执行，状态同步后可重试" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Playback control was not executed. Sync the state, then try again."}}}},
     "灵动岛显示歌词" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Show lyrics in Dynamic Island"}}}},
     "在紧凑态优先显示当前歌词；长句会截断，多活动时由系统选择最小态。" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Prioritize lyrics in the compact view. Long lines are truncated; the system chooses the minimal view when multiple activities compete."}}}},
     "悬浮歌词" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Floating lyrics"}}}},

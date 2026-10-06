@@ -185,3 +185,63 @@ BLE 协议、Sony/Android、偏好持久化格式、Widget 布局及工程配置
 
 用户明确要求按本轮审计修改后提交并合并 GitHub，继续按该授权执行。
 本地自动化通过与设备验收未通过分别保留，合并不等于真机验收或发布通过。
+
+## 2026-10-06 最新审计 N1/N2 收尾
+
+审计来源为[新的分享对话](https://chatgpt.com/share/6ac43a6b-7e20-83e9-aea7-0d6506220344)，
+实际远端与开发基线均为 `b57ba7f0893a8fa0cc7353f1ab639b4e39726745`。
+分支为 `codex/ios-lyrics-audit-n1-n2`。本轮不重做已关闭的 R1～R3 或 R4 正常协调路径，保留 R5。
+开始时主工作目录干净；PR #12 已交付的六项修改及其备份 stash 均不重复应用。
+
+### N1：发送后的明确拒绝与未知结果
+
+- `LyricsPlaybackTargetPolicy` 记录实际命令 `seq`、歌曲/代际、连接 epoch、协商的 Sony 会话以及单调发送时间。
+  `.sent` 表示发送入口接受，不是媒体执行成功；`sendLiveActivityCommand` 也开始检查实际入队返回值。
+- `handleStructuredCommandError` 接回同一策略。只有匹配请求的 `protocol/unknown_command` 被视为明确未执行：
+  Sony 分发器在该错误分支返回，没有执行媒体命令。释放后取消旧意图，要求失败之后的新有效播放回报，再由用户显式重试。
+  `retryable`、ATT 回调、未知业务错误、相同状态和超时均不能证明未执行，不据此释放 toggle 保护。
+- 已发送命令八秒未确认，或收到匹配但语义不明确的错误，进入 `unknown`，取消未发送的最后意图，并查询一次既有
+  `GET_PLAYBACK_STATE`。持续相同回报和重复请求不会再查询或再 toggle。若随后收到明确拒绝，可再查询一次以恢复可重试状态；没有轮询循环。
+- 未发送意图同样有八秒期限。PiP 停止取消未发送意图、保留已发送命令的保护及有界结果期限；重开不盲重发。
+  迟到的目标确认可以结束原命令，但不会执行已过期的后续意图，也不会对抗之后的 Sony 手动控制。
+- `LyricsStore` 与展示快照携带待确认/未知/失败提示。PiP 使用已有 1Hz active 心跳更新底部提示，应用内展示相同状态，
+  未知状态提供已有手动重新连接入口。重新连接取消旧意图，新的有效采样之后仍需用户重新操作。
+  控制提示不进入歌词语义 key，不增加 ActivityKit 歌词发布频率。
+- 异步接收入口及主线程应用检查连接 epoch；错误检查 seq、代际和会话。旧会话播放采样不能确认当前 PiP 命令，
+  但不以 `es` 全局丢弃其他状态。无 `sid` 或时钟字段的合法旧协议继续使用既有回退。
+
+当前协议没有媒体操作的逐命令成功 ACK，也没有为 Sony 找不到媒体控制器的直接返回路径发送业务失败。
+因此这一路只能安全显示结果未知并提供恢复入口，不能声称状态查询或重新连接证明了原操作未执行。
+本次没有新增协议字段、错误码或 Sony 执行行为。
+
+### N2：发布副作用之前检查生命周期身份
+
+`LiveActivityManager` 持有可取消的 publication Task，`end` 先失效 epoch 并取消任务和 observer。
+Task 启动、`publish` 入口、查找/恢复/创建活动前，以及 await 返回后下一次系统 update 前均检查 epoch 与取消状态。
+完成后仅当前 epoch 可以回写或推进队列；旧 observer 还必须匹配当前活动 ID。
+正在结束的活动 ID 不参与恢复，也不恢复 ended/dismissed 活动，旧重复活动清理任务不能结束新会话选中的活动。
+已经提交给 ActivityKit 的系统调用无法强制撤回，此修复保证旧任务不会继续产生下一项副作用或污染新会话。
+关闭紧凑歌词仍仅恢复原布局，不调用 `end`；关闭 PiP 不发送 Sony 暂停。
+
+### 回归证据与验收边界
+
+修复前先加入两项生产接入回归，并执行完整工程中的这两项 XCTest，均按预期失败：
+连续 `update → end` 后发布次数为 1（期望 0）；`.sent → 匹配明确拒绝 → 新状态 → 显式重试` 的命令数为 1（期望 2）。
+证据为 `/private/tmp/musicble-n1-n2-before.xcresult` 与 `/private/tmp/musicble-n1-n2-before.log`。
+
+| 检查 | 最终结果与证据 |
+|---|---|
+| 完整 iPhone 16 Pro / iOS 18.3 模拟器 XCTest | **首轮 PASS 117/117**：50 项歌词展示、67 项原稳定性测试。本轮新增 13 项，覆盖明确拒绝恢复、20 次同状态回报/请求、无回报期限、未知错误保护、旧 seq/代际/会话/连接隔离、停止重开与重连恢复、意图过期、实际提示像素，以及未启动/重开/在途完成生命周期。`/private/tmp/musicble-n1-n2-all.xcresult`、`/private/tmp/musicble-n1-n2-all.log` |
+| R3 与意图期限共同回归 | 陈旧采样仍不续期或确认 toggle，合法旧协议仍能恢复。46 秒后到达的合法确认只释放原命令；旧后续意图已过期，新的显式播放请求才发送第二条命令。这是增加过期语义，不放宽 R3 断言。 |
+| generic iOS App / Widget 构建 | **BUILD SUCCEEDED**，无 Swift 源码编译警告；`/private/tmp/musicble-n1-n2-device-build.log` |
+| 真实渲染器附件 | 新 unknown 提示确实进入 640×360 像素缓冲，已导出并目视检查；文字、背景和原歌词区域正常。附件名 `floating-lyrics-unknown-control-feedback`，不是系统 PiP 窗口验收。 |
+| quick smoke | **overall FAIL，Required 2/6**；两个 PASS 是 quick 跳过构建/安装。`Tm iPhone` 仍 unavailable，CoreDevice 无法定位设备，启动、日志、偏好和容器未验证；三个可选链路 SKIPPED。`/private/tmp/musicble-n1-n2-quick-smoke/report.json`、`ios_launch_stderr.log` |
+| full smoke / 本地 Android build | 本轮未触及启动、安装、UserDefaults、日志系统或工程设置，**不要求 full smoke**；没有 Android/Sony 改动，**不要求本地 Android build**。GitHub iOS/Android CI 应按实际提交另外核对，不能以旧 master CI 代替。 |
+| 图谱与差异 | 修改前核对索引、精确符号、调用路径并读取真实源码。修改后完整索引成功（8231 nodes / 43869 edges），调用图显示错误入口接入策略；当前接口未暴露 `list_projects/index_status/detect_changes`，使用完整索引、实际差异与调用位置复核。`git diff --check`、String Catalog JSON 检查通过；未生成仓库内图谱文件。 |
+| 首轮/重试口径 | 本次最终本地 117 项首轮通过，没有为通过而重复执行完整测试。原快照存储 `load == nil` 的历史 CI 间歇失败未在本次最终本地轮次出现，也未在本轮修复；后续 CI 首轮与自动重试须分别报告。 |
+
+两项设置仍独立默认关闭；默认关闭不会启动 PiP/音频/渲染心跳，也不会创建控制结果期限任务或状态查询。
+新增有界任务只在用户提出 PiP 播放意图且命令入口接受后创建。BLE UUID、JSON/A1/A2/FullLyrics/secondary、
+Sony/Android、偏好格式、Widget 布局和工程配置不变。
+跨应用 PiP、灵动岛、多活动选择、Sony BLE、后台/锁屏、音频中断和长期运行仍未完成真机验收。
+用户在本会话已明确授权修改后提交并合并 GitHub；按该授权交付，保留 smoke 失败与真机待验边界。
