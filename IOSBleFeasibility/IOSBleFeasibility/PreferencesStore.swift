@@ -120,11 +120,44 @@ final class PreferencesStore: ObservableObject {
     }
 
     @Published var compactLyricsEnabled: Bool {
-        didSet { persistBool(compactLyricsEnabled, oldValue: oldValue, key: LyricsDisplayPreferences.compactKey) }
+        didSet {
+            guard compactLyricsEnabled != oldValue else { return }
+            logChanged(key: LyricsDisplayPreferences.compactKey, value: "\(compactLyricsEnabled)")
+        }
     }
 
     @Published var floatingLyricsEnabled: Bool {
-        didSet { persistBool(floatingLyricsEnabled, oldValue: oldValue, key: LyricsDisplayPreferences.floatingKey) }
+        didSet {
+            guard floatingLyricsEnabled != oldValue else { return }
+            logChanged(key: LyricsDisplayPreferences.floatingKey, value: "\(floatingLyricsEnabled)")
+        }
+    }
+
+    @Published var floatingLyricsLineMode: FloatingLyricsLineMode {
+        didSet {
+            guard floatingLyricsLineMode != oldValue else { return }
+            defaults.set(floatingLyricsLineMode.rawValue, forKey: FloatingLyricsLineMode.userDefaultsKey)
+            logChanged(key: FloatingLyricsLineMode.userDefaultsKey, value: floatingLyricsLineMode.rawValue)
+        }
+    }
+
+    @Published var floatingLyricsShowsTitle: Bool {
+        didSet {
+            persistBool(floatingLyricsShowsTitle, oldValue: oldValue, key: FloatingLyricsAppearance.titleKey)
+        }
+    }
+
+    @Published var floatingLyricsTheme: FloatingLyricsTheme {
+        didSet {
+            guard floatingLyricsTheme != oldValue else { return }
+            defaults.set(floatingLyricsTheme.rawValue, forKey: FloatingLyricsTheme.userDefaultsKey)
+            logChanged(key: FloatingLyricsTheme.userDefaultsKey, value: floatingLyricsTheme.rawValue)
+        }
+    }
+
+    var floatingLyricsAppearance: FloatingLyricsAppearance {
+        FloatingLyricsAppearance(lineMode: floatingLyricsLineMode, showsTitle: floatingLyricsShowsTitle,
+                                 theme: floatingLyricsTheme)
     }
 
     @Published var playbackPerformanceMode: PlaybackPerformanceMode {
@@ -168,6 +201,10 @@ final class PreferencesStore: ObservableObject {
         let lyricsDisplay = LyricsDisplayPreferences(defaults: defaults)
         compactLyricsEnabled = lyricsDisplay.compactEnabled
         floatingLyricsEnabled = lyricsDisplay.floatingEnabled
+        let floatingAppearance = FloatingLyricsAppearance(defaults: defaults)
+        floatingLyricsLineMode = floatingAppearance.lineMode
+        floatingLyricsShowsTitle = floatingAppearance.showsTitle
+        floatingLyricsTheme = floatingAppearance.theme
         playbackPerformanceMode = Self.loadPlaybackPerformanceMode(defaults: defaults)
         forceProtocolV2 = Self.loadBool(
             defaults: defaults,
@@ -203,9 +240,11 @@ final class PreferencesStore: ObservableObject {
         )
         artworkDisplaySize = Self.loadArtworkDisplaySize(defaults: defaults)
         dynamicIslandStyle = Self.loadDynamicIslandStyle(defaults: defaults)
-        let lyricsDisplay = LyricsDisplayPreferences(defaults: defaults)
-        compactLyricsEnabled = lyricsDisplay.compactEnabled
-        floatingLyricsEnabled = lyricsDisplay.floatingEnabled
+        // Reload saved appearance without changing an active display session.
+        let floatingAppearance = FloatingLyricsAppearance(defaults: defaults)
+        floatingLyricsLineMode = floatingAppearance.lineMode
+        floatingLyricsShowsTitle = floatingAppearance.showsTitle
+        floatingLyricsTheme = floatingAppearance.theme
         playbackPerformanceMode = Self.loadPlaybackPerformanceMode(defaults: defaults)
         forceProtocolV2 = Self.loadBool(
             defaults: defaults,
@@ -213,6 +252,17 @@ final class PreferencesStore: ObservableObject {
             defaultValue: false
         )
         logLoaded()
+    }
+
+    func updateFloatingLyricsWindowState(_ state: LyricsPiPStateMachine.State, startPending: Bool) {
+        switch state {
+        case .active:
+            floatingLyricsEnabled = true
+        case .disabled, .stopped, .unavailable, .failed:
+            if !startPending { floatingLyricsEnabled = false }
+        default:
+            break
+        }
     }
 
     func resetToDefaults() {
@@ -227,6 +277,9 @@ final class PreferencesStore: ObservableObject {
         dynamicIslandStyle = .defaultStyle
         compactLyricsEnabled = false
         floatingLyricsEnabled = false
+        floatingLyricsLineMode = .double
+        floatingLyricsShowsTitle = false
+        floatingLyricsTheme = .warm
         playbackPerformanceMode = .defaultMode
         forceProtocolV2 = false
     }
@@ -380,6 +433,8 @@ final class PreferencesStore: ObservableObject {
                 "artworkEnhancement=\(artworkEnhancementEnabled) " +
                 "artworkDisplaySize=\(artworkDisplaySize.rawValue) " +
                 "dynamicIslandStyle=\(dynamicIslandStyle.rawValue) " +
+                "compactLyrics=\(compactLyricsEnabled) floatingLyrics=\(floatingLyricsEnabled) " +
+                "floatingTheme=\(floatingLyricsTheme.rawValue) " +
                 "performanceMode=\(playbackPerformanceMode.rawValue) " +
                 "forceProtocolV2=\(forceProtocolV2)"
         )

@@ -7,6 +7,7 @@ struct PreferencesView: View {
     let onDismiss: () -> Void
 
     @State private var actionStatus = ""
+    @State private var showLyricsSettings = false
     private let signingProfile = ProvisioningProfileInfo.current
 
     var body: some View {
@@ -56,6 +57,11 @@ struct PreferencesView: View {
         }
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
+        .sheet(isPresented: $showLyricsSettings, onDismiss: {
+            LyricsPictureInPictureController.shared.cancelPendingStart()
+        }) {
+            LyricsDisplaySettingsView(manager: bleManager, onDismiss: { showLyricsSettings = false })
+        }
     }
 
     private var currentDeviceSection: some View {
@@ -146,20 +152,14 @@ struct PreferencesView: View {
 
     private var lyricSection: some View {
         PreferencesCard(title: "歌词", systemImage: "text.quote") {
-            Toggle("灵动岛显示歌词", isOn: $preferences.compactLyricsEnabled)
-                .tint(PlayerDesignTokens.stableAccent)
-            Text("在紧凑态优先显示当前歌词；长句会截断，多活动时由系统选择最小态。")
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.58))
-
-            Toggle("悬浮歌词", isOn: $preferences.floatingLyricsEnabled)
-                .tint(PlayerDesignTokens.stableAccent)
-            Text("通过系统画中画在其他应用上方显示歌词。关闭窗口不暂停 Sony 播放。")
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.58))
-            if preferences.floatingLyricsEnabled {
-                FloatingLyricsStatusView()
+            Button { showLyricsSettings = true } label: {
+                HStack {
+                    Text("歌词显示设置")
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.caption.weight(.semibold))
+                }
             }
+            .tint(PlayerDesignTokens.stableAccent)
 
             VStack(alignment: .leading, spacing: 10) {
                 Toggle("自动同步歌词时间", isOn: automaticLyricSyncBinding)
@@ -527,7 +527,7 @@ private struct ProvisioningProfileInfo {
     }
 }
 
-private struct PreferencesCard<Content: View>: View {
+struct PreferencesCard<Content: View>: View {
     let title: String
     let systemImage: String
     @ViewBuilder var content: Content

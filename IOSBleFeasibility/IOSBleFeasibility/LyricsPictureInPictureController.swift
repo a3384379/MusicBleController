@@ -8,6 +8,7 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
     static let shared = LyricsPictureInPictureController()
     @Published private(set) var lifecycle = LyricsPiPStateMachine()
     @Published private(set) var reason = ""
+    @Published private(set) var startRequested = false
 
     private weak var sourceView: LyricsPictureInPictureSourceUIView?
     private var displayLayer: AVSampleBufferDisplayLayer?
@@ -17,7 +18,10 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
     private var controller: AVPictureInPictureController?
     private var possibleObservation: NSKeyValueObservation?
     private var callbackGeneration: UInt64 = 0
-    private var startRequested = false
+    private var hasEnqueuedFrame = false
+    private var lastStartDiagnostic = ""
+    private let supportsPictureInPicture: () -> Bool
+    private let isApplicationActive: @MainActor () -> Bool
     private var startTimeout: Task<Void, Never>?
     private var stopTimeout: Task<Void, Never>?
     private var heartbeat: Timer?
@@ -34,6 +38,16 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
     nonisolated private let playbackStatus = LyricsPiPPlaybackStatus()
 
     var state: LyricsPiPStateMachine.State { lifecycle.state }
+    var canRequestStart: Bool {
+        lifecycle.enabled && !startRequested && state != .active && state != .starting
+    }
+
+    init(supportsPictureInPicture: @escaping () -> Bool = { AVPictureInPictureController.isPictureInPictureSupported() },
+         isApplicationActive: @escaping @MainActor () -> Bool = { UIApplication.shared.applicationState == .active }) {
+        self.supportsPictureInPicture = supportsPictureInPicture
+        self.isApplicationActive = isApplicationActive
+        super.init()
+    }
 
     func setEnabled(_ enabled: Bool) {
         lifecycle.setEnabled(enabled)
@@ -50,29 +64,80 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
         snapshotProvider = snapshot
         self.setPlaying = setPlaying
         self.controlsStopped = controlsStopped
-        prepareIfNeeded()
+        advanceStart()
     }
 
     func sourceBecameVisible() {
         guard lifecycle.enabled else { return }
-        prepareIfNeeded()
-        tryStart()
+        advanceStart()
+    }
+
+    func cancelPendingStart() {
+        // Dismissing settings cancels preparation, but an active window keeps
+        // its retained display layer and renderer after its source disappears.
+        if startRequested || state == .preparing || state == .ready || state == .starting {
+            stop()
+        }
     }
 
     func requestStart() {
-        guard lifecycle.enabled, state != .active, state != .starting, state != .stopping else { return }
-        guard UIApplication.shared.applicationState == .active else {
+        guard canRequestStart else { return }
+        guard isApplicationActive() else {
             fail(AppLocalization.string("请回到应用中显示悬浮歌词"), unavailable: true)
             return
         }
-        guard AVPictureInPictureController.isPictureInPictureSupported() else {
+        guard supportsPictureInPicture() else {
             fail(AppLocalization.string("此设备不支持画中画"), unavailable: true)
             return
         }
         reason = ""
+        // A new explicit request can arrive while AVKit is still closing the
+        // old window. Finish that cleanup before preparing the new source.
+        if lifecycle.requestRestartAfterStop() {
+            startRequested = true
+            logStartStatus("restart-queued")
+            return
+        }
         startRequested = true
-        prepareIfNeeded()
-        if let snapshot = snapshotProvider?() { update(snapshot, force: true) }
+        lastStartDiagnostic = ""
+        if controller == nil { _ = lifecycle.prepare() }
+        startTimeout?.cancel()
+        startTimeout = Task { [weak self] in
+            // Bounded preparation only. Dismissal/layout and AVKit readiness can
+            // finish after the user's tap; no background polling survives it.
+            for _ in 0..<40 {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard !Task.isCancelled, let self, self.lifecycle.enabled, self.state != .active else { return }
+                self.advanceStart()
+                if self.state == .failed || self.state == .unavailable { return }
+            }
+            guard !Task.isCancelled, let self, self.state != .active else { return }
+            self.logStartStatus("timeout")
+            let message: String
+            if self.sourceView?.isVisibleForPictureInPicture != true {
+                message = AppLocalization.string("歌词预览尚未显示，请留在设置页重试")
+            } else if !self.hasEnqueuedFrame {
+                message = AppLocalization.string("歌词预览未准备完成，请再次尝试")
+            } else if self.state == .starting {
+                message = AppLocalization.string("画中画启动未获系统确认，请再次尝试")
+            } else {
+                message = AppLocalization.string("系统尚未允许画中画，请再次尝试")
+            }
+            self.fail(message, unavailable: true)
+        }
+        advanceStart()
+    }
+
+    private func advanceStart() {
+        guard startRequested else { return }
+        guard isApplicationActive() else {
+            fail(AppLocalization.string("请回到应用中显示悬浮歌词"), unavailable: true)
+            return
+        }
+        guard sourceView?.isVisibleForPictureInPicture == true else {
+            logStartStatus("waiting-source")
+            return
+        }
         do {
             if audioLease == nil {
                 let lease = LyricsPiPAudioLease()
@@ -88,25 +153,22 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
                 }
             }
         } catch {
+            logError(error, event: "audio-start")
             fail(AppLocalization.string("无法准备画中画音频会话") + ": " + error.localizedDescription)
             return
         }
-        startTimeout?.cancel()
-        startTimeout = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 8_000_000_000)
-            guard !Task.isCancelled, let self, self.state != .active else { return }
-            self.fail(AppLocalization.string("系统暂时无法显示画中画，请再次尝试"), unavailable: true)
-        }
+        prepareIfNeeded()
         tryStart()
+        logStartStatus("preparing")
     }
 
     private func prepareIfNeeded() {
-        guard lifecycle.enabled, controller == nil, let sourceView,
-              sourceView.window != nil,
-              AVPictureInPictureController.isPictureInPictureSupported(),
+        guard lifecycle.enabled, startRequested, controller == nil, let sourceView,
+              sourceView.isVisibleForPictureInPicture, supportsPictureInPicture(),
               let generation = lifecycle.prepare() else { return }
         callbackGeneration = generation
         renderer = LyricsSampleBufferRenderer()
+        hasEnqueuedFrame = false
         displayLayer = sourceView.displayLayer
         let source = AVPictureInPictureController.ContentSource(
             sampleBufferDisplayLayer: sourceView.displayLayer, playbackDelegate: self
@@ -127,12 +189,40 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
     }
 
     private func tryStart() {
-        guard startRequested, UIApplication.shared.applicationState == .active,
-              sourceView?.window != nil, let controller, controller.isPictureInPicturePossible else { return }
+        guard startRequested, isApplicationActive(), audioLease != nil, hasEnqueuedFrame,
+              displayLayer?.sampleBufferRenderer.status == .rendering,
+              sourceView?.isVisibleForPictureInPicture == true,
+              let controller, controller.isPictureInPicturePossible else { return }
         lifecycle.ready(generation: callbackGeneration)
         guard lifecycle.start(generation: callbackGeneration) else { return }
         startRequested = false
+        logStartStatus("start-call")
         controller.startPictureInPicture()
+    }
+
+    func refreshAppearance() {
+        guard renderer != nil else { return }
+        frameQueue.invalidate()
+        if let snapshot = snapshotProvider?() { update(snapshot, force: true) }
+    }
+
+    private func logStartStatus(_ event: String) {
+        let bounds = sourceView?.bounds ?? .zero
+        let detail = "state=\(state.rawValue) visible=\(sourceView?.isVisibleForPictureInPicture == true) " +
+            "source=\(Int(bounds.width))x\(Int(bounds.height)) frame=\(hasEnqueuedFrame) " +
+            "renderer=\(displayLayer?.sampleBufferRenderer.status.rawValue ?? -1) " +
+            "possible=\(controller?.isPictureInPicturePossible == true) audio=\(audioLease != nil) " +
+            "linear=\(controller?.requiresLinearPlayback == true)"
+        guard detail != lastStartDiagnostic || event == "timeout" || event == "start-call" else { return }
+        lastStartDiagnostic = detail
+        AppLogStore.shared.append("[Lyrics-PiP] \(event) \(detail)")
+    }
+
+    private func logError(_ error: Error, event: String) {
+        let error = error as NSError
+        let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError
+        AppLogStore.shared.append("[Lyrics-PiP] \(event) domain=\(error.domain) code=\(error.code) " +
+            "underlying=\(underlying?.domain ?? "-")/\(underlying?.code ?? 0) message=\(error.localizedDescription)")
     }
 
     func update(_ snapshot: LyricsPresentationSnapshot, force: Bool = false) {
@@ -167,8 +257,11 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
         cancelDisplayRendererWait()
         guard let request = frameQueue.begin() else { return }
         let snapshot = request.snapshot
+        let appearance = PreferencesStore.shared.floatingLyricsAppearance
         renderQueue.async { [self] in
-            let frame = autoreleasepool { LyricsRenderedFrame(result: Result { try renderer.render(snapshot) }) }
+            let frame = autoreleasepool {
+                LyricsRenderedFrame(result: Result { try renderer.render(snapshot, appearance: appearance) })
+            }
             DispatchQueue.main.async { [self] in
                 guard self.lifecycle.enabled, self.renderer === renderer,
                       let displayRenderer = self.displayLayer?.sampleBufferRenderer else { return }
@@ -205,6 +298,8 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
                     if !needsRetry {
                         self.bufferRecoveryAttempted = false
                         displayRenderer.enqueue(sample)
+                        self.hasEnqueuedFrame = true
+                        self.tryStart()
                     }
                 case .failure:
                     if !bufferPressure { self.fail(AppLocalization.string("无法绘制悬浮歌词")) }
@@ -266,6 +361,7 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
     }
 
     private func stop(requestSystemStop: Bool) {
+        lifecycle.cancelRestartAfterStop()
         playbackStatus.blockControls(owner: controller.map(ObjectIdentifier.init))
         controlsStopped?()
         startRequested = false
@@ -287,13 +383,21 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
             stopTimeout = Task { [weak self, weak controller] in
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard !Task.isCancelled, let self, self.controller === controller else { return }
-                self.releaseResources(preserveDelegate: true)
-                self.lifecycle.didStop()
+                self.finishStop(preserveDelegate: true)
             }
         } else {
             releaseResources()
             lifecycle.didStop()
         }
+    }
+
+    private func finishStop(preserveDelegate: Bool = false) {
+        let shouldRestart = lifecycle.takeRestartAfterStop()
+        startRequested = false
+        releaseResources(preserveDelegate: preserveDelegate)
+        lifecycle.didStop()
+        logStartStatus("stopped")
+        if shouldRestart { requestStart() }
     }
 
     private func releaseResources(preserveDelegate: Bool = false) {
@@ -315,6 +419,7 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
         frameQueue.invalidate()
         renderer = nil
         latestKey = nil
+        hasEnqueuedFrame = false
         displayLayer?.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
         displayLayer = nil
         if let interruptionObserver { NotificationCenter.default.removeObserver(interruptionObserver) }
@@ -342,6 +447,8 @@ extension LyricsPictureInPictureController: AVPictureInPictureControllerDelegate
             }
             self.startTimeout?.cancel()
             self.startTimeout = nil
+            self.reason = ""
+            self.logStartStatus("started")
             self.playbackStatus.allowControls(owner: ObjectIdentifier(pip))
             self.heartbeat = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
                 Task { @MainActor in
@@ -359,6 +466,7 @@ extension LyricsPictureInPictureController: AVPictureInPictureControllerDelegate
         playbackStatus.blockControls(owner: ObjectIdentifier(pip))
         Task { @MainActor [weak self] in
             guard let self, self.controller === pip else { return }
+            self.logStartStatus("will-stop")
             if self.state == .active || self.state == .starting { self.stop(requestSystemStop: false) }
         }
     }
@@ -366,9 +474,7 @@ extension LyricsPictureInPictureController: AVPictureInPictureControllerDelegate
     nonisolated func pictureInPictureControllerDidStopPictureInPicture(_ pip: AVPictureInPictureController) {
         Task { @MainActor [weak self] in
             guard let self, self.controller === pip else { return }
-            self.startRequested = false
-            self.releaseResources()
-            self.lifecycle.didStop()
+            self.finishStop()
         }
     }
 
@@ -376,6 +482,7 @@ extension LyricsPictureInPictureController: AVPictureInPictureControllerDelegate
                                                failedToStartPictureInPictureWithError error: Error) {
         Task { @MainActor [weak self] in
             guard let self, self.controller === pip else { return }
+            self.logError(error, event: "start-failed")
             self.fail(AppLocalization.string("系统暂时无法显示画中画，请再次尝试") + ": " + error.localizedDescription)
         }
     }
@@ -411,6 +518,7 @@ extension LyricsPictureInPictureController: AVPictureInPictureSampleBufferPlayba
                                                didTransitionToRenderSize newRenderSize: CMVideoDimensions) {
         Task { @MainActor [weak self] in
             guard let self, self.controller === pip, let snapshot = self.snapshotProvider?() else { return }
+            AppLogStore.shared.append("[Lyrics-PiP] render-size=\(newRenderSize.width)x\(newRenderSize.height)")
             self.update(snapshot, force: true)
         }
     }

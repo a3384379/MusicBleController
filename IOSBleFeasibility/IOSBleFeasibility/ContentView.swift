@@ -10,8 +10,10 @@ private final class BLETestManagerOwner: ObservableObject {
 }
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var managerOwner = BLETestManagerOwner()
     @ObservedObject private var preferences = PreferencesStore.shared
+    @ObservedObject private var pipController = LyricsPictureInPictureController.shared
     @State private var showFullLyrics = false
     @State private var showDebugPage = false
     @State private var showPlaybackHistory = false
@@ -19,10 +21,23 @@ struct ContentView: View {
     @State private var showNowPlayingDiagnostic = false
     @State private var showSystemHealthOverview = false
     @State private var showPreferences = false
+    @State private var showLyricsDisplaySettings = false
+    #if DEBUG
+    @State private var floatingLyricsSmokeRequested = false
+    @State private var floatingLyricsSmokePending = false
+    #endif
     @State private var showDeviceDetails = false
     @State private var deferredDiagnostic: DeferredPlayerDiagnostic?
 
     private var manager: BLETestManager { managerOwner.manager }
+
+    private var startsFloatingLyricsForTesting: Bool {
+        #if DEBUG
+        return floatingLyricsSmokePending
+        #else
+        return false
+        #endif
+    }
 
     var body: some View {
         NavigationStack {
@@ -42,13 +57,9 @@ struct ContentView: View {
                         showNowPlayingDiagnostic: $showNowPlayingDiagnostic,
                         showSystemHealthOverview: $showSystemHealthOverview,
                         showPreferences: $showPreferences,
+                        showLyricsDisplaySettings: $showLyricsDisplaySettings,
                         showDeviceDetails: $showDeviceDetails
                     )
-                }
-            }
-            .safeAreaInset(edge: .bottom) {
-                if preferences.floatingLyricsEnabled {
-                    FloatingLyricsPanel(manager: manager)
                 }
             }
             .toolbar(.hidden, for: .navigationBar)
@@ -60,6 +71,15 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showPreferences) {
                 PreferencesView(bleManager: manager, onDismiss: { showPreferences = false })
+            }
+            .sheet(isPresented: $showLyricsDisplaySettings, onDismiss: {
+                LyricsPictureInPictureController.shared.cancelPendingStart()
+                #if DEBUG
+                floatingLyricsSmokePending = false
+                #endif
+            }) {
+                LyricsDisplaySettingsView(manager: manager, onDismiss: { showLyricsDisplaySettings = false },
+                                           startFloatingLyricsForTesting: startsFloatingLyricsForTesting)
             }
             .sheet(isPresented: $showDeviceDetails, onDismiss: presentDeferredDiagnostic) {
                 DeviceDetailView(
@@ -101,12 +121,31 @@ struct ContentView: View {
             .onChange(of: preferences.lyricDisplayMode) { _, mode in
                 manager.requestFullLyricsOptionalFieldsIfNeeded(displayMode: mode)
             }
-            .onChange(of: preferences.compactLyricsEnabled) { _, _ in
+            .onChange(of: preferences.compactLyricsEnabled, initial: true) { _, _ in
                 manager.refreshLiveActivityAppearance()
             }
-            .onChange(of: preferences.floatingLyricsEnabled) { _, enabled in
+            .onChange(of: preferences.floatingLyricsEnabled, initial: true) { _, enabled in
                 LyricsPictureInPictureController.shared.setEnabled(enabled)
-                if enabled { LyricsPictureInPictureController.shared.requestStart() }
+            }
+            .onChange(of: preferences.floatingLyricsAppearance) { _, _ in
+                LyricsPictureInPictureController.shared.refreshAppearance()
+            }
+            .onChange(of: pipController.state) { _, state in
+                preferences.updateFloatingLyricsWindowState(
+                    state, startPending: pipController.startRequested || pipController.lifecycle.restartRequested
+                )
+            }
+            .onChange(of: scenePhase, initial: true) { _, phase in
+                #if DEBUG
+                // Explicit device-test launch only; do not persist or replay
+                // this request on normal launches or after a user closes PiP.
+                if phase == .active, !floatingLyricsSmokeRequested,
+                   ProcessInfo.processInfo.arguments.contains("--smoke-floating-lyrics") {
+                    floatingLyricsSmokeRequested = true
+                    floatingLyricsSmokePending = true
+                    showLyricsDisplaySettings = true
+                }
+                #endif
             }
             .onChange(of: showFullLyrics) { _, presented in
                 if presented {
@@ -162,6 +201,7 @@ private struct ResponsivePlayerLayout: View {
     @Binding var showNowPlayingDiagnostic: Bool
     @Binding var showSystemHealthOverview: Bool
     @Binding var showPreferences: Bool
+    @Binding var showLyricsDisplaySettings: Bool
     @Binding var showDeviceDetails: Bool
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -269,6 +309,7 @@ private struct ResponsivePlayerLayout: View {
             showNowPlayingDiagnostic: $showNowPlayingDiagnostic,
             showSystemHealthOverview: $showSystemHealthOverview,
             showPreferences: $showPreferences,
+            showLyricsDisplaySettings: $showLyricsDisplaySettings,
             showDeviceDetails: $showDeviceDetails
         )
     }
@@ -283,6 +324,7 @@ private struct PlayerHeaderStoreView: View {
     @Binding var showNowPlayingDiagnostic: Bool
     @Binding var showSystemHealthOverview: Bool
     @Binding var showPreferences: Bool
+    @Binding var showLyricsDisplaySettings: Bool
     @Binding var showDeviceDetails: Bool
 
     @ObservedObject private var preferences = PreferencesStore.shared
@@ -320,6 +362,19 @@ private struct PlayerHeaderStoreView: View {
             )
 
             Spacer()
+
+            Button { showLyricsDisplaySettings = true } label: {
+                Text("词")
+                    .font(.system(size: 19, weight: .semibold))
+                    .foregroundStyle(preferences.floatingLyricsEnabled || preferences.compactLyricsEnabled
+                                     ? PlayerDesignTokens.stableAccent : .white.opacity(0.86))
+                    .frame(width: 44, height: 44)
+                    .background(.white.opacity(0.05), in: Circle())
+                    .overlay { Circle().stroke(.white.opacity(0.08), lineWidth: 1) }
+            }
+            .buttonStyle(PressScaleButtonStyle(pressedScale: 0.96))
+            .accessibilityLabel("歌词设置")
+            .accessibilityIdentifier("lyricsSettingsButton")
 
             Menu {
                 Button { manager.scanSonyFromMenu() } label: {

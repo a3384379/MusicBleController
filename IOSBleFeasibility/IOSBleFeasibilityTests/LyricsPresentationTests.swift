@@ -1,15 +1,19 @@
 import AVFoundation
 import CoreImage
+import SwiftUI
 import UIKit
 import XCTest
 @testable import sonyMusic
 
 final class LyricsPresentationTests: XCTestCase {
-    func testNewAndLegacyPreferencesDefaultOffAndPersistAllFourCombinations() {
+    func testColdLaunchDefaultsOffEvenWithLegacyEnabledFlags() {
         let name = "lyrics-display-tests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: name)!
         defer { defaults.removePersistentDomain(forName: name) }
         defaults.set("lyricFocused", forKey: DynamicIslandStyle.userDefaultsKey)
+        defaults.set(FloatingLyricsLineMode.single.rawValue, forKey: FloatingLyricsLineMode.userDefaultsKey)
+        defaults.set(true, forKey: FloatingLyricsAppearance.titleKey)
+        defaults.set(FloatingLyricsTheme.blue.rawValue, forKey: FloatingLyricsTheme.userDefaultsKey)
         XCTAssertFalse(LyricsDisplayPreferences(defaults: defaults).compactEnabled)
         XCTAssertFalse(LyricsDisplayPreferences(defaults: defaults).floatingEnabled)
         for compact in [false, true] {
@@ -17,8 +21,12 @@ final class LyricsPresentationTests: XCTestCase {
                 defaults.set(compact, forKey: LyricsDisplayPreferences.compactKey)
                 defaults.set(floating, forKey: LyricsDisplayPreferences.floatingKey)
                 let reopened = LyricsDisplayPreferences(defaults: UserDefaults(suiteName: name)!)
-                XCTAssertEqual(reopened.compactEnabled, compact)
-                XCTAssertEqual(reopened.floatingEnabled, floating)
+                XCTAssertFalse(reopened.compactEnabled)
+                XCTAssertFalse(reopened.floatingEnabled)
+                XCTAssertNil(defaults.object(forKey: LyricsDisplayPreferences.compactKey))
+                XCTAssertNil(defaults.object(forKey: LyricsDisplayPreferences.floatingKey))
+                XCTAssertEqual(FloatingLyricsAppearance(defaults: defaults),
+                               FloatingLyricsAppearance(lineMode: .single, showsTitle: true, theme: .blue))
             }
         }
     }
@@ -27,12 +35,19 @@ final class LyricsPresentationTests: XCTestCase {
     func testPreferencesReloadAndResetKeepSwitchesIndependent() {
         let preferences = PreferencesStore.shared
         let original = UserDefaults.standard.dictionaryRepresentation()
+        let originalSwitches = (preferences.compactLyricsEnabled, preferences.floatingLyricsEnabled)
         defer {
             for (key, value) in original { UserDefaults.standard.set(value, forKey: key) }
-            for key in [LyricsDisplayPreferences.compactKey, LyricsDisplayPreferences.floatingKey]
+            for key in [LyricsDisplayPreferences.compactKey, LyricsDisplayPreferences.floatingKey,
+                        FloatingLyricsLineMode.userDefaultsKey, FloatingLyricsAppearance.titleKey,
+                        FloatingLyricsTheme.userDefaultsKey]
                 where original[key] == nil { UserDefaults.standard.removeObject(forKey: key) }
             preferences.load()
+            preferences.compactLyricsEnabled = originalSwitches.0
+            preferences.floatingLyricsEnabled = originalSwitches.1
         }
+        UserDefaults.standard.removeObject(forKey: LyricsDisplayPreferences.compactKey)
+        UserDefaults.standard.removeObject(forKey: LyricsDisplayPreferences.floatingKey)
         preferences.compactLyricsEnabled = true
         preferences.floatingLyricsEnabled = false
         preferences.load()
@@ -40,12 +55,42 @@ final class LyricsPresentationTests: XCTestCase {
         XCTAssertFalse(preferences.floatingLyricsEnabled)
         preferences.floatingLyricsEnabled = true
         preferences.compactLyricsEnabled = false
+        preferences.floatingLyricsLineMode = .single
+        preferences.floatingLyricsShowsTitle = true
+        preferences.floatingLyricsTheme = .blue
         preferences.load()
         XCTAssertFalse(preferences.compactLyricsEnabled)
         XCTAssertTrue(preferences.floatingLyricsEnabled)
+        XCTAssertNil(UserDefaults.standard.object(forKey: LyricsDisplayPreferences.compactKey))
+        XCTAssertNil(UserDefaults.standard.object(forKey: LyricsDisplayPreferences.floatingKey))
+        XCTAssertEqual(preferences.floatingLyricsLineMode, .single)
+        XCTAssertTrue(preferences.floatingLyricsShowsTitle)
+        XCTAssertEqual(preferences.floatingLyricsTheme, .blue)
         preferences.resetToDefaults()
         XCTAssertFalse(preferences.compactLyricsEnabled)
         XCTAssertFalse(preferences.floatingLyricsEnabled)
+        XCTAssertEqual(preferences.floatingLyricsLineMode, .double)
+        XCTAssertFalse(preferences.floatingLyricsShowsTitle)
+        XCTAssertEqual(preferences.floatingLyricsTheme, .warm)
+    }
+
+    @MainActor
+    func testFloatingSwitchFollowsWindowCompletionAndPreservesExplicitRestart() {
+        let preferences = PreferencesStore.shared
+        let original = preferences.floatingLyricsEnabled
+        defer { preferences.floatingLyricsEnabled = original }
+        preferences.floatingLyricsEnabled = false
+        preferences.updateFloatingLyricsWindowState(.active, startPending: false)
+        XCTAssertTrue(preferences.floatingLyricsEnabled)
+        preferences.updateFloatingLyricsWindowState(.stopping, startPending: false)
+        XCTAssertTrue(preferences.floatingLyricsEnabled, "Keep the switch while the window is still closing")
+        preferences.updateFloatingLyricsWindowState(.stopped, startPending: true)
+        XCTAssertTrue(preferences.floatingLyricsEnabled, "Cleanup must not cancel an explicit reopen request")
+        for state in [LyricsPiPStateMachine.State.stopped, .unavailable, .failed, .disabled] {
+            preferences.floatingLyricsEnabled = true
+            preferences.updateFloatingLyricsWindowState(state, startPending: false)
+            XCTAssertFalse(preferences.floatingLyricsEnabled, "No enabled switch may remain without a window or request")
+        }
     }
 
     func testOldActivityContentDecodesWithCompactLyricsOff() throws {
@@ -123,6 +168,51 @@ final class LyricsPresentationTests: XCTestCase {
         machine.stop()
         machine.didStop()
         XCTAssertTrue(machine.enabled)
+        XCTAssertEqual(machine.state, .stopped)
+        XCTAssertFalse(machine.didStart(generation: token))
+        XCTAssertFalse(machine.takeRestartAfterStop(), "Closing alone must not reopen the window")
+        let reopened = try XCTUnwrap(machine.prepare())
+        XCTAssertNotEqual(reopened, token)
+        machine.ready(generation: reopened)
+        XCTAssertTrue(machine.start(generation: reopened))
+        XCTAssertTrue(machine.didStart(generation: reopened))
+        XCTAssertEqual(machine.state, .active)
+    }
+
+    func testExplicitRestartWaitsForStopThenUsesFreshGeneration() throws {
+        var machine = LyricsPiPStateMachine()
+        machine.setEnabled(true)
+        let old = try XCTUnwrap(machine.prepare())
+        machine.ready(generation: old)
+        XCTAssertTrue(machine.start(generation: old))
+        XCTAssertTrue(machine.didStart(generation: old))
+        machine.stop()
+        XCTAssertTrue(machine.requestRestartAfterStop())
+        XCTAssertTrue(machine.requestRestartAfterStop())
+        XCTAssertNil(machine.prepare(), "The old controller must finish stopping before a new one starts")
+        XCTAssertFalse(machine.didStart(generation: old))
+        machine.didStop()
+        XCTAssertTrue(machine.takeRestartAfterStop())
+        XCTAssertFalse(machine.takeRestartAfterStop(), "One explicit intent starts only once")
+        let reopened = try XCTUnwrap(machine.prepare())
+        machine.ready(generation: reopened)
+        XCTAssertTrue(machine.start(generation: reopened))
+        XCTAssertFalse(machine.didStart(generation: old))
+        XCTAssertTrue(machine.didStart(generation: reopened))
+    }
+
+    func testDisableCancelsQueuedRestartWithoutReplayingOnReenable() throws {
+        var machine = LyricsPiPStateMachine()
+        machine.setEnabled(true)
+        let token = try XCTUnwrap(machine.prepare())
+        machine.ready(generation: token)
+        XCTAssertTrue(machine.start(generation: token))
+        machine.stop()
+        XCTAssertTrue(machine.requestRestartAfterStop())
+        machine.setEnabled(false)
+        machine.setEnabled(true)
+        machine.didStop()
+        XCTAssertFalse(machine.takeRestartAfterStop())
         XCTAssertEqual(machine.state, .stopped)
         XCTAssertFalse(machine.didStart(generation: token))
     }
@@ -879,8 +969,10 @@ final class LyricsPresentationTests: XCTestCase {
             defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
             let bytes = try XCTUnwrap(CVPixelBufferGetBaseAddress(buffer)).assumingMemoryBound(to: UInt8.self)
             let stride = CVPixelBufferGetBytesPerRow(buffer)
-            return (312..<360).reduce(0) { count, row in
-                count + (36..<604).filter { column in
+            let height = CVPixelBufferGetHeight(buffer)
+            let width = CVPixelBufferGetWidth(buffer)
+            return ((height - 30)..<height).reduce(0) { count, row in
+                count + (0..<width).filter { column in
                     let index = row * stride + column * 4
                     return bytes[index] > 100 && bytes[index + 1] > 100 && bytes[index + 2] > 100
                 }.count
@@ -905,7 +997,7 @@ final class LyricsPresentationTests: XCTestCase {
                                          CMSampleBufferGetPresentationTimeStamp(first)), 0)
         let buffer = try XCTUnwrap(CMSampleBufferGetImageBuffer(sought))
         XCTAssertEqual(CVPixelBufferGetWidth(buffer), 640)
-        XCTAssertEqual(CVPixelBufferGetHeight(buffer), 360)
+        XCTAssertEqual(CVPixelBufferGetHeight(buffer), 104)
         let image = CIImage(cvPixelBuffer: buffer)
         let cgImage = try XCTUnwrap(CIContext().createCGImage(image, from: image.extent))
         let attachment = XCTAttachment(image: UIImage(cgImage: cgImage))
@@ -1017,13 +1109,356 @@ final class LyricsPresentationTests: XCTestCase {
         XCTAssertGreaterThan(manager.makeLyricsPresentationSnapshot().timelineRevision, second.timelineRevision)
     }
 
+    func testFloatingAppearanceDefaultsAndInvalidStoredMode() {
+        let name = "floating-appearance-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name) }
+        XCTAssertEqual(FloatingLyricsAppearance(defaults: defaults), FloatingLyricsAppearance())
+        defaults.set("unsupported-mode", forKey: FloatingLyricsLineMode.userDefaultsKey)
+        defaults.set("unsupported-theme", forKey: FloatingLyricsTheme.userDefaultsKey)
+        XCTAssertEqual(FloatingLyricsAppearance(defaults: defaults).lineMode, .double)
+        XCTAssertEqual(FloatingLyricsAppearance(defaults: defaults).theme, .warm)
+        defaults.set("single", forKey: FloatingLyricsLineMode.userDefaultsKey)
+        defaults.set(true, forKey: FloatingLyricsAppearance.titleKey)
+        defaults.set("rose", forKey: FloatingLyricsTheme.userDefaultsKey)
+        let reopened = FloatingLyricsAppearance(defaults: UserDefaults(suiteName: name)!)
+        XCTAssertEqual(reopened.lineMode, .single)
+        XCTAssertTrue(reopened.showsTitle)
+        XCTAssertEqual(reopened.theme, .rose)
+    }
+
+    func testThemeSelectionChangesRenderedBackgroundAndKeepsCompactSize() throws {
+        let renderer = LyricsSampleBufferRenderer()
+        let content = snapshot(text: "气象报告天气很不错", nextText: "太阳晒的我脸颊红红")
+        var allPixels = Set<Data>()
+        for theme in FloatingLyricsTheme.allCases {
+            let appearance = FloatingLyricsAppearance(theme: theme)
+            allPixels.insert(try renderedPixels(renderer, content, appearance: appearance))
+            try autoreleasepool {
+                let sample = try renderer.render(content, appearance: appearance)
+                let buffer = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
+                XCTAssertEqual(CVPixelBufferGetWidth(buffer), 640)
+                XCTAssertEqual(CVPixelBufferGetHeight(buffer), 104)
+                let image = CIImage(cvPixelBuffer: buffer)
+                let cgImage = try XCTUnwrap(CIContext().createCGImage(image, from: image.extent))
+                let attachment = XCTAttachment(image: UIImage(cgImage: cgImage))
+                attachment.name = "floating-lyrics-theme-\(theme.rawValue)"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            }
+        }
+        XCTAssertEqual(allPixels.count, FloatingLyricsTheme.allCases.count,
+                       "Each selectable color must change the actual lyric image")
+    }
+
+    @MainActor
+    func testNextLineFollowsAcceptedTimelineAndClearsWhenStaleOrSongChanges() {
+        var now: TimeInterval = 10
+        let manager = BLETestManager(automaticallyStartBluetooth: false, lyricsPresentationUptime: { now })
+        let id = "floating-next-\(UUID().uuidString)"
+        manager.configureResponseTests(trackID: id)
+        manager.commandSenderForTesting = { _, _ in true }
+        defer { manager.disconnectResponseTests() }
+        manager.receiveStatusForTesting(["type": "fullLyricsStart", "trackId": id, "count": 3])
+        for (index, text) in ["第一句", "第二句", "第三句"].enumerated() {
+            manager.receiveStatusForTesting(["type": "fullLyricsChunk", "trackId": id, "index": index,
+                                             "timeMs": 1_000 + index * 4_000, "durationMs": 1_000, "text": text])
+        }
+        manager.receiveStatusForTesting(["type": "fullLyricsEnd", "trackId": id])
+        manager.setKaraokeOffsetMs(0)
+        receivePlayback(manager, playing: false, position: 1_100)
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().text, "第一句")
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().nextText, "第二句")
+        manager.seekToLyricLine(0)
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().status, .intro)
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().nextText, "第一句")
+        manager.seekToLyricLine(3_000)
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().status, .instrumental)
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().nextText, "第二句")
+        manager.seekToLyricLine(9_100)
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().nextText, "")
+        now = 311
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().status, .stale)
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().nextText, "")
+        manager.receiveStatusForTesting(["type": "trackInfo", "trackId": id, "generation": 2,
+                                         "title": "New song", "artist": "Artist"])
+        XCTAssertEqual(manager.makeLyricsPresentationSnapshot().nextText, "")
+    }
+
+    func testChangedNextLineRejectsOldFrameEvenWithSameCurrentLine() throws {
+        var queue = LatestLyricsFrameQueue()
+        let old = snapshot(nextText: "旧的下一句")
+        let new = snapshot(nextText: "修正后的下一句")
+        XCTAssertTrue(queue.offer(old, force: false))
+        let request = try XCTUnwrap(queue.begin())
+        XCTAssertTrue(queue.offer(new, force: false))
+        XCTAssertFalse(queue.finish(request.token, currentKey: new.key))
+        XCTAssertEqual(queue.begin()?.snapshot.nextText, new.nextText)
+    }
+
+    func testStripRenderingKeepsRowsStableAndHonoursTitleAndLineMode() throws {
+        let renderer = LyricsSampleBufferRenderer()
+        let short = snapshot(text: "当前歌词", title: "Hidden A", nextText: "下一句歌词")
+        let differentTitle = snapshot(text: "当前歌词", title: "Hidden B", nextText: "下一句歌词")
+        XCTAssertEqual(try renderedPixels(renderer, short), try renderedPixels(renderer, differentTitle),
+                       "The title is hidden by default")
+        let titleOn = FloatingLyricsAppearance(showsTitle: true)
+        XCTAssertNotEqual(try renderedPixels(renderer, short, appearance: titleOn),
+                          try renderedPixels(renderer, differentTitle, appearance: titleOn))
+        let long = snapshot(text: String(repeating: "很长的歌词 🎵 ", count: 100), nextText: "下一句歌词")
+        XCTAssertEqual(try renderedPixels(renderer, short, rows: 56..<104),
+                       try renderedPixels(renderer, long, rows: 56..<104),
+                       "Long text must not wrap into the next lyric row")
+        let changedNext = snapshot(text: "当前歌词", title: "Hidden A", nextText: "另一句歌词")
+        XCTAssertNotEqual(try renderedPixels(renderer, short, rows: 56..<104),
+                          try renderedPixels(renderer, changedNext, rows: 56..<104))
+        let single = FloatingLyricsAppearance(lineMode: .single)
+        XCTAssertEqual(try renderedPixels(renderer, short, appearance: single),
+                       try renderedPixels(renderer, changedNext, appearance: single))
+        let sample = try renderer.render(short, appearance: single)
+        let buffer = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
+        XCTAssertEqual(CVPixelBufferGetWidth(buffer), 640)
+        XCTAssertEqual(CVPixelBufferGetHeight(buffer), 60)
+        let cgImage = try XCTUnwrap(CIContext().createCGImage(CIImage(cvPixelBuffer: buffer),
+                                                           from: CGRect(x: 0, y: 0, width: 640, height: 60)))
+        let attachment = XCTAttachment(image: UIImage(cgImage: cgImage))
+        attachment.name = "floating-lyrics-single-strip"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    @MainActor
+    func testPendingStartWaitsForVisibleSourceWithoutAudioAndDisableCancelsIt() async throws {
+        let audio = AVAudioSession.sharedInstance()
+        let before = (audio.category, audio.mode, audio.categoryOptions)
+        let controller = LyricsPictureInPictureController(supportsPictureInPicture: { true }, isApplicationActive: { true })
+        controller.setEnabled(true)
+        controller.requestStart()
+        XCTAssertTrue(controller.startRequested)
+        XCTAssertEqual(controller.state, .preparing)
+        XCTAssertFalse(controller.canRequestStart)
+        let generation = controller.lifecycle.generation
+        controller.requestStart()
+        XCTAssertEqual(controller.lifecycle.generation, generation, "Repeated taps must not restart preparation")
+        XCTAssertEqual(audio.category, before.0)
+        XCTAssertEqual(audio.mode, before.1)
+        XCTAssertEqual(audio.categoryOptions, before.2)
+        controller.setEnabled(false)
+        try await Task.sleep(nanoseconds: 250_000_000)
+        XCTAssertFalse(controller.startRequested)
+        XCTAssertEqual(controller.state, .disabled)
+        XCTAssertEqual(audio.categoryOptions, before.2)
+    }
+
+    @MainActor
+    func testPendingStartStopsWhenAppLeavesForeground() async throws {
+        var active = true
+        let controller = LyricsPictureInPictureController(supportsPictureInPicture: { true }, isApplicationActive: { active })
+        defer { controller.setEnabled(false) }
+        controller.setEnabled(true)
+        controller.requestStart()
+        active = false
+        try await waitUntil { controller.state == .unavailable }
+        XCTAssertFalse(controller.startRequested)
+        XCTAssertFalse(controller.reason.isEmpty)
+    }
+
+    @MainActor
+    func testSourceVisibilityRejectsHiddenClippedAndModalCoveredPreview() async throws {
+        let previousKeyWindow = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows).first { $0.isKeyWindow }
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let root = UIViewController()
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer {
+            root.dismiss(animated: false)
+            window.isHidden = true
+            previousKeyWindow?.makeKeyAndVisible()
+        }
+        let source = LyricsPictureInPictureSourceUIView(frame: .zero)
+        root.view.addSubview(source)
+        XCTAssertFalse(source.isVisibleForPictureInPicture)
+        source.frame = CGRect(x: 20, y: 200, width: 300, height: 60)
+        XCTAssertTrue(source.isVisibleForPictureInPicture)
+        source.isHidden = true
+        XCTAssertFalse(source.isVisibleForPictureInPicture)
+        source.isHidden = false
+        source.frame.origin.y = 1_000
+        XCTAssertFalse(source.isVisibleForPictureInPicture)
+        source.frame.origin.y = 200
+        let clip = UIView(frame: CGRect(x: 0, y: 0, width: 100, height: 50))
+        clip.clipsToBounds = true
+        root.view.addSubview(clip)
+        clip.addSubview(source)
+        XCTAssertFalse(source.isVisibleForPictureInPicture)
+        root.view.addSubview(source)
+        let settings = UIViewController()
+        root.present(settings, animated: false)
+        try await waitUntil { root.presentedViewController != nil }
+        XCTAssertFalse(source.isVisibleForPictureInPicture)
+        settings.view.addSubview(source)
+        try await waitUntil { source.window === window }
+        XCTAssertTrue(source.isVisibleForPictureInPicture, "A real source inside the frontmost settings sheet is visible")
+        root.dismiss(animated: false)
+        try await waitUntil { root.presentedViewController == nil }
+        XCTAssertFalse(source.isVisibleForPictureInPicture, "The dismissed sheet cannot remain a valid source")
+        root.view.addSubview(source)
+        XCTAssertTrue(source.isVisibleForPictureInPicture)
+    }
+
+    @MainActor
+    func testDismissingSettingsCancelsPendingStartWithoutChangingPreference() {
+        let controller = LyricsPictureInPictureController(supportsPictureInPicture: { true }, isApplicationActive: { true })
+        defer { controller.setEnabled(false) }
+        controller.setEnabled(true)
+        controller.requestStart()
+        XCTAssertTrue(controller.startRequested)
+        controller.cancelPendingStart()
+        XCTAssertFalse(controller.startRequested)
+        XCTAssertEqual(controller.state, .stopped)
+        XCTAssertTrue(controller.lifecycle.enabled, "Cancel the window request, not the user's saved preference")
+        XCTAssertTrue(controller.canRequestStart)
+        let previousGeneration = controller.lifecycle.generation
+        controller.requestStart()
+        XCTAssertTrue(controller.startRequested)
+        XCTAssertEqual(controller.state, .preparing)
+        XCTAssertGreaterThan(controller.lifecycle.generation, previousGeneration)
+    }
+
+    func testCompactCanvasOnlyAddsHeightWhenTitleOrControlFeedbackIsPresent() throws {
+        let renderer = LyricsSampleBufferRenderer()
+        let plain = snapshot(text: "气象报告天气很不错", nextText: "太阳晒的我脸颊红红")
+        let pixels = try renderedPixels(renderer, plain)
+        var withFeedback = plain
+        withFeedback.playbackControlState = .unknown
+        let feedbackPixels = try renderedPixels(renderer, withFeedback)
+        let expectedStride = feedbackPixels.count / 132
+        XCTAssertEqual(pixels.count, expectedStride * 104)
+        XCTAssertEqual(Data(feedbackPixels.prefix(pixels.count)), pixels,
+                       "Control feedback must add a row without covering either lyric")
+        let titlePixels = try renderedPixels(renderer, plain, appearance: FloatingLyricsAppearance(showsTitle: true))
+        XCTAssertEqual(titlePixels.count, expectedStride * 128)
+        let bothPixels = try renderedPixels(renderer, withFeedback, appearance: FloatingLyricsAppearance(showsTitle: true))
+        XCTAssertEqual(bothPixels.count, expectedStride * 156)
+        let sample = try renderer.render(plain)
+        let buffer = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
+        let image = CIImage(cvPixelBuffer: buffer)
+        let cgImage = try XCTUnwrap(CIContext().createCGImage(image, from: image.extent))
+        let attachment = XCTAttachment(image: UIImage(cgImage: cgImage))
+        attachment.name = "floating-lyrics-compact-double-strip"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    @MainActor
+    func testMainPlayerNeverMountsFloatingLyricsPreviewForEitherPreference() async throws {
+        let preferences = PreferencesStore.shared
+        let original = preferences.floatingLyricsEnabled
+        let previousKeyWindow = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows).first { $0.isKeyWindow }
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        defer {
+            window.isHidden = true
+            preferences.floatingLyricsEnabled = original
+            previousKeyWindow?.makeKeyAndVisible()
+        }
+        func containsSource(_ view: UIView) -> Bool {
+            view is LyricsPictureInPictureSourceUIView || view.subviews.contains(where: containsSource)
+        }
+        for enabled in [false, true] {
+            preferences.floatingLyricsEnabled = enabled
+            let host = UIHostingController(rootView: ContentView())
+            window.rootViewController = host
+            window.makeKeyAndVisible()
+            host.view.frame = window.bounds
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            await Task.yield()
+            XCTAssertFalse(containsSource(host.view), "No floating-lyrics footer may appear, even when enabled")
+            let image = UIGraphicsImageRenderer(bounds: host.view.bounds).image { _ in
+                host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+            }
+            let attachment = XCTAttachment(image: image)
+            attachment.name = enabled ? "player-floating-enabled-no-footer" : "player-floating-disabled-no-footer"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+    }
+
+    @MainActor
+    func testOpeningLyricsSettingsDoesNotStartWindowOrChangeAudioSession() async throws {
+        let preferences = PreferencesStore.shared
+        let controller = LyricsPictureInPictureController.shared
+        let originalSwitches = (preferences.compactLyricsEnabled, preferences.floatingLyricsEnabled)
+        let previousKeyWindow = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows).first { $0.isKeyWindow }
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        preferences.compactLyricsEnabled = false
+        preferences.floatingLyricsEnabled = false
+        controller.setEnabled(false)
+        let audio = AVAudioSession.sharedInstance()
+        let category = audio.category
+        let options = audio.categoryOptions
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+            preferences.compactLyricsEnabled = originalSwitches.0
+            preferences.floatingLyricsEnabled = originalSwitches.1
+            controller.setEnabled(originalSwitches.1)
+            previousKeyWindow?.makeKeyAndVisible()
+        }
+        let manager = BLETestManager(automaticallyStartBluetooth: false)
+        let host = UIHostingController(rootView: LyricsDisplaySettingsView(manager: manager, onDismiss: {})
+            .environment(\.locale, preferences.appLanguage.locale))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        host.view.frame = window.bounds
+        host.view.setNeedsLayout()
+        host.view.layoutIfNeeded()
+        await Task.yield()
+        func containsSource(_ view: UIView) -> Bool {
+            view is LyricsPictureInPictureSourceUIView || view.subviews.contains(where: containsSource)
+        }
+        XCTAssertFalse(containsSource(host.view))
+        XCTAssertFalse(controller.startRequested)
+        XCTAssertEqual(controller.state, .disabled)
+        XCTAssertFalse(preferences.compactLyricsEnabled)
+        XCTAssertFalse(preferences.floatingLyricsEnabled)
+        XCTAssertEqual(audio.category, category)
+        XCTAssertEqual(audio.categoryOptions, options)
+        let image = UIGraphicsImageRenderer(bounds: host.view.bounds).image { _ in
+            host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+        }
+        let attachment = XCTAttachment(image: image)
+        attachment.name = "lyrics-settings-default-off"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    private func renderedPixels(_ renderer: LyricsSampleBufferRenderer, _ snapshot: LyricsPresentationSnapshot,
+                                appearance: FloatingLyricsAppearance = FloatingLyricsAppearance(),
+                                rows: Range<Int>? = nil) throws -> Data {
+        try autoreleasepool {
+            let sample = try renderer.render(snapshot, appearance: appearance)
+            let buffer = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
+            CVPixelBufferLockBaseAddress(buffer, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+            let stride = CVPixelBufferGetBytesPerRow(buffer)
+            let selection = rows ?? 0..<CVPixelBufferGetHeight(buffer)
+            let pointer = try XCTUnwrap(CVPixelBufferGetBaseAddress(buffer))
+            return Data(bytes: pointer.advanced(by: stride * selection.lowerBound), count: stride * selection.count)
+        }
+    }
+
     private func snapshot(lineIndex: Int = 1, generation: Int64 = 1, timeline: UInt64 = 1,
                           playing: Bool = true, status: LyricsPresentationSnapshot.Status = .ready,
-                          validUntil: TimeInterval = 100) -> LyricsPresentationSnapshot {
+                          validUntil: TimeInterval = 100, text: String = "同一句歌词 · Lyrics 🎵",
+                          title: String = "测试歌曲", nextText: String = "") -> LyricsPresentationSnapshot {
         LyricsPresentationSnapshot(trackID: "fixture", trackGeneration: generation, revision: 1,
-                                   timelineRevision: timeline, lineIndex: lineIndex, text: "同一句歌词 · Lyrics 🎵",
-                                   title: "测试歌曲", artist: "Artist", isPlaying: playing, status: status,
-                                   validUntilUptime: validUntil)
+                                   timelineRevision: timeline, lineIndex: lineIndex, text: text,
+                                   title: title, artist: "Artist", isPlaying: playing, status: status,
+                                   validUntilUptime: validUntil, nextText: nextText)
     }
 
     private func makeContent() -> SonyMusicActivityAttributes.ContentState {
