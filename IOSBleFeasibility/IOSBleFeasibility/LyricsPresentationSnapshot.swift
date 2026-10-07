@@ -1,5 +1,89 @@
 import Foundation
 
+enum FloatingLyricsLineMode: String, CaseIterable, Identifiable, Sendable {
+    case single, double
+
+    var id: String { rawValue }
+    var title: String { AppLocalization.string(self == .single ? "单行" : "双行") }
+    var pixelHeight: Int { self == .single ? 60 : 104 }
+    static let userDefaultsKey = "floatingLyricsLineMode"
+}
+
+enum FloatingLyricsTheme: String, CaseIterable, Identifiable, Sendable {
+    case warm, mint, blue, lavender, rose, slate
+
+    static let userDefaultsKey = "floatingLyricsTheme"
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .warm: return AppLocalization.string("暖棕")
+        case .mint: return AppLocalization.string("薄荷")
+        case .blue: return AppLocalization.string("雾蓝")
+        case .lavender: return AppLocalization.string("淡紫")
+        case .rose: return AppLocalization.string("玫瑰")
+        case .slate: return AppLocalization.string("深灰")
+        }
+    }
+
+    struct RGB: Equatable, Sendable {
+        let hex: UInt32
+        var red: Double { Double((hex >> 16) & 255) / 255 }
+        var green: Double { Double((hex >> 8) & 255) / 255 }
+        var blue: Double { Double(hex & 255) / 255 }
+    }
+
+    struct Palette: Sendable {
+        let start: RGB
+        let end: RGB
+        let current: RGB
+        let next: RGB
+
+        init(_ start: UInt32, _ end: UInt32, _ current: UInt32, _ next: UInt32) {
+            self.start = RGB(hex: start)
+            self.end = RGB(hex: end)
+            self.current = RGB(hex: current)
+            self.next = RGB(hex: next)
+        }
+    }
+
+    var palette: Palette {
+        switch self {
+        case .warm: return Palette(0x6B473B, 0xAD7352, 0xFFF5E3, 0xF5E0C9)
+        case .mint: return Palette(0x26574F, 0x457F6B, 0xF5FFF2, 0xCFF5DA)
+        case .blue: return Palette(0x365473, 0x5482A3, 0xF7FCFF, 0xDAF0FF)
+        case .lavender: return Palette(0x4F456E, 0x7D6E9E, 0xFCF7FF, 0xF0E0FF)
+        case .rose: return Palette(0x733D52, 0xA36475, 0xFFF5FA, 0xFFDBE6)
+        case .slate: return Palette(0x303845, 0x525C6E, 0xFAFAFF, 0xD9E3F2)
+        }
+    }
+}
+
+struct FloatingLyricsAppearance: Equatable, Sendable {
+    var lineMode: FloatingLyricsLineMode = .double
+    var showsTitle = false
+    var theme: FloatingLyricsTheme = .warm
+    static let titleKey = "floatingLyricsShowsTitle"
+
+    init(lineMode: FloatingLyricsLineMode = .double, showsTitle: Bool = false,
+         theme: FloatingLyricsTheme = .warm) {
+        self.lineMode = lineMode
+        self.showsTitle = showsTitle
+        self.theme = theme
+    }
+
+    init(defaults: UserDefaults) {
+        lineMode = defaults.string(forKey: FloatingLyricsLineMode.userDefaultsKey)
+            .flatMap(FloatingLyricsLineMode.init(rawValue:)) ?? .double
+        showsTitle = defaults.object(forKey: Self.titleKey) as? Bool ?? false
+        theme = defaults.string(forKey: FloatingLyricsTheme.userDefaultsKey)
+            .flatMap(FloatingLyricsTheme.init(rawValue:)) ?? .warm
+    }
+
+    func pixelHeight(hasControlFeedback: Bool) -> Int {
+        lineMode.pixelHeight + (showsTitle ? 24 : 0) + (hasControlFeedback ? 28 : 0)
+    }
+}
+
 struct LyricsDisplayPreferences: Equatable {
     static let compactKey = "compactLyricsEnabled"
     static let floatingKey = "floatingLyricsEnabled"
@@ -8,8 +92,12 @@ struct LyricsDisplayPreferences: Equatable {
     var floatingEnabled: Bool
 
     init(defaults: UserDefaults) {
-        compactEnabled = defaults.object(forKey: Self.compactKey) as? Bool ?? false
-        floatingEnabled = defaults.object(forKey: Self.floatingKey) as? Bool ?? false
+        // Display switches describe this app session. Older saved "on" values
+        // must not imply that a window exists after a cold launch.
+        compactEnabled = false
+        floatingEnabled = false
+        defaults.removeObject(forKey: Self.compactKey)
+        defaults.removeObject(forKey: Self.floatingKey)
     }
 }
 
@@ -29,6 +117,7 @@ struct LyricsPresentationSnapshot: Equatable, Sendable {
         let artist: String
         let isPlaying: Bool
         let status: Status
+        var nextText: String = ""
     }
 
     let trackID: String
@@ -43,11 +132,12 @@ struct LyricsPresentationSnapshot: Equatable, Sendable {
     let status: Status
     let validUntilUptime: TimeInterval
     var playbackControlState: LyricsPlaybackControlState = .idle
+    var nextText: String = ""
 
     var key: Key {
         Key(trackID: trackID, trackGeneration: trackGeneration,
             timelineRevision: timelineRevision, lineIndex: lineIndex, text: text,
-            title: title, artist: artist, isPlaying: isPlaying, status: status)
+            title: title, artist: artist, isPlaying: isPlaying, status: status, nextText: nextText)
     }
 
     var hasAuthoritativePlayback: Bool {
@@ -91,6 +181,7 @@ struct LyricsPiPStateMachine {
     private(set) var enabled = false
     private(set) var state: State = .disabled
     private(set) var generation: UInt64 = 0
+    private(set) var restartRequested = false
 
     mutating func setEnabled(_ value: Bool) {
         guard enabled != value else { return }
@@ -98,6 +189,7 @@ struct LyricsPiPStateMachine {
         if value {
             if state != .stopping { state = .stopped }
         } else {
+            restartRequested = false
             generation &+= 1
             state = state == .active || state == .starting ? .stopping : .disabled
         }
@@ -128,8 +220,23 @@ struct LyricsPiPStateMachine {
     }
 
     mutating func stop() {
+        restartRequested = false
         generation &+= 1
         state = .stopping
+    }
+
+    mutating func requestRestartAfterStop() -> Bool {
+        guard enabled, state == .stopping else { return false }
+        restartRequested = true
+        return true
+    }
+
+    mutating func cancelRestartAfterStop() { restartRequested = false }
+
+    mutating func takeRestartAfterStop() -> Bool {
+        let shouldRestart = enabled && restartRequested
+        restartRequested = false
+        return shouldRestart
     }
 
     mutating func didStop() {
@@ -138,6 +245,7 @@ struct LyricsPiPStateMachine {
     }
 
     mutating func fail(unavailable: Bool = false) {
+        restartRequested = false
         generation &+= 1
         state = enabled ? (unavailable ? .unavailable : .failed) : .disabled
     }

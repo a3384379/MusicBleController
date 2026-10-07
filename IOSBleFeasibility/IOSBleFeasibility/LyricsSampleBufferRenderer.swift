@@ -5,18 +5,24 @@ import UIKit
 /// deliberately absent from the frame clock, so backward seeks remain valid.
 final class LyricsSampleBufferRenderer: @unchecked Sendable {
     static let width = 640
-    static let height = 360
     private var pool: CVPixelBufferPool?
+    private var poolHeight = 0
     private var lastPresentationTime = CMTime.invalid
 
     enum RenderError: Error { case bufferPoolExhausted, pixelBuffer, context, format, sampleBuffer }
 
-    func render(_ snapshot: LyricsPresentationSnapshot) throws -> CMSampleBuffer {
+    func render(_ snapshot: LyricsPresentationSnapshot,
+                appearance: FloatingLyricsAppearance = FloatingLyricsAppearance()) throws -> CMSampleBuffer {
+        let height = appearance.pixelHeight(hasControlFeedback: snapshot.playbackControlState != .idle)
+        if poolHeight != height {
+            pool = nil
+            poolHeight = height
+        }
         if pool == nil {
             let attributes: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                 kCVPixelBufferWidthKey as String: Self.width,
-                kCVPixelBufferHeightKey as String: Self.height,
+                kCVPixelBufferHeightKey as String: height,
                 kCVPixelBufferCGImageCompatibilityKey as String: true,
                 kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:]
@@ -34,50 +40,53 @@ final class LyricsSampleBufferRenderer: @unchecked Sendable {
         CVPixelBufferLockBaseAddress(buffer, [])
         defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
         guard let context = CGContext(
-            data: CVPixelBufferGetBaseAddress(buffer), width: Self.width, height: Self.height,
+            data: CVPixelBufferGetBaseAddress(buffer), width: Self.width, height: height,
             bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
         ) else { throw RenderError.context }
-        context.setFillColor(UIColor(red: 0.055, green: 0.065, blue: 0.085, alpha: 1).cgColor)
-        context.fill(CGRect(x: 0, y: 0, width: Self.width, height: Self.height))
-        context.translateBy(x: 0, y: CGFloat(Self.height))
+        let palette = appearance.theme.palette
+        let colors = [palette.start.uiColor.cgColor, palette.end.uiColor.cgColor] as CFArray
+        guard let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors,
+                                        locations: [0, 1]) else { throw RenderError.context }
+        context.drawLinearGradient(gradient, start: .zero,
+                                   end: CGPoint(x: Self.width, y: 0), options: [])
+        context.translateBy(x: 0, y: CGFloat(height))
         context.scaleBy(x: 1, y: -1)
         UIGraphicsPushContext(context)
         defer { UIGraphicsPopContext() }
 
         let paragraph = NSMutableParagraphStyle()
-        paragraph.alignment = .center
+        paragraph.alignment = .left
         paragraph.lineBreakMode = .byTruncatingTail
-        let title = snapshot.title == "-" ? AppLocalization.string("等待同步") : snapshot.title
-        (String(title.prefix(100)) as NSString).draw(
-            in: CGRect(x: 36, y: 36, width: 568, height: 36),
-            withAttributes: [.font: UIFont.systemFont(ofSize: 22, weight: .medium),
-                             .foregroundColor: UIColor.lightGray, .paragraphStyle: paragraph]
-        )
-        let line = String(snapshot.displayText.prefix(512))
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: UIFont.systemFont(ofSize: 34, weight: .semibold),
-            .foregroundColor: snapshot.status == .ready ? UIColor.white : UIColor.lightGray,
-            .paragraphStyle: paragraph
-        ]
-        let textHeight = min(204, ceil((line as NSString).boundingRect(
-            with: CGSize(width: 568, height: 204), options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: attributes, context: nil
-        ).height))
-        (line as NSString).draw(
-            in: CGRect(x: 36, y: 100 + (204 - textHeight) / 2, width: 568, height: textHeight),
-            withAttributes: attributes
-        )
+        // Keep each line in one fixed row. Long lyrics never change the canvas
+        // or wrap into the neighbouring row. AVKit still owns the window size.
+        func drawLine(_ text: String, y: CGFloat, size: CGFloat, color: UIColor,
+                      weight: UIFont.Weight = .regular) {
+            let singleLine = String(text.prefix(512)).components(separatedBy: .newlines).joined(separator: " ")
+            let font = UIFont.systemFont(ofSize: size, weight: weight)
+            (singleLine as NSString).draw(
+                in: CGRect(x: 18, y: y, width: CGFloat(Self.width - 36), height: ceil(font.lineHeight) + 2),
+                withAttributes: [.font: font,
+                                 .foregroundColor: color, .paragraphStyle: paragraph]
+            )
+        }
+        if appearance.showsTitle {
+            drawLine(snapshot.title == "-" ? AppLocalization.string("等待同步") : snapshot.title,
+                     y: 4, size: 18, color: palette.next.uiColor)
+        }
+        let primaryY: CGFloat = appearance.showsTitle ? 30 : 6
+        drawLine(snapshot.displayText, y: primaryY, size: 38,
+                 color: palette.current.uiColor,
+                 weight: .semibold)
+        if appearance.lineMode == .double {
+            drawLine(snapshot.nextText, y: primaryY + 50, size: 32,
+                     color: palette.next.uiColor)
+        }
 
         if snapshot.playbackControlState != .idle {
-            let feedbackParagraph = NSMutableParagraphStyle()
-            feedbackParagraph.alignment = .center
-            (snapshot.playbackControlState.message as NSString).draw(
-                in: CGRect(x: 36, y: 312, width: 568, height: 42),
-                withAttributes: [.font: UIFont.systemFont(ofSize: 16),
-                                 .foregroundColor: UIColor.lightGray, .paragraphStyle: feedbackParagraph]
-            )
+            drawLine(snapshot.playbackControlState.message, y: CGFloat(height - 26), size: 18,
+                     color: palette.current.uiColor)
         }
 
         var format: CMVideoFormatDescription?
@@ -100,6 +109,12 @@ final class LyricsSampleBufferRenderer: @unchecked Sendable {
             attachments.first?[kCMSampleAttachmentKey_DisplayImmediately] = true
         }
         return sample
+    }
+}
+
+extension FloatingLyricsTheme.RGB {
+    var uiColor: UIColor {
+        UIColor(red: red, green: green, blue: blue, alpha: 1)
     }
 }
 

@@ -33,7 +33,7 @@ struct SonyMusicLiveActivityWidget: Widget {
                 }
             } compactLeading: {
                 if context.state.compactLyricsEnabled {
-                    CompactPlaybackGlyphView(visualState: visualState, size: 12)
+                    CompactLyricsArtworkView(state: context.state, visualState: visualState)
                 } else {
                     CompactStyleLeadingView(state: context.state)
                 }
@@ -65,9 +65,41 @@ private struct CompactLyricView: View {
             .font(.system(size: 13, weight: .medium))
             .lineLimit(1)
             .truncationMode(.tail)
-            .frame(maxWidth: 160, alignment: .leading)
-            .layoutPriority(1)
+            .frame(width: 120, height: 26, alignment: .leading)
+            .clipped()
             .foregroundStyle(.white)
+    }
+}
+
+private struct CompactLyricsArtworkView: View {
+    let state: SonyMusicActivityAttributes.ContentState
+    let visualState: DynamicIslandPlaybackVisualState
+
+    var body: some View {
+        Group {
+            if visualState == .disconnected {
+                Button(intent: ReconnectLiveActivityIntent()) { artwork }
+            } else if visualState.controlsEnabled {
+                Button(intent: PlayPauseLiveActivityIntent()) { artwork }
+            } else {
+                artwork
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text(visualState.buttonAccessibilityLabel))
+    }
+
+    private var artwork: some View {
+        ZStack(alignment: .bottomTrailing) {
+            CompactStyleLeadingView(state: state)
+            Image(systemName: visualState.symbolName)
+                .font(.system(size: 7, weight: .bold))
+                .foregroundStyle(visualState.accentColor)
+                .padding(2)
+                .background(.black, in: Circle())
+                .offset(x: 2, y: 2)
+        }
+        .frame(width: 30, height: 30)
     }
 }
 
@@ -678,7 +710,7 @@ private struct TrackSummaryView: View {
                 .minimumScaleFactor(0.75)
                 .truncationMode(.tail)
 
-            if dynamicIslandStyle == .compactDefault {
+            if state.compactLyricsEnabled || dynamicIslandStyle == .compactDefault {
                 Text(state.artist)
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.white.opacity(0.68))
@@ -725,6 +757,16 @@ private struct ExpandedBottomView: View {
 
     var body: some View {
         VStack(spacing: 6) {
+            if state.compactLyricsEnabled {
+                Text(StateTransitionEngine.lyricState(
+                    for: state, visualState: .resolve(state: state)
+                ).text)
+                    .font(.system(size: 15, weight: .medium))
+                    .lineLimit(2, reservesSpace: true)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .foregroundStyle(.white)
+            }
             LiveActivityProgressRow(state: state)
                 .padding(.horizontal, 14)
                 .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))

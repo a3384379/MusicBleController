@@ -2309,10 +2309,17 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
             status = fullLyricsUnavailableTrackIDs.contains(currentTrackID) ? .unavailable : .loading
         }
         if status != .ready { text = "" }
+        var nextText = ""
+        if fresh, fullLyricsTrackId == currentTrackID,
+           status == .ready || status == .intro || status == .instrumental {
+            // Reuse the accepted timeline; never borrow the next line from an old song.
+            nextText = fullLyrics.dropFirst(max(lineIndex + 1, 0))
+                .first { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }?.text ?? ""
+        }
         let key = LyricsPresentationSnapshot.Key(
             trackID: currentTrackID, trackGeneration: currentTrackGeneration,
             timelineRevision: lyricsTimelineRevision, lineIndex: lineIndex, text: text,
-            title: title, artist: artist, isPlaying: isPlaying, status: status
+            title: title, artist: artist, isPlaying: isPlaying, status: status, nextText: nextText
         )
         if key != lastLyricsPresentationKey {
             lyricsPresentationRevision &+= 1
@@ -2323,7 +2330,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
             revision: lyricsPresentationRevision, timelineRevision: lyricsTimelineRevision,
             lineIndex: lineIndex, text: text, title: title, artist: artist, isPlaying: isPlaying,
             status: status, validUntilUptime: deadline,
-            playbackControlState: lyricsStore.floatingPlaybackControlState
+            playbackControlState: lyricsStore.floatingPlaybackControlState, nextText: nextText
         )
     }
 
