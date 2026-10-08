@@ -13,7 +13,7 @@ final class LyricsSampleBufferRenderer: @unchecked Sendable {
 
     func render(_ snapshot: LyricsPresentationSnapshot,
                 appearance: FloatingLyricsAppearance = FloatingLyricsAppearance()) throws -> CMSampleBuffer {
-        let height = appearance.pixelHeight(hasControlFeedback: snapshot.playbackControlState != .idle)
+        let height = appearance.pixelHeight
         if poolHeight != height {
             pool = nil
             poolHeight = height
@@ -82,11 +82,6 @@ final class LyricsSampleBufferRenderer: @unchecked Sendable {
         if appearance.lineMode == .double {
             drawLine(snapshot.nextText, y: primaryY + 50, size: 32,
                      color: palette.next.uiColor)
-        }
-
-        if snapshot.playbackControlState != .idle {
-            drawLine(snapshot.playbackControlState.message, y: CGFloat(height - 26), size: 18,
-                     color: palette.current.uiColor)
         }
 
         var format: CMVideoFormatDescription?

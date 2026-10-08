@@ -47,8 +47,6 @@ private struct LyricsPictureInPictureSourceView: UIViewRepresentable {
         view.becameVisible = { [weak controller] in controller?.sourceBecameVisible() }
         controller.attach(view, snapshot: { [weak manager] in
             manager?.makeLyricsPresentationSnapshot() ?? .disconnected
-        }, setPlaying: { [weak manager] target in
-            manager?.requestFloatingLyricsPlayback(target) ?? false
         }, controlsStopped: { [weak manager] in
             manager?.cancelFloatingLyricsPlaybackIntent()
         })
@@ -65,7 +63,6 @@ struct FloatingLyricsSettingsPanel: View {
     let onStart: () -> Void
     @ObservedObject private var controller = LyricsPictureInPictureController.shared
     @ObservedObject private var preferences = PreferencesStore.shared
-    private var lyricsStore: LyricsStore { manager.lyricsStore }
 
     private var needsSourcePreview: Bool {
         controller.startRequested || controller.state == .preparing ||
@@ -78,24 +75,17 @@ struct FloatingLyricsSettingsPanel: View {
                 LyricsPictureInPictureSourceView(manager: manager, controller: controller,
                                                  appearance: preferences.floatingLyricsAppearance)
                     .aspectRatio(CGFloat(LyricsSampleBufferRenderer.width) /
-                                 CGFloat(preferences.floatingLyricsAppearance.pixelHeight(
-                                    hasControlFeedback: lyricsStore.floatingPlaybackControlState != .idle
-                                 )), contentMode: .fit)
+                                 CGFloat(preferences.floatingLyricsAppearance.pixelHeight), contentMode: .fit)
                     .frame(maxWidth: 320)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     .accessibilityLabel("悬浮歌词预览")
                     .id("floatingLyricsPreview")
             }
             FloatingLyricsStatusView(onStart: onStart)
+            Text("悬浮窗只显示歌词，播放控制请使用主界面或 Sony。")
+                .font(.caption2).foregroundStyle(.secondary)
             Text("轻点窗口可收起系统控件，双指缩放可调整大小。")
                 .font(.caption2).foregroundStyle(.secondary)
-            let controlState = lyricsStore.floatingPlaybackControlState
-            if controlState != .idle {
-                Text(controlState.message).font(.caption2).foregroundStyle(.secondary)
-            }
-            if controlState == .unknown {
-                Button("重新连接") { manager.forceReconnect() }
-            }
         }
         .onDisappear {
             controller.cancelPendingStart()

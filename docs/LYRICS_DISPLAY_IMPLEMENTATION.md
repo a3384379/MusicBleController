@@ -384,3 +384,46 @@ DEBUG 真机启动参数还会让预览在开关关闭后保留，造成截图�
 本轮只修改 iOS 展示与设置接入，没有 BLE 协议或 Sony/Android 改动，因此未重复 Android build。
 已完成最新代码测试与真机安装。以上为提交前的验证记录；用户随后授权将全部待提交内容提交并合并到 GitHub，
 实际交付状态以对应 PR 和主干提交为准。上面的回调证据不替代完整真机验收矩阵。
+
+## 2026-10-08 悬浮歌词纯展示与本机控件隐藏实验
+
+用户要求悬浮窗只显示歌词、去掉播放控件和“直播”，随后明确选择仅供本机验证的隐藏控件实验，并要求查找 GitHub 公开参考。
+本轮从 `master` 的 `c02ba9694d37ad6da1bee34358785339ca868ac5` 创建 `codex/floating-lyrics-display-only`。
+
+悬浮窗的 `attach` 不再接受播放命令回调；AVKit 的播放/暂停请求只复核系统显示状态，不发送 Sony 命令、不暂停帧更新。
+跳转回调只完成系统要求的 completion，不执行 Seek。窗口关闭仍调用既有取消未发送意图的清理路径；
+保留原播放目标策略和回归测试，不削弱已发送但未确认的 toggle 保护。主播放器和灵动岛控制沿用既有路径。
+
+删除像素缓冲中的播放控制反馈行，以及悬浮设置页的控制反馈/重连入口。
+高度仅由单双行与显示歌名决定：640×60 或 640×104，显示歌名增加 24px，控制状态不再增加 28px。
+下一句、六种配色、latest-only 帧队列、readiness 唤醒、像素池压力恢复和关闭后显式重开机制继续保留。
+
+公开接口 `requiresLinearPlayback` 只限制部分跳转操作，没有隐藏整个播放 UI 的公开开关。
+Debug 实验创建 PiP 控制器时通过 `LyricsPiPControlsBridge` 设置未公开的 `controlsStyle=1`，
+目标是隐藏播放/跳转/进度 UI（包含“直播”标识），保留关闭和返回 App；不使用隐藏全部操作的 style 2。
+调用前检查 getter/setter，在 Objective-C 中捕获 KVC 异常并核对读回值；不支持或失败时保留系统样式，
+不会让私有接口异常传播到 Swift。日志为 `controls-experiment=applied|unsupported|failed|disabled`。
+`applied` 只表示接口设置及读回成功，不代替系统窗口的实际外观验收。
+
+实验仅进入 Debug：Swift 入口由 `#if DEBUG` 包围，Objective-C 源在 Release 中排除，桥接头仅配置给 App 的 Debug。
+启动参数 `--disable-floating-lyrics-controls-experiment` 可对比公开接口版本。
+仍返回无限时长的动态帧范围，不伪造歌曲时长或声明无内容；“直播”通过隐藏系统播放 UI 处理。
+私有隐藏不属于 App Store 正式能力承诺，系统升级后需重新验证。
+
+### GitHub 参考与采用范围
+
+- [CustomPictureInPicture 中文说明](https://github.com/for-meng/CustomPictureInPicture/blob/master/README_cn.md)：展示 `controlsStyle=1` 隐藏播放、跳转和进度条。本轮仅参考接口思路，自行实现异常隔离与编译边界，未采用静音保活、强制后台切换或窗口层级注入。
+- [UIPiPDemo 的 ViewController](https://github.com/uakihir0/UIPiPDemo/blob/main/uipip/ViewController.swift)：样本帧承载动态 UIView，控制回调仅作响应。沿用本项目既有像素池渲染器，未引入该 demo 或新的第三方依赖；该仓库已归档，不能据此判定 iOS 26.4 已通过。
+- 另检查 [MeloX 歌词控制器](https://github.com/youshen2/MeloX/blob/1fe5fbab3f554e8529c4847fc54281a472b7b61a/MeloX/Features/FloatingLyrics/FloatingLyricsController.swift)：其有限时间范围和 Seek 绑定本机音频播放，不适用于本项目独立的歌词帧时钟，未移植。
+
+### 本轮验证
+
+- 完整 XCTest **PASS 137/137**（70 项歌词、67 项稳定性），iOS 18.3 模拟器：系统回调不发命令、各控制状态/行数/歌名组合的实际像素一致、固定高度、私有 setter 不可用/不生效回退，以及原生命周期和渲染恢复测试均通过。`/private/tmp/musicble-floating-display-only/tests-final.xcresult`。
+- full smoke **PASS，Required 6/6**，实际签名构建、安装、启动、日志、偏好和文件检查。可选 BLE/封面/CurrentWord 三项显式跳过，不记为通过。`ios-final-full/report.json`。完整检查覆盖 quick，无重复运行 quick。
+- Release 构建 **PASS**；二进制检查显示 `controlsStyle`、`LyricsPiPControlsBridge`、`LyricsPiPControlsExperiment` 只存在于 Debug 的 `sonyMusic.debug.dylib`，Release 可执行文件无这些实验标识。`release-build.log`。
+- iPhone 16 Pro Max / iOS 26.4 已安装 Debug 实验版，保留安装前的双行、显示歌名、暖棕选择。两项会话开关冷启动仍关闭。
+- 真机记录：22:59:12.102 发起启动、22:59:12.661 到达 active；22:59:25.468 系统关窗、22:59:26.339 完成清理，开关随之关闭。22:59:28.634 第二次创建记录 `controls-experiment=applied`，22:59:29.225 再次到达 active。用户明确确认播放按钮、快进快退、进度条和“直播”都已消失，关闭后也能重开；日志为 `device-logs/current.log`。
+- 用户随后在同一进程改为单行并关闭歌名，22:59:36.840 与 22:59:39.438 系统尺寸依次变为 418×55 和 418×39；未使用安装前偏好覆盖这些新选择。
+- 图谱完整重建成功（8340 nodes / 44531 edges，persistence=false），真实源码搜索确认浮窗不再连接 `requestFloatingLyricsPlayback`；图谱不替代测试。当前工具未暴露 `list_projects/index_status/detect_changes`，用完整索引、实际 diff 和构建补充。
+- 本次系统按钮/“直播”外观与一次系统关窗重开已由用户真机确认；跨应用、锁屏、中断、不同系统版本与长期运行仍需完整验收，不能据此关闭原 26 项矩阵。
+- 未改 BLE 协议、Sony/Android、歌词解析或灵动岛，Android build 无需执行。以上为提交前的验证记录；用户随后授权将本轮相关代码提交并合并到 GitHub，实际交付状态以对应 PR 和主干提交为准。

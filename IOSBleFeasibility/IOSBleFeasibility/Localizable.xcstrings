@@ -23,6 +23,7 @@
     "紧凑态保留封面，固定区域显示当前歌词；长按查看更多歌词，多活动时由系统选择最小态。" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Keep artwork and show lyrics in a fixed compact area. Touch and hold for more lyrics; the system selects the minimal view when activities compete."}}}},
     "开启后自动显示，窗口准备好后返回播放器。关闭窗口不暂停 Sony 播放。" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Enable to show lyrics and return to the player when ready. Closing the window does not pause Sony playback."}}}},
     "轻点窗口可收起系统控件，双指缩放可调整大小。" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Tap the window to hide system controls, and pinch to resize."}}}},
+    "悬浮窗只显示歌词，播放控制请使用主界面或 Sony。" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "The floating window only displays lyrics. Use the main player or Sony for playback controls."}}}},
     "歌词预览尚未显示，请留在设置页重试" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "The lyric preview is not visible. Stay in Settings and try again."}}}},
     "歌词预览未准备完成，请再次尝试" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "The lyric preview is not ready. Please try again."}}}},
     "画中画启动未获系统确认，请再次尝试" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Picture in Picture did not finish starting. Please try again."}}}},
