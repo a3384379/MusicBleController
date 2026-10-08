@@ -13,7 +13,6 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
     private weak var sourceView: LyricsPictureInPictureSourceUIView?
     private var displayLayer: AVSampleBufferDisplayLayer?
     private var snapshotProvider: (() -> LyricsPresentationSnapshot)?
-    private var setPlaying: ((Bool) -> Bool)?
     private var controlsStopped: (() -> Void)?
     private var controller: AVPictureInPictureController?
     private var possibleObservation: NSKeyValueObservation?
@@ -57,12 +56,10 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
     func attach(
         _ view: LyricsPictureInPictureSourceUIView,
         snapshot: @escaping () -> LyricsPresentationSnapshot,
-        setPlaying: @escaping (Bool) -> Bool,
         controlsStopped: @escaping () -> Void
     ) {
         sourceView = view
         snapshotProvider = snapshot
-        self.setPlaying = setPlaying
         self.controlsStopped = controlsStopped
         advanceStart()
     }
@@ -177,6 +174,10 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
         pip.delegate = self
         pip.requiresLinearPlayback = true
         pip.canStartPictureInPictureAutomaticallyFromInline = false
+        #if DEBUG
+        let controlsResult = LyricsPiPControlsExperiment.apply(to: pip)
+        AppLogStore.shared.append("[Lyrics-PiP] controls-experiment=\(controlsResult.rawValue)")
+        #endif
         controller = pip
         possibleObservation = pip.observe(\.isPictureInPicturePossible, options: [.initial, .new]) { [weak self] pip, _ in
             Task { @MainActor in
@@ -362,7 +363,6 @@ final class LyricsPictureInPictureController: NSObject, ObservableObject {
 
     private func stop(requestSystemStop: Bool) {
         lifecycle.cancelRestartAfterStop()
-        playbackStatus.blockControls(owner: controller.map(ObjectIdentifier.init))
         controlsStopped?()
         startRequested = false
         startTimeout?.cancel()
@@ -449,7 +449,6 @@ extension LyricsPictureInPictureController: AVPictureInPictureControllerDelegate
             self.startTimeout = nil
             self.reason = ""
             self.logStartStatus("started")
-            self.playbackStatus.allowControls(owner: ObjectIdentifier(pip))
             self.heartbeat = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
                 Task { @MainActor in
                     guard let self, self.state == .active, let snapshot = self.snapshotProvider?() else { return }
@@ -461,9 +460,7 @@ extension LyricsPictureInPictureController: AVPictureInPictureControllerDelegate
     }
 
     nonisolated func pictureInPictureControllerWillStopPictureInPicture(_ pip: AVPictureInPictureController) {
-        // Block even already queued playback callbacks before the system closes
-        // the window. Closing this display must never become a Sony pause.
-        playbackStatus.blockControls(owner: ObjectIdentifier(pip))
+        // Closing this display must never become a Sony pause.
         Task { @MainActor [weak self] in
             guard let self, self.controller === pip else { return }
             self.logStartStatus("will-stop")
@@ -490,23 +487,18 @@ extension LyricsPictureInPictureController: AVPictureInPictureControllerDelegate
 
 extension LyricsPictureInPictureController: AVPictureInPictureSampleBufferPlaybackDelegate {
     nonisolated func pictureInPictureController(_ pip: AVPictureInPictureController, setPlaying playing: Bool) {
+        // This is a display surface. AVKit callbacks must never send a Sony
+        // command or pause frame delivery, including callbacks during closure.
         Task { @MainActor [weak self] in
-            guard let self, self.controller === pip, self.state == .active, self.lifecycle.enabled,
-                  self.playbackStatus.acceptsControls(owner: ObjectIdentifier(pip)) else { return }
-            let accepted = self.setPlaying?(playing) == true
-            if !accepted {
-                // A known control failure/unknown result is displayed in the
-                // snapshot. Keep the fallback for an unavailable source only.
-                if self.snapshotProvider?().playbackControlState == .idle {
-                    self.reason = AppLocalization.string("播放状态未同步，无法执行控制")
-                }
-                pip.invalidatePlaybackState()
-            }
-            if let snapshot = self.snapshotProvider?() { self.update(snapshot, force: true) }
+            guard let self, self.controller === pip else { return }
+            pip.invalidatePlaybackState()
         }
     }
 
     nonisolated func pictureInPictureControllerTimeRangeForPlayback(_ pictureInPictureController: AVPictureInPictureController) -> CMTimeRange {
+        // The display receives live frames and has no seekable song timeline.
+        // Keep the real frame range; the local controls experiment hides LIVE
+        // together with AVKit's playback UI rather than inventing a duration.
         CMTimeRange(start: .zero, duration: .positiveInfinity)
     }
 
@@ -525,10 +517,31 @@ extension LyricsPictureInPictureController: AVPictureInPictureSampleBufferPlayba
 
     nonisolated func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
                                                skipByInterval skipInterval: CMTime, completion completionHandler: @escaping () -> Void) {
-        // A live lyrics surface has no independent seekable media timeline.
+        // A lyrics surface has no independent seekable media timeline.
         completionHandler()
     }
 }
+
+#if DEBUG
+/// Kept out of Release builds. This uses the undocumented controlsStyle key
+/// only for the user-requested device experiment, with an unchanged AVKit fallback.
+@MainActor
+enum LyricsPiPControlsExperiment {
+    enum Result: String { case applied, unsupported, failed, disabled }
+
+    static func apply(to object: NSObject) -> Result {
+        guard !ProcessInfo.processInfo.arguments.contains("--disable-floating-lyrics-controls-experiment") else {
+            return .disabled
+        }
+        switch LyricsPiPControlsBridge.apply(to: object) {
+        case .applied: return .applied
+        case .unsupported: return .unsupported
+        case .failed: return .failed
+        @unknown default: return .failed
+        }
+    }
+}
+#endif
 
 /// AVKit can query playback synchronously from its own queue. Keep that query
 /// independent of MainActor, and expire it even when the app is suspended.
@@ -537,16 +550,10 @@ private final class LyricsPiPPlaybackStatus: @unchecked Sendable {
     private var owner: ObjectIdentifier?
     private var playing = false
     private var validUntil: TimeInterval = 0
-    private var controlsAllowed = false
-    private var controlsBlocked = false
 
     func update(_ snapshot: LyricsPresentationSnapshot, owner: ObjectIdentifier?) {
         lock.lock()
         defer { lock.unlock() }
-        if self.owner != owner {
-            controlsAllowed = false
-            controlsBlocked = false
-        }
         self.owner = owner
         playing = snapshot.isPlaying && snapshot.hasAuthoritativePlayback
         validUntil = snapshot.validUntilUptime
@@ -558,30 +565,6 @@ private final class LyricsPiPPlaybackStatus: @unchecked Sendable {
         owner = nil
         playing = false
         validUntil = 0
-        controlsAllowed = false
-        controlsBlocked = false
-    }
-
-    func allowControls(owner: ObjectIdentifier) {
-        lock.lock()
-        defer { lock.unlock() }
-        if self.owner == owner && !controlsBlocked { controlsAllowed = true }
-    }
-
-    func blockControls(owner: ObjectIdentifier?) {
-        lock.lock()
-        defer { lock.unlock() }
-        if self.owner == owner {
-            controlsAllowed = false
-            // A queued didStart must not reopen controls after willStop.
-            controlsBlocked = true
-        }
-    }
-
-    func acceptsControls(owner: ObjectIdentifier) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return self.owner == owner && controlsAllowed
     }
 
     func isPaused(owner: ObjectIdentifier) -> Bool {

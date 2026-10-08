@@ -65,6 +65,7 @@
 		A10000000000000000000044 /* LyricsPictureInPictureController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000044 /* LyricsPictureInPictureController.swift */; };
 		A10000000000000000000045 /* LyricsPictureInPictureSourceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000045 /* LyricsPictureInPictureSourceView.swift */; };
 		A10000000000000000000046 /* LyricsDisplaySettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000046 /* LyricsDisplaySettingsView.swift */; };
+		A10000000000000000000048 /* LyricsPiPControlsBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000048 /* LyricsPiPControlsBridge.m */; };
 		C10000000000000000000002 /* LyricsPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000000000000000000003 /* LyricsPresentationTests.swift */; };
 /* End PBXBuildFile section */
 
@@ -156,6 +157,9 @@
 		A20000000000000000000044 /* LyricsPictureInPictureController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LyricsPictureInPictureController.swift; sourceTree = "<group>"; };
 		A20000000000000000000045 /* LyricsPictureInPictureSourceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LyricsPictureInPictureSourceView.swift; sourceTree = "<group>"; };
 		A20000000000000000000046 /* LyricsDisplaySettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LyricsDisplaySettingsView.swift; sourceTree = "<group>"; };
+		A20000000000000000000047 /* LyricsPiPControlsBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = LyricsPiPControlsBridge.h; sourceTree = "<group>"; };
+		A20000000000000000000048 /* LyricsPiPControlsBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = LyricsPiPControlsBridge.m; sourceTree = "<group>"; };
+		A20000000000000000000049 /* IOSBleFeasibility-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "IOSBleFeasibility-Bridging-Header.h"; sourceTree = "<group>"; };
 		C20000000000000000000003 /* LyricsPresentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LyricsPresentationTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -243,6 +247,9 @@
 				A20000000000000000000004 /* BLETestManager.swift */,
 				A20000000000000000000005 /* Info.plist */,
 				A20000000000000000000013 /* IOSBleFeasibility.entitlements */,
+				A20000000000000000000047 /* LyricsPiPControlsBridge.h */,
+				A20000000000000000000048 /* LyricsPiPControlsBridge.m */,
+				A20000000000000000000049 /* IOSBleFeasibility-Bridging-Header.h */,
 				A20000000000000000000007 /* Assets.xcassets */,
 			);
 			path = IOSBleFeasibility;
@@ -443,6 +450,7 @@
 				A10000000000000000000027 /* PreferencesStore.swift in Sources */,
 				A10000000000000000000045 /* LyricsPictureInPictureSourceView.swift in Sources */,
 				A10000000000000000000046 /* LyricsDisplaySettingsView.swift in Sources */,
+				A10000000000000000000048 /* LyricsPiPControlsBridge.m in Sources */,
 				A10000000000000000000044 /* LyricsPictureInPictureController.swift in Sources */,
 				A10000000000000000000043 /* LyricsSampleBufferRenderer.swift in Sources */,
 				A10000000000000000000042 /* LyricsPresentationSnapshot.swift in Sources */,
@@ -615,6 +623,7 @@
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "IOSBleFeasibility/IOSBleFeasibility-Bridging-Header.h";
 				SWIFT_STRICT_CONCURRENCY = targeted;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
@@ -630,6 +639,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 98K7KHA6Z7;
+				EXCLUDED_SOURCE_FILE_NAMES = LyricsPiPControlsBridge.m;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = IOSBleFeasibility/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;

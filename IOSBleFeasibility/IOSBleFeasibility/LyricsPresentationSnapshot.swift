@@ -79,8 +79,8 @@ struct FloatingLyricsAppearance: Equatable, Sendable {
             .flatMap(FloatingLyricsTheme.init(rawValue:)) ?? .warm
     }
 
-    func pixelHeight(hasControlFeedback: Bool) -> Int {
-        lineMode.pixelHeight + (showsTitle ? 24 : 0) + (hasControlFeedback ? 28 : 0)
+    var pixelHeight: Int {
+        lineMode.pixelHeight + (showsTitle ? 24 : 0)
     }
 }
 

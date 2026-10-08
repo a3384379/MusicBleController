@@ -1,4 +1,5 @@
 import AVFoundation
+import AVKit
 import CoreImage
 import SwiftUI
 import UIKit
@@ -924,7 +925,6 @@ final class LyricsPresentationTests: XCTestCase {
         let controller = LyricsPictureInPictureController()
         let view = LyricsPictureInPictureSourceUIView()
         controller.attach(view, snapshot: { manager.makeLyricsPresentationSnapshot() },
-                          setPlaying: { manager.requestFloatingLyricsPlayback($0) },
                           controlsStopped: { manager.cancelFloatingLyricsPlaybackIntent() })
         controller.stop()
         XCTAssertEqual(sent, 1)
@@ -955,39 +955,71 @@ final class LyricsPresentationTests: XCTestCase {
         manager.disconnectResponseTests()
     }
 
-    func testUnknownControlFeedbackIsRenderedWithoutChangingLyricIdentity() throws {
+    func testFloatingLyricsIgnoreAllPlaybackControlFeedback() throws {
         let renderer = LyricsSampleBufferRenderer()
         let normal = snapshot()
-        var unknown = normal
-        unknown.playbackControlState = .unknown
-        XCTAssertEqual(normal.key, unknown.key, "Control feedback must not increase ActivityKit lyric publication")
-        let plain = try renderer.render(normal)
-        let feedback = try renderer.render(unknown)
-        func brightFooterPixels(_ sample: CMSampleBuffer) throws -> Int {
-            let buffer = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
-            CVPixelBufferLockBaseAddress(buffer, .readOnly)
-            defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-            let bytes = try XCTUnwrap(CVPixelBufferGetBaseAddress(buffer)).assumingMemoryBound(to: UInt8.self)
-            let stride = CVPixelBufferGetBytesPerRow(buffer)
-            let height = CVPixelBufferGetHeight(buffer)
-            let width = CVPixelBufferGetWidth(buffer)
-            return ((height - 30)..<height).reduce(0) { count, row in
-                count + (0..<width).filter { column in
-                    let index = row * stride + column * 4
-                    return bytes[index] > 100 && bytes[index + 1] > 100 && bytes[index + 2] > 100
-                }.count
+        for lineMode in FloatingLyricsLineMode.allCases {
+            for showsTitle in [false, true] {
+                let appearance = FloatingLyricsAppearance(lineMode: lineMode, showsTitle: showsTitle)
+                let plain = try renderedPixels(renderer, normal, appearance: appearance)
+                for state in [LyricsPlaybackControlState.pending, .unknown, .failed, .unavailable] {
+                    var feedback = normal
+                    feedback.playbackControlState = state
+                    XCTAssertEqual(normal.key, feedback.key)
+                    XCTAssertEqual(try renderedPixels(renderer, feedback, appearance: appearance), plain,
+                                   "Control status must not draw text or enlarge the display-only lyrics strip")
+                }
             }
         }
-        XCTAssertEqual(try brightFooterPixels(plain), 0)
-        XCTAssertGreaterThan(try brightFooterPixels(feedback), 100)
-        let buffer = try XCTUnwrap(CMSampleBufferGetImageBuffer(feedback))
-        let image = CIImage(cvPixelBuffer: buffer)
-        let cgImage = try XCTUnwrap(CIContext().createCGImage(image, from: image.extent))
-        let attachment = XCTAttachment(image: UIImage(cgImage: cgImage))
-        attachment.name = "floating-lyrics-unknown-control-feedback"
-        attachment.lifetime = .keepAlways
-        add(attachment)
     }
+
+    @MainActor
+    func testFloatingLyricsSystemCallbacksDoNotSendPlaybackOrSeekCommands() async {
+        var sent: [String] = []
+        let manager = BLETestManager(automaticallyStartBluetooth: false,
+                                    floatingPlaybackCommandSender: { _, _, _ in sent.append("PLAY_PAUSE"); return .sent })
+        manager.configureResponseTests(trackID: "lyrics-display-only-\(UUID().uuidString)")
+        manager.commandSenderForTesting = { command, _ in sent.append(command); return true }
+        let controller = LyricsPictureInPictureController()
+        let view = LyricsPictureInPictureSourceUIView()
+        controller.attach(view, snapshot: { manager.makeLyricsPresentationSnapshot() },
+                          controlsStopped: { manager.cancelFloatingLyricsPlaybackIntent() })
+        let source = AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer: view.displayLayer,
+                                                                playbackDelegate: controller)
+        let pip = AVPictureInPictureController(contentSource: source)
+        defer { controller.stop(); manager.disconnectResponseTests() }
+        for playing in [false, true] {
+            receivePlayback(manager, playing: playing)
+            sent.removeAll()
+            let range = controller.pictureInPictureControllerTimeRangeForPlayback(pip)
+            XCTAssertTrue(range.isValid)
+            XCTAssertTrue(range.duration.isPositiveInfinity, "The real frame timeline must not use a fabricated song duration")
+            controller.pictureInPictureController(pip, setPlaying: !playing)
+            var completed = false
+            controller.pictureInPictureController(pip, skipByInterval: CMTime(seconds: 10, preferredTimescale: 600)) {
+                completed = true
+            }
+            await Task.yield()
+            XCTAssertTrue(completed, "AVKit skip callbacks must always finish")
+            XCTAssertTrue(sent.isEmpty, "System callbacks must not send playback, seek or state-query commands")
+            XCTAssertEqual(manager.isPlaying, playing)
+            XCTAssertEqual(manager.lyricsStore.floatingPlaybackControlState, .idle)
+            XCTAssertTrue(controller.reason.isEmpty)
+        }
+    }
+
+    #if DEBUG
+    @MainActor
+    func testExperimentalControlsKeepWindowActionsAndHandleUnsupportedSetters() {
+        let writable = WritablePiPControlsFixture()
+        XCTAssertEqual(LyricsPiPControlsExperiment.apply(to: writable), .applied)
+        XCTAssertEqual(writable.controlsStyle, 1, "Style 1 keeps close/restore; style 2 must never be requested")
+        XCTAssertEqual(LyricsPiPControlsExperiment.apply(to: NSObject()), .unsupported)
+        let ignored = IgnoredPiPControlsFixture()
+        XCTAssertEqual(LyricsPiPControlsExperiment.apply(to: ignored), .failed)
+        XCTAssertEqual(ignored.controlsStyle, 0, "Failed application keeps the original system style")
+    }
+    #endif
 
     func testSampleBufferPixelsAndTimestampsRemainValidAcrossBackwardSeek() throws {
         let renderer = LyricsSampleBufferRenderer()
@@ -1326,21 +1358,20 @@ final class LyricsPresentationTests: XCTestCase {
         XCTAssertGreaterThan(controller.lifecycle.generation, previousGeneration)
     }
 
-    func testCompactCanvasOnlyAddsHeightWhenTitleOrControlFeedbackIsPresent() throws {
+    func testCompactCanvasOnlyAddsHeightWhenTitleIsPresent() throws {
         let renderer = LyricsSampleBufferRenderer()
         let plain = snapshot(text: "气象报告天气很不错", nextText: "太阳晒的我脸颊红红")
         let pixels = try renderedPixels(renderer, plain)
         var withFeedback = plain
         withFeedback.playbackControlState = .unknown
         let feedbackPixels = try renderedPixels(renderer, withFeedback)
-        let expectedStride = feedbackPixels.count / 132
+        let expectedStride = feedbackPixels.count / 104
         XCTAssertEqual(pixels.count, expectedStride * 104)
-        XCTAssertEqual(Data(feedbackPixels.prefix(pixels.count)), pixels,
-                       "Control feedback must add a row without covering either lyric")
+        XCTAssertEqual(feedbackPixels, pixels, "Playback control feedback does not belong in floating lyrics")
         let titlePixels = try renderedPixels(renderer, plain, appearance: FloatingLyricsAppearance(showsTitle: true))
         XCTAssertEqual(titlePixels.count, expectedStride * 128)
         let bothPixels = try renderedPixels(renderer, withFeedback, appearance: FloatingLyricsAppearance(showsTitle: true))
-        XCTAssertEqual(bothPixels.count, expectedStride * 156)
+        XCTAssertEqual(bothPixels.count, expectedStride * 128)
         let sample = try renderer.render(plain)
         let buffer = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
         let image = CIImage(cvPixelBuffer: buffer)
@@ -1550,3 +1581,16 @@ private final class ActivityPublicationRecorder {
 
     func completeNext() { completions.removeFirst().resume(returning: true) }
 }
+
+#if DEBUG
+private final class WritablePiPControlsFixture: NSObject {
+    @objc dynamic var controlsStyle = 0
+}
+
+private final class IgnoredPiPControlsFixture: NSObject {
+    @objc dynamic var controlsStyle: Int {
+        get { 0 }
+        set { }
+    }
+}
+#endif
