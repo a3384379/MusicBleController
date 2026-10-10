@@ -1,0 +1,31 @@
+<resources>
+    <string name="app_name">手机声音实验</string>
+    <string name="title">手机声音 → Sony</string>
+    <string name="instructions">仅用于固定设备的 AirPlay 可行性验证。先暂停 Sony 音乐，再开始接收；在 iPhone 控制中心的音频输出列表选择 Sony Phone Audio Lab。</string>
+    <string name="music_paused">我已暂停 Sony 当前音乐</string>
+    <string name="start">开始接收</string>
+    <string name="stop">结束接收</string>
+    <string name="stop_title">结束手机声音</string>
+    <string name="stop_message">请先暂停手机视频。结束输出或网络中断时，系统可能恢复手机扬声器。本实验不会自动恢复 Sony 音乐。</string>
+    <string name="cancel">取消</string>
+    <string name="confirm_stop">已暂停，结束</string>
+    <string name="off">关闭</string>
+    <string name="preparing">正在准备接收</string>
+    <string name="waiting">等待 iPhone 选择系统音频输出</string>
+    <string name="connected">已连接，等待有效音频</string>
+    <string name="processing">正在处理音频；实际出声和音画同步仍需确认</string>
+    <string name="silent">音源暂停或暂时无声；保持手机音源，不恢复 Sony 音乐</string>
+    <string name="stopping">正在结束</string>
+    <string name="failed">接收失败；请结束后重试</string>
+    <string name="interrupted">接收中断；请检查手机当前输出</string>
+    <string name="pairing_code">在 iPhone 输入配对码：%1$s</string>
+    <string name="metrics">接收端积压：%1$d ms；缓冲目标：%2$d ms；解码错误：%3$d。以上不是端到端音画延迟。</string>
+    <string name="boundary">画面留在 iPhone。请使用同一 Wi-Fi 的系统音频输出选择，不使用屏幕镜像。手机是否同时外放、切换残音与延迟，必须在真实视频中确认。每次实验最多 15 分钟。</string>
+    <string name="notification_channel">手机声音接收实验</string>
+    <string name="notification">实验接收会话正在运行</string>
+    <string name="failure_start">请确认 Sony 已连接局域网，结束后重新开始。尚未确认手机输出已转到 Sony。</string>
+    <string name="failure_interruption">会话已中断。请先暂停手机视频，检查手机当前音频输出，再重新开始。</string>
+    <string name="failure_focus">Sony 当前音频输出不可用。请暂停其他音源后重试。</string>
+    <string name="failure_mirroring">本实验仅接收音频。请从 iPhone 音频输出列表选择设备，不使用屏幕镜像。</string>
+    <string name="failure_deadline">本次 15 分钟实验已结束。请检查手机当前音频输出；需要继续时手动重新开始。</string>
+</resources>
