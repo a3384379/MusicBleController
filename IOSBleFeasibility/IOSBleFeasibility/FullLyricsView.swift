@@ -22,8 +22,10 @@ struct FullLyricsView: View {
     let onShowDiagnostic: () -> Void
 
     @State private var followState = FullLyricsFollowState()
+    @State private var scrollState = FullLyricsScrollState()
+    @State private var browseGeometry = FullLyricsBrowseGeometry()
+    @State private var browsePreviewIndex: Int?
     @State private var lastAutoScrolledIndex: Int?
-    @State private var isProgrammaticScroll = false
     @ObservedObject private var preferences = PreferencesStore.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -170,8 +172,8 @@ struct FullLyricsView: View {
 
     private var lyricsList: some View {
         ScrollViewReader { proxy in
-            GeometryReader { viewport in
-                ZStack(alignment: .topTrailing) {
+            VStack(spacing: 8) {
+                GeometryReader { viewport in
                     ScrollView(showsIndicators: false) {
                         LazyVStack(alignment: .leading, spacing: 24) {
                             Color.clear
@@ -188,45 +190,48 @@ struct FullLyricsView: View {
                                 .frame(height: max(viewport.size.height * 0.42, 140))
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .coordinateSpace(name: "fullLyricsContent")
+                        .id(lyricsIdentity)
                     }
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 8)
-                            .onChanged { _ in
-                                enterBrowseMode()
-                            }
-                    )
-
-                    if isBrowsingLyrics, !lyrics.isEmpty {
-                        Button {
-                            restoreFollowMode(proxy)
-                        } label: {
-                            Label("回到当前歌词", systemImage: "location.fill")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .frame(minHeight: 44)
-                                .background(.white.opacity(0.12), in: Capsule())
-                                .overlay {
-                                    Capsule().stroke(.white.opacity(0.10), lineWidth: 1)
-                                }
+                    .onPreferenceChange(FullLyricsRowLayoutKey.self) { layout in
+                        guard layout.identity == lyricsIdentity else { return }
+                        browseGeometry.prepare(for: lyricsIdentity)
+                        browseGeometry.updateRows(layout.frames, for: lyricsIdentity)
+                        refreshBrowsePreview()
+                    }
+                    .onScrollGeometryChange(for: CGRect.self) { geometry in
+                        geometry.visibleRect
+                    } action: { _, viewport in
+                        browseGeometry.prepare(for: lyricsIdentity)
+                        browseGeometry.updateViewport(viewport)
+                        refreshBrowsePreview()
+                    }
+                    .onScrollPhaseChange { _, phase in
+                        scrollState.phaseDidChange(to: phase)
+                        if phase == .interacting || phase == .decelerating {
+                            followState.userDidBrowse()
+                            refreshBrowsePreview()
                         }
-                        .buttonStyle(FullLyricsPressStyle())
-                        .padding(.top, 4)
                     }
                 }
-                .onAppear {
-                    scrollToCurrent(proxy)
+
+                FullLyricsBrowseFooter(
+                    isBrowsing: isBrowsingLyrics && !lyrics.isEmpty
+                ) {
+                    restoreFollowMode(proxy)
                 }
-                .onChange(of: currentIndex) { _, _ in
-                    guard !isBrowsingLyrics else { return }
+            }
+            .onAppear {
+                scrollToCurrent(proxy)
+            }
+            .onChange(of: currentIndex) { _, _ in
+                guard !isBrowsingLyrics else { return }
+                scrollToCurrent(proxy)
+            }
+            .onChange(of: lyricsIdentity) { _, _ in
+                resetBrowseState()
+                DispatchQueue.main.async {
                     scrollToCurrent(proxy)
-                }
-                .onChange(of: lyricsIdentity) { _, _ in
-                    resetBrowseState()
-                    DispatchQueue.main.async {
-                        scrollToCurrent(proxy)
-                    }
                 }
             }
         }
@@ -259,50 +264,56 @@ struct FullLyricsView: View {
 
     private func lyricRow(index: Int, line: LyricLine) -> some View {
         let isCurrent = index == currentIndex
+        let isBrowsePreview = isBrowsingLyrics && index == browsePreviewIndex
         return Button {
-            guard isConnected else { return }
+            guard isConnected, scrollState.canSeek() else { return }
             seekToLine(line)
         } label: {
-            HStack(alignment: .center, spacing: 14) {
+            FullLyricsBrowseRow(timeMs: isBrowsePreview ? line.timeMs : nil) {
                 lyricText(
                     index: index,
                     line: line,
-                    isCurrent: isCurrent
+                    isCurrent: isCurrent,
+                    isBrowsePreview: isBrowsePreview
                 )
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .animation(
-                    reduceMotion ? nil : .easeInOut(duration: 0.18),
-                    value: currentIndex
-                )
-
-                if isBrowsingLyrics {
-                    Image(systemName: "play.circle.fill")
-                        .font(.system(size: 25, weight: .semibold))
-                        .foregroundStyle(.white.opacity(isConnected ? 0.82 : 0.28))
-                        .transition(.opacity)
-                }
             }
-            .frame(minHeight: 44)
+            .animation(
+                reduceMotion ? nil : .easeInOut(duration: 0.18),
+                value: currentIndex
+            )
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .disabled(!isConnected)
+        .background {
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: FullLyricsRowLayoutKey.self,
+                    value: FullLyricsRowLayout(
+                        identity: lyricsIdentity,
+                        frames: [index: geometry.frame(in: .named("fullLyricsContent"))]
+                    )
+                )
+            }
+        }
         .accessibilityLabel("歌词 \(line.text)")
+        .accessibilityValue(isBrowsePreview ? FullLyricsBrowseTime.text(timeMs: line.timeMs) ?? "" : "")
         .accessibilityHint(isConnected ? "跳转到这句" : "Sony 未连接")
     }
 
-    private func lyricColor(isCurrent: Bool) -> Color {
+    private func lyricColor(isCurrent: Bool, isBrowsePreview: Bool) -> Color {
         if isCurrent {
             return PlayerDesignTokens.stableAccent
         }
-        return .white.opacity(0.42)
+        return .white.opacity(isBrowsePreview ? 0.86 : 0.42)
     }
 
     @ViewBuilder
     private func lyricText(
         index: Int,
         line: LyricLine,
-        isCurrent: Bool
+        isCurrent: Bool,
+        isBrowsePreview: Bool
     ) -> some View {
         if isCurrent {
             lyricStack(
@@ -335,7 +346,7 @@ struct FullLyricsView: View {
                             design: .rounded
                         )
                     )
-                    .foregroundStyle(lyricColor(isCurrent: false))
+                    .foregroundStyle(lyricColor(isCurrent: false, isBrowsePreview: isBrowsePreview))
                     .multilineTextAlignment(.leading)
                     .lineLimit(3)
             }
@@ -435,11 +446,10 @@ struct FullLyricsView: View {
         .accessibilityLabel(AppLocalization.string(title))
     }
 
-    private func scrollToCurrent(_ proxy: ScrollViewProxy) {
+    private func scrollToCurrent(_ proxy: ScrollViewProxy, force: Bool = false) {
         guard lyrics.indices.contains(currentIndex) else { return }
-        guard currentIndex != lastAutoScrolledIndex || !isProgrammaticScroll else { return }
+        guard force || currentIndex != lastAutoScrolledIndex else { return }
         lastAutoScrolledIndex = currentIndex
-        isProgrammaticScroll = true
         if reduceMotion {
             proxy.scrollTo(lyrics[currentIndex].id, anchor: .center)
         } else {
@@ -447,31 +457,125 @@ struct FullLyricsView: View {
                 proxy.scrollTo(lyrics[currentIndex].id, anchor: .center)
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-            isProgrammaticScroll = false
-        }
-    }
-
-    private func enterBrowseMode() {
-        guard !isProgrammaticScroll else { return }
-        followState.userDidBrowse()
     }
 
     private func restoreFollowMode(_ proxy: ScrollViewProxy) {
         followState.returnToCurrent()
-        scrollToCurrent(proxy)
+        browsePreviewIndex = nil
+        scrollToCurrent(proxy, force: true)
     }
 
     private func resetBrowseState() {
         followState.trackDidChange()
+        browsePreviewIndex = nil
+        browseGeometry.prepare(for: lyricsIdentity)
         lastAutoScrolledIndex = nil
-        isProgrammaticScroll = false
     }
 
     private func seekToLine(_ line: LyricLine) {
         onSeekToLine(line.timeMs)
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         followState.returnToCurrent()
+        browsePreviewIndex = nil
+    }
+
+    private func refreshBrowsePreview() {
+        guard isBrowsingLyrics else { return }
+        let index = browseGeometry.nearestLineIndex
+        if browsePreviewIndex != index {
+            browsePreviewIndex = index
+        }
+    }
+}
+
+private struct FullLyricsRowLayout: Equatable {
+    var identity: String?
+    var frames: [Int: CGRect] = [:]
+}
+
+private struct FullLyricsRowLayoutKey: PreferenceKey {
+    static var defaultValue = FullLyricsRowLayout()
+
+    static func reduce(value: inout FullLyricsRowLayout, nextValue: () -> FullLyricsRowLayout) {
+        let next = nextValue()
+        guard next.identity != nil else { return }
+        if value.identity != next.identity {
+            value = next
+        } else {
+            value.frames.merge(next.frames) { _, new in new }
+        }
+    }
+}
+
+struct FullLyricsBrowseRow<Lyric: View>: View {
+    let timeMs: Int64?
+    @ViewBuilder let lyric: Lyric
+
+    private var time: String? { timeMs.flatMap(FullLyricsBrowseTime.text) }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            lyric.frame(maxWidth: .infinity, alignment: .leading)
+            ZStack {
+                if let time {
+                    Text(time)
+                        .font(.system(size: 12, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundStyle(.white.opacity(0.74))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.5)
+                        .accessibilityLabel(Text("定位时间"))
+                        .accessibilityValue(time)
+                }
+            }
+            // Reserve the same column for every row so the preview cannot rewrap lyrics.
+            .frame(width: 54, alignment: .trailing)
+        }
+        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        .overlay(alignment: .leading) {
+            if time != nil {
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(.white.opacity(0.52))
+                    .frame(width: 2)
+                    .padding(.vertical, 4)
+                    .offset(x: -10)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+}
+
+struct FullLyricsBrowseFooter: View {
+    let isBrowsing: Bool
+    let onReturnToCurrent: () -> Void
+    @ScaledMetric(relativeTo: .caption) private var reservedHeight: CGFloat = 44
+
+    var body: some View {
+        // Keep the viewport stable when returning to playback-follow mode.
+        ZStack {
+            if isBrowsing {
+                returnButton
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: reservedHeight)
+    }
+
+    private var returnButton: some View {
+        Button(action: onReturnToCurrent) {
+            Label("回到当前歌词", systemImage: "location.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .frame(minHeight: 44)
+                .background(.white.opacity(0.12), in: Capsule())
+                .overlay {
+                    Capsule().stroke(.white.opacity(0.10), lineWidth: 1)
+                }
+        }
+        .buttonStyle(FullLyricsPressStyle())
     }
 }
 

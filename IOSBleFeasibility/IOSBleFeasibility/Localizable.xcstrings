@@ -1,6 +1,7 @@
 {
   "sourceLanguage" : "zh-Hans",
   "strings" : {
+    "定位时间" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Preview time"}}}},
     "歌词设置" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Lyric settings"}}}},
     "歌词显示设置" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Lyric display settings"}}}},
     "灵动岛歌词" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Dynamic Island lyrics"}}}},
