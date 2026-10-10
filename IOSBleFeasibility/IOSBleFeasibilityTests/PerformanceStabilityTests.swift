@@ -124,6 +124,71 @@ final class PerformanceStabilityTests: XCTestCase {
             named: "full-lyrics-empty",
             height: 667
         )
+
+        for isBrowsing in [false, true] {
+            assertViewRenders(
+                AnyView(FullLyricsBrowseFooter(isBrowsing: isBrowsing, onReturnToCurrent: {})
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.black)),
+                named: "full-lyrics-footer-\(isBrowsing ? "browse" : "follow")",
+                height: 120
+            )
+        }
+        assertViewRenders(
+            AnyView(FullLyricsBrowseFooter(isBrowsing: true, onReturnToCurrent: {})
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black)
+                .environment(\.locale, Locale(identifier: "en"))
+                .environment(\.dynamicTypeSize, .accessibility3)),
+            named: "full-lyrics-footer-english-accessibility",
+            width: 320,
+            height: 260
+        )
+        assertViewRenders(
+            AnyView(
+                VStack(alignment: .leading, spacing: 24) {
+                    FullLyricsBrowseRow(timeMs: nil) {
+                        Text("上一句歌词")
+                            .font(.system(size: 21, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.42))
+                    }
+                    FullLyricsBrowseRow(timeMs: 83_000) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("定位的歌词长句会换行，时间始终属于这句")
+                                .font(.system(size: 21, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.86))
+                            Text("The translation belongs to the same lyric row.")
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.34))
+                        }
+                    }
+                    FullLyricsBrowseRow(timeMs: nil) {
+                        Text("下一句歌词")
+                            .font(.system(size: 21, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.42))
+                    }
+                }
+                .padding(.horizontal, 26)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black)
+            ),
+            named: "full-lyrics-browse-time-beside",
+            height: 320
+        )
+        assertViewRenders(
+            AnyView(FullLyricsBrowseRow(timeMs: 3_983_000) {
+                Text("A long lyric wraps without moving its timestamp")
+                    .font(.system(size: 21, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.86))
+            }
+                .padding(.horizontal, 26)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black)
+                .environment(\.dynamicTypeSize, .accessibility3)),
+            named: "full-lyrics-browse-hour-time-compact",
+            width: 320,
+            height: 260
+        )
     }
 
     func testLyricDiagnosticAndMediaLoadingPresentationBranches() {
@@ -2462,6 +2527,118 @@ final class PerformanceStabilityTests: XCTestCase {
         XCTAssertFalse(state.showsReturnToCurrent)
     }
 
+    func testFullLyricsBrowseTimeUsesTheVisibleLineAtTheViewportCenter() {
+        let geometry = FullLyricsBrowseGeometry()
+        geometry.prepare(for: "song-a")
+        geometry.updateRows([
+            0: CGRect(x: 0, y: 100, width: 300, height: 44),
+            1: CGRect(x: 0, y: 168, width: 300, height: 44),
+            2: CGRect(x: 0, y: 236, width: 300, height: 44)
+        ], for: "song-a")
+        geometry.updateViewport(CGRect(x: 0, y: 90, width: 300, height: 200))
+        XCTAssertEqual(geometry.nearestLineIndex, 1)
+        geometry.updateViewport(CGRect(x: 0, y: 150, width: 300, height: 200))
+        XCTAssertEqual(geometry.nearestLineIndex, 2)
+        geometry.updateViewport(CGRect(x: 0, y: 1_000, width: 300, height: 200))
+        XCTAssertNil(geometry.nearestLineIndex)
+    }
+
+    func testFullLyricsBrowseTimeKeepsTranslatedAndWrappedTextWithItsOriginalRow() {
+        let geometry = FullLyricsBrowseGeometry()
+        geometry.prepare(for: "song-a")
+        geometry.updateRows([
+            7: CGRect(x: 0, y: 100, width: 300, height: 300),
+            8: CGRect(x: 0, y: 424, width: 300, height: 44)
+        ], for: "song-a")
+        geometry.updateViewport(CGRect(x: 0, y: 260, width: 300, height: 200))
+        XCTAssertEqual(geometry.nearestLineIndex, 7)
+        // The center lies halfway between rows: choose deterministically, without flickering.
+        geometry.updateViewport(CGRect(x: 0, y: 312, width: 300, height: 200))
+        XCTAssertEqual(geometry.nearestLineIndex, 7)
+        geometry.updateViewport(CGRect(x: 0, y: 330, width: 300, height: 200))
+        XCTAssertEqual(geometry.nearestLineIndex, 8)
+    }
+
+    func testFullLyricsBrowseGeometryRejectsOldTrackRowsAndAcceptsReusedLineIndices() {
+        let geometry = FullLyricsBrowseGeometry()
+        let frame = CGRect(x: 0, y: 100, width: 300, height: 44)
+        geometry.prepare(for: "song-a")
+        geometry.updateViewport(CGRect(x: 0, y: 20, width: 300, height: 200))
+        geometry.updateRows([0: frame], for: "song-a")
+        XCTAssertEqual(geometry.nearestLineIndex, 0)
+        geometry.prepare(for: "song-b")
+        XCTAssertNil(geometry.nearestLineIndex)
+        geometry.updateRows([5: frame], for: "song-a")
+        XCTAssertNil(geometry.nearestLineIndex)
+        geometry.updateRows([0: frame], for: "song-b")
+        XCTAssertEqual(geometry.nearestLineIndex, 0)
+    }
+
+    func testFullLyricsBrowseGeometryReplacesRemovedRowsAndRequiresAValidViewport() {
+        let geometry = FullLyricsBrowseGeometry()
+        geometry.prepare(for: "song-a")
+        geometry.updateRows([0: CGRect(x: 0, y: 100, width: 300, height: 44)], for: "song-a")
+        XCTAssertNil(geometry.nearestLineIndex)
+        geometry.updateViewport(CGRect(x: 0, y: 20, width: 300, height: 200))
+        XCTAssertEqual(geometry.nearestLineIndex, 0)
+        geometry.updateRows([:], for: "song-a")
+        XCTAssertNil(geometry.nearestLineIndex)
+    }
+
+    func testFullLyricsBrowseTimeFormatsLineStartAtSecondMinuteAndHourBoundaries() {
+        for (timeMs, expected) in [
+            (Int64(0), "00:00"), (999, "00:00"), (59_999, "00:59"),
+            (60_000, "01:00"), (83_999, "01:23"),
+            (3_599_999, "59:59"), (3_600_000, "1:00:00"), (3_983_000, "1:06:23")
+        ] {
+            XCTAssertEqual(FullLyricsBrowseTime.text(timeMs: timeMs), expected)
+        }
+        XCTAssertNil(FullLyricsBrowseTime.text(timeMs: -1))
+    }
+
+    func testFullLyricsScrollAllowsAnOrdinaryLyricTap() {
+        var state = FullLyricsScrollState()
+        XCTAssertTrue(state.canSeek(at: 1))
+        state.phaseDidChange(to: .tracking, at: 1)
+        XCTAssertTrue(state.canSeek(at: 1.1))
+        state.phaseDidChange(to: .idle, at: 1.1)
+        XCTAssertTrue(state.canSeek(at: 1.1))
+    }
+
+    func testFullLyricsDragAndInertiaCannotSeekOnRelease() {
+        var state = FullLyricsScrollState()
+        state.phaseDidChange(to: .tracking, at: 1)
+        state.phaseDidChange(to: .interacting, at: 1.1)
+        XCTAssertFalse(state.canSeek(at: 1.2))
+        state.phaseDidChange(to: .decelerating, at: 1.3)
+        XCTAssertFalse(state.canSeek(at: 2))
+        state.phaseDidChange(to: .idle, at: 2)
+        XCTAssertFalse(state.canSeek(at: 2.01))
+        XCTAssertTrue(state.canSeek(at: 2.3))
+        state.phaseDidChange(to: .tracking, at: 2.4)
+        XCTAssertTrue(state.canSeek(at: 2.5))
+    }
+
+    func testFullLyricsTouchStoppingInertiaDoesNotSelectTheTouchedLine() {
+        var state = FullLyricsScrollState()
+        state.phaseDidChange(to: .interacting, at: 1)
+        state.phaseDidChange(to: .decelerating, at: 1.1)
+        state.phaseDidChange(to: .tracking, at: 1.2)
+        XCTAssertFalse(state.canSeek(at: 2))
+        state.phaseDidChange(to: .idle, at: 2)
+        XCTAssertFalse(state.canSeek(at: 2.01))
+        XCTAssertTrue(state.canSeek(at: 2.3))
+    }
+
+    func testFullLyricsAutomaticScrollAllowsATapAfterSettling() {
+        var state = FullLyricsScrollState()
+        state.phaseDidChange(to: .animating, at: 1)
+        XCTAssertFalse(state.canSeek(at: 1.1))
+        state.phaseDidChange(to: .idle, at: 1.3)
+        state.phaseDidChange(to: .tracking, at: 1.4)
+        XCTAssertTrue(state.canSeek(at: 1.5))
+    }
+
     func testLiveArtworkRevisionFenceRejectsLateCompletion() {
         var fence = LiveActivityArtworkRevisionFence()
         let first = fence.begin()
@@ -2655,6 +2832,12 @@ final class PerformanceStabilityTests: XCTestCase {
         }
         XCTAssertEqual(image.size.width, width, accuracy: 0.1, name)
         XCTAssertEqual(image.size.height, height, accuracy: 0.1, name)
+        if name.hasPrefix("full-lyrics-") {
+            let attachment = XCTAttachment(image: image)
+            attachment.name = name
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
 
         window.isHidden = true
         window.rootViewController = nil

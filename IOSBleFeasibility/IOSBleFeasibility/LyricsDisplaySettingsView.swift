@@ -53,10 +53,9 @@ struct LyricsDisplaySettingsView: View {
                     }
                 }
             }
+            .navigationTitle("歌词设置")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Text("歌词设置").font(.headline.weight(.bold)).foregroundStyle(.white)
-                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("完成", action: onDismiss).foregroundStyle(.white)
                 }

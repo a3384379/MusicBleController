@@ -222,6 +222,95 @@ struct FullLyricsFollowState: Equatable {
     }
 }
 
+struct FullLyricsScrollState: Equatable {
+    private(set) var phase: ScrollPhase = .idle
+    private var suppressCurrentTouch = false
+    private var suppressSeekUntil: TimeInterval = 0
+
+    mutating func phaseDidChange(
+        to newPhase: ScrollPhase,
+        at uptime: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) {
+        let wasUserScrolling = phase == .interacting || phase == .decelerating
+        switch newPhase {
+        case .tracking:
+            // A touch that stops inertia is a scroll interaction, not a lyric selection.
+            suppressCurrentTouch = suppressCurrentTouch || wasUserScrolling || uptime < suppressSeekUntil
+        case .interacting, .decelerating:
+            suppressCurrentTouch = true
+        case .idle:
+            if wasUserScrolling || suppressCurrentTouch {
+                // The row action can arrive just after the scroll view reports idle.
+                suppressSeekUntil = uptime + 0.2
+            }
+            suppressCurrentTouch = false
+        case .animating:
+            break
+        @unknown default:
+            suppressCurrentTouch = true
+        }
+        phase = newPhase
+    }
+
+    func canSeek(at uptime: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
+        (phase == .idle || phase == .tracking)
+            && !suppressCurrentTouch
+            && uptime >= suppressSeekUntil
+    }
+}
+
+// Geometry is cached without publishing every scroll offset. The view only publishes a new line ID.
+final class FullLyricsBrowseGeometry {
+    private var identity: String?
+    private var rowFrames: [Int: CGRect] = [:]
+    private var viewport = CGRect.zero
+
+    func prepare(for identity: String) {
+        guard self.identity != identity else { return }
+        self.identity = identity
+        rowFrames.removeAll()
+    }
+
+    func updateRows(_ frames: [Int: CGRect], for identity: String) {
+        guard self.identity == identity else { return }
+        rowFrames = frames
+    }
+
+    func updateViewport(_ viewport: CGRect) {
+        self.viewport = viewport
+    }
+
+    var nearestLineIndex: Int? {
+        guard viewport.height > 0, viewport.midY.isFinite else { return nil }
+        var nearest: Int?
+        var nearestDistance = CGFloat.greatestFiniteMagnitude
+        for (index, frame) in rowFrames {
+            guard frame.height > 0, frame.minY.isFinite, frame.maxY.isFinite,
+                  frame.maxY > viewport.minY, frame.minY < viewport.maxY else { continue }
+            // A tall translated row containing the center wins over a nearby short row.
+            let distance = max(frame.minY - viewport.midY, viewport.midY - frame.maxY, 0)
+            if distance < nearestDistance || (distance == nearestDistance && index < (nearest ?? .max)) {
+                nearest = index
+                nearestDistance = distance
+            }
+        }
+        return nearest
+    }
+}
+
+enum FullLyricsBrowseTime {
+    static func text(timeMs: Int64) -> String? {
+        guard timeMs >= 0 else { return nil }
+        let seconds = timeMs / 1_000
+        let hours = seconds / 3_600
+        let minutes = (seconds / 60) % 60
+        let remainder = seconds % 60
+        let minuteText = minutes < 10 ? "0\(minutes)" : "\(minutes)"
+        let secondText = remainder < 10 ? "0\(remainder)" : "\(remainder)"
+        return hours > 0 ? "\(hours):\(minuteText):\(secondText)" : "\(minuteText):\(secondText)"
+    }
+}
+
 struct FullLyricsStoreHost: View {
     let manager: BLETestManager
     let onDismiss: () -> Void
