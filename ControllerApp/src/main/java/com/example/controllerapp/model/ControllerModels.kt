@@ -268,5 +268,8 @@ data class HistoryState(
     val stats: Map<String, PlaybackStats> = emptyMap(),
     val loading: Boolean = false,
     val status: String = "",
-    val hasMore: Boolean = true
+    val hasMore: Boolean = true,
+    val failedRanges: Set<String> = emptySet(),
+    val showingOlderWindow: Boolean = false,
+    val clearing: Boolean = false
 )

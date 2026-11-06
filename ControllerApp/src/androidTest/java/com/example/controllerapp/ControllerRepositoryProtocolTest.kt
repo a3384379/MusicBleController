@@ -64,7 +64,12 @@ class ControllerRepositoryProtocolTest {
     fun tearDown() {
         repository.close()
         database.close()
+        val worker = ControllerLogStore::class.java.getDeclaredField("thread").apply {
+            isAccessible = true
+        }.get(logStore) as Thread
         logStore.close()
+        worker.join(5_000L)
+        assertFalse("log worker did not stop", worker.isAlive)
         root.deleteRecursively()
     }
 

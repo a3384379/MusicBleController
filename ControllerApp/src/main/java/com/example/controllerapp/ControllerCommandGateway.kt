@@ -32,6 +32,7 @@ class ControllerCommandGateway internal constructor(
 
     fun syncHistory() = repository.syncHistory()
     fun loadMoreHistory() = repository.loadMoreHistory()
+    fun showRecentHistory() = repository.showRecentHistory()
     fun clearLocalHistory() = repository.clearLocalHistory()
 
     fun requestSonyLogs() = repository.requestSonyLogs()

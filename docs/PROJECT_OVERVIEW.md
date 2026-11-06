@@ -27,6 +27,7 @@ V4 本次按维护者决定提前接入主干，属于阶段性交付，不等�
 - Android Controller 服务：[ControllerConnectionService.kt](/Volumes/雷电/project/MusicBleController/ControllerApp/src/main/java/com/example/controllerapp/service/ControllerConnectionService.kt)
 - Android Controller 协议与状态：[ControllerRepository.kt](/Volumes/雷电/project/MusicBleController/ControllerApp/src/main/java/com/example/controllerapp/ControllerRepository.kt)、[ControllerModels.kt](/Volumes/雷电/project/MusicBleController/ControllerApp/src/main/java/com/example/controllerapp/model/ControllerModels.kt)
 - Android Controller 界面：[ControllerAppUi.kt](/Volumes/雷电/project/MusicBleController/ControllerApp/src/main/java/com/example/controllerapp/ui/ControllerAppUi.kt)
+- Android Controller 历史同步、游标与数据库升级：[ANDROID_HISTORY_ARCHITECTURE.md](ANDROID_HISTORY_ARCHITECTURE.md)
 
 ## 总体数据流
 

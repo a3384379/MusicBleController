@@ -8,8 +8,8 @@ import android.util.Base64
 import com.example.controllerapp.data.ControllerLogStore
 import com.example.controllerapp.data.ControllerPreferences
 import com.example.controllerapp.data.NowPlayingSnapshotStore
+import com.example.controllerapp.history.PlaybackHistoryCoordinator
 import com.example.controllerapp.data.PlaybackHistoryDao
-import com.example.controllerapp.data.PlaybackHistoryEntity
 import com.example.controllerapp.media.ArtworkCache
 import com.example.controllerapp.media.ArtworkEnhancer
 import com.example.controllerapp.media.ArtworkPlaceholderPolicy
@@ -22,26 +22,21 @@ import com.example.controllerapp.model.ConnectionHealth
 import com.example.controllerapp.model.ConnectionPhase
 import com.example.controllerapp.model.ConnectionState
 import com.example.controllerapp.model.ControllerSettings
-import com.example.controllerapp.model.DailyListenStat
 import com.example.controllerapp.model.DiagnosticsState
-import com.example.controllerapp.model.HistoryState
 import com.example.controllerapp.model.LyricDiagnosticState
 import com.example.controllerapp.model.LyricDisplayMode
 import com.example.controllerapp.model.LyricLine
 import com.example.controllerapp.model.LyricLoadingStage
 import com.example.controllerapp.model.LyricsState
-import com.example.controllerapp.model.PlaybackHistorySession
 import com.example.controllerapp.model.PlaybackPerformanceMode
 import com.example.controllerapp.model.PlaybackState
-import com.example.controllerapp.model.PlaybackStats
-import com.example.controllerapp.model.PlaybackTopArtist
-import com.example.controllerapp.model.PlaybackTopTrack
 import com.example.controllerapp.protocol.CapabilityPolicy
 import com.example.controllerapp.protocol.ControllerProtocolCodec
 import com.example.controllerapp.protocol.CurrentWordOrderingFence
 import com.example.controllerapp.protocol.LyricsPublicationPolicy
 import com.example.controllerapp.protocol.MediaIdentityPolicy
 import com.example.controllerapp.protocol.ServerCapabilities
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExecutorCoroutineDispatcher
@@ -72,8 +67,10 @@ interface ControllerServiceActions {
 class ControllerRepository(
     context: Context,
     val preferences: ControllerPreferences,
-    private val historyDao: PlaybackHistoryDao,
-    val logStore: ControllerLogStore
+    historyDao: PlaybackHistoryDao,
+    val logStore: ControllerLogStore,
+    historyDispatcher: CoroutineDispatcher? = null,
+    historyTimeoutMs: Long = 8_000L
 ) {
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -124,9 +121,6 @@ class ControllerRepository(
     private val artworkPlaceholderRefreshCounts = HashMap<String, Int>()
     private var textTransfer: TextTransfer? = null
     private var diagnosticTransferTimeout: Job? = null
-    private val historyTransfers = HashMap<String, HistoryPayloadTransfer>()
-    private val historySyncQueue = ArrayDeque<String>()
-    private var historySyncTimeout: Job? = null
     private var volumeSyncTimeout: Job? = null
     private var volumeSyncAttempts = 0
     private val requestedArtwork = HashSet<String>()
@@ -149,8 +143,14 @@ class ControllerRepository(
     private val _diagnostics = MutableStateFlow(DiagnosticsState())
     val diagnostics: StateFlow<DiagnosticsState> = _diagnostics.asStateFlow()
 
-    private val _history = MutableStateFlow(HistoryState())
-    val history: StateFlow<HistoryState> = _history.asStateFlow()
+    private val historyCoordinator = PlaybackHistoryCoordinator(
+        dao = historyDao,
+        dispatcher = historyDispatcher ?: Dispatchers.IO,
+        timeoutMs = historyTimeoutMs,
+        send = ::sendCommand,
+        log = logStore::append
+    )
+    val history = historyCoordinator.state
 
     private val _settings = MutableStateFlow(ControllerSettings())
     val settings: StateFlow<ControllerSettings> = _settings.asStateFlow()
@@ -159,11 +159,6 @@ class ControllerRepository(
         scope.launch {
             preferences.settings.collectLatest { value ->
                 if (_settings.value != value) _settings.value = value
-            }
-        }
-        scope.launch(Dispatchers.IO) {
-            historyDao.observeRecent().collectLatest { values ->
-                _history.update { it.copy(sessions = values.map(PlaybackHistoryEntity::toModel)) }
             }
         }
         scope.launch {
@@ -203,6 +198,9 @@ class ControllerRepository(
         address: String = _connection.value.deviceAddress,
         reason: String = ""
     ) {
+        if (phase == ConnectionPhase.DISCONNECTED) {
+            historyCoordinator.invalidate("Sony 已断开连接")
+        }
         val previous = _connection.value
         val health = when (phase) {
             ConnectionPhase.CONNECTED -> ConnectionHealth.HEALTHY
@@ -229,6 +227,7 @@ class ControllerRepository(
     }
 
     fun onTransportReady(deviceName: String, address: String, mtu: Int) {
+        historyCoordinator.invalidate("连接已更新")
         val nextGeneration = _connection.value.generation + 1L
         _connection.value = _connection.value.copy(
             phase = ConnectionPhase.CONNECTED,
@@ -294,6 +293,10 @@ class ControllerRepository(
             val command = runCatching {
                 JSONObject(String(payload, Charsets.UTF_8)).optString("cmd")
             }.getOrDefault("unknown")
+            val requestId = runCatching {
+                JSONObject(String(payload, Charsets.UTF_8)).optString("requestId")
+            }.getOrDefault("")
+            if (requestId.isNotBlank()) historyCoordinator.onWriteFailed(requestId)
             reportIssue("命令写入失败：$command")
         }
     }
@@ -301,10 +304,11 @@ class ControllerRepository(
     fun handleNotification(value: ByteArray) {
         markNotifyActivity()
         val snapshot = value.copyOf()
-        mediaScope.launch { handleNotificationOnMedia(snapshot) }
+        val historyEpoch = historyCoordinator.currentEpoch
+        mediaScope.launch { handleNotificationOnMedia(snapshot, historyEpoch) }
     }
 
-    private fun handleNotificationOnMedia(value: ByteArray) {
+    private fun handleNotificationOnMedia(value: ByteArray, historyEpoch: Long) {
         when (value.firstOrNull()?.toInt()?.and(0xff)) {
             ControllerProtocolCodec.ALBUM_ART_MAGIC -> handleArtworkBinaryChunk(value)
             ControllerProtocolCodec.FULL_LYRICS_MAGIC -> handleLyricsBinaryChunk(value)
@@ -315,7 +319,7 @@ class ControllerRepository(
                     reportIssue("状态消息解析失败")
                     return
                 }
-                handleJson(objectValue)
+                handleJson(objectValue, historyEpoch)
             }
         }
     }
@@ -603,45 +607,13 @@ class ControllerRepository(
         mediaScope.launch { requestRemoteText("DUMP_MEDIA_FIELDS", "dump") }
     }
 
-    fun syncHistory() {
-        if (_history.value.loading) return
-        _history.update { it.copy(loading = true, status = "正在同步") }
-        scope.launch(Dispatchers.IO) {
-            synchronized(historySyncQueue) {
-                historySyncQueue.clear()
-                historySyncQueue.addAll(listOf("TODAY", "WEEK", "MONTH"))
-            }
-            val after = historyDao.latestSessionId() ?: 0L
-            mediaScope.launch { requestHistorySinceOnMedia(after) }
-        }
-    }
+    fun syncHistory() = historyCoordinator.sync()
 
-    fun loadMoreHistory() {
-        mediaScope.launch {
-            if (_history.value.loading || !_history.value.hasMore) return@launch
-            val before = _history.value.sessions.minOfOrNull { it.sessionId } ?: Long.MAX_VALUE
-            _history.update { it.copy(loading = true, status = "正在加载更多") }
-            val sent = sendCommand(
-                "GET_PLAY_HISTORY_PAGE",
-                JSONObject()
-                    .put("requestId", requestId("page"))
-                    .put("beforeSessionId", before)
-                    .put("limit", 50)
-            )
-            if (sent) {
-                scheduleHistoryTimeout("更多历史")
-            } else {
-                _history.update { it.copy(loading = false, status = "Sony 未连接") }
-            }
-        }
-    }
+    fun loadMoreHistory() = historyCoordinator.loadMore()
 
-    fun clearLocalHistory() {
-        scope.launch(Dispatchers.IO) {
-            historyDao.clear()
-            _history.update { it.copy(stats = emptyMap(), status = "本地缓存已清理") }
-        }
-    }
+    fun showRecentHistory() = historyCoordinator.showRecent()
+
+    fun clearLocalHistory() = historyCoordinator.clear()
 
     fun clearArtworkCache() {
         val id = _playback.value.trackId
@@ -708,6 +680,7 @@ class ControllerRepository(
     }
 
     fun close() {
+        historyCoordinator.close()
         logListener?.let(logStore::removeListener)
         logListener = null
         commandSender = null
@@ -758,7 +731,7 @@ class ControllerRepository(
         return sent
     }
 
-    private fun handleJson(value: JSONObject) {
+    private fun handleJson(value: JSONObject, historyEpoch: Long) {
         when (val type = value.optString("type")) {
             "clientCapabilitiesAck" -> handleCapabilities(value)
             "pong" -> markHealth(ConnectionHealth.HEALTHY)
@@ -808,21 +781,9 @@ class ControllerRepository(
             "mediaFieldDumpError" -> finishRemoteTextWithError(
                 "Media Dump失败：${value.optString("message")}"
             )
-            "playHistoryPage", "playHistorySince", "playStats" -> handleHistoryPayload(value)
-            "historyPayloadStart" -> startHistoryPayload(value)
-            "historyPayloadChunk" -> appendHistoryPayload(value)
-            "historyPayloadEnd" -> finishHistoryPayload(value)
-            "playHistoryError" -> {
-                historySyncTimeout?.cancel()
-                historySyncTimeout = null
-                synchronized(historySyncQueue) { historySyncQueue.clear() }
-                _history.update {
-                    it.copy(
-                        loading = false,
-                        status = value.optString("message", "同步失败")
-                    )
-                }
-            }
+            "playHistoryPage", "playHistorySince", "playStats", "historyPayloadStart",
+            "historyPayloadChunk", "historyPayloadEnd", "playHistoryError" ->
+                historyCoordinator.receive(value, historyEpoch)
             else -> logStore.append("[Protocol] unsupported type=$type")
         }
     }
@@ -2363,239 +2324,6 @@ class ControllerRepository(
         reportIssue(reason)
     }
 
-    private fun startHistoryPayload(value: JSONObject) {
-        val requestId = value.optString("requestId")
-        val chunks = value.optInt("chunks")
-        if (requestId.isBlank() || chunks <= 0) return
-        historyTransfers[requestId] = HistoryPayloadTransfer(
-            responseType = value.optString("responseType"),
-            expectedSize = value.optInt("size"),
-            expectedChunks = chunks
-        )
-        scheduleHistoryTimeout("历史数据传输")
-    }
-
-    private fun appendHistoryPayload(value: JSONObject) {
-        val requestId = value.optString("requestId")
-        val transfer = historyTransfers[requestId] ?: return
-        val index = value.optInt("index", -1)
-        if (index !in 0 until transfer.expectedChunks) return
-        runCatching { Base64.decode(value.optString("data"), Base64.NO_WRAP) }
-            .getOrNull()
-            ?.let {
-                transfer.chunks[index] = it
-                scheduleHistoryTimeout("历史数据传输")
-            }
-    }
-
-    private fun finishHistoryPayload(value: JSONObject) {
-        val requestId = value.optString("requestId")
-        val transfer = historyTransfers.remove(requestId) ?: return
-        val data = ControllerProtocolCodec.reassemble(
-            transfer.chunks,
-            transfer.expectedChunks
-        )
-        if (data == null || (transfer.expectedSize > 0 && data.size != transfer.expectedSize)) {
-            failHistorySync("历史数据分包不完整")
-            return
-        }
-        val payload = runCatching { JSONObject(String(data, Charsets.UTF_8)) }.getOrNull()
-        if (payload == null) {
-            failHistorySync("历史数据解析失败")
-            return
-        }
-        handleHistoryPayload(payload)
-    }
-
-    private fun handleHistoryPayload(value: JSONObject) {
-        when (value.optString("type")) {
-            "playHistoryPage", "playHistorySince" -> {
-                val sessions = decodeHistorySessions(value.optJSONArray("items"))
-                val responseType = value.optString("type")
-                val hasMore = value.optBoolean("hasMore")
-                val lastSessionId = value.optLong(
-                    "lastSessionId",
-                    sessions.maxOfOrNull(PlaybackHistorySession::sessionId) ?: 0L
-                )
-                scope.launch(Dispatchers.IO) {
-                    historyDao.upsert(sessions.map(PlaybackHistoryEntity::from))
-                    _history.update {
-                        it.copy(
-                            status = if (sessions.isEmpty()) "历史已是最新" else "历史同步完成",
-                            hasMore = if (responseType == "playHistoryPage") hasMore else it.hasMore
-                        )
-                    }
-                    mediaScope.launch {
-                        if (responseType == "playHistorySince" && hasMore && lastSessionId > 0L) {
-                            requestHistorySinceOnMedia(lastSessionId)
-                        } else {
-                            requestNextHistoryStat()
-                        }
-                    }
-                }
-            }
-            "playStats" -> {
-                decodeStats(value)?.let { stats ->
-                    _history.update {
-                        it.copy(
-                            stats = it.stats + (stats.range to stats),
-                            status = "${stats.range} 统计已更新"
-                        )
-                    }
-                }
-                requestNextHistoryStat()
-            }
-        }
-    }
-
-    private fun requestNextHistoryStat() {
-        val range = synchronized(historySyncQueue) {
-            if (historySyncQueue.isEmpty()) null else historySyncQueue.removeFirst()
-        }
-        if (range == null) {
-            historySyncTimeout?.cancel()
-            historySyncTimeout = null
-            _history.update { it.copy(loading = false, status = "同步完成") }
-            return
-        }
-        val sent = sendCommand(
-            "GET_PLAY_STATS",
-            JSONObject()
-                .put("requestId", requestId("stats"))
-                .put("range", range)
-        )
-        if (sent) {
-            scheduleHistoryTimeout("$range 统计")
-        } else {
-            requestNextHistoryStat()
-        }
-    }
-
-    private fun requestHistorySinceOnMedia(afterSessionId: Long) {
-        val sent = sendCommand(
-            "GET_PLAY_HISTORY_SINCE",
-            JSONObject()
-                .put("requestId", requestId("history"))
-                .put("afterSessionId", afterSessionId.coerceAtLeast(0L))
-                .put("limit", 100)
-        )
-        if (sent) {
-            scheduleHistoryTimeout("历史记录")
-        } else {
-            synchronized(historySyncQueue) { historySyncQueue.clear() }
-            _history.update { it.copy(loading = false, status = "Sony 未连接，保留本地历史") }
-        }
-    }
-
-    private fun scheduleHistoryTimeout(stage: String) {
-        historySyncTimeout?.cancel()
-        historySyncTimeout = mediaScope.launch {
-            delay(HISTORY_SYNC_TIMEOUT_MS)
-            synchronized(historySyncQueue) { historySyncQueue.clear() }
-            historyTransfers.clear()
-            historySyncTimeout = null
-            _history.update {
-                it.copy(
-                    loading = false,
-                    status = "$stage 超时，已保留本地数据，可稍后重试"
-                )
-            }
-            logStore.append("[History] timeout stage=$stage")
-        }
-    }
-
-    private fun failHistorySync(reason: String) {
-        historySyncTimeout?.cancel()
-        historySyncTimeout = null
-        synchronized(historySyncQueue) { historySyncQueue.clear() }
-        _history.update { it.copy(loading = false, status = "$reason，已保留本地数据") }
-        logStore.append("[History] failed reason=$reason")
-    }
-
-    private fun decodeHistorySessions(array: JSONArray?): List<PlaybackHistorySession> =
-        buildList {
-            if (array == null) return@buildList
-            repeat(array.length()) { index ->
-                val value = array.optJSONObject(index) ?: return@repeat
-                val sessionId = value.optLong("sessionId")
-                if (sessionId <= 0L) return@repeat
-                add(
-                    PlaybackHistorySession(
-                        sessionId = sessionId,
-                        trackKey = value.optString("trackKey"),
-                        title = value.optString("title"),
-                        artist = value.optString("artist"),
-                        album = value.optString("album"),
-                        artworkId = value.optString("artworkId").ifBlank { null },
-                        startedAt = value.optLong("startedAt"),
-                        endedAt = value.opt("endedAt")
-                            ?.takeUnless { it == JSONObject.NULL }
-                            ?.toString()
-                            ?.toLongOrNull(),
-                        listenedMs = value.optLong("listenedMs"),
-                        durationMs = value.optLong("durationMs"),
-                        completed = value.optBoolean("completed"),
-                        skipped = value.optBoolean("skipped"),
-                        countedPlay = value.optBoolean("countedPlay")
-                    )
-                )
-            }
-        }
-
-    private fun decodeStats(value: JSONObject): PlaybackStats? {
-        val range = value.optString("range")
-        if (range.isBlank()) return null
-        return PlaybackStats(
-            range = range,
-            totalListenMs = value.optLong("totalListenMs"),
-            playCount = value.optInt("playCount"),
-            uniqueTrackCount = value.optInt("uniqueTrackCount"),
-            completionRate = value.optDouble("completionRate"),
-            skipRate = value.optDouble("skipRate"),
-            topTracks = buildList {
-                val array = value.optJSONArray("topTracks") ?: JSONArray()
-                repeat(array.length()) { index ->
-                    val item = array.optJSONObject(index) ?: return@repeat
-                    add(
-                        PlaybackTopTrack(
-                            trackKey = item.optString("trackKey"),
-                            title = item.optString("title"),
-                            artist = item.optString("artist"),
-                            listenedMs = item.optLong("listenedMs"),
-                            playCount = item.optInt("playCount")
-                        )
-                    )
-                }
-            },
-            topArtists = buildList {
-                val array = value.optJSONArray("topArtists") ?: JSONArray()
-                repeat(array.length()) { index ->
-                    val item = array.optJSONObject(index) ?: return@repeat
-                    add(
-                        PlaybackTopArtist(
-                            artist = item.optString("artist"),
-                            listenedMs = item.optLong("listenedMs"),
-                            playCount = item.optInt("playCount")
-                        )
-                    )
-                }
-            },
-            dailyTrend = buildList {
-                val array = value.optJSONArray("dailyTrend") ?: JSONArray()
-                repeat(array.length()) { index ->
-                    val item = array.optJSONObject(index) ?: return@repeat
-                    add(
-                        DailyListenStat(
-                            dateKey = item.optString("dateKey"),
-                            listenedMs = item.optLong("listenedMs"),
-                            playCount = item.optInt("playCount")
-                        )
-                    )
-                }
-            }
-        )
-    }
-
     private fun appendJsonChunk(transfer: JsonChunkTransfer?, value: JSONObject) {
         transfer ?: return
         val index = value.optInt("index", -1)
@@ -2674,8 +2402,6 @@ class ControllerRepository(
             volumeSyncTimeout?.cancel()
             volumeSyncTimeout = null
             volumeSyncAttempts = 0
-            historySyncTimeout?.cancel()
-            historySyncTimeout = null
             artworkTransfer = null
             requestedArtwork.clear()
             artworkRequestRetryCounts.clear()
@@ -2683,7 +2409,6 @@ class ControllerRepository(
             diagnosticTransferTimeout?.cancel()
             diagnosticTransferTimeout = null
             textTransfer = null
-            historyTransfers.clear()
         }
         logStore.append("[Transfer] reset reason=$reason")
     }
@@ -2860,13 +2585,6 @@ class ControllerRepository(
         val chunks: MutableMap<Int, ByteArray> = HashMap()
     )
 
-    private data class HistoryPayloadTransfer(
-        val responseType: String,
-        val expectedSize: Int,
-        val expectedChunks: Int,
-        val chunks: MutableMap<Int, ByteArray> = HashMap()
-    )
-
     companion object {
         private const val MAIN_ARTWORK_MAXIMUM_PIXEL_SIZE = 780
         private const val CACHED_PREVIEW_HQ_DELAY_MS = 350L
@@ -2892,7 +2610,6 @@ class ControllerRepository(
         private const val MAX_ARTWORK_TRANSFER_RETRIES = 1
         private const val VOLUME_SYNC_TIMEOUT_MS = 2_000L
         private const val MAX_VOLUME_SYNC_RETRIES = 1
-        private const val HISTORY_SYNC_TIMEOUT_MS = 8_000L
         private const val DIAGNOSTIC_TRANSFER_TIMEOUT_MS = 6_000L
         private val SECONDARY_MODES = setOf("translation", "romanization")
     }

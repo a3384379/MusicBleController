@@ -27,9 +27,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -1395,101 +1395,149 @@ private fun HistoryScreen(
     navController: NavHostController
 ) {
     val history by viewModel.history.collectAsStateWithLifecycle()
+    val listState = rememberLazyListState()
     var range by remember { mutableStateOf("TODAY") }
     LaunchedEffect(Unit) { viewModel.syncHistory() }
+    LaunchedEffect(history.showingOlderWindow) {
+        if (!history.showingOlderWindow) listState.scrollToItem(0)
+    }
     Scaffold(
         topBar = {
             ControllerTopBar(
                 title = "播放历史",
                 navController = navController,
                 action = {
-                    IconButton(onClick = viewModel::syncHistory) {
+                    IconButton(
+                        onClick = viewModel::syncHistory,
+                        enabled = !history.loading && !history.clearing
+                    ) {
                         Icon(Icons.Default.Sync, "同步历史")
                     }
                 }
             )
         }
     ) { padding ->
-        LazyColumn(
-            Modifier.fillMaxSize(),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                top = padding.calculateTopPadding() + 12.dp,
-                bottom = padding.calculateBottomPadding() + 28.dp,
-                start = 16.dp,
-                end = 16.dp
-            ),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            item {
-                StatsRangeSelector(range) { range = it }
-            }
-            history.stats[range]?.let { stats ->
-                item { StatsOverview(stats) }
-            }
-            item {
-                Text(
-                    "最近播放",
-                    style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.padding(top = 8.dp)
-                )
-            }
-            if (history.sessions.isEmpty()) {
+        Column(Modifier.fillMaxSize().padding(top = padding.calculateTopPadding())) {
+            HistoryStatusPanel(history, range, viewModel)
+            LazyColumn(
+                Modifier.weight(1f).testTag("history_list"),
+                state = listState,
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                    top = 12.dp,
+                    bottom = padding.calculateBottomPadding() + 28.dp,
+                    start = 16.dp,
+                    end = 16.dp
+                ),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                item {
+                    StatsRangeSelector(range) { range = it }
+                }
+                history.stats[range]?.let { stats ->
+                    item { StatsOverview(stats) }
+                }
                 item {
                     Text(
-                        history.status.ifBlank { if (history.loading) "正在同步…" else "暂无历史" },
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(vertical = 28.dp)
+                        "最近播放",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.padding(top = 8.dp)
                     )
                 }
-            }
-            items(history.sessions, key = { it.sessionId }) { session ->
-                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                if (history.sessions.isEmpty()) {
+                    item {
+                        Text(
+                            history.status.ifBlank { if (history.loading) "正在同步…" else "暂无历史" },
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(vertical = 28.dp)
+                        )
+                    }
+                }
+                items(history.sessions, key = { it.sessionId }) { session ->
+                    Card(
+                        modifier = Modifier.testTag("history_session_${session.sessionId}"),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
                     ) {
-                        HistoryArtwork(session.artworkId, viewModel)
-                        Spacer(Modifier.width(12.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                session.title.ifBlank { "未知歌曲" },
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                fontWeight = FontWeight.Medium
-                            )
-                            Text(
-                                "${session.artist} · ${formatDate(session.startedAt)}",
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontSize = 13.sp,
-                                maxLines = 1
-                            )
+                        Row(
+                            Modifier.fillMaxWidth().padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            HistoryArtwork(session.artworkId, viewModel)
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    session.title.ifBlank { "未知歌曲" },
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    "${session.artist} · ${formatDate(session.startedAt)}",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    fontSize = 13.sp,
+                                    maxLines = 1
+                                )
+                            }
+                            Column(horizontalAlignment = Alignment.End) {
+                                Text(formatDuration(session.listenedMs))
+                                Text(
+                                    when {
+                                        session.completed -> "已完播"
+                                        session.skipped -> "已跳过"
+                                        else -> "播放中断"
+                                    },
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                         }
-                        Column(horizontalAlignment = Alignment.End) {
-                            Text(formatDuration(session.listenedMs))
-                            Text(
-                                when {
-                                    session.completed -> "已完播"
-                                    session.skipped -> "已跳过"
-                                    else -> "播放中断"
-                                },
-                                fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                    }
+                }
+                if (history.sessions.isNotEmpty() && history.hasMore) {
+                    item(key = "history_load_more") {
+                        OutlinedButton(
+                            onClick = viewModel::loadMoreHistory,
+                            enabled = !history.loading && !history.clearing,
+                            modifier = Modifier.fillMaxWidth().testTag("history_load_more")
+                        ) {
+                            Text(if (history.loading) "正在加载…" else "加载更早记录")
                         }
                     }
                 }
             }
-            if (history.sessions.isNotEmpty() && history.hasMore) {
-                item {
-                    OutlinedButton(
-                        onClick = viewModel::loadMoreHistory,
-                        enabled = !history.loading,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(if (history.loading) "正在加载…" else "加载更多")
-                    }
-                }
-            }
+        }
+    }
+}
+
+@Composable
+private fun HistoryStatusPanel(history: HistoryState, range: String, viewModel: ControllerViewModel) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        if (history.loading || history.clearing) LinearProgressIndicator(Modifier.fillMaxWidth())
+        Text(
+            history.status.ifBlank { "同步 Sony 播放历史，保留本地缓存" },
+            modifier = Modifier.testTag("history_status"),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        if (range in history.failedRanges) {
+            Text(
+                if (range in history.stats) "当前范围统计更新失败，显示上次数据" else "当前范围统计更新失败，可重试",
+                color = MaterialTheme.colorScheme.error
+            )
+            OutlinedButton(
+                onClick = viewModel::syncHistory,
+                enabled = !history.loading && !history.clearing
+            ) { Text("重试同步") }
+        }
+        if (history.showingOlderWindow) {
+            Text("正在查看更早记录，每次最多展示 1000 条", style = MaterialTheme.typography.bodySmall)
+            OutlinedButton(
+                onClick = viewModel::showRecentHistory,
+                enabled = !history.loading && !history.clearing,
+                modifier = Modifier.testTag("history_show_recent")
+            ) { Text("返回最近播放") }
         }
     }
 }

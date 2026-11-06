@@ -142,6 +142,8 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
         commands.loadMoreHistory()
     }
 
+    fun showRecentHistory() = commands.showRecentHistory()
+
     fun clearLocalHistory() {
         commands.clearLocalHistory()
     }
