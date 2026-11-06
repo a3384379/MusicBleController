@@ -298,10 +298,13 @@ final class FullLyricsBrowseGeometry {
 
     func readingAnchor(for identity: String, layoutKey: FullLyricsLayoutKey = .default) -> FullLyricsReadingAnchor? {
         guard self.identity == identity, let snapshot = snapshots[layoutKey], snapshot.viewport.height > 0 else { return nil }
-        let candidates = snapshot.frames.filter { _, frame in
-            frame.height > 0 && frame.midY >= snapshot.viewport.minY && frame.midY <= snapshot.viewport.maxY
+        let completeRows = snapshot.frames.filter { _, frame in
+            frame.height > 0 && frame.minY.isFinite && frame.maxY.isFinite &&
+                frame.minY >= snapshot.viewport.minY && frame.maxY <= snapshot.viewport.maxY
         }
-        let firstCentered = candidates.min(by: { $0.value.minY < $1.value.minY })
+        // A clipped preceding row may grow when secondary lyrics arrive. Keeping
+        // its top would move the first complete row the reader is actually viewing.
+        let firstComplete = completeRows.min(by: { $0.value.minY < $1.value.minY })
         let intersecting = snapshot.frames.filter { _, frame in
             frame.height > 0 && frame.minY.isFinite && frame.maxY.isFinite &&
                 frame.maxY > snapshot.viewport.minY && frame.minY < snapshot.viewport.maxY
@@ -314,7 +317,7 @@ final class FullLyricsBrowseGeometry {
             let right = distance(rhs.value)
             return left == right ? lhs.key < rhs.key : left < right
         }
-        guard let pair = firstCentered ?? closest, pair.value.minY.isFinite else { return nil }
+        guard let pair = firstComplete ?? closest, pair.value.minY.isFinite else { return nil }
         return FullLyricsReadingAnchor(id: pair.key, screenY: pair.value.minY - snapshot.viewport.minY + snapshot.viewportGlobalMinY)
     }
 

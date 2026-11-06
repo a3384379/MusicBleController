@@ -2802,6 +2802,34 @@ final class PerformanceStabilityTests: XCTestCase {
         XCTAssertNil(geometry.readingAnchor(for: "song-a"))
     }
 
+    func testReadingAnchorPrefersCompleteRowWhenClippedPrecedingRowGrows() throws {
+        let geometry = FullLyricsBrowseGeometry()
+        let oldKey = FullLyricsLayoutKey.default
+        let newKey = FullLyricsLayoutKey(documentRevision: 1, mode: .original, dynamicTypeSize: .large)
+        geometry.prepare(for: "song-a")
+        geometry.updateViewport(CGRect(x: 0, y: 100, width: 300, height: 200), layoutKey: oldKey,
+                                viewportGlobalMinY: 200)
+        geometry.updateRows([
+            // Its center is visible, but its top is clipped by the viewport.
+            23: CGRect(x: 0, y: 90, width: 300, height: 44),
+            24: CGRect(x: 0, y: 158, width: 300, height: 44),
+            25: CGRect(x: 0, y: 226, width: 300, height: 44)
+        ], for: "song-a", layoutKey: oldKey, viewportGlobalMinY: 200)
+        let anchor = try XCTUnwrap(geometry.readingAnchor(for: "song-a", layoutKey: oldKey))
+        XCTAssertEqual(anchor, FullLyricsReadingAnchor(id: 24, screenY: 258))
+
+        geometry.updateViewport(CGRect(x: 0, y: 1_600, width: 300, height: 200), layoutKey: newKey,
+                                viewportGlobalMinY: 200)
+        geometry.updateRows([
+            23: CGRect(x: 0, y: 1_590, width: 300, height: 69.5),
+            24: CGRect(x: 0, y: 1_683.5, width: 300, height: 69.5)
+        ], for: "song-a", layoutKey: newKey, viewportGlobalMinY: 200)
+        let offset = try XCTUnwrap(geometry.anchorContentY(for: anchor, identity: "song-a", layoutKey: newKey,
+                                                          lineOrder: [23: 23, 24: 24]))
+        XCTAssertEqual(1_683.5 - offset + 200, anchor.screenY, accuracy: 0.001,
+                       "Growth of the clipped preceding row must not move the complete reading row")
+    }
+
     func testNewTrackRowsUseCurrentViewportWithoutRequiringAChangedScrollEvent() {
         let geometry = FullLyricsBrowseGeometry()
         geometry.prepare(for: "song-a")
