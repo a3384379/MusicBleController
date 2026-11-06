@@ -191,6 +191,180 @@ final class PerformanceStabilityTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testFullLyricsLongLinesAndAccessibilitySizeExpandRealScrollContent() throws {
+        let preferences = PreferencesStore.shared
+        let previousMode = preferences.lyricDisplayMode
+        defer { preferences.lyricDisplayMode = previousMode }
+        let longText = String(repeating: "Readable long lyric text ", count: 28)
+
+        func contentHeight(text: String, secondary: String?, current: Bool,
+                           size: DynamicTypeSize, width: CGFloat = 320,
+                           height: CGFloat = 667) throws -> CGFloat {
+            let line = LyricLine(index: 0, timeMs: 0, durationMs: 2_000, text: text,
+                                 translation: secondary, romanization: secondary, words: [])
+            let host = UIHostingController(rootView: FullLyricsView(
+                title: "Song", artist: "Artist", albumArtImage: nil, lyrics: [line],
+                lyricsIdentity: "layout-test", currentIndex: current ? 0 : -1, positionMs: 0,
+                translationState: .ready, romanizationState: .ready, isPlaying: false,
+                isConnected: true, onDismiss: {}, onPrevious: {}, onPlayPause: {}, onNext: {},
+                onSeekToLine: { _ in }, onShowDiagnostic: {}
+            ).environment(\.dynamicTypeSize, size))
+            let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+            let previousWindow = scene?.windows.first(where: \.isKeyWindow)
+            let window = scene.map(UIWindow.init(windowScene:)) ?? UIWindow(frame: .zero)
+            window.frame = CGRect(x: 0, y: 0, width: width, height: height)
+            window.rootViewController = host
+            window.makeKeyAndVisible()
+            defer {
+                window.isHidden = true
+                window.rootViewController = nil
+                previousWindow?.makeKeyAndVisible()
+            }
+            host.loadViewIfNeeded()
+            host.view.frame = window.bounds
+            host.view.layoutIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.15))
+            host.view.layoutIfNeeded()
+            func scrollView(in view: UIView) -> UIScrollView? {
+                if let child = view.subviews.lazy.compactMap({ scrollView(in: $0) }).first {
+                    return child
+                }
+                if let scroll = view as? UIScrollView, scroll.contentSize.height > scroll.bounds.height {
+                    return scroll
+                }
+                return nil
+            }
+            let scroll = try XCTUnwrap(scrollView(in: host.view))
+            XCTAssertGreaterThanOrEqual(scroll.bounds.height, 145, "The lyric viewport must remain usable")
+            var ancestor = scroll.superview
+            while let view = ancestor {
+                if let outerScroll = view as? UIScrollView {
+                    outerScroll.scrollRectToVisible(scroll.convert(scroll.bounds, to: outerScroll), animated: false)
+                    host.view.layoutIfNeeded()
+                    break
+                }
+                ancestor = view.superview
+            }
+            let point = scroll.convert(CGPoint(x: scroll.bounds.midX, y: scroll.bounds.midY), to: window)
+            let hit = try XCTUnwrap(window.hitTest(point, with: nil))
+            XCTAssertTrue(hit === scroll || hit.isDescendant(of: scroll), "The lyric viewport must receive touches")
+            let initialOffset = scroll.contentOffset.y
+            let maximumOffset = max(-scroll.adjustedContentInset.top,
+                                    scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)
+            let targetOffset = min(maximumOffset, initialOffset + 100)
+            if targetOffset > initialOffset + 1 {
+                scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: targetOffset), animated: false)
+                XCTAssertEqual(scroll.contentOffset.y, targetOffset, accuracy: 1, "Long lyrics must actually scroll")
+            }
+            return scroll.contentSize.height
+        }
+
+        preferences.lyricDisplayMode = .original
+        for current in [false, true] {
+            let short = try contentHeight(text: "Short", secondary: nil, current: current, size: .large)
+            let long = try contentHeight(text: longText, secondary: nil, current: current, size: .large)
+            XCTAssertGreaterThan(long, short + 150, "Original lyrics must not stop at three lines")
+        }
+        let regular = try contentHeight(text: longText, secondary: nil, current: false, size: .large)
+        let accessible = try contentHeight(text: longText, secondary: nil, current: false, size: .accessibility3)
+        XCTAssertGreaterThan(accessible, regular, "Lyrics must grow with the system text size")
+
+        preferences.lyricDisplayMode = .originalTranslationRomanization
+        let withSecondary = try contentHeight(text: longText, secondary: longText, current: false, size: .large)
+        XCTAssertGreaterThan(withSecondary, regular + 200, "Translation and romanization must retain their full height")
+        for size in [DynamicTypeSize.accessibility3, .accessibility5] {
+            _ = try contentHeight(text: longText, secondary: longText, current: false,
+                                  size: size, width: 667, height: 375)
+        }
+    }
+
+    func testPlaybackStatisticsCopyCoversBothLanguagesAndProgressStates() {
+        let chinese = PlaybackStatisticsCopy.explanation(language: .simplifiedChinese)
+        let english = PlaybackStatisticsCopy.explanation(language: .english)
+        XCTAssertTrue(chinese.contains("30 秒") && chinese.contains("已结束") && chinese.contains("开始时间"))
+        XCTAssertTrue(english.contains("30 seconds") && english.contains("ended sessions") && english.contains("started"))
+        XCTAssertEqual(PlaybackStatisticsCopy.inProgress(counted: true, language: .english), "In progress · counted")
+        XCTAssertEqual(PlaybackStatisticsCopy.inProgress(counted: false, language: .simplifiedChinese), "进行中 · 未计播放")
+    }
+
+    func testReadingRestoreFenceRejectsRevisionsAndReturnThenBrowse() {
+        var fence = FullLyricsRestoreFence()
+        let firstRevision = fence.generation
+        fence.invalidate() // New document revision supersedes the pending correction.
+        let secondRevision = fence.generation
+        XCTAssertFalse(fence.accepts(firstRevision))
+        XCTAssertTrue(fence.accepts(secondRevision))
+        fence.invalidate() // Return to current, before a new browse begins.
+        fence.invalidate() // New user touch starts another interaction.
+        XCTAssertFalse(fence.accepts(secondRevision))
+        XCTAssertTrue(fence.accepts(fence.generation))
+    }
+
+    @MainActor
+    func testPlaybackStatisticsExplanationAppearanceInBothLanguages() {
+        let preferences = PreferencesStore.shared
+        let previousLanguage = preferences.appLanguage
+        defer { preferences.appLanguage = previousLanguage }
+        for language in [AppLanguage.simplifiedChinese, .english] {
+            preferences.appLanguage = language
+            assertViewRenders(AnyView(PlaybackStatsView(stats: makePlaybackStatsFixture())
+                .environment(\.dynamicTypeSize, .accessibility3)),
+                named: "playback-stats-\(language.rawValue)", width: 375, height: 812)
+        }
+    }
+
+    @MainActor
+    func testFullLyricsReadingAppearanceMatrix() {
+        let preferences = PreferencesStore.shared
+        let previousMode = preferences.lyricDisplayMode
+        let previousLanguage = preferences.appLanguage
+        defer {
+            preferences.lyricDisplayMode = previousMode
+            preferences.appLanguage = previousLanguage
+        }
+        preferences.lyricDisplayMode = .originalTranslationRomanization
+        let text = String(repeating: "这是一句需要完整阅读的歌词 Long lyrics ", count: 8)
+        let lines = (0..<4).map { index in
+            LyricLine(index: index, timeMs: Int64(index * 5_000), durationMs: 5_000,
+                      text: text, translation: text, romanization: text, words: [])
+        }
+        let whiteCover = UIGraphicsImageRenderer(size: CGSize(width: 10, height: 10)).image { context in
+            UIColor.white.setFill()
+            context.cgContext.fill(CGRect(x: 0, y: 0, width: 10, height: 10))
+        }
+        for (name, size, color, width, height) in [
+            ("light-white-cover", DynamicTypeSize.large, ColorScheme.light, CGFloat(390), CGFloat(844)),
+            ("dark-white-cover", DynamicTypeSize.large, ColorScheme.dark, CGFloat(390), CGFloat(844)),
+            ("accessibility-portrait", DynamicTypeSize.accessibility3, ColorScheme.light, CGFloat(375), CGFloat(812)),
+            ("accessibility-landscape", DynamicTypeSize.accessibility3, ColorScheme.light, CGFloat(667), CGFloat(375)),
+            ("accessibility5-landscape", DynamicTypeSize.accessibility5, ColorScheme.light, CGFloat(667), CGFloat(375))
+        ] {
+            let view = FullLyricsView(
+                title: "Song", artist: "Artist", albumArtImage: whiteCover, lyrics: lines,
+                lyricsIdentity: "appearance-matrix", currentIndex: 0, positionMs: 0,
+                translationState: .ready, romanizationState: .ready, isPlaying: false,
+                isConnected: true, onDismiss: {}, onPrevious: {}, onPlayPause: {}, onNext: {},
+                onSeekToLine: { _ in }, onShowDiagnostic: {}
+            )
+            assertViewRenders(AnyView(view.environment(\.dynamicTypeSize, size)
+                .environment(\.colorScheme, color)), named: "full-lyrics-matrix-\(name)",
+                width: width, height: height)
+        }
+        for language in [AppLanguage.simplifiedChinese, .english] {
+            preferences.appLanguage = language
+            let view = FullLyricsView(
+                title: "Song", artist: "Artist", albumArtImage: whiteCover, lyrics: lines,
+                lyricsIdentity: "appearance-matrix", currentIndex: 0, positionMs: 0,
+                translationState: .ready, romanizationState: .ready, isPlaying: false,
+                isConnected: true, onDismiss: {}, onPrevious: {}, onPlayPause: {}, onNext: {},
+                onSeekToLine: { _ in }, onShowDiagnostic: {}
+            )
+            assertViewRenders(AnyView(view.environment(\.dynamicTypeSize, .xxxLarge)),
+                              named: "full-lyrics-matrix-xxxlarge-\(language.rawValue)", width: 320, height: 667)
+        }
+    }
+
     func testLyricDiagnosticAndMediaLoadingPresentationBranches() {
         let statuses = [
             "loaded",
@@ -2594,6 +2768,124 @@ final class PerformanceStabilityTests: XCTestCase {
         XCTAssertEqual(geometry.nearestLineIndex, 0)
     }
 
+    func testFullLyricsReadingAnchorUsesFirstHittableStableRowAndRejectsOldTrack() {
+        let geometry = FullLyricsBrowseGeometry()
+        geometry.prepare(for: "song-a")
+        geometry.updateViewport(CGRect(x: 0, y: 100, width: 300, height: 200))
+        geometry.updateRows([
+            20: CGRect(x: 0, y: 50, width: 300, height: 70),
+            21: CGRect(x: 0, y: 130, width: 300, height: 70),
+            22: CGRect(x: 0, y: 210, width: 300, height: 70)
+        ], for: "song-a")
+        XCTAssertEqual(geometry.readingAnchor(for: "song-a"), FullLyricsReadingAnchor(id: 21, screenY: 30))
+        geometry.prepare(for: "song-b")
+        XCTAssertNil(geometry.readingAnchor(for: "song-a"))
+    }
+
+    func testNewTrackRowsUseCurrentViewportWithoutRequiringAChangedScrollEvent() {
+        let geometry = FullLyricsBrowseGeometry()
+        geometry.prepare(for: "song-a")
+        geometry.updateViewport(CGRect(x: 0, y: 100, width: 300, height: 200))
+        geometry.updateRows([1: CGRect(x: 0, y: 130, width: 300, height: 44)], for: "song-a")
+        geometry.prepare(for: "song-b")
+        geometry.updateRows([2: CGRect(x: 0, y: 130, width: 300, height: 44)], for: "song-b")
+        XCTAssertEqual(geometry.nearestLineIndex, 2)
+        XCTAssertEqual(geometry.readingAnchor(for: "song-b"), FullLyricsReadingAnchor(id: 2, screenY: 30))
+        XCTAssertNil(geometry.readingAnchor(for: "song-a"))
+    }
+
+    func testReadingAnchorKeepsPreviousRevisionAndFindsPartiallyVisibleLongRow() {
+        let geometry = FullLyricsBrowseGeometry()
+        let oldKey = FullLyricsLayoutKey.default
+        let newKey = FullLyricsLayoutKey(documentRevision: 1, mode: .original, dynamicTypeSize: .large)
+        geometry.prepare(for: "song-a")
+        geometry.updateViewport(CGRect(x: 0, y: 100, width: 300, height: 100), layoutKey: oldKey)
+        geometry.updateRows([22: CGRect(x: 0, y: -200, width: 300, height: 350)], for: "song-a", layoutKey: oldKey,
+                            viewportGlobalMinY: 200)
+        geometry.updateViewport(CGRect(x: 0, y: 300, width: 300, height: 100), layoutKey: newKey)
+        geometry.updateRows([22: CGRect(x: 0, y: 320, width: 300, height: 350)], for: "song-a", layoutKey: newKey,
+                            viewportGlobalMinY: 140)
+        XCTAssertEqual(geometry.readingAnchor(for: "song-a", layoutKey: oldKey),
+                       FullLyricsReadingAnchor(id: 22, screenY: -100))
+        let anchor = FullLyricsReadingAnchor(id: 22, screenY: -100)
+        XCTAssertEqual(geometry.anchorContentY(for: anchor, identity: "song-a", layoutKey: newKey,
+                                               lineOrder: [22: 22]), 560)
+    }
+
+    func testReadingAnchorContentPositionUsesViewportOriginAndRejectsNonfiniteValues() throws {
+        let offset = try XCTUnwrap(FullLyricsAnchorPosition.resolve(rowMinY: 2_240.35,
+                                                                    viewportGlobalMinY: 235,
+                                                                    screenY: 292.73))
+        XCTAssertEqual(offset, 2_182.62, accuracy: 0.001)
+        XCTAssertEqual(FullLyricsAnchorPosition.resolve(rowMinY: 10, viewportGlobalMinY: 100, screenY: 150), -40)
+        XCTAssertNil(FullLyricsAnchorPosition.resolve(rowMinY: .infinity, viewportGlobalMinY: 0, screenY: 0))
+    }
+
+    func testReadingRestoreWaitsForOrderedGeometryAndVisibleTarget() {
+        let geometry = FullLyricsBrowseGeometry()
+        let key = FullLyricsLayoutKey(documentRevision: 1, mode: .original, dynamicTypeSize: .large)
+        let anchor = FullLyricsReadingAnchor(id: 22, screenY: 180)
+        let order = [0: 0, 10: 10, 20: 20, 22: 22]
+        geometry.prepare(for: "song-a")
+        geometry.updateViewport(CGRect(x: 0, y: 285, width: 300, height: 400), layoutKey: key,
+                                viewportGlobalMinY: 100)
+        geometry.updateRows([
+            0: CGRect(x: 0, y: 187, width: 300, height: 69),
+            10: CGRect(x: 0, y: 1_120, width: 300, height: 69),
+            20: CGRect(x: 0, y: 162, width: 300, height: 69),
+            22: CGRect(x: 0, y: 298, width: 300, height: 69)
+        ], for: "song-a", layoutKey: key, viewportGlobalMinY: 100)
+        XCTAssertNil(geometry.anchorContentY(for: anchor, identity: "song-a", layoutKey: key, lineOrder: order))
+        geometry.updateRows([22: CGRect(x: 0, y: 330, width: 300, height: 69)],
+                            for: "song-a", layoutKey: key, viewportGlobalMinY: 100)
+        XCTAssertNotNil(geometry.anchorContentY(for: anchor, identity: "song-a", layoutKey: key, lineOrder: order),
+                        "A materialized visible target need not align at the top")
+        geometry.updateViewport(CGRect(x: 0, y: 330, width: 300, height: 400), layoutKey: key,
+                                viewportGlobalMinY: 100)
+        XCTAssertNotNil(geometry.anchorContentY(for: anchor, identity: "song-a", layoutKey: key, lineOrder: order))
+        geometry.updateViewport(CGRect(x: 0, y: 1_600, width: 300, height: 400), layoutKey: key,
+                                viewportGlobalMinY: 100)
+        geometry.updateRows([22: CGRect(x: 0, y: 1_800, width: 300, height: 69)],
+                            for: "song-a", layoutKey: key, viewportGlobalMinY: 100)
+        XCTAssertNotNil(geometry.anchorContentY(for: anchor, identity: "song-a", layoutKey: key, lineOrder: order),
+                        "A visible target remains eligible near the end of the document")
+    }
+
+    func testLyricsDocumentRevisionChangesOnlyWhenDocumentChanges() {
+        let store = LyricsStore()
+        var document = BLEFullLyricsViewState()
+        XCTAssertEqual(store.documentRevision, 0)
+        store.updateDocument(document)
+        XCTAssertEqual(store.documentRevision, 0)
+        document.trackId = "song-a"
+        store.updateDocument(document)
+        XCTAssertEqual(store.documentRevision, 1)
+        store.updateDocument(document)
+        XCTAssertEqual(store.documentRevision, 1)
+        document.translationState = .ready
+        store.updateDocument(document)
+        XCTAssertEqual(store.documentRevision, 2)
+    }
+
+    func testLyricWindowTimelineUsesArrayPositionAndKeepsStableLineIdentity() throws {
+        let window = (20...24).map { index in
+            LyricLine(index: index, timeMs: Int64(index * 2_000), durationMs: 2_000,
+                      text: "Line \(index)", translation: nil, romanization: nil, words: [])
+        }
+        let full = (0...79).map { index in
+            LyricLine(index: index, timeMs: Int64(index * 2_000), durationMs: 2_000,
+                      text: "Line \(index)", translation: nil, romanization: nil, words: [])
+        }
+        let position: Int64 = 45_000
+        let windowOffset = try XCTUnwrap(LyricTimelineHelper.currentIndex(lines: window, positionMs: position))
+        let fullOffset = try XCTUnwrap(LyricTimelineHelper.currentIndex(lines: full, positionMs: position))
+        XCTAssertEqual(windowOffset, 2)
+        XCTAssertEqual(window[windowOffset].id, 22)
+        XCTAssertEqual(full[fullOffset].id, window[windowOffset].id)
+        XCTAssertEqual(LyricTimelineHelper.lineProgress(lines: window, index: windowOffset, positionMs: position), 0.5)
+        XCTAssertEqual(LyricTimelineHelper.lineProgress(lines: full, index: fullOffset, positionMs: position), 0.5)
+    }
+
     func testFullLyricsBrowseGeometryReplacesRemovedRowsAndRequiresAValidViewport() {
         let geometry = FullLyricsBrowseGeometry()
         geometry.prepare(for: "song-a")
@@ -2852,7 +3144,7 @@ final class PerformanceStabilityTests: XCTestCase {
         }
         XCTAssertEqual(image.size.width, width, accuracy: 0.1, name)
         XCTAssertEqual(image.size.height, height, accuracy: 0.1, name)
-        if name.hasPrefix("full-lyrics-") {
+        if name.hasPrefix("full-lyrics-") || name.hasPrefix("playback-stats-") {
             let attachment = XCTAttachment(image: image)
             attachment.name = name
             attachment.lifetime = .keepAlways

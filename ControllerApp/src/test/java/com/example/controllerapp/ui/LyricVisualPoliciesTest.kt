@@ -8,21 +8,30 @@ import org.junit.Test
 
 class LyricVisualPoliciesTest {
     @Test
+    fun `scrolling and recent release cannot activate a lyric`() {
+        assertFalse(LyricBrowsePolicy.canActivate(true, 1_000, 5_000))
+        assertFalse(LyricBrowsePolicy.canActivate(false, 1_000, 1_249))
+        assertTrue(LyricBrowsePolicy.canActivate(false, 1_000, 1_250))
+        assertFalse(LyricBrowsePolicy.canActivate(false, 1_000, 999))
+        assertTrue(LyricBrowsePolicy.canActivate(false, Long.MIN_VALUE, 0))
+    }
+
+    @Test
     fun `first lyric tap selects and second connected tap confirms seek`() {
         val first = LyricBrowsePolicy.onLineTapped(
             browsing = false,
-            selectedLinePosition = null,
-            tappedLinePosition = 8,
+            selectedLineId = null,
+            tappedLineId = 8,
             lineTimeMs = 42_300,
             connected = true
         )
-        assertEquals(8, first.selectedLinePosition)
+        assertEquals(8, first.selectedLineId)
         assertNull(first.seekPositionMs)
 
         val confirmed = LyricBrowsePolicy.onLineTapped(
             browsing = true,
-            selectedLinePosition = first.selectedLinePosition,
-            tappedLinePosition = 8,
+            selectedLineId = first.selectedLineId,
+            tappedLineId = 8,
             lineTimeMs = 42_300,
             connected = true
         )
@@ -32,7 +41,7 @@ class LyricVisualPoliciesTest {
     @Test
     fun `disconnected lyric selection never seeks`() {
         val result = LyricBrowsePolicy.onLineTapped(true, 3, 3, 8_000, false)
-        assertEquals(3, result.selectedLinePosition)
+        assertEquals(3, result.selectedLineId)
         assertNull(result.seekPositionMs)
     }
 
@@ -42,13 +51,25 @@ class LyricVisualPoliciesTest {
             4,
             LyricBrowsePolicy.nearestLine(
                 listOf(
-                    LyricViewportItem(3, 120),
-                    LyricViewportItem(4, 205),
-                    LyricViewportItem(5, 310)
+                    LyricViewportItem(3, 100, 140),
+                    LyricViewportItem(4, 180, 230),
+                    LyricViewportItem(5, 280, 340)
                 ),
                 viewportCenterPx = 220
             )
         )
+    }
+
+    @Test
+    fun `viewport center inside long line takes priority over closer adjacent center`() {
+        assertEquals(20, LyricBrowsePolicy.nearestLine(
+            listOf(LyricViewportItem(20, -900, 300), LyricViewportItem(21, 308, 408)),
+            viewportCenterPx = 250
+        ))
+        assertEquals(21, LyricBrowsePolicy.nearestLine(
+            listOf(LyricViewportItem(20, -900, 300), LyricViewportItem(21, 308, 408)),
+            viewportCenterPx = 306
+        ))
     }
 
     @Test

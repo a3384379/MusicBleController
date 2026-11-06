@@ -194,6 +194,7 @@
 				A40000000000000000000002 /* IOSBleFeasibility */,
 				B40000000000000000000001 /* SonyMusicLiveActivityExtension */,
 				C40000000000000000000001 /* IOSBleFeasibilityTests */,
+				D40000000000000000000001 /* LyricsReadingUITests */,
 				A40000000000000000000003 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -261,6 +262,7 @@
 				A20000000000000000000006 /* sonyMusic.app */,
 				B20000000000000000000007 /* SonyMusicLiveActivityExtension.appex */,
 				C20000000000000000000002 /* IOSBleFeasibilityTests.xctest */,
+				D20000000000000000000002 /* LyricsReadingUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -373,6 +375,10 @@
 						CreatedOnToolsVersion = 16.2;
 						TestTargetID = A50000000000000000000001;
 					};
+					D50000000000000000000001 = {
+						CreatedOnToolsVersion = 16.2;
+						TestTargetID = A50000000000000000000001;
+					};
 				};
 			};
 			buildConfigurationList = A90000000000000000000001 /* Build configuration list for PBXProject "IOSBleFeasibility" */;
@@ -392,6 +398,7 @@
 				A50000000000000000000001 /* sonyMusic */,
 				B50000000000000000000001 /* SonyMusicLiveActivityExtension */,
 				C50000000000000000000001 /* IOSBleFeasibilityTests */,
+				D50000000000000000000001 /* LyricsReadingUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -796,6 +803,74 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* UI regression target: uses simulator-only fixtures and the production lyrics view. */
+		D10000000000000000000001 = {isa = PBXBuildFile; fileRef = D20000000000000000000001; };
+		D20000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LyricsReadingUITests.swift; sourceTree = "<group>"; };
+		D20000000000000000000002 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LyricsReadingUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		D40000000000000000000001 = {
+			isa = PBXGroup;
+			children = (D20000000000000000000001, );
+			path = LyricsReadingUITests;
+			sourceTree = "<group>";
+		};
+		D30000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		D30000000000000000000002 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (D10000000000000000000001, ); runOnlyForDeploymentPostprocessing = 0; };
+		D30000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		D80000000000000000000002 = {
+			isa = PBXTargetDependency;
+			target = A50000000000000000000001;
+			targetProxy = C80000000000000000000001;
+		};
+		D50000000000000000000001 = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D90000000000000000000001;
+			buildPhases = (D30000000000000000000002, D30000000000000000000001, D30000000000000000000003, );
+			buildRules = ();
+			dependencies = (D80000000000000000000002, );
+			name = LyricsReadingUITests;
+			productName = LyricsReadingUITests;
+			productReference = D20000000000000000000002;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+		D70000000000000000000001 = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 98K7KHA6Z7;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sqz.IOSBleFeasibility.LyricsReadingUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = iphonesimulator;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_TARGET_NAME = sonyMusic;
+			};
+			name = Debug;
+		};
+		D70000000000000000000002 = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 98K7KHA6Z7;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sqz.IOSBleFeasibility.LyricsReadingUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = iphonesimulator;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_TARGET_NAME = sonyMusic;
+			};
+			name = Release;
+		};
+		D90000000000000000000001 = {
+			isa = XCConfigurationList;
+			buildConfigurations = (D70000000000000000000001, D70000000000000000000002, );
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 	};
 	rootObject = A60000000000000000000001 /* Project object */;
 }

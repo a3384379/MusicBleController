@@ -1,6 +1,27 @@
 import CryptoKit
 import SwiftUI
 
+// Paired translations for the statistics explanation and in-progress status.
+enum PlaybackStatisticsCopy {
+    static func inProgress(counted: Bool, language: AppLanguage) -> String {
+        switch (language, counted) {
+        case (.english, true): return "In progress · counted"
+        case (.english, false): return "In progress · not counted"
+        case (.simplifiedChinese, true): return "进行中 · 已计播放"
+        case (.simplifiedChinese, false): return "进行中 · 未计播放"
+        }
+    }
+
+    static func explanation(language: AppLanguage) -> String {
+        switch language {
+        case .english:
+            return "A play counts after 30 seconds of listening, or half the track when its duration is known. Listening time and counted plays include sessions in progress. Completion and skip rates use ended sessions only. Today, week and month follow Sony's local calendar; sessions belong to the period in which they started."
+        case .simplifiedChinese:
+            return "实际收听满 30 秒，或歌曲时长已知时听满半曲，计为一次播放。收听时长和已计播放包含进行中的会话；完播率和跳过率只以已结束会话计算。今日、本周和本月按 Sony 当地自然日、周和月计算，会话按开始时间归入统计周期。"
+        }
+    }
+}
+
 struct PlaybackHistoryView: View {
     @ObservedObject var bleManager: BLETestManager
     @Environment(\.dismiss) private var dismiss
@@ -167,6 +188,7 @@ private enum PlaybackHistoryRange: String, CaseIterable, Identifiable {
 
 private struct PlaybackHistoryRow: View {
     let session: PlaybackHistorySession
+    @ObservedObject private var preferences = PreferencesStore.shared
 
     var body: some View {
         HStack(spacing: 12) {
@@ -184,7 +206,7 @@ private struct PlaybackHistoryRow: View {
                     .font(.caption)
                     .foregroundStyle(PlayerDesignTokens.secondaryText)
                     .monospacedDigit()
-                Text(stateText)
+                Text(verbatim: stateText)
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(stateColor)
             }
@@ -194,13 +216,17 @@ private struct PlaybackHistoryRow: View {
     }
 
     private var stateText: String {
-        if session.completed { return "已完播" }
-        if session.skipped { return "已跳过" }
-        if session.countedPlay { return "已计播放" }
-        return "未计播放"
+        if session.endedAt == nil {
+            return PlaybackStatisticsCopy.inProgress(counted: session.countedPlay, language: preferences.appLanguage)
+        }
+        if session.completed { return AppLocalization.string("已完播") }
+        if session.skipped { return AppLocalization.string("已跳过") }
+        if session.countedPlay { return AppLocalization.string("已计播放") }
+        return AppLocalization.string("未计播放")
     }
 
     private var stateColor: Color {
+        if session.endedAt == nil { return PlayerDesignTokens.secondaryText }
         if session.completed { return PlayerDesignTokens.stableAccent }
         if session.skipped { return PlayerDesignTokens.warning }
         return PlayerDesignTokens.secondaryText
@@ -209,11 +235,17 @@ private struct PlaybackHistoryRow: View {
 
 struct PlaybackStatsView: View {
     let stats: [String: PlaybackStatsSnapshot]
+    @ObservedObject private var preferences = PreferencesStore.shared
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 summaryGrid
+                Text(verbatim: PlaybackStatisticsCopy.explanation(language: preferences.appLanguage))
+                    .font(.footnote)
+                    .foregroundStyle(PlayerDesignTokens.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("playbackStats.explanation")
                 if let week = stats["WEEK"] {
                     rankingSection(title: "本周最常听歌曲", tracks: week.topTracks)
                     artistSection(title: "本周最常听歌手", artists: week.topArtists)

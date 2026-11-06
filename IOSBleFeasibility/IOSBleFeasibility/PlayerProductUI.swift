@@ -264,20 +264,82 @@ final class FullLyricsBrowseGeometry {
     private var identity: String?
     private var rowFrames: [Int: CGRect] = [:]
     private var viewport = CGRect.zero
+    private var snapshots: [FullLyricsLayoutKey: Snapshot] = [:]
+    private var snapshotOrder: [FullLyricsLayoutKey] = []
+
+    private struct Snapshot {
+        var frames: [Int: CGRect]
+        var viewport: CGRect
+        var viewportGlobalMinY: CGFloat
+    }
 
     func prepare(for identity: String) {
         guard self.identity != identity else { return }
         self.identity = identity
         rowFrames.removeAll()
+        snapshots.removeAll()
+        snapshotOrder.removeAll()
     }
 
-    func updateRows(_ frames: [Int: CGRect], for identity: String) {
+    func updateRows(_ frames: [Int: CGRect], for identity: String, layoutKey: FullLyricsLayoutKey = .default,
+                    viewportGlobalMinY: CGFloat = 0) {
         guard self.identity == identity else { return }
         rowFrames = frames
+        if snapshots[layoutKey] == nil {
+            snapshotOrder.append(layoutKey)
+            if snapshotOrder.count > 3 {
+                snapshots.removeValue(forKey: snapshotOrder.removeFirst())
+            }
+        }
+        let previousViewport = snapshots[layoutKey]?.viewport ?? viewport
+        snapshots[layoutKey] = Snapshot(frames: frames, viewport: previousViewport,
+                                        viewportGlobalMinY: viewportGlobalMinY)
     }
 
-    func updateViewport(_ viewport: CGRect) {
+    func readingAnchor(for identity: String, layoutKey: FullLyricsLayoutKey = .default) -> FullLyricsReadingAnchor? {
+        guard self.identity == identity, let snapshot = snapshots[layoutKey], snapshot.viewport.height > 0 else { return nil }
+        let candidates = snapshot.frames.filter { _, frame in
+            frame.height > 0 && frame.midY >= snapshot.viewport.minY && frame.midY <= snapshot.viewport.maxY
+        }
+        let firstCentered = candidates.min(by: { $0.value.minY < $1.value.minY })
+        let intersecting = snapshot.frames.filter { _, frame in
+            frame.height > 0 && frame.minY.isFinite && frame.maxY.isFinite &&
+                frame.maxY > snapshot.viewport.minY && frame.minY < snapshot.viewport.maxY
+        }
+        let closest = intersecting.min { lhs, rhs in
+            func distance(_ frame: CGRect) -> CGFloat {
+                max(frame.minY - snapshot.viewport.midY, snapshot.viewport.midY - frame.maxY, 0)
+            }
+            let left = distance(lhs.value)
+            let right = distance(rhs.value)
+            return left == right ? lhs.key < rhs.key : left < right
+        }
+        guard let pair = firstCentered ?? closest, pair.value.minY.isFinite else { return nil }
+        return FullLyricsReadingAnchor(id: pair.key, screenY: pair.value.minY - snapshot.viewport.minY + snapshot.viewportGlobalMinY)
+    }
+
+    func updateViewport(_ viewport: CGRect, layoutKey: FullLyricsLayoutKey = .default,
+                        viewportGlobalMinY: CGFloat = 0) {
         self.viewport = viewport
+        if snapshots[layoutKey] == nil {
+            snapshotOrder.append(layoutKey)
+            if snapshotOrder.count > 3 {
+                snapshots.removeValue(forKey: snapshotOrder.removeFirst())
+            }
+        }
+        snapshots[layoutKey] = Snapshot(frames: snapshots[layoutKey]?.frames ?? [:], viewport: viewport,
+                                        viewportGlobalMinY: viewportGlobalMinY)
+    }
+
+    func anchorContentY(for anchor: FullLyricsReadingAnchor, identity: String,
+                        layoutKey: FullLyricsLayoutKey, lineOrder: [Int: Int]) -> CGFloat? {
+        guard self.identity == identity, let snapshot = snapshots[layoutKey], snapshot.viewport.height > 0,
+              let frame = snapshot.frames[anchor.id], frame.height > 0,
+              frame.maxY > snapshot.viewport.minY, frame.minY < snapshot.viewport.maxY,
+              FullLyricsGeometryCoherence.isOrdered(snapshot.frames, lineOrder: lineOrder) else { return nil }
+        return FullLyricsAnchorPosition.resolve(rowMinY: frame.minY,
+                                                viewportGlobalMinY: snapshot.viewportGlobalMinY,
+                                                screenY: anchor.screenY)
     }
 
     var nearestLineIndex: Int? {
@@ -296,6 +358,45 @@ final class FullLyricsBrowseGeometry {
         }
         return nearest
     }
+}
+
+enum FullLyricsGeometryCoherence {
+    static func isOrdered(_ frames: [Int: CGRect], lineOrder: [Int: Int]) -> Bool {
+        let ordered = frames.compactMap { id, frame -> (Int, CGRect)? in
+            guard let order = lineOrder[id], frame.minY.isFinite, frame.maxY.isFinite, frame.height > 0 else { return nil }
+            return (order, frame)
+        }.sorted { $0.0 < $1.0 }
+        guard !ordered.isEmpty else { return false }
+        return zip(ordered, ordered.dropFirst()).allSatisfy { left, right in
+            left.1.maxY <= right.1.minY + 1
+        }
+    }
+}
+
+struct FullLyricsReadingAnchor: Equatable {
+    let id: Int
+    let screenY: CGFloat
+}
+
+enum FullLyricsAnchorPosition {
+    static func resolve(rowMinY: CGFloat, viewportGlobalMinY: CGFloat, screenY: CGFloat) -> CGFloat? {
+        let result = rowMinY + viewportGlobalMinY - screenY
+        return result.isFinite ? result : nil
+    }
+}
+
+struct FullLyricsRestoreFence {
+    private(set) var generation: UInt64 = 0
+
+    mutating func invalidate() { generation &+= 1 }
+    func accepts(_ candidate: UInt64) -> Bool { generation == candidate }
+}
+
+struct FullLyricsLayoutKey: Hashable {
+    let documentRevision: UInt64
+    let mode: LyricDisplayMode
+    let dynamicTypeSize: DynamicTypeSize
+    static let `default` = FullLyricsLayoutKey(documentRevision: 0, mode: .original, dynamicTypeSize: .large)
 }
 
 enum FullLyricsBrowseTime {
@@ -330,7 +431,8 @@ struct FullLyricsStoreHost: View {
             artist: display(metadata.artist, fallback: "等待同步"),
             albumArtImage: manager.artworkStore.state.image,
             lyrics: lines,
-            lyricsIdentity: "\(document.trackId)|\(lines.count)|\(lines.first?.timeMs ?? -1)|\(lines.last?.timeMs ?? -1)",
+            lyricsIdentity: document.trackId,
+            lyricsRevision: manager.lyricsStore.documentRevision,
             currentIndex: LyricTimelineHelper.currentIndex(lines: lines, positionMs: position) ?? -1,
             positionMs: position,
             translationState: document.translationState,

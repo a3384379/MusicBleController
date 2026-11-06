@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Scheme LastUpgradeVersion="1620" version="1.3">
+   <BuildAction parallelizeBuildables="YES" buildImplicitDependencies="YES">
+      <BuildActionEntries>
+         <BuildActionEntry buildForTesting="YES" buildForRunning="YES" buildForProfiling="NO" buildForArchiving="NO" buildForAnalyzing="YES">
+            <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="A50000000000000000000001" BuildableName="sonyMusic.app" BlueprintName="sonyMusic" ReferencedContainer="container:IOSBleFeasibility.xcodeproj"/>
+         </BuildActionEntry>
+         <BuildActionEntry buildForTesting="YES" buildForRunning="NO" buildForProfiling="NO" buildForArchiving="NO" buildForAnalyzing="YES">
+            <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="D50000000000000000000001" BuildableName="LyricsReadingUITests.xctest" BlueprintName="LyricsReadingUITests" ReferencedContainer="container:IOSBleFeasibility.xcodeproj"/>
+         </BuildActionEntry>
+      </BuildActionEntries>
+   </BuildAction>
+   <TestAction buildConfiguration="Debug" selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier="Xcode.IDEFoundation.Launcher.LLDB" shouldUseLaunchSchemeArgsEnv="YES">
+      <Testables>
+         <TestableReference skipped="NO" parallelizable="NO">
+            <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="D50000000000000000000001" BuildableName="LyricsReadingUITests.xctest" BlueprintName="LyricsReadingUITests" ReferencedContainer="container:IOSBleFeasibility.xcodeproj"/>
+         </TestableReference>
+      </Testables>
+      <MacroExpansion>
+         <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="A50000000000000000000001" BuildableName="sonyMusic.app" BlueprintName="sonyMusic" ReferencedContainer="container:IOSBleFeasibility.xcodeproj"/>
+      </MacroExpansion>
+   </TestAction>
+   <LaunchAction buildConfiguration="Debug" selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier="Xcode.IDEFoundation.Launcher.LLDB" launchStyle="0" useCustomWorkingDirectory="NO" ignoresPersistentStateOnLaunch="NO" debugDocumentVersioning="YES" debugServiceExtension="internal" allowLocationSimulation="YES">
+      <BuildableProductRunnable runnableDebuggingMode="0">
+         <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="A50000000000000000000001" BuildableName="sonyMusic.app" BlueprintName="sonyMusic" ReferencedContainer="container:IOSBleFeasibility.xcodeproj"/>
+      </BuildableProductRunnable>
+   </LaunchAction>
+   <ProfileAction buildConfiguration="Release" shouldUseLaunchSchemeArgsEnv="YES" savedToolIdentifier="" useCustomWorkingDirectory="NO" debugDocumentVersioning="YES"/>
+   <AnalyzeAction buildConfiguration="Debug"/>
+   <ArchiveAction buildConfiguration="Release" revealArchiveInOrganizer="YES"/>
+</Scheme>

@@ -203,6 +203,7 @@ final class PlaybackStore {
 final class LyricsStore {
     private(set) var live = BLELiveLyricState()
     private(set) var document = BLEFullLyricsViewState()
+    private(set) var documentRevision: UInt64 = 0
     private(set) var floatingPlaybackControlState: LyricsPlaybackControlState = .idle
 
     func updateFloatingPlaybackControlState(_ value: LyricsPlaybackControlState) {
@@ -214,7 +215,10 @@ final class LyricsStore {
     }
 
     func updateDocument(_ value: BLEFullLyricsViewState) {
-        if document != value { document = value }
+        if document != value {
+            document = value
+            documentRevision &+= 1
+        }
     }
 }
 
