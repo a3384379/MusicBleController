@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.os.Build
 import android.os.SystemClock
 import android.text.format.DateUtils
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -31,6 +32,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -64,6 +66,7 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -92,12 +95,15 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -1500,12 +1506,17 @@ private fun HistoryScreen(
     navController: NavHostController
 ) {
     val history by viewModel.history.collectAsStateWithLifecycle()
-    val listState = rememberLazyListState()
+    // Entering an older window keeps the current scroll anchor. Returning to
+    // recent replaces the list and its state together, instead of scrolling a
+    // list whose backing window has just shrunk from 1000 to 500 rows.
+    val previousListState = remember { arrayOfNulls<LazyListState>(1) }
+    val listState = rememberSaveable(history.showingOlderWindow, saver = LazyListState.Saver) {
+        if (history.showingOlderWindow) previousListState[0] ?: LazyListState()
+        else LazyListState()
+    }
+    SideEffect { previousListState[0] = listState }
     var range by remember { mutableStateOf("TODAY") }
     LaunchedEffect(Unit) { viewModel.syncHistory() }
-    LaunchedEffect(history.showingOlderWindow) {
-        if (!history.showingOlderWindow) listState.scrollToItem(0)
-    }
     Scaffold(
         topBar = {
             ControllerTopBar(
@@ -1524,83 +1535,85 @@ private fun HistoryScreen(
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(top = padding.calculateTopPadding())) {
             HistoryStatusPanel(history, range, viewModel)
-            LazyColumn(
-                Modifier.weight(1f).testTag("history_list"),
-                state = listState,
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                    top = 12.dp,
-                    bottom = padding.calculateBottomPadding() + 28.dp,
-                    start = 16.dp,
-                    end = 16.dp
-                ),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                item(key = "history_range", contentType = "history_range") {
-                    StatsRangeSelector(range) { range = it }
-                }
-                history.stats[range]?.let { stats ->
-                    item(key = "history_stats", contentType = "history_stats") { StatsOverview(stats) }
-                }
-                item(key = "history_recent_title", contentType = "history_recent_title") {
-                    Text(
-                        "最近播放",
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.padding(top = 8.dp)
-                    )
-                }
-                if (history.sessions.isEmpty()) {
-                    item(key = "history_empty", contentType = "history_empty") {
+            key(history.showingOlderWindow) {
+                LazyColumn(
+                    Modifier.weight(1f).testTag("history_list"),
+                    state = listState,
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                        top = 12.dp,
+                        bottom = padding.calculateBottomPadding() + 28.dp,
+                        start = 16.dp,
+                        end = 16.dp
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    item(key = "history_range", contentType = "history_range") {
+                        StatsRangeSelector(range) { range = it }
+                    }
+                    history.stats[range]?.let { stats ->
+                        item(key = "history_stats", contentType = "history_stats") { StatsOverview(stats) }
+                    }
+                    item(key = "history_recent_title", contentType = "history_recent_title") {
                         Text(
-                            history.status.ifBlank { if (history.loading) "正在同步…" else "暂无历史" },
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(vertical = 28.dp)
+                            "最近播放",
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.padding(top = 8.dp)
                         )
                     }
-                }
-                items(history.sessions, key = { it.sessionId }, contentType = { "history_session" }) { session ->
-                    Card(
-                        modifier = Modifier.testTag("history_session_${session.sessionId}"),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-                    ) {
-                        Row(
-                            Modifier.fillMaxWidth().padding(14.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                    if (history.sessions.isEmpty()) {
+                        item(key = "history_empty", contentType = "history_empty") {
+                            Text(
+                                history.status.ifBlank { if (history.loading) "正在同步…" else "暂无历史" },
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(vertical = 28.dp)
+                            )
+                        }
+                    }
+                    items(history.sessions, key = { it.sessionId }, contentType = { "history_session" }) { session ->
+                        Card(
+                            modifier = Modifier.testTag("history_session_${session.sessionId}"),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
                         ) {
-                            HistoryArtwork(session.artworkId, viewModel)
-                            Spacer(Modifier.width(12.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text(
-                                    session.title.ifBlank { "未知歌曲" },
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    fontWeight = FontWeight.Medium
-                                )
-                                Text(
-                                    "${session.artist} · ${formatDate(session.startedAt)}",
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    fontSize = 13.sp,
-                                    maxLines = 1
-                                )
-                            }
-                            Column(horizontalAlignment = Alignment.End) {
-                                Text(formatDuration(session.listenedMs))
-                                Text(
-                                    HistoryDisplayPolicy.status(session),
-                                    fontSize = 12.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
+                            Row(
+                                Modifier.fillMaxWidth().padding(14.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                HistoryArtwork(session.artworkId, viewModel)
+                                Spacer(Modifier.width(12.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        session.title.ifBlank { "未知歌曲" },
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    Text(
+                                        "${session.artist} · ${formatDate(session.startedAt)}",
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        fontSize = 13.sp,
+                                        maxLines = 1
+                                    )
+                                }
+                                Column(horizontalAlignment = Alignment.End) {
+                                    Text(formatDuration(session.listenedMs))
+                                    Text(
+                                        HistoryDisplayPolicy.status(session),
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
                             }
                         }
                     }
-                }
-                if (history.sessions.isNotEmpty() && history.hasMore) {
-                    item(key = "history_load_more", contentType = "history_load_more") {
-                        OutlinedButton(
-                            onClick = viewModel::loadMoreHistory,
-                            enabled = !history.loading && !history.clearing,
-                            modifier = Modifier.fillMaxWidth().testTag("history_load_more")
-                        ) {
-                            Text(if (history.loading) "正在加载…" else "加载更早记录")
+                    if (history.sessions.isNotEmpty() && history.hasMore) {
+                        item(key = "history_load_more", contentType = "history_load_more") {
+                            OutlinedButton(
+                                onClick = viewModel::loadMoreHistory,
+                                enabled = !history.loading && !history.clearing,
+                                modifier = Modifier.fillMaxWidth().testTag("history_load_more")
+                            ) {
+                                Text(if (history.loading) "正在加载…" else "加载更早记录")
+                            }
                         }
                     }
                 }
@@ -2075,6 +2088,23 @@ private fun DebugToolsScreen(
 ) {
     val diagnostics by viewModel.diagnostics.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    var confirmSnapshotDeletion by remember { mutableStateOf(false) }
+    if (confirmSnapshotDeletion) {
+        AlertDialog(
+            onDismissRequest = { confirmSnapshotDeletion = false },
+            title = { Text("删除已导出的日志副本？") },
+            text = { Text("删除后，尚未读取完成的分享可能失败；本地日志不会被删除。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmSnapshotDeletion = false
+                    viewModel.clearExportedLogs { success ->
+                        Toast.makeText(context, if (success) "已删除导出副本" else "删除导出副本失败", Toast.LENGTH_LONG).show()
+                    }
+                }) { Text("删除") }
+            },
+            dismissButton = { TextButton(onClick = { confirmSnapshotDeletion = false }) { Text("取消") } }
+        )
+    }
     Scaffold(topBar = { ControllerTopBar("调试工具", navController) }) { padding ->
         Column(
             Modifier.fillMaxSize()
@@ -2098,27 +2128,35 @@ private fun DebugToolsScreen(
             DebugAction("获取 Sony 日志", Icons.Default.ContentCopy, viewModel::requestSonyLogs)
             DebugAction("获取 Media Dump", Icons.Default.ContentCopy, viewModel::requestMediaDump)
             DebugAction("分享 Android 日志", Icons.Default.Share) {
-                val file = viewModel.logFile()
-                if (file.exists()) {
-                    val uri = FileProvider.getUriForFile(
-                        context,
-                        "${context.packageName}.files",
-                        file
-                    )
-                    context.startActivity(
-                        Intent.createChooser(
-                            Intent(Intent.ACTION_SEND).apply {
-                                type = "text/plain"
-                                putExtra(Intent.EXTRA_STREAM, uri)
-                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            },
-                            "分享诊断日志"
-                        )
-                    )
+                viewModel.exportLogs { file, error ->
+                    if (file == null) {
+                        Toast.makeText(context, "日志导出失败：${error ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                    } else {
+                        try {
+                            val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+                            context.startActivity(
+                                Intent.createChooser(
+                                    Intent(Intent.ACTION_SEND).apply {
+                                        type = "text/plain"
+                                        putExtra(Intent.EXTRA_STREAM, uri)
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    },
+                                    "分享诊断日志"
+                                )
+                            )
+                        } catch (_: Exception) {
+                            Toast.makeText(context, "无法打开日志分享", Toast.LENGTH_LONG).show()
+                        }
+                    }
                 }
             }
+            TextButton(onClick = { confirmSnapshotDeletion = true }) { Text("删除已导出的日志副本") }
             OutlinedButton(
-                onClick = viewModel::clearLogs,
+                onClick = {
+                    viewModel.clearLogs { success ->
+                        Toast.makeText(context, if (success) "已清理本地日志" else "清理本地日志失败", Toast.LENGTH_LONG).show()
+                    }
+                },
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Icon(Icons.Default.Close, null)

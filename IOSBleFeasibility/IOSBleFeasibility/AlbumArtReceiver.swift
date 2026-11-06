@@ -243,6 +243,11 @@ protocol AlbumArtReceiverDelegate: AnyObject {
     func albumArtPublishLiveArtwork(image: UIImage, key: String, reason: String)
     func albumArtClearLiveArtwork(reason: String, shouldUpdate: Bool)
     func albumArtUpdateLiveActivity(force: Bool, reason: String)
+    func albumArtPublicationTraceContext(for id: String) -> RealtimeHandoffContext?
+}
+
+extension AlbumArtReceiverDelegate {
+    func albumArtPublicationTraceContext(for id: String) -> RealtimeHandoffContext? { nil }
 }
 
 final class AlbumArtReceiver {
@@ -2256,11 +2261,16 @@ final class AlbumArtReceiver {
         displayedAlbumArtID = id
         artworkDisplayQuality = quality
         currentCachedAlbumArtQuality = quality.label
+        let traceContext = delegate?.albumArtPublicationTraceContext(for: id)
         RealtimeTraceStore.shared.record(
             stage: quality >= .hq ? "hqPublished" : "previewPublished",
             trackId: id,
+            generation: traceContext?.generation,
             payloadType: quality.label,
-            result: "published"
+            result: "published",
+            reason: reason,
+            handoffId: traceContext?.handoffId,
+            triggerType: traceContext?.triggerType.rawValue
         )
         updateArtworkEnhancementStatus(message: reason)
         if previous != quality {

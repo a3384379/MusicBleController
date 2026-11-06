@@ -31,6 +31,8 @@ V4 本次按维护者决定提前接入主干，属于阶段性交付，不等�
 - Android Controller 界面：[ControllerAppUi.kt](/Volumes/雷电/project/MusicBleController/ControllerApp/src/main/java/com/example/controllerapp/ui/ControllerAppUi.kt)
 - Android Controller 历史同步、游标与数据库升级：[ANDROID_HISTORY_ARCHITECTURE.md](ANDROID_HISTORY_ARCHITECTURE.md)
 - Sony 播放统计口径与聚合查询：[SONY_PLAYBACK_STATISTICS.md](SONY_PLAYBACK_STATISTICS.md)
+- Android Controller 日志容量、清理与分享：[ANDROID_LOGGING_ARCHITECTURE.md](ANDROID_LOGGING_ARCHITECTURE.md)
+- CI 设备测试分组、启动重试与失败证据：[CI_VALIDATION.md](CI_VALIDATION.md)
 
 ## 总体数据流
 

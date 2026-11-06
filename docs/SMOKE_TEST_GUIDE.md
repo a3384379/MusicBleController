@@ -304,6 +304,12 @@ xcodebuild \
 
 完整清单位于本次工作机 `/tmp/musicble-ble-guard-20261106/verification.json`，包含原始失败、最终分组测试和各轮报告。该路径为临时证据，非长期归档。新权限 helper 仅对注入 SDK 判断中的内联权限名称局部说明 `InlinedApi` 误报；未屏蔽历史 lint 告警。
 
+## 本轮自用范围与多设备修复（2026-11-07）
+
+Android `--device` 现在向子脚本导出所选 serial，多台设备在线时仍只检查指定设备；设备检查失败时，`--json` 也输出报告位置与失败摘要，进程保持失败退出。相关无设备回归共 16 项通过，多设备环境下 Sony quick 为整体 PASS、Required 8/8，使用 `--no-debug-control`，未触发调试 START/RECOVER。
+
+本轮最终 iPhone full 与同构建 quick 均整体 PASS、Required 6/6。完整回归及证据边界见[优化进度](OPTIMIZATION_PROGRESS.md)和[CI 验证](CI_VALIDATION.md)。用户已取消真实两端性能采样、120 分钟长稳、双控制器和能耗对照；这些不属于当前 smoke 必选项，也没有记为通过。既有性能工具仅供以后主动手动使用。
+
 ## 不允许随便修改的点
 
 - iOS smoke 工具不得调用 `adb`、`logcat` 或 Android Gradle 构建。
@@ -319,7 +325,7 @@ xcodebuild \
 - Preferences FAIL：确认安装的是 DEBUG 包且支持 `--smoke-test-preferences`。
 - Log File FAIL：确认 App 启动过，且 `ios_ble.log` 有预期关键词。
 - AlbumArt Flow FAIL：查看 `album_art_flow.json` 的 `events` 和 `reason`。
-- Android Device Check FAIL：确认 `adb devices -l` 只有一台 `device`，且 Sony 已授权 USB 调试。
+- Android Device Check FAIL：确认 Sony 已授权 USB 调试；多台设备在线时使用 `--device <serial>` 或 `ANDROID_DEVICE_ID` 明确选择目标。
 - Android Build FAIL：看 `android_build_stderr.log`。
 - Android Launch FAIL：看 `launch_logcat.log`。
 - Android BLE Service WARN：可能只是未手动启动 PlayerAgent 前台服务。

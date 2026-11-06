@@ -30,6 +30,7 @@ with open(os.environ["FAKE_COMMANDS"], "a") as f:
 if args[:1] == ["devices"]:
     print("List of devices attached")
     if os.environ.get("FAKE_NO_DEVICE") != "1": print("fake-device device")
+    if os.environ.get("FAKE_MULTIPLE_DEVICES") == "1": print("other-device device")
 elif "broadcast" in args:
     sys.exit(int(os.environ.get("FAKE_BROADCAST_RC", "0")))
 elif "logcat" in args and "-d" in args:
@@ -92,6 +93,29 @@ elif "shell" in args and any(x.startswith("p=") for x in args):
         health = json.loads((out / "ble_health_watchdog.json").read_text())
         self.assertTrue(health["recoverCommandAttempted"])
         self.assertEqual(health["recoverCommandRc"], 0)
+
+    def test_cli_device_is_forwarded_when_multiple_devices_are_online(self):
+        out = self.root / "selected-suite"
+        proc = self.invoke("run_android_smoke_tests.sh", ["--quick", "--json", "--no-debug-control",
+                           "--device", "fake-device", "--output", out], FAKE_MULTIPLE_DEVICES="1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = json.loads(proc.stdout)
+        self.assertEqual(summary["summary"]["overall_result"], "PASS")
+        self.assertIn("-s fake-device", self.actions())
+        self.assertNotIn("-s other-device", self.actions())
+        self.assertEqual((out / "device_info.tsv").read_text().split("\t")[1], "fake-device")
+
+    def test_cli_missing_device_returns_failure_json_before_launch(self):
+        out = self.root / "absent-suite"
+        proc = self.invoke("run_android_smoke_tests.sh", ["--quick", "--json", "--no-debug-control",
+                           "--device", "absent-device", "--output", out], FAKE_MULTIPLE_DEVICES="1")
+        self.assertNotEqual(proc.returncode, 0)
+        summary = json.loads(proc.stdout)
+        self.assertEqual(summary["summary"]["overall_result"], "FAIL")
+        self.assertTrue((out / "report.json").is_file())
+        self.assertNotIn("broadcast", self.actions())
+        self.assertNotIn("monkey", self.actions())
+        self.assertNotIn("pidof", self.actions())
 
     def test_watchdog_default_broadcast_failure_is_attempted(self):
         health = self.watchdog(DEVICE_ID="fake-device", FAKE_BROADCAST_RC="13")

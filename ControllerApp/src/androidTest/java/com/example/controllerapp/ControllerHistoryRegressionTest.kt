@@ -85,13 +85,8 @@ class ControllerHistoryRegressionTest {
         settle()
         database.close()
         logStore?.let { store ->
-            // close() posts its flush. Removing files before this join fabricates a crash.
-            val worker = ControllerLogStore::class.java.getDeclaredField("thread").apply {
-                isAccessible = true
-            }.get(store) as Thread
             store.close()
-            worker.join(5_000L)
-            assertFalse("log worker did not stop", worker.isAlive)
+            assertTrue("log worker did not stop", store.awaitClosed(5_000L))
         }
         root.deleteRecursively()
         Unit

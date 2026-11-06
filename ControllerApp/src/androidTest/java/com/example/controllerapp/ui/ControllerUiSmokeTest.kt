@@ -1,11 +1,13 @@
 package com.example.controllerapp.ui
 
 import android.graphics.Bitmap
+import android.util.Log
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.isDisplayed
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -109,6 +111,7 @@ class ControllerUiSmokeTest {
                 true
             }
             setControllerContent()
+            historyPhase("navigate to history")
             compose.onNodeWithContentDescription("打开菜单").performClick()
             compose.onNodeWithText("播放历史").performClick()
             // Drive navigation/LaunchedEffect before awaiting work on the BLE thread.
@@ -121,10 +124,12 @@ class ControllerUiSmokeTest {
             finishHistoryStatistics(repository, commands)
             waitForHistory("initial sync completed") { !repository.history.value.loading }
             compose.waitForIdle()
+            historyPhase("scroll to row 510")
             compose.onNodeWithTag("history_list").performScrollToKey(510L)
             compose.onNodeWithTag("history_session_510").assertIsDisplayed()
 
             // The fixed sync action remains usable while this older row is on screen.
+            historyPhase("sync while reading row 510")
             compose.onNodeWithContentDescription("同步历史").assertIsDisplayed().performClick()
             val update = awaitHistoryCommand(commands, "GET_PLAY_HISTORY_SINCE", after = 1)
             assertEquals(1_000L, update.getLong("afterSessionId"))
@@ -139,12 +144,18 @@ class ControllerUiSmokeTest {
             compose.onNodeWithTag("history_status").assertIsDisplayed().assertTextEquals("同步完成")
             saveHistoryScreenshot(application, "history-ui-anchor.png")
 
+            historyPhase("load older window")
             compose.onNodeWithTag("history_list").performScrollToKey("history_load_more")
+            val readingAnchor = (510L downTo 501L).firstOrNull {
+                compose.onNodeWithTag("history_session_$it").isDisplayed()
+            } ?: error("No recent-window session visible before loading older history")
             compose.onNodeWithTag("history_load_more").assertIsDisplayed().performClick()
             waitForHistory("load more moved to older window ending at 1") {
                 !repository.history.value.loading && repository.history.value.showingOlderWindow &&
                     repository.history.value.sessions.lastOrNull()?.sessionId == 1L
             }
+            compose.onNodeWithTag("history_session_$readingAnchor").assertIsDisplayed()
+            historyPhase("return to recent window")
             compose.onNodeWithTag("history_show_recent").assertIsDisplayed().performClick()
             waitForHistory("return recent restored 500 rows starting at 1020") {
                 !repository.history.value.showingOlderWindow &&
@@ -156,6 +167,7 @@ class ControllerUiSmokeTest {
             compose.onNodeWithTag("history_session_1020").assertIsDisplayed()
             saveHistoryScreenshot(application, "history-ui-recent.png")
         } finally {
+            historyPhase("clear history in teardown")
             repository.attachTransport(null)
             repository.clearLocalHistory()
             waitForHistory("teardown cleared application database") {
@@ -213,6 +225,7 @@ class ControllerUiSmokeTest {
     }
 
     private fun waitForHistory(phase: String, condition: () -> Boolean) {
+        historyPhase("wait: $phase")
         try {
             runBlocking { withTimeout(5_000L) { while (!condition()) delay(10L) } }
         } catch (error: kotlinx.coroutines.TimeoutCancellationException) {
@@ -234,6 +247,11 @@ class ControllerUiSmokeTest {
                 error
             )
         }
+        historyPhase("completed: $phase")
+    }
+
+    private fun historyPhase(phase: String) {
+        Log.i("HistoryUiRegression", phase)
     }
 
     private fun saveHistoryScreenshot(application: ControllerApplication, name: String) {

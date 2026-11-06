@@ -152,8 +152,9 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
         commands.clearArtworkCache()
     }
 
-    fun clearLogs() {
-        repository.clearLogs()
+    fun clearLogs(done: (Boolean) -> Unit) {
+        val main = android.os.Handler(android.os.Looper.getMainLooper())
+        repository.clearLogs { succeeded -> main.post { done(succeeded) } }
     }
 
     fun startLegacyRfcomm() {
@@ -194,7 +195,19 @@ class ControllerViewModel(application: Application) : AndroidViewModel(applicati
         repository.updateArtworkEnhancement(value)
     }
 
-    fun logFile() = repository.logStore.currentFile
+    fun exportLogs(done: (java.io.File?, String?) -> Unit) {
+        val main = android.os.Handler(android.os.Looper.getMainLooper())
+        val accepted = repository.logStore.export { file, error ->
+            main.post { done(file, error) }
+        }
+        if (!accepted) done(null, "日志服务繁忙或已关闭")
+    }
+
+    fun clearExportedLogs(done: (Boolean) -> Unit) {
+        val main = android.os.Handler(android.os.Looper.getMainLooper())
+        val accepted = repository.logStore.clearSnapshots { succeeded -> main.post { done(succeeded) } }
+        if (!accepted) done(false)
+    }
 
     suspend fun historyArtwork(artworkId: String) =
         repository.historyArtwork(artworkId)

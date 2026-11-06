@@ -81,9 +81,9 @@ CoreBluetooth 使用 `com.musicblecontroller.sony.central.v1` 做状态恢复，
 - 歌词：`lyric`、`fullLyrics`、`fullLyricsTrackId`、`lyricDiagnostic`、`lyricSecondaryTransfer`。
 - 封面：`albumArtImage`、`artworkDisplayQuality`、`artworkEnhancementStatus`，由 `AlbumArtReceiver` 镜像到 `BLETestManager`。
 - 设置：`PreferencesStore.shared` 是真实 owner；`BLETestManager` 只做兼容读取/同步。
-- 显示进度的运行条件为 active、播放中且有有效时长；暂停、inactive/background 停止显示调度。流畅 100ms，自动正常电量 250ms、系统低电 500ms，省电 500ms。模式或低电变化时比较有效间隔，只有不同才取消并重建；保留播放锚点，旧调度回调失效，seek 编辑受保护。订阅和调度随 manager 释放。
+- 显示进度只在本轮连接已有有效播放锚点、active、播放中且有有效时长时运行；暂停、inactive/background 停止显示调度。流畅 100ms，自动正常电量 250ms、系统低电 500ms，省电 500ms。模式或低电变化时比较有效间隔，只有不同才取消并重建；保留播放锚点，旧调度回调失效，seek 编辑受保护。订阅和调度随 manager 释放。
 - 伪频谱自动 15fps、流畅 20fps、省电或 Reduce Motion 静态化；自动模式系统低电时也静态化。歌词插值间隔沿用同一刷新策略；低电通知可以触发两种视图更新。
-- 断线停表尚有既有差距：连接清理保留 playing 状态时，本地显示时钟可能继续。该项单列在[剩余任务](OPTIMIZATION_PROGRESS.md#显示时钟断线行为)，本轮模式刷新修复不关闭此项。
+- 断线、central 不可用或健康检查确认传输丢失时，统一清理传输并推进连接代次，取消显示调度，保留最后显示位置。仅连接就绪、link/PONG、回前台或切换性能模式不能恢复旧锚点；收到本轮有效 playbackState 且未处于 seek 编辑时才建立新锚点。旧后台解码与旧计时回调不能恢复显示推进，离线时长不会累加到重连后的进度。
 - 稳定歌曲会异步写入 `LastNowPlayingSnapshot-v1.json`；首个真实 playbackState 不匹配或没有活动歌曲时立即清除占位。
 
 ## UI 状态与无障碍

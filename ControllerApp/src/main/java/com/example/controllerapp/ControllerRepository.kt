@@ -202,6 +202,7 @@ class ControllerRepository(
             historyCoordinator.invalidate("Sony 已断开连接")
         }
         val previous = _connection.value
+        if (previous.phase != phase) logStore.appendImportant("[Connection] ${previous.phase} -> $phase reason=$reason")
         val health = when (phase) {
             ConnectionPhase.CONNECTED -> ConnectionHealth.HEALTHY
             ConnectionPhase.DISCONNECTED -> ConnectionHealth.DISCONNECTED
@@ -282,7 +283,7 @@ class ControllerRepository(
 
     fun recordSelfHealing(action: String) {
         if (action.isBlank()) return
-        logStore.append("[SelfHealing] $action")
+        logStore.appendImportant("[SelfHealing] $action")
         _diagnostics.update {
             it.copy(selfHealingActions = (it.selfHealingActions + action).takeLast(50))
         }
@@ -629,9 +630,11 @@ class ControllerRepository(
         }
     }
 
-    fun clearLogs() {
-        logStore.clear()
-        _diagnostics.update { it.copy(recentLogs = emptyList()) }
+    fun clearLogs(done: (Boolean) -> Unit = {}) {
+        if (!logStore.clear { succeeded ->
+                if (succeeded) _diagnostics.update { it.copy(recentLogs = emptyList()) }
+                done(succeeded)
+            }) done(false)
     }
 
     fun updateExperienceMode(value: AppExperienceMode) {
@@ -2488,7 +2491,7 @@ class ControllerRepository(
 
     private fun reportIssue(message: String) {
         if (message.isBlank()) return
-        logStore.append("[Issue] $message")
+        logStore.appendImportant("[Issue] $message")
         _diagnostics.update { it.copy(lastIssue = message) }
     }
 

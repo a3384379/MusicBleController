@@ -854,6 +854,7 @@ final class LyricsPresentationTests: XCTestCase {
         var attempts = 0
         let manager = BLETestManager(automaticallyStartBluetooth: false, lyricsPresentationUptime: { now },
                                     floatingPlaybackCommandSender: { _, _, _ in attempts += 1; return .debounced })
+        manager.commandSenderForTesting = { _, _ in true }
         manager.configureResponseTests(trackID: "lyrics-expired-unsent-\(UUID().uuidString)")
         receivePlayback(manager, playing: true)
         XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
@@ -876,6 +877,7 @@ final class LyricsPresentationTests: XCTestCase {
             sent += 1
             return .sent
         })
+        manager.commandSenderForTesting = { _, _ in true }
         manager.configureResponseTests(trackID: "lyrics-deferred-target-\(UUID().uuidString)")
         receivePlayback(manager, playing: true)
         XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
@@ -1597,6 +1599,100 @@ private final class IgnoredPiPControlsFixture: NSObject {
 #endif
 
 extension LyricsPresentationTests {
+    @MainActor
+    func testProgressRefreshRejectsPlaybackQueuedBeforeTransportLoss() async {
+        let preferences = PreferencesStore.shared
+        let original = preferences.playbackPerformanceMode
+        defer { preferences.playbackPerformanceMode = original }
+        let fixture = makeProgressRefreshFixture(mode: .smooth)
+        fixture.environment.uptime += 1
+        fixture.scheduler.entries[0].action()
+        let submitted = DispatchSemaphore(value: 0)
+        let manager = fixture.manager
+        var packet = progressRefreshPacket()
+        packet["position"] = 50_000
+        let queuedPacket = packet
+        DispatchQueue.global().async {
+            manager.receiveStatusForTesting(queuedPacket)
+            submitted.signal()
+        }
+        XCTAssertEqual(submitted.wait(timeout: .now() + 2), .success)
+        manager.disconnectResponseTests()
+        let drained = expectation(description: "queued inbound apply drained")
+        DispatchQueue.main.async { drained.fulfill() }
+        await fulfillment(of: [drained], timeout: 2)
+        XCTAssertEqual(manager.displayPositionMs, 2_000)
+        XCTAssertEqual(fixture.scheduler.entries.count, 1)
+        XCTAssertTrue(fixture.scheduler.entries[0].cancelled)
+        fixture.environment.uptime += 60
+        fixture.scheduler.entries[0].action()
+        XCTAssertEqual(manager.displayPositionMs, 2_000)
+    }
+
+    @MainActor
+    func testProgressRefreshDisconnectFreezesUntilNewPlaybackAnchor() {
+        let preferences = PreferencesStore.shared
+        let original = preferences.playbackPerformanceMode
+        defer { preferences.playbackPerformanceMode = original }
+        let fixture = makeProgressRefreshFixture(mode: .smooth)
+        fixture.environment.uptime += 1
+        fixture.scheduler.entries[0].action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 2_000)
+
+        fixture.manager.disconnectResponseTests()
+        XCTAssertTrue(fixture.scheduler.entries[0].cancelled)
+        XCTAssertEqual(fixture.manager.displayPositionMs, 2_000, "Disconnect preserves the last displayed position")
+        fixture.environment.uptime += 60
+        fixture.scheduler.entries[0].action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 2_000, "A stale timer cannot advance offline progress")
+        preferences.playbackPerformanceMode = .powerSaving
+        fixture.center.post(name: UIApplication.willResignActiveNotification, object: nil)
+        fixture.center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        fixture.manager.configureResponseTests(trackID: "refresh-fixture")
+        fixture.manager.receiveStatusForTesting(["type": "link"])
+        fixture.manager.receiveStatusForTesting(["type": "pong"])
+        fixture.manager.receiveStatusForTesting(["type": "playbackState", "playing": true, "position": -1])
+        XCTAssertEqual(fixture.scheduler.entries.count, 1, "Transport readiness and invalid packets do not restore an anchor")
+        XCTAssertEqual(fixture.manager.displayPositionMs, 2_000)
+
+        var packet = progressRefreshPacket()
+        packet["position"] = 8_000
+        fixture.manager.receiveStatusForTesting(packet)
+        XCTAssertEqual(fixture.scheduler.entries.map(\.interval), [0.1, 0.5])
+        XCTAssertEqual(fixture.manager.displayPositionMs, 8_000)
+        fixture.environment.uptime += 0.5
+        fixture.scheduler.entries[0].action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 8_000)
+        fixture.scheduler.entries.last?.action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 8_500, "Reconnect starts from the new anchor without the offline elapsed time")
+    }
+
+    @MainActor
+    func testProgressRefreshDisconnectDuringSeekKeepsEditAndRejectsUnanchoredResume() {
+        let preferences = PreferencesStore.shared
+        let original = preferences.playbackPerformanceMode
+        defer { preferences.playbackPerformanceMode = original }
+        let fixture = makeProgressRefreshFixture(mode: .automatic)
+        fixture.manager.beginSeeking()
+        fixture.manager.updateSeekPosition(30_000)
+        fixture.manager.disconnectResponseTests()
+        fixture.manager.configureResponseTests(trackID: "refresh-fixture")
+        fixture.manager.receiveStatusForTesting(progressRefreshPacket())
+        preferences.playbackPerformanceMode = .smooth
+        XCTAssertEqual(fixture.manager.seekPositionMs, 30_000)
+        XCTAssertTrue(fixture.scheduler.entries.allSatisfy(\.cancelled))
+        XCTAssertEqual(fixture.scheduler.entries.count, 1, "A packet ignored during seek cannot authorize progress interpolation")
+        fixture.manager.finishSeeking()
+        fixture.environment.uptime += 5
+        fixture.scheduler.entries[0].action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 30_000)
+        fixture.manager.receiveStatusForTesting(progressRefreshPacket())
+        XCTAssertEqual(fixture.scheduler.entries.count, 2)
+        fixture.environment.uptime += 0.1
+        fixture.scheduler.entries.last?.action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 1_100)
+    }
+
     @MainActor
     func testProgressRefreshModeChangesPreserveClockAndRejectCancelledTicks() {
         let preferences = PreferencesStore.shared

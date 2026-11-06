@@ -652,7 +652,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     func disconnectResponseTests() {
-        clearConnectionTransports(reason: "test disconnect")
+        handleUnavailableTransport(reason: "test disconnect")
         connectionStatus = "未连接"
     }
     #endif
@@ -675,6 +675,9 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private var progressTimer: AnyCancellable?
     private var scheduledProgressInterval: TimeInterval?
     private var progressTimerRevision: UInt64 = 0
+    // A restored snapshot, a ready transport, or a local seek is not a new
+    // authoritative playback anchor. Invalidate it with the transport epoch.
+    private var progressAnchorTransportEpoch: UInt64?
     private var playbackPerformanceSubscription: AnyCancellable?
     private var progressLifecycleObservers: [NSObjectProtocol] = []
     private var lastCurrentWordReceivedAtMs: Int64 = 0
@@ -3991,7 +3994,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         lyricClockSampleCount = 0
         lyricClockSyncConfident = false
         lastStaleRemoteAnchorLogAtMs = 0
-        log("[ClockSync] reset reason=\(reason)")
+        log("[ClockSync] reset reason=\(reason) monoMs=\(monotonicTimeMs())")
     }
 
     private func pauseClockSyncScheduling(reason: String) {
@@ -4215,7 +4218,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
                 "[ClockSync] pong seq=\(sequence) bestRttMs=\(snapshot.bestRoundTripMs) " +
                     "offsetMs=\(Int64(snapshot.localMinusServerMs.rounded())) " +
                     "jitterMs=\(snapshot.offsetJitterMs) samples=\(snapshot.sampleCount) " +
-                    "confident=\(snapshot.isConfident)"
+                    "confident=\(snapshot.isConfident) monoMs=\(receivedAtElapsedMs)"
             )
         }
         return true
@@ -4472,11 +4475,11 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
             return
         }
         guard centralManager.state == .poweredOn else {
-            setConnectionHealth(.disconnected, reason: "bluetooth not powered")
+            handleUnavailableTransport(reason: "bluetooth not powered")
             return
         }
         guard sonyPeripheral?.state == .connected else {
-            setConnectionHealth(.disconnected, reason: "peripheral not connected")
+            handleUnavailableTransport(reason: "peripheral not connected")
             return
         }
         guard sonyCommandCharacteristic != nil else {
@@ -4879,6 +4882,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
 
     private func clearConnectionTransports(reason: String) {
         connectionTransportEpoch &+= 1
+        invalidateProgressAnchor()
         capabilitiesServerSessionID = "-"
         lyricsConfirmedTrackID = ""
         lyricsConfirmedUptime = 0
@@ -4937,6 +4941,13 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         isMediaFieldDumpReceiving = false
         mediaFieldDumpProgressText = ""
         log("[BLE-Reconnect] cancel in-flight albumArt/secondary")
+    }
+
+    private func handleUnavailableTransport(reason: String) {
+        // Also fence queued inbound work: cancellation alone cannot prevent a
+        // pre-loss playback packet from creating a fresh display schedule.
+        clearConnectionTransports(reason: reason)
+        setConnectionHealth(.disconnected, reason: reason)
     }
 
     private func scheduleCoreBluetoothRestoreTimeout(for peripheral: CBPeripheral) {
@@ -5662,7 +5673,7 @@ extension BLETestManager: CBCentralManagerDelegate {
             }
         } else if central.state != .poweredOn {
             stopHealthMonitoring(reason: "central not powered")
-            setConnectionHealth(.disconnected, reason: "central state=\(central.state.rawValue)")
+            handleUnavailableTransport(reason: "central state=\(central.state.rawValue)")
             setStatus("未连接")
             setAutoReconnectState(.failed)
         }
@@ -6469,7 +6480,6 @@ extension BLETestManager: CBPeripheralDelegate {
                 self.remotePlaybackSpeed = parsedSpeed.isFinite && parsedSpeed > 0
                     ? parsedSpeed
                     : 1.0
-                self.updateProgressTimerState()
                 self.updateLightweightLyricDiagnostic(from: object)
                 if let lyric = object["lyric"] as? String {
                     let lyricHandoff = self.realtimeHandoffCorrelation.context(
@@ -6548,10 +6558,12 @@ extension BLETestManager: CBPeripheralDelegate {
                     self.seekPositionMs = calibratedPositionMs
                     self.basePlaybackPositionMs = calibratedPositionMs
                     self.playbackAnchorElapsedMs = self.progressTimeMs()
+                    self.progressAnchorTransportEpoch = transportEpoch
                     self.confirmLyricsPresentationClock()
                     self.lyricsPlaybackConfirmationRevision &+= 1
                     MainActor.assumeIsolated { self.reconcileFloatingLyricsPlayback() }
                 }
+                self.updateProgressTimerState()
                 self.log(
                     "[iOS][Status] playbackState " +
                         "position=\(self.positionMs) duration=\(self.durationMs)"
@@ -9584,6 +9596,10 @@ extension BLETestManager: CBPeripheralDelegate {
     }
 
     private func updateProgressTimerState() {
+        guard progressAnchorTransportEpoch == connectionTransportEpoch else {
+            cancelProgressTimer()
+            return
+        }
         let shouldRun = PlaybackClockPolicy.shouldRun(
             isPlaying: isPlaying,
             durationMs: durationMs,
@@ -9625,6 +9641,11 @@ extension BLETestManager: CBPeripheralDelegate {
         progressTimer?.cancel()
         progressTimer = nil
         scheduledProgressInterval = nil
+    }
+
+    private func invalidateProgressAnchor() {
+        progressAnchorTransportEpoch = nil
+        cancelProgressTimer()
     }
 
     private func observePlaybackPerformance() {
@@ -9682,7 +9703,7 @@ extension BLETestManager: CBPeripheralDelegate {
     }
 
     private func updateInterpolatedProgress() {
-        guard !isSeeking else { return }
+        guard progressAnchorTransportEpoch == connectionTransportEpoch, !isSeeking else { return }
         guard durationMs > 0 else {
             if displayPositionMs != 0 {
                 displayPositionMs = 0
@@ -10038,6 +10059,13 @@ extension BLETestManager: AlbumArtReceiverDelegate {
             lyricSecondaryTransfer != nil ||
             isRemoteLogTransferInProgress ||
             isMediaFieldDumpReceiving
+    }
+
+    func albumArtPublicationTraceContext(for id: String) -> RealtimeHandoffContext? {
+        guard id == currentTrackID, currentTrackGeneration > 0,
+              let context = realtimeHandoffCorrelation.context(for: id),
+              context.generation == currentTrackGeneration else { return nil }
+        return context
     }
 
     func albumArtLog(_ message: String) {

@@ -2382,6 +2382,26 @@ final class PerformanceStabilityTests: XCTestCase {
         )
     }
 
+    func testArtworkPublicationTraceContextRejectsDifferentTrackAndOldGeneration() throws {
+        let manager = BLETestManager(automaticallyStartBluetooth: false)
+        manager.receiveStatusForTesting([
+            "type": "trackInfo", "trackId": "art-trace-first", "generation": 21,
+            "title": "Fixture", "artist": "Artist"
+        ])
+        let first = try XCTUnwrap(manager.albumArtPublicationTraceContext(for: "art-trace-first"))
+        XCTAssertEqual(first.generation, 21)
+        XCTAssertEqual(first.trackId, "art-trace-first")
+        XCTAssertNil(manager.albumArtPublicationTraceContext(for: "art-trace-other"))
+        manager.receiveStatusForTesting([
+            "type": "trackInfo", "trackId": "art-trace-second", "generation": 22,
+            "title": "Second", "artist": "Artist"
+        ])
+        XCTAssertNil(manager.albumArtPublicationTraceContext(for: "art-trace-first"))
+        let second = try XCTUnwrap(manager.albumArtPublicationTraceContext(for: "art-trace-second"))
+        XCTAssertEqual(second.generation, 22)
+        XCTAssertNotEqual(first.handoffId, second.handoffId)
+    }
+
     func testObservableSliceDeduplicatesAndPlaybackClockPauses() {
         let slice = ObservableStateSlice(BLEConnectionViewState())
         var emissions = 0

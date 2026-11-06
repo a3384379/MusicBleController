@@ -3,4 +3,5 @@
     <files-path
         name="controller_logs"
         path="logs/" />
+    <cache-path name="controller_log_snapshots" path="log-snapshots/" />
 </paths>
