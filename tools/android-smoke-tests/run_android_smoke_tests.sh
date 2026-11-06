@@ -286,7 +286,8 @@ else
 fi
 
 start="$(now_ms)"
-"$SCRIPT_DIR/ble_health_watchdog_test.sh" "$OUT_DIR/sony_logcat.log" \
+DEBUG_CONTROL_ENABLED="$DEBUG_CONTROL" \
+  "$SCRIPT_DIR/ble_health_watchdog_test.sh" "$OUT_DIR/sony_logcat.log" \
   >"$OUT_DIR/ble_health_watchdog_stdout.log" \
   2>"$OUT_DIR/ble_health_watchdog_stderr.log" || true
 ble_health_cost="$(elapsed_ms "$start")"

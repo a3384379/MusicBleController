@@ -78,6 +78,8 @@ PlaybackStatsCalculator 在一个 Room 事务内调用五个聚合查询入口�
 
 首轮完整冒烟未授蓝牙运行时权限，必选 8/8 通过，但可选 BLE Health Watchdog 失败。真实日志显示 Activity 正常拒绝缺权限启动后，调试恢复广播仍冷启动前台服务，`startForeground` 因 connectedDevice 权限前提不满足抛出 SecurityException。另一个工具问题是 `--no-debug-control` 尚未传给 watchdog 检查，因此该选项并未阻止它发送恢复广播。
 
-上述服务、调试接收器、Manifest 和冒烟脚本均与基线 `2570913` 完全一致。本批只修改统计、测试和文档；这两项既有缺陷保留待修，首轮失败报告也保留，权限完整后的通过结果不表示缺权限路径已修复。
+上述服务、调试接收器、Manifest 和冒烟脚本在统计批次均与基线 `2570913` 完全一致。统计批次只修改统计、测试和文档；当时这两项既有缺陷保留待修，首轮失败报告也保留，权限完整后的通过结果不表示缺权限路径已修复。
+
+后续 `codex/ble-recovery-permissions` 批次专门修复这两项：调试入口拒绝缺权限冷启动、服务处理前台提升失败，`--no-debug-control` 同时约束 START 与 watchdog RECOVER。具体行为和独立验证见 [Android smoke 说明](../tools/android-smoke-tests/README.md)。这不改变上述统计批次的原始结果和验收边界。
 
 BLE 消息字段、数据库表结构和版本均未改变。本批没有 iOS 源码改动，因此未要求或运行 iOS quick/full smoke；工作区已有的 iOS 文案修改保持原样。Sony 真机上的历史量级性能、老系统兼容性以及与 iPhone/Controller 的统计展示仍需实机验收。

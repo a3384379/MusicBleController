@@ -1,6 +1,5 @@
 package com.example.playeragent.service
 
-import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -55,6 +54,7 @@ class PlayerAgentForegroundService : Service() {
     private var qrcIncrementalPrebuildManager: QrcIncrementalPrebuildManager? = null
     private var qrcDirectoryWatcher: QrcDirectoryWatcher? = null
     private var executionHub: PlayerAgentExecutionHub? = null
+    private var foregroundPromoted = false
     @Volatile
     private var serviceStopping = false
     @Volatile
@@ -86,11 +86,18 @@ class PlayerAgentForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         StartupGuard.markServiceOnCreate(::log)
-        running = true
         serviceStopping = false
-        executionHub = PlayerAgentExecutionHub("PlayerAgent")
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, createNotification(BleHealthState.STARTING))
+        try {
+            startForeground(NOTIFICATION_ID, createNotification(BleHealthState.STARTING))
+        } catch (error: SecurityException) {
+            Log.w(TAG, "[ControlServiceAutoStart] failed reason=foreground_permission_denied", error)
+            stopSelf()
+            return
+        }
+        foregroundPromoted = true
+        running = true
+        executionHub = PlayerAgentExecutionHub("PlayerAgent")
         registerReceiver(
             bluetoothStateReceiver,
             IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
@@ -101,6 +108,10 @@ class PlayerAgentForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!foregroundPromoted) {
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         when (intent?.action) {
             ACTION_STOP_SERVICE -> stopSelf()
             ACTION_STOP_QRC_WATCHER -> stopQrcWatcher()
@@ -121,6 +132,10 @@ class PlayerAgentForegroundService : Service() {
         running = false
         serviceStopping = true
         mainHandler.removeCallbacksAndMessages(null)
+        if (!foregroundPromoted) {
+            super.onDestroy()
+            return
+        }
         bleHealthWatchdogRunnable = null
         runCatching { unregisterReceiver(bluetoothStateReceiver) }
         stopPlaybackHistoryMonitor()
@@ -144,9 +159,16 @@ class PlayerAgentForegroundService : Service() {
         super.onTrimMemory(level)
     }
 
-    private fun ensureBleStackStarted(reason: String, forceRebuild: Boolean = false) {
+    private fun ensureBleStackStarted(reason: String, forceRebuild: Boolean = false): Boolean {
         log("[BLE-RECOVERY] ensure start reason=$reason")
-        initializeBluetooth(reason = reason, forceRebuild = forceRebuild)
+        return try {
+            initializeBluetooth(reason = reason, forceRebuild = forceRebuild)
+            true
+        } catch (error: SecurityException) {
+            bluetoothAvailable = false
+            log("[BLE-RECOVERY] failed reason=permission_denied trigger=$reason")
+            false
+        }
     }
 
     private fun startPlaybackHistoryMonitor() {
@@ -330,8 +352,22 @@ class PlayerAgentForegroundService : Service() {
     }
 
     private fun recoverBleStack(reason: String, respectCooldown: Boolean = false) {
+        try {
+            recoverBleStackWithPermissions(reason, respectCooldown)
+        } catch (error: SecurityException) {
+            bluetoothAvailable = false
+            bleRecovering = false
+            log("[BLE-RECOVERY] failed reason=permission_denied trigger=$reason")
+        }
+    }
+
+    private fun recoverBleStackWithPermissions(reason: String, respectCooldown: Boolean) {
         if (serviceStopping) {
             log("[BLE-RECOVERY] skipped reason=service stopping")
+            return
+        }
+        if (!hasBluetoothRuntimePermissions()) {
+            log("[BLE-RECOVERY] skipped reason=permission_missing trigger=$reason")
             return
         }
         val now = SystemClock.elapsedRealtime()
@@ -358,7 +394,10 @@ class PlayerAgentForegroundService : Service() {
         publishBleHealthSnapshot("recovering reason=$reason")
         log("[BLE-RECOVERY] start reason=$reason")
         logBleDiagnostics("before recovery reason=$reason")
-        ensureBleStackStarted(reason = reason, forceRebuild = true)
+        if (!ensureBleStackStarted(reason = reason, forceRebuild = true)) {
+            bleRecovering = false
+            return
+        }
         bleRecovering = false
         val success = gattServerManager?.isServerReady() == true
         log("[BLE-RECOVERY] done")
@@ -388,7 +427,7 @@ class PlayerAgentForegroundService : Service() {
         if (serviceStopping) {
             return
         }
-        if (!bluetoothAvailable || bluetoothAdapter?.isEnabled != true) {
+        if (!bluetoothAvailable || bluetoothEnabledOrNull() != true) {
             return
         }
         val manager = gattServerManager
@@ -503,7 +542,7 @@ class PlayerAgentForegroundService : Service() {
         }
         val state = when {
             bleRecovering -> BleHealthState.RECOVERING
-            !bluetoothAvailable && bluetoothAdapter?.isEnabled == false -> BleHealthState.ERROR
+            !bluetoothAvailable && bluetoothEnabledOrNull() == false -> BleHealthState.ERROR
             else -> BleHealthState.STARTING
         }
         return BleHealthSnapshot(
@@ -532,7 +571,7 @@ class PlayerAgentForegroundService : Service() {
         val watcher = qrcDirectoryWatcher
         log(
             "[BLE-DIAG] reason=$reason " +
-                "bluetoothEnabled=${bluetoothAdapter?.isEnabled ?: false} " +
+                "bluetoothEnabled=${bluetoothEnabledOrNull() ?: false} " +
                 "bluetoothAvailable=$bluetoothAvailable " +
                 "gattState=${gattSnapshot?.serverState ?: "none"} " +
                 "gattStarted=${gattSnapshot?.started ?: false} " +
@@ -686,15 +725,15 @@ class PlayerAgentForegroundService : Service() {
     }
 
     private fun hasBluetoothRuntimePermissions(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) ==
-                PackageManager.PERMISSION_GRANTED &&
-                checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) ==
-                PackageManager.PERMISSION_GRANTED
-        } else {
-            checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
-                PackageManager.PERMISSION_GRANTED
-        }
+        return BleRuntimePermissions.granted(this)
+    }
+
+    private fun bluetoothEnabledOrNull(): Boolean? = try {
+        bluetoothAdapter?.isEnabled
+    } catch (error: SecurityException) {
+        bluetoothAvailable = false
+        log("[BLE-RECOVERY] bluetooth state unavailable reason=permission_denied")
+        null
     }
 
     private fun createNotificationChannel() {

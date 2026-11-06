@@ -8,6 +8,7 @@ if [[ -z "$LOG_PATH" || ! -f "$LOG_PATH" ]]; then
 fi
 
 OUT_DIR="${OUT_DIR:-$(dirname "$LOG_PATH")}"
+source "$(cd "$(dirname "$0")" && pwd)/logcat_snapshot.sh"
 DEBUG_CONTROL_ENABLED="${DEBUG_CONTROL_ENABLED:-true}"
 DEBUG_CONTROL_AVAILABLE=false
 DEBUG_CONTROL_START_ATTEMPTED=false
@@ -33,8 +34,8 @@ PY
 }
 
 if [[ "$DEBUG_CONTROL_ENABLED" == true ]]; then
-  DEBUG_CONTROL_START_ATTEMPTED=true
   if [[ -n "${ADB_BIN:-}" && -n "${DEVICE_ID:-}" ]]; then
+    DEBUG_CONTROL_START_ATTEMPTED=true
     set +e
     "$ADB_BIN" -s "$DEVICE_ID" shell am broadcast \
       -a com.example.playeragent.debug.START_BLE_SERVICE \
@@ -44,14 +45,22 @@ if [[ "$DEBUG_CONTROL_ENABLED" == true ]]; then
     broadcast_rc="$?"
     set -e
     sleep 3
-    "$ADB_BIN" -s "$DEVICE_ID" logcat -d > "$LOG_PATH" || true
+    refresh_logcat_snapshot "$LOG_PATH" || true
     grep -E "PlayerAgent|ControlServiceAutoStart|MediaSessionReader|BleGattServer|BLE-A|BLE-ADV|BLE-GATT|BLE-RECOVERY|BLE-DIAG|DebugControl|Qrc|Lyric|AlbumArt|FullLyrics|FATAL EXCEPTION|ANR|AndroidRuntime" \
       "$LOG_PATH" > "$OUT_DIR/sony_filtered.log" || true
     if grep -q "\[DebugControl\] received action=com.example.playeragent.debug.START_BLE_SERVICE" "$LOG_PATH"; then
       DEBUG_CONTROL_AVAILABLE=true
-      DEBUG_CONTROL_START_RESULT="started"
-    elif [[ "$broadcast_rc" -ne 0 ]]; then
+    fi
+    if [[ "$broadcast_rc" -ne 0 ]]; then
       DEBUG_CONTROL_START_RESULT="broadcast failed rc=$broadcast_rc"
+    elif grep -q "\[DebugControl\] skipped action=START_BLE_SERVICE reason=permission_missing" "$LOG_PATH"; then
+      DEBUG_CONTROL_START_RESULT="skipped: permission_missing"
+    elif grep -q "\[DebugControl\] failed action=START_BLE_SERVICE reason=permission_denied" "$LOG_PATH"; then
+      DEBUG_CONTROL_START_RESULT="failed: permission_denied"
+    elif grep -q "\[DebugControl\] completed action=START_BLE_SERVICE" "$LOG_PATH"; then
+      DEBUG_CONTROL_START_RESULT="forwarded to service"
+    elif [[ "$DEBUG_CONTROL_AVAILABLE" == true ]]; then
+      DEBUG_CONTROL_START_RESULT="received; forwarding not confirmed"
     else
       DEBUG_CONTROL_START_RESULT="receiver unavailable"
     fi
