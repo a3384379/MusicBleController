@@ -1608,6 +1608,7 @@ private struct DarkLyricRhythmLine: View {
 
     @StateObject private var spectrumEngine = NaturalPseudoSpectrumEngine()
     @ObservedObject private var preferences = PreferencesStore.shared
+    @ObservedObject private var playbackPowerState = PlaybackPowerState.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var opacity: Double {
@@ -1648,7 +1649,7 @@ private struct DarkLyricRhythmLine: View {
             return nil
         }
         if performanceMode == .automatic,
-           ProcessInfo.processInfo.isLowPowerModeEnabled {
+           playbackPowerState.isLowPowerModeEnabled {
             return nil
         }
         switch state {
@@ -2081,6 +2082,7 @@ struct KaraokeLyricText: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject private var preferences = PreferencesStore.shared
+    @ObservedObject private var playbackPowerState = PlaybackPowerState.shared
     @State private var renderedProgress = 0.0
     @State private var previousTargetProgress: Double?
 
@@ -2110,7 +2112,7 @@ struct KaraokeLyricText: View {
     private var interpolationDuration: TimeInterval {
         KaraokeProgressAnimationPolicy.duration(
             for: preferences.playbackPerformanceMode,
-            isLowPowerModeEnabled: ProcessInfo.processInfo.isLowPowerModeEnabled
+            isLowPowerModeEnabled: playbackPowerState.isLowPowerModeEnabled
         )
     }
 
@@ -2331,14 +2333,7 @@ enum KaraokeProgressAnimationPolicy {
         for mode: PlaybackPerformanceMode,
         isLowPowerModeEnabled: Bool
     ) -> TimeInterval {
-        switch mode {
-        case .smooth:
-            return 0.10
-        case .automatic:
-            return isLowPowerModeEnabled ? 0.50 : 0.25
-        case .powerSaving:
-            return 0.50
-        }
+        PlaybackClockPolicy.refreshInterval(for: mode, isLowPowerModeEnabled: isLowPowerModeEnabled)
     }
 
     static func shouldAnimate(

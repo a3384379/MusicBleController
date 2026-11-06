@@ -2243,6 +2243,26 @@ final class PerformanceStabilityTests: XCTestCase {
         )
     }
 
+    func testPlaybackClockRefreshMatchesLyricAnimationForEveryModeAndPowerState() {
+        let cases: [(PlaybackPerformanceMode, Bool, TimeInterval)] = [
+            (.smooth, false, 0.1), (.smooth, true, 0.1),
+            (.automatic, false, 0.25), (.automatic, true, 0.5),
+            (.powerSaving, false, 0.5), (.powerSaving, true, 0.5)
+        ]
+        for (mode, lowPower, expectedInterval) in cases {
+            XCTAssertEqual(
+                PlaybackClockPolicy.refreshInterval(for: mode, isLowPowerModeEnabled: lowPower),
+                expectedInterval,
+                accuracy: 0.0001
+            )
+            XCTAssertEqual(
+                KaraokeProgressAnimationPolicy.duration(for: mode, isLowPowerModeEnabled: lowPower),
+                expectedInterval,
+                accuracy: 0.0001
+            )
+        }
+    }
+
     func testProtocolCapabilitiesV1V2AndV3Negotiation() {
         let v1 = BLEProtocolV3Parser.capabilitiesAck(from: [:])
         XCTAssertEqual(v1.protocolVersion, 1)

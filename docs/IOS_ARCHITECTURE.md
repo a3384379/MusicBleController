@@ -9,6 +9,7 @@
 - `ConnectionStore` / `PlaybackStore` / `LyricsStore` / `ArtworkStore` / `DiagnosticsStore`：基于 Observation 的聚焦状态域；播放器子视图只读取自己需要的属性。
 - `BLEProtocolV3Parser`：V1/V2/V3 能力 ACK、`sid/es` 元信息、`commandError` 和 `mediaLoadState` 的 typed 解析及输入尺寸保护。
 - `PreferencesStore`：本地设置和 UserDefaults。包括日常/调试模式、自动重连、歌词偏移、歌词显示模式、封面增强、封面尺寸和自动/流畅/省电性能模式。
+- `PlaybackPowerState`：只读系统低电状态，监听电源变化和回到前台；由进度调度、歌词插值和频谱共同观察，不写入用户偏好。
 - `AlbumArtReceiver`：封面 offer、preview/HQ 请求、legacy/base64 和 binary 接收、超时、缓存、displayQuality、enhanced、诊断 snapshot。
 - `ArtworkImageCache`：40 项/32MB 解码图片缓存，以及 utility 串行队列上的 ImageIO 降采样。
 - `BLEObservableStateModels`：聚焦 Store、协议 typed payload、事件序号诊断、布局/刷新策略和 Live Activity revision fence；旧 `ObservableStateSlice` 仅保留给兼容代码和渐进迁移测试。
@@ -80,7 +81,9 @@ CoreBluetooth 使用 `com.musicblecontroller.sony.central.v1` 做状态恢复，
 - 歌词：`lyric`、`fullLyrics`、`fullLyricsTrackId`、`lyricDiagnostic`、`lyricSecondaryTransfer`。
 - 封面：`albumArtImage`、`artworkDisplayQuality`、`artworkEnhancementStatus`，由 `AlbumArtReceiver` 镜像到 `BLETestManager`。
 - 设置：`PreferencesStore.shared` 是真实 owner；`BLETestManager` 只做兼容读取/同步。
-- 播放时钟只在前台且播放中运行；暂停、断开、后台保持静态位置。进度刷新为自动 4Hz、流畅 10Hz、省电 2Hz；伪频谱自动 15fps、流畅 20fps、省电或 Reduce Motion 静态化。
+- 显示进度的运行条件为 active、播放中且有有效时长；暂停、inactive/background 停止显示调度。流畅 100ms，自动正常电量 250ms、系统低电 500ms，省电 500ms。模式或低电变化时比较有效间隔，只有不同才取消并重建；保留播放锚点，旧调度回调失效，seek 编辑受保护。订阅和调度随 manager 释放。
+- 伪频谱自动 15fps、流畅 20fps、省电或 Reduce Motion 静态化；自动模式系统低电时也静态化。歌词插值间隔沿用同一刷新策略；低电通知可以触发两种视图更新。
+- 断线停表尚有既有差距：连接清理保留 playing 状态时，本地显示时钟可能继续。该项单列在[剩余任务](OPTIMIZATION_PROGRESS.md#显示时钟断线行为)，本轮模式刷新修复不关闭此项。
 - 稳定歌曲会异步写入 `LastNowPlayingSnapshot-v1.json`；首个真实 playbackState 不匹配或没有活动歌曲时立即清除占位。
 
 ## UI 状态与无障碍

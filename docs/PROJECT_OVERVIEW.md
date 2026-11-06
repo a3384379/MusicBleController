@@ -4,6 +4,8 @@
 
 V4 本次按维护者决定提前接入主干，属于阶段性交付，不等于第四阶段完成或 SLO 全部达标。继续开发前应先读 [V4 验收状态与未达标指标](V4_ACCEPTANCE_STATUS.md)，不得因分支已合并而关闭未通过的性能、覆盖率和稳定性项目。
 
+2026 年 11 月全面审计后的七批优化状态、剩余实现与实机验收见[审计优化进度](OPTIMIZATION_PROGRESS.md)。
+
 ## 模块职责
 
 - `PlayerAgentApp/`：运行在 Sony Android 设备上的权威数据源。负责读取 MediaSession/通知、记录播放历史、解析 QQMusic QRC 歌词、监听 QRC 文件变化、提供 BLE GATT Server、执行播放/音量控制。

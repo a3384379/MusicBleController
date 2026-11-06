@@ -665,10 +665,18 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
     private var trackInfoChunks: [Int: Data] = [:]
     private var trackInfoTransferToken = UUID()
     private var basePlaybackPositionMs: Int64 = 0
-    private var playbackAnchorElapsedMs = Int64(
-        (ProcessInfo.processInfo.systemUptime * 1_000).rounded()
-    )
-    private var progressTimer: Timer?
+    private var playbackAnchorElapsedMs: Int64 = 0
+    private let progressUptime: () -> TimeInterval
+    private let progressTimerScheduler: PlaybackProgressTimerScheduler
+    private let playbackPowerState: PlaybackPowerState
+    private let progressNotificationCenter: NotificationCenter
+    private var progressPerformanceMode = PreferencesStore.shared.playbackPerformanceMode
+    private var progressLowPowerModeEnabled: Bool
+    private var progressTimer: AnyCancellable?
+    private var scheduledProgressInterval: TimeInterval?
+    private var progressTimerRevision: UInt64 = 0
+    private var playbackPerformanceSubscription: AnyCancellable?
+    private var progressLifecycleObservers: [NSObjectProtocol] = []
     private var lastCurrentWordReceivedAtMs: Int64 = 0
     private var currentWordIntervalTotalMs: Int64 = 0
     private var currentWordIntervalCount: Int64 = 0
@@ -826,16 +834,28 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         lyricsPresentationUptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         remoteClock: MonotonicClockSynchronizer = MonotonicClockSynchronizer(),
         floatingPlaybackCommandSender: (@MainActor (LiveActivityControlCommand, UInt64, Date) -> LiveActivityControlResult)? = nil,
-        floatingPlaybackConfirmationTimeout: TimeInterval = 8
+        floatingPlaybackConfirmationTimeout: TimeInterval = 8,
+        playbackPowerState: PlaybackPowerState = .shared,
+        progressTimerScheduler: @escaping PlaybackProgressTimerScheduler = PlaybackProgressTimer.schedule,
+        progressUptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        progressNotificationCenter: NotificationCenter = .default
     ) {
         self.liveActivityPublisher = liveActivityPublisher
         self.lyricsPresentationUptime = lyricsPresentationUptime
         self.clockSynchronizer = remoteClock
         self.floatingPlaybackCommandSender = floatingPlaybackCommandSender
         self.floatingPlaybackTargetPolicy = LyricsPlaybackTargetPolicy(confirmationTimeout: floatingPlaybackConfirmationTimeout)
+        self.playbackPowerState = playbackPowerState
+        self.progressLowPowerModeEnabled = playbackPowerState.isLowPowerModeEnabled
+        self.progressTimerScheduler = progressTimerScheduler
+        self.progressUptime = progressUptime
+        self.progressNotificationCenter = progressNotificationCenter
+        self.playbackAnchorElapsedMs = Int64((progressUptime() * 1_000).rounded())
         super.init()
         syncAllStores()
         syncPreferencesStateFromStore()
+        observePlaybackPerformance()
+        observeProgressLifecycle()
         guard automaticallyStartBluetooth else { return }
         logAppExperienceModeLoaded()
         log("[BLE-iOS] app log store ready")
@@ -1817,7 +1837,9 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
 
     deinit {
         LiveActivityCommandBridge.shared.unregister(self)
-        progressTimer?.invalidate()
+        playbackPerformanceSubscription?.cancel()
+        progressLifecycleObservers.forEach(progressNotificationCenter.removeObserver)
+        progressTimer?.cancel()
         mainHeartbeatWorkItem?.cancel()
         healthCheckWorkItem?.cancel()
         healthProbeTimeoutWorkItem?.cancel()
@@ -2277,7 +2299,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         let fresh = confirmed && now < deadline
         var position = displayPositionMs
         if fresh, isPlaying, !isSeeking, durationMs > 0 {
-            let elapsed = max(monotonicTimeMs() - playbackAnchorElapsedMs, 0)
+            let elapsed = max(progressTimeMs() - playbackAnchorElapsedMs, 0)
             position = (basePlaybackPositionMs + Int64(Double(elapsed) * max(remotePlaybackSpeed, 0)))
                 .clamped(to: 0...durationMs)
         }
@@ -3272,7 +3294,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         displayPositionMs = targetPosition
         seekPositionMs = targetPosition
         basePlaybackPositionMs = targetPosition
-        playbackAnchorElapsedMs = monotonicTimeMs()
+        playbackAnchorElapsedMs = progressTimeMs()
         log("[iOS][Seek] lyric line position=\(targetPosition)")
         updateLiveActivity(force: true, reason: "seek")
         seek(to: targetPosition)
@@ -3522,7 +3544,7 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
         positionMs = targetPosition
         displayPositionMs = targetPosition
         basePlaybackPositionMs = targetPosition
-        playbackAnchorElapsedMs = monotonicTimeMs()
+        playbackAnchorElapsedMs = progressTimeMs()
         isSeeking = false
         resetCurrentWordFence()
         log("[iOS][Seek] user set position=\(targetPosition)")
@@ -3947,6 +3969,10 @@ final class BLETestManager: NSObject, ObservableObject, @unchecked Sendable {
 
     private func monotonicTimeMs() -> Int64 {
         Int64((ProcessInfo.processInfo.systemUptime * 1_000).rounded())
+    }
+
+    private func progressTimeMs() -> Int64 {
+        Int64((progressUptime() * 1_000).rounded())
     }
 
     private func resetClockSync(reason: String) {
@@ -6434,7 +6460,7 @@ extension BLETestManager: CBPeripheralDelegate {
                 let hadConfirmedClock = self.lyricsConfirmedTrackID == self.currentTrackID &&
                     self.lyricsConfirmedGeneration == self.currentTrackGeneration && self.lyricsConfirmedUptime > 0
                 let predictedPosition = self.basePlaybackPositionMs + (oldIsPlaying
-                    ? Int64(Double(max(self.monotonicTimeMs() - self.playbackAnchorElapsedMs, 0)) * max(self.remotePlaybackSpeed, 0))
+                    ? Int64(Double(max(self.progressTimeMs() - self.playbackAnchorElapsedMs, 0)) * max(self.remotePlaybackSpeed, 0))
                     : 0)
                 let reconnectSyncWindow = self.isInReconnectStateSyncWindow()
                 self.isPlaying = incomingIsPlaying
@@ -6521,7 +6547,7 @@ extension BLETestManager: CBPeripheralDelegate {
                     self.displayPositionMs = calibratedPositionMs
                     self.seekPositionMs = calibratedPositionMs
                     self.basePlaybackPositionMs = calibratedPositionMs
-                    self.playbackAnchorElapsedMs = self.monotonicTimeMs()
+                    self.playbackAnchorElapsedMs = self.progressTimeMs()
                     self.confirmLyricsPresentationClock()
                     self.lyricsPlaybackConfirmationRevision &+= 1
                     MainActor.assumeIsolated { self.reconcileFloatingLyricsPlayback() }
@@ -9514,7 +9540,7 @@ extension BLETestManager: CBPeripheralDelegate {
             displayPositionMs = calibratedPositionMs
             seekPositionMs = calibratedPositionMs
             basePlaybackPositionMs = calibratedPositionMs
-            playbackAnchorElapsedMs = monotonicTimeMs()
+            playbackAnchorElapsedMs = progressTimeMs()
             confirmLyricsPresentationClock()
         }
 
@@ -9564,8 +9590,7 @@ extension BLETestManager: CBPeripheralDelegate {
             appLifecycleState: appLifecycleState
         )
         guard shouldRun else {
-            progressTimer?.invalidate()
-            progressTimer = nil
+            cancelProgressTimer()
             let stablePosition = durationMs > 0
                 ? positionMs.clamped(to: 0...durationMs)
                 : 0
@@ -9574,22 +9599,67 @@ extension BLETestManager: CBPeripheralDelegate {
             }
             return
         }
-        guard progressTimer == nil else { return }
-        let timer = Timer(timeInterval: progressRefreshInterval, repeats: true) { [weak self] _ in
-            self?.updateInterpolatedProgress()
+        let interval = PlaybackClockPolicy.refreshInterval(
+            for: progressPerformanceMode,
+            isLowPowerModeEnabled: progressLowPowerModeEnabled
+        )
+        guard progressTimer == nil || scheduledProgressInterval != interval else { return }
+        cancelProgressTimer()
+        scheduledProgressInterval = interval
+        let revision = progressTimerRevision
+        progressTimer = progressTimerScheduler(interval) { [weak self] in
+            let tick = { [weak self] in
+                guard let self, self.progressTimerRevision == revision else { return }
+                self.updateInterpolatedProgress()
+            }
+            if Thread.isMainThread {
+                tick()
+            } else {
+                DispatchQueue.main.async(execute: tick)
+            }
         }
-        progressTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
     }
 
-    private var progressRefreshInterval: TimeInterval {
-        switch preferences.playbackPerformanceMode {
-        case .smooth:
-            return 0.1
-        case .automatic:
-            return ProcessInfo.processInfo.isLowPowerModeEnabled ? 0.5 : 0.25
-        case .powerSaving:
-            return 0.5
+    private func cancelProgressTimer() {
+        progressTimerRevision &+= 1
+        progressTimer?.cancel()
+        progressTimer = nil
+        scheduledProgressInterval = nil
+    }
+
+    private func observePlaybackPerformance() {
+        playbackPerformanceSubscription = preferences.$playbackPerformanceMode
+            .combineLatest(playbackPowerState.$isLowPowerModeEnabled)
+            .removeDuplicates { $0.0 == $1.0 && $0.1 == $1.1 }
+            .sink { [weak self] mode, lowPower in
+                let apply = { [weak self] in
+                    guard let self else { return }
+                    // @Published emits in willSet; consume the emitted values.
+                    self.progressPerformanceMode = mode
+                    self.progressLowPowerModeEnabled = lowPower
+                    self.updateProgressTimerState()
+                }
+                if Thread.isMainThread {
+                    apply()
+                } else {
+                    DispatchQueue.main.async(execute: apply)
+                }
+            }
+    }
+
+    private func observeProgressLifecycle() {
+        let states: [(Notification.Name, UIApplication.State)] = [
+            (UIApplication.didBecomeActiveNotification, .active),
+            (UIApplication.willResignActiveNotification, .inactive),
+            (UIApplication.didEnterBackgroundNotification, .background)
+        ]
+        for (name, state) in states {
+            progressLifecycleObservers.append(
+                progressNotificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    // This observer never starts Bluetooth or runs reconnect work.
+                    self?.updateAppLifecycleState(state, emitLog: false)
+                }
+            )
         }
     }
 
@@ -9627,7 +9697,7 @@ extension BLETestManager: CBPeripheralDelegate {
             return
         }
 
-        let elapsedMs = max(monotonicTimeMs() - playbackAnchorElapsedMs, 0)
+        let elapsedMs = max(progressTimeMs() - playbackAnchorElapsedMs, 0)
         let scaledElapsedMs = Int64(
             (Double(max(elapsedMs, 0)) * max(remotePlaybackSpeed, 0)).rounded()
         )
