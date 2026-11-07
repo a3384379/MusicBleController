@@ -17,11 +17,15 @@ iOS 紧凑态歌词与画中画悬浮歌词使用两项独立、默认关闭的�
 - Sony `LyricsTransferCoordinator` / `CompressedLyricsCache`：独立持有歌词重传与最多 16 项/512KB 的 zlib 正文和 CRC，不受封面生命周期影响。
 - Sony `PredictiveMediaCoordinator`：最多两个候选的有界 Hot Set；只在低优先级线程验证现有 QRC parsed cache 和 fingerprint，不复制第二份完整歌词。
 - iOS `FullLyricsView`：显示原文、翻译、罗马音，逐字高亮只作用于原文。
+  - 完整歌词不限制原文、翻译或罗马音行数，字体随 Dynamic Type 缩放。当前行与普通行沿用同一排版尺寸，播放换句仅改变高亮，避免阅读中改变行高。紧凑高度及无障碍字号使用可滚动页面，并为歌词视口单独保留高度。
+  - 曲目身份只使用当前文档的 trackId，同曲窗口扩展、翻译和罗马音到达不重置浏览模式。数组位置用于当前行和逐字计算，稳定 line.id 用于行、滚动锚和几何缓存；窗口从非零行号开始时两者不能混用。
+  - `LyricsStore.documentRevision` 仅在文档确实变化时递增，不进入协议或持久化。阅读恢复按修订保留几何快照，优先以第一条完整可见行作为锚点，避免顶部半截行补齐辅助歌词后变高而推动阅读点；没有完整可见行时，仍保留覆盖视口中心的长行。先实例化稳定目标行，确认新布局行序及可见性后使用同一原生滚动状态恢复屏幕位置；旧修订或用户新动作不能恢复旧位置。
   - 歌词行不显示重复的播放图标；点击文字仍通过既有 `seekToLyricLine` 跳转。
   - 用户拖动或惯性滚动进入浏览模式，不发送跳转；停止惯性的触摸及滚动结束后的短暂释放窗口同样禁止误触跳转。自动滚动不进入浏览模式。
   - 浏览时按可见歌词整行的实际布局定位中央那一句，显示其原始 `timeMs` 起点；翻译/罗马音和长句属于同一行，几何缓存按歌词身份隔离，不使用当前播放时间冒充浏览时间。
-  - 定位时间直接显示在定位歌词右侧，仅这一句显示，并使用浅色文字与左侧细线标明归属；所有歌词预留同宽时间栏，避免时间出现时歌词换行或定位抖动，不放大字体改变行高。几何偏移缓存不发布每个像素的状态，只在定位行变化时刷新时间。
+  - 定位时间仅在定位句显示，并使用浅色文字与左侧细线标明归属；普通字号预留右侧同宽时间栏，无障碍字号改为每行上方等高保留区，避免时间出现时歌词换行或定位抖动。几何偏移缓存不发布每个像素的状态，只在定位行变化时刷新时间。
   - “回到当前歌词”位于歌词列表下方、底部控制上方的独立固定高度区域；跟随时保留区域，避免按钮出现时歌词重新排版。
+- Android `FullLyricsContent`：由现有 Controller 状态驱动完整歌词页，原文和辅助行自然换行；浏览保持到主动返回当前或切歌，不设置四秒恢复期限。选中态和可见项使用稳定行号，长行定位使用视口中心到整行边界的距离。停稳后继续按最终布局定位，主动点选才锁定选择。短屏导航与模式合并、状态进入横向栏，正文不被提示覆盖。拖动及停止惯性的触摸受独立释放保护，普通两次选择/确认仍通过原 seek 动作提交。
 
 ## 核心文件
 
@@ -92,6 +96,23 @@ iOS 紧凑态歌词与画中画悬浮歌词使用两项独立、默认关闭的�
 - iOS UserDefaults 歌词显示模式/偏移：full smoke。
 - Sony QRC/Recovery/Cache：Android build `./gradlew :PlayerAgentApp:assembleDebug`，真机播放有/无歌词、懒加载、翻译/罗马音歌曲。
 - docs-only：`git diff --check`。
+
+## 歌词阅读回归
+
+iOS 的 `PerformanceStabilityTests` 验证长行实际布局、无障碍字号视口、命中和非零窗口行号；`LyricsReadingUITests` 独立 scheme 使用生产 `FullLyricsView` 执行真实拖动、点按、同曲补齐、返回和切歌。固定数据入口仅在 Debug 模拟器且显式传入 `--lyrics-reading-ui-test` 时存在，不创建 BLE manager，也不写测试偏好；普通启动、真机和 Release 沿用原入口。
+
+Android 的 `FullLyricsInteractionTest` 验证真实 Compose 布局、触摸、长行定位、非零窗口补齐和跟随恢复。两端 UI 测试的回调验证与 Sony 实际执行 seek 分别验收；模拟器和固定数据截图不能替代真实设备的屏幕阅读器、BLE 或长时间播放验收。本批执行结果和未验项见[优化进度](OPTIMIZATION_PROGRESS.md)。
+
+独立 iOS 手势回归入口：
+
+```bash
+xcodebuild -project IOSBleFeasibility/IOSBleFeasibility.xcodeproj \
+  -scheme LyricsReadingUITests \
+  -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=18.3' \
+  -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO test
+```
+
+原 `sonyMusic` 共享 scheme 保留主 App 的运行、单测、Profile 和 Archive 入口。独立 UI scheme 不参与真机签名或发布；CI 接入仍属于第6批。
 
 V4 实时性观测使用 `trackId + generation` 关联 `lyricRequestQueued`、`lyricReady`、pending、LyricWindow、FullLyrics 和 CurrentWord 阶段。Trace 不读取歌词正文，也不改变 QRC 加载、pending flush、队列优先级或 stale fence；指标定义见 [REALTIME_SLO_V4.md](/Volumes/雷电/project/MusicBleController/docs/REALTIME_SLO_V4.md)。
 

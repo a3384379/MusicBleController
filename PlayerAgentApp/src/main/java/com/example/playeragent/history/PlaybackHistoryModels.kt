@@ -111,3 +111,15 @@ data class PlaybackStatsSummary(
     val topArtists: List<TopArtist>,
     val dailyTrend: List<DailyListenStat>
 )
+
+/** SQL projection only; this is not a new table or a BLE response field. */
+data class PlaybackStatsTotals(
+    val totalListenMs: Long,
+    val playCount: Int,
+    val uniqueTrackCount: Int,
+    val endedSessionCount: Int,
+    val completedCount: Int,
+    val skippedCount: Int
+)
+
+data class PlaybackStatsTimeBucket(val firstStartedAt: Long, val lastStartedAt: Long)

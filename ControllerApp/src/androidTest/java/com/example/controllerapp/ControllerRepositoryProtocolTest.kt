@@ -65,6 +65,7 @@ class ControllerRepositoryProtocolTest {
         repository.close()
         database.close()
         logStore.close()
+        assertTrue("log worker did not stop", logStore.awaitClosed(5_000L))
         root.deleteRecursively()
     }
 

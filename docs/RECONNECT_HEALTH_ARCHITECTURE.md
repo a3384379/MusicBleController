@@ -29,6 +29,7 @@
 9. 单次 `didWrite` 回调超时只标记 suspect 并延长等待，不移除 in-flight 请求、不推进写队列；连续两次写回调超时才 hard reconnect。
 10. Sony 端业务静默只触发按地址的轻量 notify 探针；只有真实 notify 失败达到阈值才隔离该地址，禁止用静默时间直接重建共享 GATT。
 11. Sony 对合法 command 保持即时 ATT response，随后按设备保留短 quiet window；业务命令继续异步执行。iOS 会取消已经过时的普通播放状态 fallback，但保护前台验证和 Health probe，避免频繁切歌把无用状态读取堆在真实控制之前。
+12. 断线回调、central 非 poweredOn、健康检查确认 peripheral 不再连接均统一清理传输并推进连接代次。显示计时器同时失效，后台排队的旧 playbackState 不能重新启动它；恢复显示推进必须等待本轮有效播放锚点。
 
 ## 关键状态
 

@@ -74,6 +74,7 @@ In quick mode, build/install are marked PASS as skipped by request.
 ## Optional Tests
 
 - BLE Service
+- BLE Health Watchdog
 - Control Service Auto-start
 - PlaybackDiff Flow
 - CurrentWord Flow
@@ -136,7 +137,30 @@ Sony-only歌词矩阵还会使用
 `com.example.playeragent.debug.REFRESH_CURRENT_LYRIC`，经同一个 Debug Receiver
 转发给非导出的前台服务；测试脚本不得直接从 shell 启动该服务。
 
-Use `--no-debug-control` to keep the previous passive behavior.
+The BLE optional check sends `START_BLE_SERVICE`; the health watchdog also sends
+`com.example.playeragent.debug.RECOVER_BLE_STACK`. Both respect
+`--no-debug-control`. With that option, those checks only analyze existing logs:
+they do not send debug broadcasts, wait for debug actions, or refresh logcat.
+The suite still performs its normal device checks, app launch and log collection
+(and build/install in full mode). The app may auto-start its service itself.
+This option does not make the entire suite read-only.
+
+The receiver rejects cold-start operations with `permission_missing` unless BLE
+runtime permissions are granted: CONNECT and ADVERTISE on Android 12+, or fine
+location on older supported versions. STOP calls `stopService` without starting
+a new foreground service and remains available without BLE permissions.
+
+The service also handles a platform `SecurityException` during foreground
+promotion. That failed instance stops, returns `START_NOT_STICKY` if a command
+arrives, and does not initialize BLE/history workers or execute normal teardown
+for resources it never created. Recovery protects permission checks and adapter
+reads against a permission race. This is a local lifecycle change; BLE messages
+and the non-exported service boundary remain unchanged.
+
+`POST_NOTIFICATIONS` is not a system prerequisite for launching an FGS; the
+service still supplies its notification. The Activity retains its own existing
+permission workflow. See Android's [FGS runtime checks](https://developer.android.com/about/versions/14/changes/fgs-types-required#system-runtime-checks)
+and [notification permission guidance](https://developer.android.com/develop/ui/compose/notifications/notification-permission).
 
 ## Reports
 
@@ -155,7 +179,43 @@ Important files:
 - `failure_excerpt.log`: key excerpt when failures or warnings exist
 - `file_checks.tsv`: app/cache/QQMusic path checks
 - `debug_control.json`: whether debug control receiver was available and whether START was attempted
+- `ble_health_watchdog.json`: passive health evidence and whether RECOVER was attempted
 - `playback_diff_flow.json`: parsed PlaybackDiff metrics from Sony logcat
+
+`debugControlStartResult` distinguishes `skipped: permission_missing`,
+`failed: permission_denied`, `received; forwarding not confirmed`, and
+`forwarded to service`. Receiving a broadcast alone does not prove the service
+started; GATT/advertising logs are evaluated separately.
+
+The watchdog records `debugControlEnabled`, `recoverCommandAttempted`,
+`recoverCommandRc` and `recoverCommandSkipReason`. An unattempted command has
+`recoverCommandRc: null`; skip reasons include `debug_control_disabled`,
+`adb_device_missing`, and `logcat_missing`. A broadcast return code of zero only
+means the broadcast command completed, not that BLE recovery succeeded. FATAL/ANR
+evidence remains a failure even when debug control is disabled. Snapshot refresh
+preserves previously captured severe lines and retains the old snapshot if adb
+collection fails, without duplicating healthy events and GATT-start counts.
+
+## Regression Tests
+
+Device-free tests exercise the real scripts with a fake adb, including suite flag
+propagation, command attempts, permission refusals, passive mode and severe-log
+preservation:
+
+```bash
+python3 -m unittest discover -s tools/android-smoke-tests/tests -p 'test_*.py' -v
+```
+
+`BleServicePermissionTest` runs real Android lifecycle cases on API 34+. Revoke
+CONNECT, ADVERTISE and SCAN **before instrumentation** for the two `denied*`
+cases; grant them and leave POST_NOTIFICATIONS denied for the `granted*` case.
+Permission revocation during instrumentation can kill the target process, so the
+test deliberately does not change device permission state itself. Use a
+disposable emulator or a dedicated test device. The direct FGS case bypasses the
+receiver and waits beyond the device's configured foreground-promotion timeout.
+When running the whole class, unmatched permission scenarios are skipped using
+Assume. Acceptance requires explicitly running both permission groups and checking
+that all three selected cases pass without assumption skips.
 
 ## Why It Does Not Start The Service Directly
 

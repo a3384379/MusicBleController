@@ -9,6 +9,7 @@ import math
 import re
 import statistics
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -48,6 +49,11 @@ METRIC_NAMES = (
     "trackAcceptedToFirstWordMs",
     "commandToSonyReceiveMs",
     "commandToTrackPublishMs",
+    "t0ToTrackPublishMs",
+    "t0ToCurrentLyricMs",
+    "t0ToCurrentWordMs",
+    "t0ToPreviewArtMs",
+    "t0ToHqArtMs",
     "trackToCurrentLyricMs",
     "trackToCurrentWordMs",
     "trackToPreviewArtMs",
@@ -197,15 +203,16 @@ def load_events(paths: Iterable[Path]) -> tuple[list[Event], int]:
     for path in paths:
         if not path.exists():
             continue
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            source_line += 1
-            if TRACE_MARKER not in line:
-                continue
-            event = parse_trace_line(line, source_line)
-            if event is None:
-                malformed += 1
-            else:
-                events.append(event)
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                source_line += 1
+                if TRACE_MARKER not in line:
+                    continue
+                event = parse_trace_line(line, source_line)
+                if event is None:
+                    malformed += 1
+                else:
+                    events.append(event)
     return events, malformed
 
 
@@ -221,15 +228,16 @@ def discover_clock_sync(paths: Iterable[Path]) -> tuple[bool, Optional[int]]:
     for path in paths:
         if not path.exists():
             continue
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            match = pattern.search(line)
-            if match:
-                sample_count = int(match.group(2))
-                if (previous_sample_count is not None
-                        and sample_count < previous_sample_count):
-                    reset_seen = True
-                previous_sample_count = sample_count
-                latest = (match.group(3).lower() == "true", int(match.group(1)))
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                match = pattern.search(line)
+                if match:
+                    sample_count = int(match.group(2))
+                    if (previous_sample_count is not None
+                            and sample_count < previous_sample_count):
+                        reset_seen = True
+                    previous_sample_count = sample_count
+                    latest = (match.group(3).lower() == "true", int(match.group(1)))
     # One offset must never be applied across a hard reconnect. Even if the
     # final segment later converges, its offset cannot validate events from the
     # earlier segment; keep cross-device metrics unavailable for that run.
@@ -273,6 +281,12 @@ def _track_key(event: Event) -> Optional[tuple]:
 
 def _track_id_key(event: Event) -> Optional[tuple]:
     return (event.track_id[:12],) if event.track_id else None
+
+
+def _precise_track_key(event: Event) -> Optional[tuple]:
+    if not event.track_id or event.generation is None or event.generation <= 0:
+        return None
+    return _track_key(event)
 
 
 def _ready_track_key(event: Event) -> Optional[tuple]:
@@ -512,6 +526,8 @@ def derive_track_t0(
                 identity for identity in identities
                 if identity.source_line not in used_identity_lines
                 and identity.mono_ms >= control.mono_ms
+                and (not control.handoff_id or not identity.handoff_id
+                     or control.handoff_id == identity.handoff_id)
                 and (
                     next_control_ms is None
                     or identity.mono_ms < next_control_ms
@@ -533,6 +549,8 @@ def derive_track_t0(
                     mono_ms=control.mono_ms,
                     command_seq=control.command_seq,
                     command_type=control.command_type,
+                    handoff_id=control.handoff_id,
+                    trigger_type=control.trigger_type,
                     track_id=identity.track_id,
                     generation=identity.generation,
                     result="manual",
@@ -583,6 +601,8 @@ def derive_track_t0(
                 mono_ms=mapped_t0_ms,
                 track_id=identity.track_id,
                 generation=identity.generation,
+                handoff_id=sony_identity.handoff_id,
+                trigger_type=sony_identity.trigger_type,
                 result="automatic",
                 source_line=-(index + 1),
             )
@@ -777,8 +797,14 @@ def classify_transition_samples(
             classifications.append("LYRIC_CACHE_HIT")
         if any(event.stage == "lyricParsedCacheMiss" for event in grouped):
             classifications.append("LYRIC_CACHE_MISS")
-        if any(event.stage in {"albumArtCacheHit", "prefetchLocalCacheHit"} for event in grouped):
+        if any(event.stage == "runtimeCacheHit" for event in grouped):
+            classifications.append("RUNTIME_CACHE_HIT")
+        if any(event.stage == "runtimeCacheMiss" for event in grouped):
+            classifications.append("RUNTIME_CACHE_MISS")
+        if any(event.stage == "albumArtCacheHit" for event in grouped):
             classifications.append("PREVIEW_CACHE_HIT")
+        if any(event.stage == "albumArtCacheMiss" for event in grouped):
+            classifications.append("PREVIEW_CACHE_MISS")
         if any(event.stage in {"previewSendStart", "previewPublished"} for event in grouped):
             classifications.append("PREVIEW_TRANSFER")
         if not clock_trusted:
@@ -792,11 +818,11 @@ def classify_transition_samples(
             for event in grouped
         ):
             classifications.append("STALE_REJECTED")
-        if any(event.result in {"failure", "failed"} for event in grouped):
+        if any((event.result or "").lower() in {"failure", "failed", "timeout"} for event in grouped):
             classifications.append("FAILED")
         if absent:
             classifications.append("TRACE_INCOMPLETE")
-        elif ios_track_changed:
+        elif ios_track_changed and "FAILED" not in classifications:
             classifications.append("COMPLETE")
         sample_id = anchor.handoff_id or f"sample-{index + 1}"
         sample = {
@@ -1186,6 +1212,50 @@ def analyze(
         track_publish_missing,
     )
 
+    # Add end-to-end T0 measurements without changing the historical
+    # trackTo* segments. Match exact generation, and never add percentiles.
+    # An artwork publication without generation is deliberately unmeasurable.
+    t0_specs = {
+        "t0ToTrackPublishMs": {"trackIdentityAccepted"},
+        "t0ToCurrentLyricMs": {"lyricCurrentLinePublished"},
+        "t0ToCurrentWordMs": {"currentWordPublished"},
+        "t0ToPreviewArtMs": {"previewPublished", "hqPublished"},
+        "t0ToHqArtMs": {"hqPublished"},
+    }
+    t0_samples = []
+    for start in sorted(track_t0_events, key=lambda item: item.mono_ms):
+        identity = min((event for event in events if event.side == "ios"
+            and event.stage == "trackIdentityAccepted" and event.result == "changed"
+            and event.mono_ms >= start.mono_ms and event.track_id and start.track_id
+            and event.track_id[:12] == start.track_id[:12]
+            and event.generation == start.generation),
+            key=lambda event: event.mono_ms, default=None)
+        next_identity_ms = min((event.mono_ms for event in events
+            if identity is not None and event.side == "ios" and event.stage == "trackIdentityAccepted"
+            and event.result == "changed" and event.mono_ms > identity.mono_ms), default=None)
+        record = {"commandSeq": start.command_seq, "commandType": start.command_type,
+                  "handoffId": start.handoff_id, "triggerType": start.trigger_type,
+                  "trigger": start.result,
+                  "trackIdSummary": start.track_id[:12] if start.track_id else None,
+                  "generation": start.generation, "t0MonoMs": start.mono_ms}
+        for name, stages in t0_specs.items():
+            candidates = [event for event in events
+                if event.side == "ios" and event.stage in stages
+                and event.mono_ms >= start.mono_ms
+                and (next_identity_ms is None or event.mono_ms < next_identity_ms)
+                and start.generation is not None and start.generation > 0
+                and event.generation == start.generation
+                and start.track_id and event.track_id
+                and event.track_id[:12] == start.track_id[:12]
+                and (event.stage != "lyricCurrentLinePublished" or event.result == "published")
+                and (event.stage != "trackIdentityAccepted" or event.result == "changed")]
+            record[name] = min((event.mono_ms - start.mono_ms for event in candidates), default=None)
+        t0_samples.append(record)
+    for name in t0_specs:
+        values = [sample[name] for sample in t0_samples if sample[name] is not None]
+        metric_samples[name] = values
+        metrics[name] = summarize(values, len(t0_samples) - len(values) + track_publish_missing)
+
     usable_artwork_events = [
         replace(event, stage="usableArtworkPublished")
         for event in events
@@ -1201,8 +1271,8 @@ def analyze(
     track_pair_specs = (
         ("trackToCurrentLyricMs", "currentLyricPublished", _track_key),
         ("trackToCurrentWordMs", "currentWordPublished", _track_key),
-        ("trackToPreviewArtMs", "usableArtworkPublished", _track_id_key),
-        ("trackToHqArtMs", "hqPublished", _track_id_key),
+        ("trackToPreviewArtMs", "usableArtworkPublished", _precise_track_key),
+        ("trackToHqArtMs", "hqPublished", _precise_track_key),
     )
     track_analysis_events = [*events, *usable_artwork_events, *track_identity_t0_events]
     for name, end_stage, key in track_pair_specs:
@@ -1215,6 +1285,8 @@ def analyze(
             key,
             categories,
         )
+        if key is _precise_track_key:
+            missing += sum(_precise_track_key(event) is None for event in track_identity_t0_events)
         metric_samples[name] = values
         metrics[name] = summarize(values, missing)
 
@@ -1353,6 +1425,7 @@ def analyze(
         "sideCounts": dict(Counter(event.side for event in events)),
         "stageCounts": dict(Counter(event.stage for event in events)),
         "metrics": metrics,
+        "t0Samples": t0_samples,
         "categories": classifications,
         "diagnostics": dict(sorted(categories.items())),
         "slowSamples": slow_samples,
@@ -1397,16 +1470,20 @@ def render_summary(report: dict) -> str:
 
 def write_combined_trace(paths: list[Path], destination: Path) -> None:
     """Preserve the report bundle contract even when a trace source is empty."""
-    contents = [
-        path.read_text(encoding="utf-8", errors="replace")
-        for path in paths
-        if path.exists()
-    ]
-    with destination.open("w", encoding="utf-8") as output:
-        for content in contents:
-            output.write(content)
-            if content and not content.endswith("\n"):
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=destination.parent,
+                                     delete=False) as output:
+        temporary = Path(output.name)
+        for path in paths:
+            if not path.exists():
+                continue
+            last = ""
+            with path.open(encoding="utf-8", errors="replace") as source:
+                for line in source:
+                    output.write(line)
+                    last = line
+            if last and not last.endswith("\n"):
                 output.write("\n")
+    temporary.replace(destination)
 
 
 def main(argv: Optional[list[str]] = None) -> int:

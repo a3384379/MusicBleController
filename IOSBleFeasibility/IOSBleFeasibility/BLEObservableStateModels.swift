@@ -203,6 +203,7 @@ final class PlaybackStore {
 final class LyricsStore {
     private(set) var live = BLELiveLyricState()
     private(set) var document = BLEFullLyricsViewState()
+    private(set) var documentRevision: UInt64 = 0
     private(set) var floatingPlaybackControlState: LyricsPlaybackControlState = .idle
 
     func updateFloatingPlaybackControlState(_ value: LyricsPlaybackControlState) {
@@ -214,7 +215,10 @@ final class LyricsStore {
     }
 
     func updateDocument(_ value: BLEFullLyricsViewState) {
-        if document != value { document = value }
+        if document != value {
+            document = value
+            documentRevision &+= 1
+        }
     }
 }
 
@@ -549,6 +553,71 @@ enum PlaybackClockPolicy {
         appLifecycleState: String
     ) -> Bool {
         isPlaying && durationMs > 0 && appLifecycleState == "active"
+    }
+
+    static func refreshInterval(
+        for mode: PlaybackPerformanceMode,
+        isLowPowerModeEnabled: Bool
+    ) -> TimeInterval {
+        switch mode {
+        case .smooth:
+            return 0.1
+        case .automatic:
+            return isLowPowerModeEnabled ? 0.5 : 0.25
+        case .powerSaving:
+            return 0.5
+        }
+    }
+}
+
+typealias PlaybackProgressTimerScheduler = (TimeInterval, @escaping () -> Void) -> AnyCancellable
+
+enum PlaybackProgressTimer {
+    static func schedule(every interval: TimeInterval, action: @escaping () -> Void) -> AnyCancellable {
+        let timer = Timer(timeInterval: interval, repeats: true) { _ in action() }
+        RunLoop.main.add(timer, forMode: .common)
+        return AnyCancellable { timer.invalidate() }
+    }
+}
+
+/// System state shared by progress sampling and its lyric/spectrum consumers.
+/// It is deliberately separate from persisted user preferences.
+final class PlaybackPowerState: ObservableObject {
+    static let shared = PlaybackPowerState()
+
+    @Published private(set) var isLowPowerModeEnabled: Bool
+
+    private let notificationCenter: NotificationCenter
+    private let readLowPowerMode: () -> Bool
+    private var observers: [NSObjectProtocol] = []
+
+    init(
+        notificationCenter: NotificationCenter = .default,
+        isLowPowerModeEnabled: @escaping () -> Bool = { ProcessInfo.processInfo.isLowPowerModeEnabled }
+    ) {
+        self.notificationCenter = notificationCenter
+        self.readLowPowerMode = isLowPowerModeEnabled
+        self.isLowPowerModeEnabled = isLowPowerModeEnabled()
+        for name in [Notification.Name.NSProcessInfoPowerStateDidChange,
+                     UIApplication.didBecomeActiveNotification] {
+            observers.append(notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.refresh()
+            })
+        }
+    }
+
+    func refresh() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.refresh() }
+            return
+        }
+        let enabled = readLowPowerMode()
+        guard isLowPowerModeEnabled != enabled else { return }
+        isLowPowerModeEnabled = enabled
+    }
+
+    deinit {
+        observers.forEach(notificationCenter.removeObserver)
     }
 }
 

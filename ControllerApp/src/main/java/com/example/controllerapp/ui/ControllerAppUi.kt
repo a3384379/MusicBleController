@@ -3,12 +3,15 @@ package com.example.controllerapp.ui
 import android.content.Intent
 import android.graphics.Bitmap
 import android.os.Build
+import android.os.SystemClock
 import android.text.format.DateUtils
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -21,16 +24,20 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -59,8 +66,10 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
@@ -86,13 +95,17 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.BlurredEdgeTreatment
@@ -108,11 +121,14 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -761,7 +777,8 @@ private fun WordHighlightedText(
     lineHeightValue: Int = if (line.text.length > 42) 21 else 26,
     textAlign: TextAlign = TextAlign.Center,
     highlightColor: Color = Color.White,
-    pendingColor: Color = Color.White.copy(alpha = 0.45f)
+    pendingColor: Color = Color.White.copy(alpha = 0.45f),
+    maxLines: Int = 3
 ) {
     val characterProgresses = LyricTimeline.characterProgresses(line, positionMs)
     val value = buildAnnotatedString {
@@ -785,7 +802,7 @@ private fun WordHighlightedText(
         fontSize = fontSizeValue.sp,
         lineHeight = lineHeightValue.sp,
         fontWeight = FontWeight.SemiBold,
-        maxLines = 3,
+        maxLines = maxLines,
         overflow = TextOverflow.Ellipsis,
         textAlign = textAlign
     )
@@ -936,6 +953,37 @@ private fun FullLyricsScreen(
     val artwork by viewModel.artwork.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val position by viewModel.displayedPositionMs.collectAsStateWithLifecycle()
+    val reduceAnimations by viewModel.reduceAnimations.collectAsStateWithLifecycle()
+    LaunchedEffect(lyrics.trackId, lyrics.isFinal) {
+        if (lyrics.trackId.isNotBlank() && !lyrics.isFinal) viewModel.ensureFullLyrics()
+    }
+    FullLyricsContent(
+        connection = connection, playback = playback, lyrics = lyrics, artwork = artwork,
+        settings = settings, position = position, navController = navController,
+        reduceAnimations = reduceAnimations,
+        onModeSelected = viewModel::updateLyricMode, onRetry = viewModel::retryLyrics,
+        onSeek = viewModel::seekTo, onPrevious = viewModel::previous,
+        onPlayPause = viewModel::playPause, onNext = viewModel::next
+    )
+}
+
+@Composable
+internal fun FullLyricsContent(
+    connection: ConnectionState,
+    playback: PlaybackState,
+    lyrics: LyricsState,
+    artwork: ArtworkState,
+    settings: ControllerSettings,
+    position: Long,
+    navController: NavHostController,
+    reduceAnimations: Boolean,
+    onModeSelected: (LyricDisplayMode) -> Unit,
+    onRetry: () -> Unit,
+    onSeek: (Long) -> Unit,
+    onPrevious: () -> Unit,
+    onPlayPause: () -> Unit,
+    onNext: () -> Unit
+) {
     val displayLines = lyrics.lines
     val current = currentLineIndex(
         displayLines,
@@ -944,19 +992,21 @@ private fun FullLyricsScreen(
     )
     val listState = rememberLazyListState()
     var following by remember { mutableStateOf(true) }
-    var selectedLinePosition by remember { mutableStateOf<Int?>(null) }
-    var programmaticScroll by remember { mutableStateOf(false) }
-    var resumeFollowToken by remember { mutableIntStateOf(0) }
+    var selectedLineId by remember { mutableStateOf<Int?>(null) }
+    var selectionFromScroll by remember { mutableStateOf(false) }
+    var lastScrollEndMs by remember { mutableLongStateOf(Long.MIN_VALUE) }
+    var touchInterruptedScroll by remember { mutableStateOf(false) }
     val isDragged by listState.interactionSource.collectIsDraggedAsState()
-    val nearestVisibleLine by remember(displayLines) {
+    val nearestVisibleLineId by remember {
         derivedStateOf {
             val layout = listState.layoutInfo
             val viewportCenter = (layout.viewportStartOffset + layout.viewportEndOffset) / 2
             LyricBrowsePolicy.nearestLine(
-                layout.visibleItemsInfo.map { item ->
+                layout.visibleItemsInfo.mapNotNull { item ->
                     LyricViewportItem(
-                        linePosition = item.index,
-                        centerPx = item.offset + item.size / 2
+                        linePosition = item.key as? Int ?: return@mapNotNull null,
+                        topPx = item.offset,
+                        bottomPx = item.offset + item.size
                     )
                 },
                 viewportCenterPx = viewportCenter
@@ -969,54 +1019,42 @@ private fun FullLyricsScreen(
                 listState.layoutInfo.viewportStartOffset).coerceAtLeast(0)
         }
     }
-    val lyricTopPaddingPx = with(LocalDensity.current) { 132.dp.roundToPx() }
-    LaunchedEffect(lyrics.trackId, lyrics.isFinal) {
-        if (lyrics.trackId.isNotBlank() && !lyrics.isFinal) {
-            viewModel.ensureFullLyrics()
-        }
-    }
+    val lyricTopPaddingPx = with(LocalDensity.current) { 24.dp.roundToPx() }
+    val missingMessage = secondaryMissingMessage(displayLines, settings.lyricDisplayMode, lyrics.isFinal)
     LaunchedEffect(lyrics.trackId) {
         following = true
-        selectedLinePosition = null
-        resumeFollowToken = 0
+        selectedLineId = null
+        selectionFromScroll = false
     }
-    LaunchedEffect(current, following, lyrics.isFinal, lyricViewportHeight) {
+    LaunchedEffect(lyrics.trackId, current, following, lyrics.isFinal, lyricViewportHeight, reduceAnimations) {
         if (following && lyricViewportHeight > 0 && current >= 0 && current < displayLines.size) {
-            programmaticScroll = true
-            try {
-                listState.animateScrollToItem(
-                    current,
-                    scrollOffset = -(
-                        lyricViewportHeight / 2 - 56 - lyricTopPaddingPx
-                    ).coerceAtLeast(0)
-                )
-            } finally {
-                programmaticScroll = false
-            }
+            val offset = -(lyricViewportHeight / 2 - lyricTopPaddingPx).coerceAtLeast(0)
+            if (reduceAnimations) listState.scrollToItem(current, offset)
+            else listState.animateScrollToItem(current, offset)
         }
     }
     LaunchedEffect(isDragged) {
-        if (isDragged && !programmaticScroll) {
+        if (isDragged) {
             following = false
-            resumeFollowToken += 1
-        } else if (!following && !programmaticScroll) {
-            resumeFollowToken += 1
+            selectionFromScroll = true
         }
     }
-    LaunchedEffect(nearestVisibleLine, following) {
-        if (!following && nearestVisibleLine != null) {
-            selectedLinePosition = nearestVisibleLine
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress }.collect { scrolling ->
+            if (!scrolling) lastScrollEndMs = SystemClock.uptimeMillis()
         }
     }
-    LaunchedEffect(resumeFollowToken) {
-        if (resumeFollowToken > 0) {
-            delay(4_000L)
-            following = true
-            selectedLinePosition = null
+    LaunchedEffect(following, listState.isScrollInProgress) {
+        if (!following && listState.isScrollInProgress) selectionFromScroll = true
+    }
+    LaunchedEffect(nearestVisibleLineId, following, selectionFromScroll) {
+        if (!following && selectionFromScroll) {
+            nearestVisibleLineId?.let { selectedLineId = it }
         }
     }
 
-    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+    BoxWithConstraints(Modifier.fillMaxSize().background(Color(0xff090b10))) {
+        val compactScreen = maxHeight < 420.dp
         ArtworkAtmosphereBackground(
             bitmap = artwork.bitmap,
             overlayColors = listOf(
@@ -1028,30 +1066,23 @@ private fun FullLyricsScreen(
         Scaffold(
             containerColor = Color.Transparent,
             topBar = {
+                if (!compactScreen) {
                 ControllerTopBar(
                     title = "歌词",
                     navController = navController,
-                    transparent = true,
-                    action = {
-                        TextButton(
-                            onClick = {
-                                following = true
-                                selectedLinePosition = null
-                            },
-                            enabled = !following
-                        ) {
-                            Text(if (following) "跟随中" else "回到当前")
-                        }
-                    }
+                    transparent = true
                 )
+                }
             }
         ) { padding ->
             CompositionLocalProvider(LocalContentColor provides Color.White) {
+                BoxWithConstraints(Modifier.fillMaxSize().padding(padding)) {
+                val compactHeight = maxHeight < 420.dp
                 Column(
                     Modifier.fillMaxSize()
-                        .padding(padding)
                         .padding(horizontal = 20.dp)
                 ) {
+                if (!compactHeight) {
                 Text(
                     playback.title.ifBlank { "等待 QQ 音乐" },
                     fontSize = 19.sp,
@@ -1067,26 +1098,37 @@ private fun FullLyricsScreen(
                     overflow = TextOverflow.Ellipsis
                 )
                 Spacer(Modifier.height(12.dp))
-                LyricModeSelector(
-                    selected = settings.lyricDisplayMode,
-                    onSelected = viewModel::updateLyricMode
-                )
-                secondaryMissingMessage(
-                    lines = displayLines,
-                    mode = settings.lyricDisplayMode,
-                    isFinal = lyrics.isFinal
-                )?.let { message ->
-                    Text(
-                        message,
-                        fontSize = 12.sp,
-                        color = Color.White.copy(alpha = 0.56f),
-                        modifier = Modifier.padding(top = 7.dp)
-                    )
                 }
-                AnimatedVisibility(!lyrics.isFinal && displayLines.isNotEmpty()) {
-                    FullLyricsLoadingBanner(lyrics, settings, viewModel::retryLyrics)
+                if (compactScreen) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = { navController.popBackStack() }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回", tint = Color.White)
+                        }
+                        LyricModeSelector(
+                            selected = settings.lyricDisplayMode,
+                            onSelected = onModeSelected,
+                            modifier = Modifier.weight(1f),
+                            inlineStatus = if (!lyrics.isFinal && displayLines.isNotEmpty()) {
+                                lyricStageText(lyrics.loadingStage)
+                            } else missingMessage,
+                            onInlineRetry = onRetry.takeIf { !lyrics.isFinal && displayLines.isNotEmpty() }
+                        )
+                    }
+                } else {
+                    LyricModeSelector(selected = settings.lyricDisplayMode, onSelected = onModeSelected)
+                    Box(Modifier.fillMaxWidth().height(64.dp), contentAlignment = Alignment.CenterStart) {
+                        if (!lyrics.isFinal && displayLines.isNotEmpty()) {
+                            FullLyricsLoadingBanner(lyrics, settings, onRetry)
+                        } else if (missingMessage != null) {
+                            Text(
+                                missingMessage,
+                                modifier = Modifier.testTag("lyrics_status"),
+                                fontSize = 12.sp,
+                                color = Color.White.copy(alpha = 0.85f)
+                            )
+                        }
+                    }
                 }
-
                 if (displayLines.isEmpty()) {
                     EmptyState(
                         title = lyricStageText(lyrics.loadingStage),
@@ -1094,7 +1136,7 @@ private fun FullLyricsScreen(
                             "正在等待 Sony 解析 QQ 音乐歌词"
                         },
                         action = "重新请求",
-                        onAction = viewModel::retryLyrics,
+                        onAction = onRetry,
                         modifier = Modifier.weight(1f)
                     )
                 } else {
@@ -1102,19 +1144,37 @@ private fun FullLyricsScreen(
                         LazyColumn(
                             state = listState,
                             contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                                top = 132.dp,
-                                bottom = 178.dp,
+                                top = 24.dp,
+                                bottom = 24.dp,
                                 start = 2.dp,
                                 end = 2.dp
                             ),
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                             modifier = Modifier.fillMaxSize().testTag("full_lyrics_list")
+                                .pointerInput(listState) {
+                                    awaitEachGesture {
+                                        try {
+                                            do {
+                                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                                val pressed = event.changes.any { it.pressed }
+                                                if (pressed && listState.isScrollInProgress) {
+                                                    touchInterruptedScroll = true
+                                                }
+                                            } while (pressed)
+                                        } finally {
+                                            if (touchInterruptedScroll) {
+                                                lastScrollEndMs = SystemClock.uptimeMillis()
+                                                touchInterruptedScroll = false
+                                            }
+                                        }
+                                    }
+                                }
                         ) {
                             itemsIndexed(displayLines, key = { _, line -> line.index }) {
                                     linePosition, line ->
                                 val isCurrent = linePosition == current
                                 val isBrowseSelected = !following &&
-                                    linePosition == selectedLinePosition
+                                    line.index == selectedLineId
                                 FullLyricRow(
                                     line = line,
                                     positionMs = position + settings.lyricOffsetMs,
@@ -1123,27 +1183,34 @@ private fun FullLyricsScreen(
                                     isBrowseSelected = isBrowseSelected,
                                     connected = connection.connected,
                                     onSelect = {
+                                        if (!LyricBrowsePolicy.canActivate(
+                                                listState.isScrollInProgress || touchInterruptedScroll, lastScrollEndMs,
+                                                SystemClock.uptimeMillis()
+                                            )) return@FullLyricRow
                                         val result = LyricBrowsePolicy.onLineTapped(
                                             browsing = !following,
-                                            selectedLinePosition = selectedLinePosition,
-                                            tappedLinePosition = linePosition,
+                                            selectedLineId = selectedLineId,
+                                            tappedLineId = line.index,
                                             lineTimeMs = line.timeMs,
                                             connected = connection.connected
                                         )
                                         following = false
-                                        selectedLinePosition = result.selectedLinePosition
-                                        resumeFollowToken += 1
+                                        selectionFromScroll = false
+                                        selectedLineId = result.selectedLineId
                                         result.seekPositionMs?.let { seekPosition ->
-                                            viewModel.seekTo(seekPosition)
+                                            onSeek(seekPosition)
                                             following = true
-                                            selectedLinePosition = null
+                                            selectedLineId = null
                                         }
                                     },
                                     onSeek = {
-                                        if (connection.connected) {
-                                            viewModel.seekTo(line.timeMs)
+                                        if (connection.connected && LyricBrowsePolicy.canActivate(
+                                                listState.isScrollInProgress || touchInterruptedScroll, lastScrollEndMs,
+                                                SystemClock.uptimeMillis()
+                                            )) {
+                                            onSeek(line.timeMs)
                                             following = true
-                                            selectedLinePosition = null
+                                            selectedLineId = null
                                         }
                                     }
                                 )
@@ -1157,32 +1224,38 @@ private fun FullLyricsScreen(
                                     .clip(CircleShape)
                                     .background(Color(0xff8ee6a3))
                             )
-                            Surface(
-                                onClick = {
-                                    following = true
-                                    selectedLinePosition = null
-                                },
-                                shape = RoundedCornerShape(50),
-                                color = Color.Black.copy(alpha = 0.46f),
-                                modifier = Modifier.align(Alignment.TopEnd).padding(top = 8.dp)
-                            ) {
-                                Text(
-                                    "回到当前歌词",
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-                                )
-                            }
                         }
                     }
                 }
+                if (compactHeight) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        LyricsReturnControl(following, Modifier.weight(1f)) {
+                            following = true
+                            selectedLineId = null
+                        }
+                        FullLyricsControls(
+                            isPlaying = playback.isPlaying,
+                            enabled = connection.connected,
+                            onPrevious = onPrevious,
+                            onPlayPause = onPlayPause,
+                            onNext = onNext,
+                            compact = true
+                        )
+                    }
+                } else {
+                    LyricsReturnControl(following, Modifier.align(Alignment.CenterHorizontally)) {
+                        following = true
+                        selectedLineId = null
+                    }
                     FullLyricsControls(
                         isPlaying = playback.isPlaying,
                         enabled = connection.connected,
-                        onPrevious = viewModel::previous,
-                        onPlayPause = viewModel::playPause,
-                        onNext = viewModel::next
+                        onPrevious = onPrevious,
+                        onPlayPause = onPlayPause,
+                        onNext = onNext
                     )
+                }
+                }
                 }
             }
         }
@@ -1190,9 +1263,25 @@ private fun FullLyricsScreen(
 }
 
 @Composable
+private fun LyricsReturnControl(following: Boolean, modifier: Modifier = Modifier, onReturn: () -> Unit) {
+    TextButton(
+        onClick = onReturn,
+        enabled = !following,
+        colors = ButtonDefaults.textButtonColors(
+            contentColor = Color(0xffa4efb6),
+            disabledContentColor = Color.White.copy(alpha = 0.72f)
+        ),
+        modifier = modifier.heightIn(min = 48.dp).testTag("lyrics_return_current")
+    ) { Text(if (following) "跟随中" else "回到当前歌词") }
+}
+
+@Composable
 private fun LyricModeSelector(
     selected: LyricDisplayMode,
-    onSelected: (LyricDisplayMode) -> Unit
+    onSelected: (LyricDisplayMode) -> Unit,
+    modifier: Modifier = Modifier,
+    inlineStatus: String? = null,
+    onInlineRetry: (() -> Unit)? = null
 ) {
     val options = listOf(
         LyricDisplayMode.ORIGINAL to "原文",
@@ -1201,11 +1290,13 @@ private fun LyricModeSelector(
         LyricDisplayMode.ALL to "全部"
     )
     Row(
-        Modifier.fillMaxWidth()
+        modifier.fillMaxWidth()
             .clip(RoundedCornerShape(14.dp))
             .background(Color.White.copy(alpha = 0.07f))
+            .horizontalScroll(rememberScrollState())
             .padding(3.dp),
-        horizontalArrangement = Arrangement.spacedBy(3.dp)
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
         options.forEach { (mode, label) ->
             Surface(
@@ -1217,15 +1308,30 @@ private fun LyricModeSelector(
                     Color.Transparent
                 },
                 contentColor = Color.White,
-                modifier = Modifier.weight(1f)
+                modifier = Modifier.widthIn(min = 72.dp).heightIn(min = 48.dp)
+                    .semantics { this.selected = selected == mode }
             ) {
                 Text(
                     label,
                     fontSize = 12.sp,
                     fontWeight = if (selected == mode) FontWeight.Bold else FontWeight.Medium,
                     textAlign = TextAlign.Center,
-                    modifier = Modifier.padding(vertical = 8.dp)
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp)
                 )
+            }
+            if (selected == mode && inlineStatus != null) {
+                Text(
+                    inlineStatus,
+                    color = Color.White.copy(alpha = 0.85f),
+                    fontSize = 12.sp,
+                    modifier = Modifier.testTag("lyrics_status").padding(horizontal = 8.dp)
+                )
+                if (onInlineRetry != null) {
+                    TextButton(
+                        onClick = onInlineRetry,
+                        colors = ButtonDefaults.textButtonColors(contentColor = Color.White)
+                    ) { Text("重试") }
+                }
             }
         }
     }
@@ -1238,10 +1344,10 @@ private fun FullLyricsLoadingBanner(
     retry: () -> Unit
 ) {
     Row(
-        Modifier.fillMaxWidth().padding(top = 8.dp)
+        Modifier.fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.10f))
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            .padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(Modifier.weight(1f)) {
@@ -1258,12 +1364,14 @@ private fun FullLyricsLoadingBanner(
                 )
             }
         }
-        TextButton(onClick = retry) { Text("重试", fontSize = 12.sp) }
+        TextButton(onClick = retry, colors = ButtonDefaults.textButtonColors(contentColor = Color.White)) {
+            Text("重试", fontSize = 12.sp)
+        }
     }
 }
 
 @Composable
-private fun FullLyricRow(
+internal fun FullLyricRow(
     line: LyricLine,
     positionMs: Long,
     displayMode: LyricDisplayMode,
@@ -1273,10 +1381,13 @@ private fun FullLyricRow(
     onSelect: () -> Unit,
     onSeek: () -> Unit
 ) {
-    Row(
+    val actionHeight = with(LocalDensity.current) { maxOf(48.dp, 12.sp.toDp() + 16.dp) }
+    Column(
         Modifier.fillMaxWidth()
             .clip(RoundedCornerShape(15.dp))
+            .testTag("lyric_row_${line.index}")
             .clickable(onClick = onSelect)
+            .heightIn(min = 48.dp)
             .background(
                 when {
                     isBrowseSelected -> Color.White.copy(alpha = 0.105f)
@@ -1284,58 +1395,56 @@ private fun FullLyricRow(
                     else -> Color.Transparent
                 }
             )
-            .padding(horizontal = 12.dp, vertical = 11.dp),
-        verticalAlignment = Alignment.CenterVertically
+            .padding(horizontal = 12.dp, vertical = 11.dp)
     ) {
-        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             if (isCurrent) {
                 WordHighlightedText(
                     line = line,
                     positionMs = positionMs,
-                    modifier = Modifier.fillMaxWidth(),
-                    fontSizeValue = if (line.text.length > 48) 21 else 26,
-                    lineHeightValue = if (line.text.length > 48) 27 else 33,
+                    modifier = Modifier.fillMaxWidth().testTag("lyric_original_${line.index}"),
+                    fontSizeValue = if (line.text.length > 48) 17 else 20,
+                    lineHeightValue = if (line.text.length > 48) 23 else 28,
                     textAlign = TextAlign.Start,
                     highlightColor = Color(0xff8ee6a3),
-                    pendingColor = Color.White.copy(alpha = if (isBrowseSelected) 0.60f else 0.34f)
+                    pendingColor = Color.White.copy(alpha = 0.76f),
+                    maxLines = Int.MAX_VALUE
                 )
             } else {
                 Text(
                     line.text,
-                    fontSize = if (line.text.length > 48) 17.sp else if (isBrowseSelected) 22.sp else 20.sp,
+                    modifier = Modifier.testTag("lyric_original_${line.index}"),
+                    fontSize = if (line.text.length > 48) 17.sp else 20.sp,
                     lineHeight = if (line.text.length > 48) 23.sp else 28.sp,
-                    fontWeight = if (isBrowseSelected) FontWeight.SemiBold else FontWeight.Medium,
-                    color = Color.White.copy(alpha = if (isBrowseSelected) 0.92f else 0.43f),
-                    maxLines = 3,
-                    overflow = TextOverflow.Ellipsis
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White.copy(alpha = if (isBrowseSelected) 0.96f else 0.76f)
                 )
             }
-            lyricAuxiliaryLines(line, displayMode).forEach { auxiliary ->
+            lyricAuxiliaryLines(line, displayMode).forEachIndexed { index, auxiliary ->
                 Text(
                     auxiliary,
-                    fontSize = if (isCurrent) 15.sp else 14.sp,
-                    lineHeight = if (isCurrent) 20.sp else 19.sp,
-                    fontWeight = if (isBrowseSelected) FontWeight.SemiBold else FontWeight.Medium,
+                    modifier = Modifier.testTag("lyric_aux_${line.index}_$index"),
+                    fontSize = 14.sp,
+                    lineHeight = 19.sp,
+                    fontWeight = FontWeight.Medium,
                     color = Color.White.copy(
                         alpha = when {
-                            isCurrent -> 0.70f
-                            isBrowseSelected -> 0.62f
-                            else -> 0.32f
+                            isCurrent -> 0.82f
+                            isBrowseSelected -> 0.82f
+                            else -> 0.76f
                         }
-                    ),
-                    maxLines = 3,
-                    overflow = TextOverflow.Ellipsis
+                    )
                 )
             }
         }
+        Box(Modifier.fillMaxWidth().height(actionHeight), contentAlignment = Alignment.CenterEnd) {
         if (isBrowseSelected) {
-            Spacer(Modifier.width(10.dp))
             Surface(
                 onClick = onSeek,
                 enabled = connected,
                 shape = RoundedCornerShape(50),
                 color = Color.White.copy(alpha = 0.14f),
-                modifier = Modifier.testTag("lyric_seek_time_${line.index}")
+                modifier = Modifier.heightIn(min = actionHeight).testTag("lyric_seek_time_${line.index}")
                     .semantics { contentDescription = "跳转到 ${formatDuration(line.timeMs)}" }
             ) {
                 Row(
@@ -1352,6 +1461,7 @@ private fun FullLyricRow(
                 }
             }
         }
+        }
     }
 }
 
@@ -1361,11 +1471,12 @@ private fun FullLyricsControls(
     enabled: Boolean,
     onPrevious: () -> Unit,
     onPlayPause: () -> Unit,
-    onNext: () -> Unit
+    onNext: () -> Unit,
+    compact: Boolean = false
 ) {
     Row(
-        Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 14.dp),
-        horizontalArrangement = Arrangement.spacedBy(30.dp, Alignment.CenterHorizontally),
+        if (compact) Modifier else Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 14.dp),
+        horizontalArrangement = Arrangement.spacedBy(if (compact) 0.dp else 30.dp, Alignment.CenterHorizontally),
         verticalAlignment = Alignment.CenterVertically
     ) {
         IconButton(enabled = enabled, onClick = onPrevious) {
@@ -1374,12 +1485,12 @@ private fun FullLyricsControls(
         FilledIconButton(
             enabled = enabled,
             onClick = onPlayPause,
-            modifier = Modifier.size(58.dp)
+            modifier = Modifier.size(if (compact) 48.dp else 58.dp)
         ) {
             Icon(
                 if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                 if (isPlaying) "暂停" else "播放",
-                Modifier.size(32.dp)
+                Modifier.size(if (compact) 26.dp else 32.dp)
             )
         }
         IconButton(enabled = enabled, onClick = onNext) {
@@ -1395,6 +1506,15 @@ private fun HistoryScreen(
     navController: NavHostController
 ) {
     val history by viewModel.history.collectAsStateWithLifecycle()
+    // Entering an older window keeps the current scroll anchor. Returning to
+    // recent replaces the list and its state together, instead of scrolling a
+    // list whose backing window has just shrunk from 1000 to 500 rows.
+    val previousListState = remember { arrayOfNulls<LazyListState>(1) }
+    val listState = rememberSaveable(history.showingOlderWindow, saver = LazyListState.Saver) {
+        if (history.showingOlderWindow) previousListState[0] ?: LazyListState()
+        else LazyListState()
+    }
+    SideEffect { previousListState[0] = listState }
     var range by remember { mutableStateOf("TODAY") }
     LaunchedEffect(Unit) { viewModel.syncHistory() }
     Scaffold(
@@ -1403,93 +1523,135 @@ private fun HistoryScreen(
                 title = "播放历史",
                 navController = navController,
                 action = {
-                    IconButton(onClick = viewModel::syncHistory) {
+                    IconButton(
+                        onClick = viewModel::syncHistory,
+                        enabled = !history.loading && !history.clearing
+                    ) {
                         Icon(Icons.Default.Sync, "同步历史")
                     }
                 }
             )
         }
     ) { padding ->
-        LazyColumn(
-            Modifier.fillMaxSize(),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                top = padding.calculateTopPadding() + 12.dp,
-                bottom = padding.calculateBottomPadding() + 28.dp,
-                start = 16.dp,
-                end = 16.dp
-            ),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            item {
-                StatsRangeSelector(range) { range = it }
-            }
-            history.stats[range]?.let { stats ->
-                item { StatsOverview(stats) }
-            }
-            item {
-                Text(
-                    "最近播放",
-                    style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.padding(top = 8.dp)
-                )
-            }
-            if (history.sessions.isEmpty()) {
-                item {
-                    Text(
-                        history.status.ifBlank { if (history.loading) "正在同步…" else "暂无历史" },
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(vertical = 28.dp)
-                    )
-                }
-            }
-            items(history.sessions, key = { it.sessionId }) { session ->
-                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        HistoryArtwork(session.artworkId, viewModel)
-                        Spacer(Modifier.width(12.dp))
-                        Column(Modifier.weight(1f)) {
+        Column(Modifier.fillMaxSize().padding(top = padding.calculateTopPadding())) {
+            HistoryStatusPanel(history, range, viewModel)
+            key(history.showingOlderWindow) {
+                LazyColumn(
+                    Modifier.weight(1f).testTag("history_list"),
+                    state = listState,
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                        top = 12.dp,
+                        bottom = padding.calculateBottomPadding() + 28.dp,
+                        start = 16.dp,
+                        end = 16.dp
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    item(key = "history_range", contentType = "history_range") {
+                        StatsRangeSelector(range) { range = it }
+                    }
+                    history.stats[range]?.let { stats ->
+                        item(key = "history_stats", contentType = "history_stats") { StatsOverview(stats) }
+                    }
+                    item(key = "history_recent_title", contentType = "history_recent_title") {
+                        Text(
+                            "最近播放",
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.padding(top = 8.dp)
+                        )
+                    }
+                    if (history.sessions.isEmpty()) {
+                        item(key = "history_empty", contentType = "history_empty") {
                             Text(
-                                session.title.ifBlank { "未知歌曲" },
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                fontWeight = FontWeight.Medium
-                            )
-                            Text(
-                                "${session.artist} · ${formatDate(session.startedAt)}",
+                                history.status.ifBlank { if (history.loading) "正在同步…" else "暂无历史" },
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontSize = 13.sp,
-                                maxLines = 1
+                                modifier = Modifier.padding(vertical = 28.dp)
                             )
                         }
-                        Column(horizontalAlignment = Alignment.End) {
-                            Text(formatDuration(session.listenedMs))
-                            Text(
-                                when {
-                                    session.completed -> "已完播"
-                                    session.skipped -> "已跳过"
-                                    else -> "播放中断"
-                                },
-                                fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                    }
+                    items(history.sessions, key = { it.sessionId }, contentType = { "history_session" }) { session ->
+                        Card(
+                            modifier = Modifier.testTag("history_session_${session.sessionId}"),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                        ) {
+                            Row(
+                                Modifier.fillMaxWidth().padding(14.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                HistoryArtwork(session.artworkId, viewModel)
+                                Spacer(Modifier.width(12.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        session.title.ifBlank { "未知歌曲" },
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    Text(
+                                        "${session.artist} · ${formatDate(session.startedAt)}",
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        fontSize = 13.sp,
+                                        maxLines = 1
+                                    )
+                                }
+                                Column(horizontalAlignment = Alignment.End) {
+                                    Text(formatDuration(session.listenedMs))
+                                    Text(
+                                        HistoryDisplayPolicy.status(session),
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    if (history.sessions.isNotEmpty() && history.hasMore) {
+                        item(key = "history_load_more", contentType = "history_load_more") {
+                            OutlinedButton(
+                                onClick = viewModel::loadMoreHistory,
+                                enabled = !history.loading && !history.clearing,
+                                modifier = Modifier.fillMaxWidth().testTag("history_load_more")
+                            ) {
+                                Text(if (history.loading) "正在加载…" else "加载更早记录")
+                            }
                         }
                     }
                 }
             }
-            if (history.sessions.isNotEmpty() && history.hasMore) {
-                item {
-                    OutlinedButton(
-                        onClick = viewModel::loadMoreHistory,
-                        enabled = !history.loading,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(if (history.loading) "正在加载…" else "加载更多")
-                    }
-                }
-            }
+        }
+    }
+}
+
+@Composable
+private fun HistoryStatusPanel(history: HistoryState, range: String, viewModel: ControllerViewModel) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        if (history.loading || history.clearing) LinearProgressIndicator(Modifier.fillMaxWidth())
+        Text(
+            history.status.ifBlank { "同步 Sony 播放历史，保留本地缓存" },
+            modifier = Modifier.testTag("history_status"),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        if (range in history.failedRanges) {
+            Text(
+                if (range in history.stats) "当前范围统计更新失败，显示上次数据" else "当前范围统计更新失败，可重试",
+                color = MaterialTheme.colorScheme.error
+            )
+            OutlinedButton(
+                onClick = viewModel::syncHistory,
+                enabled = !history.loading && !history.clearing
+            ) { Text("重试同步") }
+        }
+        if (history.showingOlderWindow) {
+            Text("正在查看更早记录，每次最多展示 1000 条", style = MaterialTheme.typography.bodySmall)
+            OutlinedButton(
+                onClick = viewModel::showRecentHistory,
+                enabled = !history.loading && !history.clearing,
+                modifier = Modifier.testTag("history_show_recent")
+            ) { Text("返回最近播放") }
         }
     }
 }
@@ -1561,6 +1723,12 @@ private fun StatsOverview(stats: com.example.controllerapp.model.PlaybackStats) 
                 Stat("跳过率", "${(stats.skipRate * 100).toInt()}%")
                 Stat("趋势", "${stats.dailyTrend.size} 天")
             }
+            Text(
+                "统计按会话开始时间归属所选范围，本周和本月采用 Sony 当地自然周、自然月。实际收听满 30 秒，或歌曲时长已知且听满一半，计为一次有效播放；时长未知时以 30 秒为准。进行中会话计入收听时长及已达到门槛的播放次数，但不计入完播率和跳过率；两项比率均以已结束会话数为分母。",
+                modifier = Modifier.testTag("stats_explanation"),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             stats.topTracks.firstOrNull()?.let {
                 Text(
                     "常听歌曲：${it.title} · ${it.artist}",
@@ -1920,6 +2088,23 @@ private fun DebugToolsScreen(
 ) {
     val diagnostics by viewModel.diagnostics.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    var confirmSnapshotDeletion by remember { mutableStateOf(false) }
+    if (confirmSnapshotDeletion) {
+        AlertDialog(
+            onDismissRequest = { confirmSnapshotDeletion = false },
+            title = { Text("删除已导出的日志副本？") },
+            text = { Text("删除后，尚未读取完成的分享可能失败；本地日志不会被删除。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmSnapshotDeletion = false
+                    viewModel.clearExportedLogs { success ->
+                        Toast.makeText(context, if (success) "已删除导出副本" else "删除导出副本失败", Toast.LENGTH_LONG).show()
+                    }
+                }) { Text("删除") }
+            },
+            dismissButton = { TextButton(onClick = { confirmSnapshotDeletion = false }) { Text("取消") } }
+        )
+    }
     Scaffold(topBar = { ControllerTopBar("调试工具", navController) }) { padding ->
         Column(
             Modifier.fillMaxSize()
@@ -1943,27 +2128,35 @@ private fun DebugToolsScreen(
             DebugAction("获取 Sony 日志", Icons.Default.ContentCopy, viewModel::requestSonyLogs)
             DebugAction("获取 Media Dump", Icons.Default.ContentCopy, viewModel::requestMediaDump)
             DebugAction("分享 Android 日志", Icons.Default.Share) {
-                val file = viewModel.logFile()
-                if (file.exists()) {
-                    val uri = FileProvider.getUriForFile(
-                        context,
-                        "${context.packageName}.files",
-                        file
-                    )
-                    context.startActivity(
-                        Intent.createChooser(
-                            Intent(Intent.ACTION_SEND).apply {
-                                type = "text/plain"
-                                putExtra(Intent.EXTRA_STREAM, uri)
-                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            },
-                            "分享诊断日志"
-                        )
-                    )
+                viewModel.exportLogs { file, error ->
+                    if (file == null) {
+                        Toast.makeText(context, "日志导出失败：${error ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                    } else {
+                        try {
+                            val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+                            context.startActivity(
+                                Intent.createChooser(
+                                    Intent(Intent.ACTION_SEND).apply {
+                                        type = "text/plain"
+                                        putExtra(Intent.EXTRA_STREAM, uri)
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    },
+                                    "分享诊断日志"
+                                )
+                            )
+                        } catch (_: Exception) {
+                            Toast.makeText(context, "无法打开日志分享", Toast.LENGTH_LONG).show()
+                        }
+                    }
                 }
             }
+            TextButton(onClick = { confirmSnapshotDeletion = true }) { Text("删除已导出的日志副本") }
             OutlinedButton(
-                onClick = viewModel::clearLogs,
+                onClick = {
+                    viewModel.clearLogs { success ->
+                        Toast.makeText(context, if (success) "已清理本地日志" else "清理本地日志失败", Toast.LENGTH_LONG).show()
+                    }
+                },
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Icon(Icons.Default.Close, null)

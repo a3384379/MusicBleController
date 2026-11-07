@@ -244,3 +244,84 @@ Sony scheduler 段已经收敛：eligible → scheduler p95 0ms、scheduler → 
 后续 authority-acceptance fast lane 在 Sony 已确认 MediaSession 新身份时先建立正式 runtime generation 并发布现有 TrackInfo，再继续歌词、capability 和诊断工作；没有新增协议、UUID、持续轮询或预测展示。NEXT/PREVIOUS 30 次的 command → Track p95 分别为 546.4ms/391.8ms，metadata observed → Track accepted p95 为 30.5ms/14.0ms；前者仍受 QQ 音乐暴露 metadata 时机限制。带逐字 QRC 的 90 秒专用窗口记录到 27 条 iOS accepted，日志派生 CurrentWord latency p95=114ms、stale=0、main stall=0；该稳态结果不替代统一 Trace 的切歌首字验收。100 次快速交替切歌以 `STALE_CONTENT=0/duplicate_control=0` PASS。
 
 2026-09-05 最终安装版 NEXT 5 次的 Trace 完整性仍为 PASS，但 command → Track p95=3153.6ms（dispatch → metadata p95=2838.2ms），Preview p95=2643.2ms，无 word eligible 样本。小样本保留为长尾反例，不能仅引用前一日 30 次数据宣称整体稳定达标；详见第四阶段报告第 21 节。
+
+## 20. 严格验收与连续采集（2026-11）
+
+`realtime_latency_v4_test.sh` 保留 `report.json` 和原分段指标，并额外输出
+`acceptance.json`：分别列出 capture、trace、correctness、slo、stability，整体结果为
+`PASS`、`FAIL` 或 `INCOMPLETE`。退出码依次为 0、1、2；单独运行
+`realtime_latency_report.py` 返回 0 只表示报告生成成功。原有 `trackTo*` 从 iOS
+身份确认开始；新增 `t0To*` 逐样本从手动命令意图或可信跨端时钟下的 Sony 身份
+确认计算，不相加分段 p95。`t0Samples` 中无法验证 generation 的媒体值为 null，
+包括旧版未记录 generation 的 Preview/HQ；它们不能用于宣称达标。
+
+工具在主机持续写 Sony logcat，周期复制 iOS current/old/current 三个原始快照，
+保存每个原始文件、复制输出及错误、SHA-256 和字节前缀连续性结果。采集失败、
+轮转前缀消失、重复前缀歧义、长空窗或采集器提前退出都会保留证据且不能通过。
+`sha256.json` 索引本轮产物；输出目录必须为空。自然播放实际观测窗口须达到
+7200 秒，提前结束不合格；运行内外部 NEXT/PREVIOUS 不会被改称自然切歌。
+NEXT/PREVIOUS 各至少 30 个完整有效样本，失败样本不计入；快速场景逐条记录
+100 次交替操作及命令发送、Sony 接收和执行，缺失分别报告。
+
+例子（安装证据格式见下文，工具不会安装应用）：
+
+```bash
+./tools/smoke/realtime_latency_v4_test.sh --runs 30 --installed-builds /path/to/builds.json --json
+./tools/smoke/realtime_latency_v4_test.sh --runs 100 --fast-switch --installed-builds /path/to/builds.json --json
+./tools/smoke/realtime_latency_v4_test.sh --natural --duration-minutes 120 --installed-builds /path/to/builds.json --json
+```
+
+安装证据 JSON 顶层 `ios` 包含 `artifact`、`sha256`、`appPath`、`infoPlist`、
+`infoPlistSha256`、`version`（CFBundleVersion）、`bundleIdentifier`、`deviceId`、
+`installReceipt`、`installReceiptSha256`、`appsReceipt`、`appsReceiptSha256`、
+`codesignEvidence`、`codesignEvidenceSha256` 和 `cdHash`。本机签名文件和 plist
+须位于安装的 .app，安装及 apps 查询使用原始 devicectl JSON。此链只证明安装
+命令、签名和设备查询一致，不能伪称已读取 iOS 设备二进制。
+
+`sony` 包含 `artifact`、`sha256`、`installedApk`、`installedApkSha256`、
+`version`、`deviceId`、`packageName`、`installReceipt`、`installReceiptSha256`、
+`packageInfo` 和 `packageInfoSha256`；本机 APK 与设备 pull 的 APK 哈希须一致，
+安装及 package 查询使用原始证据。文件路径可为绝对路径或相对于报告目录。
+
+`source` 包含 `head`、`dirtyDiffFile`、`dirtyDiffSha256`、`sourceHashesFile`、
+`sourceHashesSha256`、`buildLogFile`、`buildLogSha256`；source hashes JSON 的
+`files` 字段映射源文件路径到 SHA-256。工具核对源码 HEAD、文件与安装设备，
+留存构建材料；这些材料不单独证明构建过程。运行中来源发生变化应重新构建。
+
+严格工具检查 iOS 实际 scheduled/start/end runId、Sony 主机 marker、Sony Trace
+进程 PID、两端单调时钟回退、采集器生存/退出和窗口覆盖，缺失或不一致标记
+INCOMPLETE。启动前先采集基线，再绑定本次启动后第一个新 runId；后续重启单独
+保留并判 FAIL。工具重新从已哈希的本轮原始日志解析和核对报告与事件文件，
+不能把其他轮次的结果当作当前证据。逐样本直接计算 command enqueue→Sony receive、word eligible→
+publish、lyric ready→FullLyrics，跨端时钟不可信或身份无法唯一关联时为空；
+逐字不可用、前奏等待和歌词缓存等待的样本单独分类，前奏等待不按立即首字
+500ms 误判。Track、歌词和封面分别依据对应资源的缓存证据分组，各组独立检查
+p95；来源没有明确的封面缓存未命中事件时该组为 INCOMPLETE。
+
+严格跨端指标使用每条 ClockSync pong/reset 的 iOS 单调时刻建立可信窗口，样本
+起止须处在同一个窗口；每个窗口最长 150 秒（120 秒刷新间隔加 30 秒调度余量），
+样本数回退、未定位的 reset、过期或大于 100ms 的 offset 跳变不会被之后的可信
+采样追溯补齐。历史报告仍保留原有时钟与分段字段，其值不替代严格逐样本判定。
+
+通过 `--ios-syslog-udid <UDID>` 可使用 PATH 中接受 `-u <UDID>` 的
+`idevicesyslog` 命令或兼容适配器持续采集系统流；产物记录实际可执行文件路径、
+哈希、完整参数与 devicectl 的设备 ID/UDID 对照，不推断采集器实现；
+完整系统流、裁剪窗口、哈希和稳定性扫描按块或按行处理；窗口包含跨边界的完整
+行，并保留有界故障示例与全部原始日志。
+没有完整 iOS 系统流时 stability 为 INCOMPLETE，不能用无新增 crash 文件冒充
+完整系统日志。首字/稳态、第二控制器、CPU、内存和能耗 A/B 单列未评估。
+旧版报告中的历史 PASS 只表示当时 Trace 样本采集完成，不表示通过当前严格 SLO
+或稳定性验收。
+
+可单独运行 `python3 tools/smoke/realtime_resource_capture.py --serial <Sony序列号>
+--duration-seconds 7200 --interval-seconds 60 --output-dir <新目录>`，按主机单调
+时钟保存 `dumpsys cpuinfo` 与 PlayerAgent `dumpsys meminfo` 的原始输出、错误、
+退出码及哈希。采样本身可能影响负载，应在相同条件下解释；返回 0 只表示这些
+命令有输出，不等于 CPU、内存、能耗或 A/B 验收通过。它不采集 iOS 或能耗。
+
+## 21. 自用范围调整（2026-11）
+
+本轮按使用者决定，取消第七批真实双端性能采样、120 分钟自然播放、双控制器和
+能耗 A/B 对照，不再将这些重型实机验收作为本次交付门槛。上述性能采集和严格
+验收工具保留，今后仅在需要时手动运行；工具检查通过不代表已完成本轮取消的
+实机验收。本文既有历史 SLO 数据及其通过、未达标或未验证结论保持原样。

@@ -11,6 +11,7 @@ if [[ -z "${OUT_DIR:-}" ]]; then
   OUT_DIR="$(dirname "$LOG_PATH")"
 fi
 JSON_PATH="$OUT_DIR/control_service_autostart.json"
+source "$(cd "$(dirname "$0")" && pwd)/logcat_snapshot.sh"
 
 # Service startup is intentionally asynchronous on the low-power Sony player.
 # When the launch snapshot already contains the auto-start request, give the
@@ -20,7 +21,7 @@ if [[ -n "${ADB_BIN:-}" && -n "${DEVICE_ID:-}" ]] && \
   ! grep -Eq "\[BleGattServer\] (started|already started)" "$LOG_PATH"; then
   for _ in 1 2 3 4 5 6; do
     sleep 1
-    "$ADB_BIN" -s "$DEVICE_ID" logcat -d > "$LOG_PATH" || true
+    refresh_logcat_snapshot "$LOG_PATH" || true
     if grep -Eq "\[BleGattServer\] (started|already started)" "$LOG_PATH"; then
       break
     fi

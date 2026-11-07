@@ -1,5 +1,6 @@
 import AVFoundation
 import AVKit
+import Combine
 import CoreImage
 import SwiftUI
 import UIKit
@@ -853,6 +854,7 @@ final class LyricsPresentationTests: XCTestCase {
         var attempts = 0
         let manager = BLETestManager(automaticallyStartBluetooth: false, lyricsPresentationUptime: { now },
                                     floatingPlaybackCommandSender: { _, _, _ in attempts += 1; return .debounced })
+        manager.commandSenderForTesting = { _, _ in true }
         manager.configureResponseTests(trackID: "lyrics-expired-unsent-\(UUID().uuidString)")
         receivePlayback(manager, playing: true)
         XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
@@ -875,6 +877,7 @@ final class LyricsPresentationTests: XCTestCase {
             sent += 1
             return .sent
         })
+        manager.commandSenderForTesting = { _, _ in true }
         manager.configureResponseTests(trackID: "lyrics-deferred-target-\(UUID().uuidString)")
         receivePlayback(manager, playing: true)
         XCTAssertTrue(manager.requestFloatingLyricsPlayback(false))
@@ -1594,3 +1597,326 @@ private final class IgnoredPiPControlsFixture: NSObject {
     }
 }
 #endif
+
+extension LyricsPresentationTests {
+    @MainActor
+    func testProgressRefreshRejectsPlaybackQueuedBeforeTransportLoss() async {
+        let preferences = PreferencesStore.shared
+        let original = preferences.playbackPerformanceMode
+        defer { preferences.playbackPerformanceMode = original }
+        let fixture = makeProgressRefreshFixture(mode: .smooth)
+        fixture.environment.uptime += 1
+        fixture.scheduler.entries[0].action()
+        let submitted = DispatchSemaphore(value: 0)
+        let manager = fixture.manager
+        var packet = progressRefreshPacket()
+        packet["position"] = 50_000
+        let queuedPacket = packet
+        DispatchQueue.global().async {
+            manager.receiveStatusForTesting(queuedPacket)
+            submitted.signal()
+        }
+        XCTAssertEqual(submitted.wait(timeout: .now() + 2), .success)
+        manager.disconnectResponseTests()
+        let drained = expectation(description: "queued inbound apply drained")
+        DispatchQueue.main.async { drained.fulfill() }
+        await fulfillment(of: [drained], timeout: 2)
+        XCTAssertEqual(manager.displayPositionMs, 2_000)
+        XCTAssertEqual(fixture.scheduler.entries.count, 1)
+        XCTAssertTrue(fixture.scheduler.entries[0].cancelled)
+        fixture.environment.uptime += 60
+        fixture.scheduler.entries[0].action()
+        XCTAssertEqual(manager.displayPositionMs, 2_000)
+    }
+
+    @MainActor
+    func testProgressRefreshDisconnectFreezesUntilNewPlaybackAnchor() {
+        let preferences = PreferencesStore.shared
+        let original = preferences.playbackPerformanceMode
+        defer { preferences.playbackPerformanceMode = original }
+        let fixture = makeProgressRefreshFixture(mode: .smooth)
+        fixture.environment.uptime += 1
+        fixture.scheduler.entries[0].action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 2_000)
+
+        fixture.manager.disconnectResponseTests()
+        XCTAssertTrue(fixture.scheduler.entries[0].cancelled)
+        XCTAssertEqual(fixture.manager.displayPositionMs, 2_000, "Disconnect preserves the last displayed position")
+        fixture.environment.uptime += 60
+        fixture.scheduler.entries[0].action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 2_000, "A stale timer cannot advance offline progress")
+        preferences.playbackPerformanceMode = .powerSaving
+        fixture.center.post(name: UIApplication.willResignActiveNotification, object: nil)
+        fixture.center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        fixture.manager.configureResponseTests(trackID: "refresh-fixture")
+        fixture.manager.receiveStatusForTesting(["type": "link"])
+        fixture.manager.receiveStatusForTesting(["type": "pong"])
+        fixture.manager.receiveStatusForTesting(["type": "playbackState", "playing": true, "position": -1])
+        XCTAssertEqual(fixture.scheduler.entries.count, 1, "Transport readiness and invalid packets do not restore an anchor")
+        XCTAssertEqual(fixture.manager.displayPositionMs, 2_000)
+
+        var packet = progressRefreshPacket()
+        packet["position"] = 8_000
+        fixture.manager.receiveStatusForTesting(packet)
+        XCTAssertEqual(fixture.scheduler.entries.map(\.interval), [0.1, 0.5])
+        XCTAssertEqual(fixture.manager.displayPositionMs, 8_000)
+        fixture.environment.uptime += 0.5
+        fixture.scheduler.entries[0].action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 8_000)
+        fixture.scheduler.entries.last?.action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 8_500, "Reconnect starts from the new anchor without the offline elapsed time")
+    }
+
+    @MainActor
+    func testProgressRefreshDisconnectDuringSeekKeepsEditAndRejectsUnanchoredResume() {
+        let preferences = PreferencesStore.shared
+        let original = preferences.playbackPerformanceMode
+        defer { preferences.playbackPerformanceMode = original }
+        let fixture = makeProgressRefreshFixture(mode: .automatic)
+        fixture.manager.beginSeeking()
+        fixture.manager.updateSeekPosition(30_000)
+        fixture.manager.disconnectResponseTests()
+        fixture.manager.configureResponseTests(trackID: "refresh-fixture")
+        fixture.manager.receiveStatusForTesting(progressRefreshPacket())
+        preferences.playbackPerformanceMode = .smooth
+        XCTAssertEqual(fixture.manager.seekPositionMs, 30_000)
+        XCTAssertTrue(fixture.scheduler.entries.allSatisfy(\.cancelled))
+        XCTAssertEqual(fixture.scheduler.entries.count, 1, "A packet ignored during seek cannot authorize progress interpolation")
+        fixture.manager.finishSeeking()
+        fixture.environment.uptime += 5
+        fixture.scheduler.entries[0].action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 30_000)
+        fixture.manager.receiveStatusForTesting(progressRefreshPacket())
+        XCTAssertEqual(fixture.scheduler.entries.count, 2)
+        fixture.environment.uptime += 0.1
+        fixture.scheduler.entries.last?.action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 1_100)
+    }
+
+    @MainActor
+    func testProgressRefreshModeChangesPreserveClockAndRejectCancelledTicks() {
+        let preferences = PreferencesStore.shared
+        let original = preferences.playbackPerformanceMode
+        defer { preferences.playbackPerformanceMode = original }
+        let fixture = makeProgressRefreshFixture(mode: .smooth)
+        XCTAssertEqual(fixture.scheduler.entries.map(\.interval), [0.1])
+        fixture.environment.uptime += 1
+        fixture.scheduler.entries[0].action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 2_000)
+
+        // No new playback packet arrives between these preference changes.
+        preferences.playbackPerformanceMode = .powerSaving
+        XCTAssertEqual(fixture.scheduler.entries.map(\.interval), [0.1, 0.5])
+        XCTAssertTrue(fixture.scheduler.entries[0].cancelled)
+        XCTAssertEqual(fixture.manager.displayPositionMs, 2_000)
+        fixture.environment.uptime += 0.5
+        fixture.scheduler.entries[0].action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 2_000, "Cancelled work cannot publish")
+        fixture.scheduler.entries[1].action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 2_500, "Mode changes preserve the original anchor")
+
+        preferences.playbackPerformanceMode = .automatic
+        preferences.playbackPerformanceMode = .smooth
+        preferences.playbackPerformanceMode = .smooth
+        XCTAssertEqual(fixture.scheduler.entries.map(\.interval), [0.1, 0.5, 0.25, 0.1])
+        XCTAssertEqual(fixture.scheduler.entries.filter { !$0.cancelled }.count, 1)
+    }
+
+    @MainActor
+    func testProgressRefreshLowPowerEventsDeduplicateEquivalentPolicies() {
+        let preferences = PreferencesStore.shared
+        let original = preferences.playbackPerformanceMode
+        defer { preferences.playbackPerformanceMode = original }
+        let fixture = makeProgressRefreshFixture(mode: .automatic)
+        XCTAssertEqual(fixture.scheduler.entries.map(\.interval), [0.25])
+        fixture.environment.lowPower = true
+        fixture.center.post(name: .NSProcessInfoPowerStateDidChange, object: nil)
+        XCTAssertEqual(fixture.scheduler.entries.map(\.interval), [0.25, 0.5])
+        preferences.playbackPerformanceMode = .powerSaving
+        preferences.playbackPerformanceMode = .automatic
+        fixture.center.post(name: .NSProcessInfoPowerStateDidChange, object: nil)
+        XCTAssertEqual(fixture.scheduler.entries.count, 2, "Automatic low-power and power-saving share one schedule")
+        fixture.environment.lowPower = false
+        fixture.center.post(name: .NSProcessInfoPowerStateDidChange, object: nil)
+        XCTAssertEqual(fixture.scheduler.entries.map(\.interval), [0.25, 0.5, 0.25])
+        preferences.playbackPerformanceMode = .smooth
+        fixture.environment.lowPower = true
+        fixture.center.post(name: .NSProcessInfoPowerStateDidChange, object: nil)
+        XCTAssertEqual(fixture.scheduler.entries.map(\.interval), [0.25, 0.5, 0.25, 0.1])
+        XCTAssertEqual(fixture.scheduler.entries.filter { !$0.cancelled }.count, 1)
+    }
+
+    @MainActor
+    func testProgressRefreshLifecycleUsesLatestPolicyAndStopsForPauseOrMissingDuration() {
+        let preferences = PreferencesStore.shared
+        let original = preferences.playbackPerformanceMode
+        defer { preferences.playbackPerformanceMode = original }
+        let fixture = makeProgressRefreshFixture(mode: .automatic)
+        fixture.center.post(name: UIApplication.willResignActiveNotification, object: nil)
+        XCTAssertTrue(fixture.scheduler.entries[0].cancelled)
+        preferences.playbackPerformanceMode = .smooth
+        fixture.center.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+        preferences.playbackPerformanceMode = .automatic
+        fixture.environment.lowPower = true // No power notification while suspended.
+        XCTAssertEqual(fixture.scheduler.entries.count, 1)
+        fixture.center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        XCTAssertEqual(fixture.scheduler.entries.map(\.interval), [0.25, 0.5])
+        fixture.center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        XCTAssertEqual(fixture.scheduler.entries.count, 2)
+
+        fixture.manager.receiveStatusForTesting(progressRefreshPacket(playing: false))
+        XCTAssertTrue(fixture.scheduler.entries[1].cancelled)
+        preferences.playbackPerformanceMode = .smooth
+        XCTAssertEqual(fixture.scheduler.entries.count, 2)
+        fixture.manager.receiveStatusForTesting(progressRefreshPacket(duration: 0))
+        XCTAssertEqual(fixture.scheduler.entries.count, 2)
+        XCTAssertTrue(fixture.scheduler.entries.allSatisfy(\.cancelled))
+        fixture.manager.receiveStatusForTesting(progressRefreshPacket())
+        XCTAssertEqual(fixture.scheduler.entries.map(\.interval), [0.25, 0.5, 0.1])
+    }
+
+    @MainActor
+    func testProgressRefreshModeChangesRespectSeekEditingAndNewAnchor() {
+        let preferences = PreferencesStore.shared
+        let original = preferences.playbackPerformanceMode
+        defer { preferences.playbackPerformanceMode = original }
+        let fixture = makeProgressRefreshFixture(mode: .smooth)
+        fixture.environment.uptime += 1
+        fixture.scheduler.entries[0].action()
+        fixture.manager.beginSeeking()
+        fixture.manager.updateSeekPosition(30_000)
+        preferences.playbackPerformanceMode = .powerSaving
+        fixture.environment.uptime += 2
+        fixture.scheduler.entries[1].action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 2_000)
+        XCTAssertEqual(fixture.manager.seekPositionMs, 30_000)
+        fixture.manager.finishSeeking()
+        fixture.environment.uptime += 0.5
+        fixture.scheduler.entries[1].action()
+        XCTAssertEqual(fixture.manager.displayPositionMs, 30_500)
+    }
+
+    @MainActor
+    func testProgressRefreshReleaseCancelsTimerAndPreferenceLifecycleSubscriptions() async throws {
+        let preferences = PreferencesStore.shared
+        let original = preferences.playbackPerformanceMode
+        defer { preferences.playbackPerformanceMode = original }
+        preferences.playbackPerformanceMode = .automatic
+        let center = NotificationCenter()
+        let environment = ProgressRefreshEnvironment()
+        let scheduler = ProgressRefreshSchedulerSpy()
+        let power = PlaybackPowerState(notificationCenter: center, isLowPowerModeEnabled: { environment.lowPower })
+        var manager: BLETestManager? = BLETestManager(
+            automaticallyStartBluetooth: false, playbackPowerState: power,
+            progressTimerScheduler: scheduler.schedule, progressUptime: { environment.uptime },
+            progressNotificationCenter: center
+        )
+        manager?.configureResponseTests(trackID: "refresh-release")
+        manager?.receiveStatusForTesting(progressRefreshPacket())
+        weak var released: BLETestManager?
+        released = manager
+        XCTAssertEqual(scheduler.entries.count, 1)
+        manager = nil
+        // Packet handling may have already enqueued finite publication work.
+        // Drain it before checking whether observers or timers retain the owner.
+        try await waitUntil { released == nil }
+        XCTAssertNil(released)
+        XCTAssertTrue(scheduler.entries[0].cancelled)
+        preferences.playbackPerformanceMode = .smooth
+        environment.lowPower = true
+        center.post(name: .NSProcessInfoPowerStateDidChange, object: nil)
+        center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        XCTAssertEqual(scheduler.entries.count, 1)
+    }
+
+    @MainActor
+    func testProgressRefreshPowerNotificationsFromBackgroundPublishOnMain() async throws {
+        let center = NotificationCenter()
+        let environment = ProgressRefreshEnvironment()
+        let power = PlaybackPowerState(notificationCenter: center, isLowPowerModeEnabled: { environment.lowPower })
+        let changed = expectation(description: "low-power change on main")
+        let subscription = power.$isLowPowerModeEnabled.dropFirst().sink { enabled in
+            XCTAssertTrue(Thread.isMainThread)
+            XCTAssertTrue(enabled)
+            changed.fulfill()
+        }
+        defer { subscription.cancel() }
+        environment.lowPower = true
+        DispatchQueue.global().async { center.post(name: .NSProcessInfoPowerStateDidChange, object: nil) }
+        await fulfillment(of: [changed], timeout: 2)
+        XCTAssertTrue(power.isLowPowerModeEnabled)
+    }
+
+    @MainActor
+    func testProgressRefreshFoundationTimerDeliversAndCancelsCallbacks() async throws {
+        let delivered = expectation(description: "two real progress timer callbacks")
+        var callbacks = 0
+        var schedule: AnyCancellable?
+        schedule = PlaybackProgressTimer.schedule(every: 0.01) {
+            XCTAssertTrue(Thread.isMainThread)
+            callbacks += 1
+            if callbacks == 2 {
+                schedule?.cancel()
+                delivered.fulfill()
+            }
+        }
+        defer { schedule?.cancel(); schedule = nil }
+        await fulfillment(of: [delivered], timeout: 2)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(callbacks, 2, "Invalidated Foundation Timer must stop delivering")
+    }
+
+    @MainActor
+    private func makeProgressRefreshFixture(mode: PlaybackPerformanceMode) -> ProgressRefreshFixture {
+        PreferencesStore.shared.playbackPerformanceMode = mode
+        let environment = ProgressRefreshEnvironment()
+        let center = NotificationCenter()
+        let scheduler = ProgressRefreshSchedulerSpy()
+        let power = PlaybackPowerState(notificationCenter: center, isLowPowerModeEnabled: { environment.lowPower })
+        let manager = BLETestManager(
+            automaticallyStartBluetooth: false, playbackPowerState: power,
+            progressTimerScheduler: scheduler.schedule, progressUptime: { environment.uptime },
+            progressNotificationCenter: center
+        )
+        manager.configureResponseTests(trackID: "refresh-fixture")
+        manager.commandSenderForTesting = { _, _ in true }
+        manager.receiveStatusForTesting(progressRefreshPacket())
+        return ProgressRefreshFixture(manager: manager, center: center, environment: environment,
+                                      scheduler: scheduler, power: power)
+    }
+
+    private func progressRefreshPacket(playing: Bool = true, duration: Int64 = 180_000) -> [String: Any] {
+        ["type": "playbackState", "playing": playing, "position": 1_000, "duration": duration, "speed": 1.0]
+    }
+}
+
+private final class ProgressRefreshEnvironment {
+    var uptime: TimeInterval = 10
+    var lowPower = false
+}
+
+private final class ProgressRefreshSchedulerSpy {
+    final class Entry {
+        let interval: TimeInterval
+        let action: () -> Void
+        var cancelled = false
+        init(interval: TimeInterval, action: @escaping () -> Void) {
+            self.interval = interval
+            self.action = action
+        }
+    }
+    var entries: [Entry] = []
+    func schedule(interval: TimeInterval, action: @escaping () -> Void) -> AnyCancellable {
+        let entry = Entry(interval: interval, action: action)
+        entries.append(entry)
+        return AnyCancellable { entry.cancelled = true }
+    }
+}
+
+private struct ProgressRefreshFixture {
+    let manager: BLETestManager
+    let center: NotificationCenter
+    let environment: ProgressRefreshEnvironment
+    let scheduler: ProgressRefreshSchedulerSpy
+    let power: PlaybackPowerState
+}

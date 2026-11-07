@@ -7,6 +7,7 @@ struct FullLyricsView: View {
     let albumArtImage: UIImage?
     let lyrics: [LyricLine]
     let lyricsIdentity: String
+    var lyricsRevision: UInt64 = 0
     let currentIndex: Int
     let positionMs: Int64
     let translationState: LyricSecondaryLoadState
@@ -26,27 +27,56 @@ struct FullLyricsView: View {
     @State private var browseGeometry = FullLyricsBrowseGeometry()
     @State private var browsePreviewIndex: Int?
     @State private var lastAutoScrolledIndex: Int?
+    @State private var pendingReadingAnchor: PendingReadingAnchor?
+    @State private var readingRestoreFence = FullLyricsRestoreFence()
+    @State private var scrollPosition = ScrollPosition(idType: Int.self)
     @ObservedObject private var preferences = PreferencesStore.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @ScaledMetric(relativeTo: .title3) private var lyricSize: CGFloat = 21
+    @ScaledMetric(relativeTo: .subheadline) private var secondarySize: CGFloat = 15
+    @ScaledMetric(relativeTo: .caption) private var footerHeight: CGFloat = 44
 
     private var isBrowsingLyrics: Bool { followState.showsReturnToCurrent }
+    private var currentLineID: Int? {
+        lyrics.indices.contains(currentIndex) ? lyrics[currentIndex].id : nil
+    }
+    private var layoutKey: FullLyricsLayoutKey {
+        FullLyricsLayoutKey(documentRevision: lyricsRevision, mode: displayMode, dynamicTypeSize: dynamicTypeSize)
+    }
 
     var body: some View {
         ZStack {
             PlayerLyricsBackgroundView(image: albumArtImage)
                 .ignoresSafeArea()
 
-            VStack(spacing: 18) {
-                header
-                displayModePicker
-                secondaryMissingHint
-                lyricsList
-                controls
+            GeometryReader { geometry in
+                let compact = geometry.size.height < 520 || dynamicTypeSize.isAccessibilitySize
+                if compact {
+                    ScrollView {
+                        content(compact: true, lyricsHeight: max(footerHeight + 158, geometry.size.height * 0.5))
+                    }
+                    .accessibilityIdentifier("fullLyrics.page")
+                } else {
+                    content(compact: false, lyricsHeight: nil)
+                }
             }
-            .padding(.horizontal, 26)
-            .padding(.top, 18)
-            .padding(.bottom, 30)
         }
+        // The artwork treatment and controls are intentionally dark in either system appearance.
+        .environment(\.colorScheme, .dark)
+    }
+
+    private func content(compact: Bool, lyricsHeight: CGFloat?) -> some View {
+        VStack(spacing: compact ? 8 : 18) {
+            header
+            displayModePicker
+            secondaryMissingHint
+            lyricsList.frame(height: lyricsHeight)
+            controls
+        }
+        .padding(.horizontal, compact ? 16 : 26)
+        .padding(.top, compact ? 8 : 18)
+        .padding(.bottom, compact ? 8 : 30)
     }
 
     private var displayModeBinding: Binding<LyricDisplayMode> {
@@ -157,21 +187,35 @@ struct FullLyricsView: View {
             }
             .buttonStyle(FullLyricsPressStyle())
             .accessibilityLabel("关闭歌词")
+            .accessibilityIdentifier("fullLyrics.close")
         }
     }
 
-    private var displayModePicker: some View {
+    private var displayModeOptions: some View {
         Picker("歌词显示", selection: displayModeBinding) {
             ForEach(LyricDisplayMode.allCases) { mode in
                 Text(mode.title).tag(mode)
             }
         }
-        .pickerStyle(.segmented)
-        .tint(.white)
+    }
+
+    @ViewBuilder
+    private var displayModePicker: some View {
+        Group {
+            if dynamicTypeSize >= .xxxLarge {
+                displayModeOptions
+                    .pickerStyle(.menu)
+                    .tint(.white)
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            } else {
+                displayModeOptions.pickerStyle(.segmented)
+            }
+        }
+        .accessibilityIdentifier("fullLyrics.displayMode")
     }
 
     private var lyricsList: some View {
-        ScrollViewReader { proxy in
+        Group {
             VStack(spacing: 8) {
                 GeometryReader { viewport in
                     ScrollView(showsIndicators: false) {
@@ -181,58 +225,84 @@ struct FullLyricsView: View {
                             if lyrics.isEmpty {
                                 emptyLyricsView
                             } else {
-                                ForEach(lyrics) { line in
-                                    lyricRow(index: line.index, line: line)
+                                ForEach(Array(lyrics.enumerated()), id: \.element.id) { position, line in
+                                    lyricRow(position: position, line: line)
                                         .id(line.id)
                                 }
                             }
                             Color.clear
                                 .frame(height: max(viewport.size.height * 0.42, 140))
                         }
+                        .scrollTargetLayout()
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .coordinateSpace(name: "fullLyricsContent")
                         .id(lyricsIdentity)
                     }
+                    .scrollPosition($scrollPosition)
+                    .accessibilityIdentifier("fullLyrics.list")
                     .onPreferenceChange(FullLyricsRowLayoutKey.self) { layout in
                         guard layout.identity == lyricsIdentity else { return }
                         browseGeometry.prepare(for: lyricsIdentity)
-                        browseGeometry.updateRows(layout.frames, for: lyricsIdentity)
+                        browseGeometry.updateRows(layout.frames, for: lyricsIdentity, layoutKey: layout.key,
+                                                  viewportGlobalMinY: viewport.frame(in: .global).minY)
+                        restoreReadingAnchorIfReady()
                         refreshBrowsePreview()
                     }
-                    .onScrollGeometryChange(for: CGRect.self) { geometry in
-                        geometry.visibleRect
-                    } action: { _, viewport in
+                    .onScrollGeometryChange(for: ScrollGeometry.self) { $0 } action: { _, geometry in
                         browseGeometry.prepare(for: lyricsIdentity)
-                        browseGeometry.updateViewport(viewport)
+                        browseGeometry.updateViewport(geometry.visibleRect, layoutKey: layoutKey,
+                                                      viewportGlobalMinY: viewport.frame(in: .global).minY)
+                        restoreReadingAnchorIfReady()
                         refreshBrowsePreview()
                     }
                     .onScrollPhaseChange { _, phase in
                         scrollState.phaseDidChange(to: phase)
+                        if phase == .tracking || phase == .interacting || phase == .decelerating {
+                            cancelPendingReadingAnchor()
+                        }
                         if phase == .interacting || phase == .decelerating {
                             followState.userDidBrowse()
                             refreshBrowsePreview()
                         }
+                        if phase == .idle { restoreReadingAnchorIfReady() }
                     }
                 }
 
                 FullLyricsBrowseFooter(
                     isBrowsing: isBrowsingLyrics && !lyrics.isEmpty
                 ) {
-                    restoreFollowMode(proxy)
+                    restoreFollowMode()
                 }
             }
             .onAppear {
-                scrollToCurrent(proxy)
+                scrollToCurrent()
             }
             .onChange(of: currentIndex) { _, _ in
                 guard !isBrowsingLyrics else { return }
-                scrollToCurrent(proxy)
+                scrollToCurrent()
+            }
+            .onChange(of: layoutKey) { oldKey, newKey in
+                cancelPendingReadingAnchor()
+                guard isBrowsingLyrics, scrollState.phase == .idle,
+                      let anchor = browseGeometry.readingAnchor(for: lyricsIdentity, layoutKey: oldKey),
+                      lyrics.contains(where: { $0.id == anchor.id }) else { return }
+                var lineOrder: [Int: Int] = [:]
+                for (position, line) in lyrics.enumerated() { lineOrder[line.id] = position }
+                let pending = PendingReadingAnchor(anchor: anchor, identity: lyricsIdentity,
+                                                   key: newKey, interactionGeneration: readingRestoreFence.generation,
+                                                   lineOrder: lineOrder)
+                pendingReadingAnchor = pending
+                // A lazy stack may have discarded the old row after insertion. Materialize
+                // it first, then correct its actual position when the new layout arrives.
+                var transaction = Transaction()
+                transaction.animation = nil
+                withTransaction(transaction) {
+                    scrollPosition.scrollTo(id: anchor.id, anchor: .top)
+                }
             }
             .onChange(of: lyricsIdentity) { _, _ in
                 resetBrowseState()
-                DispatchQueue.main.async {
-                    scrollToCurrent(proxy)
-                }
+                scrollToCurrent()
             }
         }
     }
@@ -262,24 +332,25 @@ struct FullLyricsView: View {
             .frame(maxWidth: .infinity, alignment: .center)
     }
 
-    private func lyricRow(index: Int, line: LyricLine) -> some View {
-        let isCurrent = index == currentIndex
-        let isBrowsePreview = isBrowsingLyrics && index == browsePreviewIndex
+    private func lyricRow(position: Int, line: LyricLine) -> some View {
+        let isCurrent = position == currentIndex
+        let isBrowsePreview = isBrowsingLyrics && line.id == browsePreviewIndex
         return Button {
             guard isConnected, scrollState.canSeek() else { return }
             seekToLine(line)
         } label: {
             FullLyricsBrowseRow(timeMs: isBrowsePreview ? line.timeMs : nil) {
                 lyricText(
-                    index: index,
+                    index: position,
                     line: line,
                     isCurrent: isCurrent,
                     isBrowsePreview: isBrowsePreview
                 )
             }
+            .id(lyricsRevision)
             .animation(
-                reduceMotion ? nil : .easeInOut(duration: 0.18),
-                value: currentIndex
+                reduceMotion || isBrowsingLyrics ? nil : .easeInOut(duration: 0.18),
+                value: currentLineID
             )
             .contentShape(Rectangle())
         }
@@ -291,21 +362,35 @@ struct FullLyricsView: View {
                     key: FullLyricsRowLayoutKey.self,
                     value: FullLyricsRowLayout(
                         identity: lyricsIdentity,
-                        frames: [index: geometry.frame(in: .named("fullLyricsContent"))]
+                        key: layoutKey,
+                        frames: [line.id: geometry.frame(in: .named("fullLyricsContent"))]
                     )
                 )
             }
         }
-        .accessibilityLabel("歌词 \(line.text)")
+        .accessibilityIdentifier("fullLyrics.line.\(line.id)")
+        .accessibilityLabel(accessibleLyric(line))
+        .accessibilityAddTraits(isCurrent ? .isSelected : [])
         .accessibilityValue(isBrowsePreview ? FullLyricsBrowseTime.text(timeMs: line.timeMs) ?? "" : "")
         .accessibilityHint(isConnected ? "跳转到这句" : "Sony 未连接")
+    }
+
+    private func accessibleLyric(_ line: LyricLine) -> String {
+        var parts = [line.text]
+        if displayMode.showsTranslation, let text = sanitizedSecondaryText(line.translation) {
+            parts.append(text)
+        }
+        if displayMode.showsRomanization, let text = sanitizedSecondaryText(line.romanization) {
+            parts.append(text)
+        }
+        return parts.joined(separator: ". ")
     }
 
     private func lyricColor(isCurrent: Bool, isBrowsePreview: Bool) -> Color {
         if isCurrent {
             return PlayerDesignTokens.stableAccent
         }
-        return .white.opacity(isBrowsePreview ? 0.86 : 0.42)
+        return .white.opacity(isBrowsePreview ? 0.95 : 0.76)
     }
 
     @ViewBuilder
@@ -327,11 +412,11 @@ struct FullLyricsView: View {
                     positionMs: positionMs,
                     isPlaying: isPlaying,
                     highlightColor: PlayerDesignTokens.stableAccent,
-                    normalColor: Color.white.opacity(0.36),
-                    font: .system(size: 28, weight: .bold, design: .rounded),
-                    lineLimit: 3,
+                    normalColor: Color.white.opacity(0.76),
+                    font: .system(size: lyricSize, weight: .medium, design: .rounded),
                     alignment: .leading
                 )
+                .fixedSize(horizontal: false, vertical: true)
             }
         } else {
             lyricStack(
@@ -341,14 +426,14 @@ struct FullLyricsView: View {
                 Text(line.text)
                     .font(
                         .system(
-                            size: 21,
+                            size: lyricSize,
                             weight: .medium,
                             design: .rounded
                         )
                     )
-                    .foregroundStyle(lyricColor(isCurrent: false, isBrowsePreview: isBrowsePreview))
+                    .foregroundStyle(lyricColor(isCurrent: isCurrent, isBrowsePreview: isBrowsePreview))
                     .multilineTextAlignment(.leading)
-                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -358,7 +443,7 @@ struct FullLyricsView: View {
         isCurrent: Bool,
         @ViewBuilder original: () -> Original
     ) -> some View {
-        VStack(alignment: .leading, spacing: isCurrent ? 5 : 4) {
+        VStack(alignment: .leading, spacing: 4) {
             original()
             if displayMode.showsTranslation,
                let translation = sanitizedSecondaryText(line.translation) {
@@ -384,15 +469,15 @@ struct FullLyricsView: View {
         Text(text)
             .font(
                 .system(
-                    size: isCurrent ? 17 : 15,
+                    size: secondarySize,
                     weight: .medium,
                     design: .rounded
                 )
             )
             .foregroundStyle(
                 isCurrent
-                    ? Color.white.opacity(0.70)
-                    : Color.white.opacity(0.34)
+                    ? Color.white.opacity(0.84)
+                    : Color.white.opacity(0.76)
             )
             .multilineTextAlignment(.leading)
             .fixedSize(horizontal: false, vertical: true)
@@ -419,6 +504,7 @@ struct FullLyricsView: View {
             }
             .buttonStyle(FullLyricsPressStyle(pressedScale: 0.92))
             .accessibilityLabel(isPlaying ? "暂停" : "播放")
+            .accessibilityIdentifier("fullLyrics.playPause")
             controlButton("下一首", systemImage: "forward.fill", size: 52, action: onNext)
         }
         .padding(.top, 4)
@@ -444,25 +530,27 @@ struct FullLyricsView: View {
         }
         .buttonStyle(FullLyricsPressStyle(pressedScale: 0.92))
         .accessibilityLabel(AppLocalization.string(title))
+        .accessibilityIdentifier("fullLyrics.control.\(systemImage)")
     }
 
-    private func scrollToCurrent(_ proxy: ScrollViewProxy, force: Bool = false) {
+    private func scrollToCurrent(force: Bool = false) {
         guard lyrics.indices.contains(currentIndex) else { return }
         guard force || currentIndex != lastAutoScrolledIndex else { return }
         lastAutoScrolledIndex = currentIndex
         if reduceMotion {
-            proxy.scrollTo(lyrics[currentIndex].id, anchor: .center)
+            scrollPosition.scrollTo(id: lyrics[currentIndex].id, anchor: .center)
         } else {
             withAnimation(.easeInOut(duration: 0.28)) {
-                proxy.scrollTo(lyrics[currentIndex].id, anchor: .center)
+                scrollPosition.scrollTo(id: lyrics[currentIndex].id, anchor: .center)
             }
         }
     }
 
-    private func restoreFollowMode(_ proxy: ScrollViewProxy) {
+    private func restoreFollowMode() {
+        cancelPendingReadingAnchor()
         followState.returnToCurrent()
         browsePreviewIndex = nil
-        scrollToCurrent(proxy, force: true)
+        scrollToCurrent(force: true)
     }
 
     private func resetBrowseState() {
@@ -470,9 +558,31 @@ struct FullLyricsView: View {
         browsePreviewIndex = nil
         browseGeometry.prepare(for: lyricsIdentity)
         lastAutoScrolledIndex = nil
+        cancelPendingReadingAnchor()
+    }
+
+    private func cancelPendingReadingAnchor() {
+        readingRestoreFence.invalidate()
+        pendingReadingAnchor = nil
+    }
+
+    private func restoreReadingAnchorIfReady() {
+        guard let pending = pendingReadingAnchor, pending.identity == lyricsIdentity,
+              layoutKey == pending.key,
+              let targetY = browseGeometry.anchorContentY(for: pending.anchor, identity: pending.identity,
+                                                         layoutKey: pending.key, lineOrder: pending.lineOrder),
+              isBrowsingLyrics, scrollState.phase == .idle,
+              readingRestoreFence.accepts(pending.interactionGeneration) else { return }
+        pendingReadingAnchor = nil
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) {
+            scrollPosition.scrollTo(y: targetY)
+        }
     }
 
     private func seekToLine(_ line: LyricLine) {
+        cancelPendingReadingAnchor()
         onSeekToLine(line.timeMs)
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         followState.returnToCurrent()
@@ -490,7 +600,16 @@ struct FullLyricsView: View {
 
 private struct FullLyricsRowLayout: Equatable {
     var identity: String?
+    var key: FullLyricsLayoutKey = .default
     var frames: [Int: CGRect] = [:]
+}
+
+private struct PendingReadingAnchor: Equatable {
+    let anchor: FullLyricsReadingAnchor
+    let identity: String
+    let key: FullLyricsLayoutKey
+    let interactionGeneration: UInt64
+    let lineOrder: [Int: Int]
 }
 
 private struct FullLyricsRowLayoutKey: PreferenceKey {
@@ -499,7 +618,7 @@ private struct FullLyricsRowLayoutKey: PreferenceKey {
     static func reduce(value: inout FullLyricsRowLayout, nextValue: () -> FullLyricsRowLayout) {
         let next = nextValue()
         guard next.identity != nil else { return }
-        if value.identity != next.identity {
+        if value.identity != next.identity || value.key != next.key {
             value = next
         } else {
             value.frames.merge(next.frames) { _, new in new }
@@ -510,10 +629,47 @@ private struct FullLyricsRowLayoutKey: PreferenceKey {
 struct FullLyricsBrowseRow<Lyric: View>: View {
     let timeMs: Int64?
     @ViewBuilder let lyric: Lyric
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     private var time: String? { timeMs.flatMap(FullLyricsBrowseTime.text) }
 
     var body: some View {
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: 4) {
+                    // Reserve the same header in every row so showing a time does not move text.
+                    ZStack(alignment: .trailing) {
+                        Text(verbatim: "0:00:00").hidden().accessibilityHidden(true)
+                        if let time {
+                            Text(verbatim: time)
+                                .accessibilityLabel(Text("定位时间"))
+                                .accessibilityValue(time)
+                        }
+                    }
+                    .font(.caption2.weight(.medium))
+                    .monospacedDigit()
+                    .foregroundStyle(.white.opacity(0.84))
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    lyric.frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } else {
+                standardRow
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        .overlay(alignment: .leading) {
+            if time != nil {
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(.white.opacity(0.52))
+                    .frame(width: 2)
+                    .padding(.vertical, 4)
+                    .offset(x: -10)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+
+    private var standardRow: some View {
         HStack(spacing: 12) {
             lyric.frame(maxWidth: .infinity, alignment: .leading)
             ZStack {
@@ -530,17 +686,6 @@ struct FullLyricsBrowseRow<Lyric: View>: View {
             }
             // Reserve the same column for every row so the preview cannot rewrap lyrics.
             .frame(width: 54, alignment: .trailing)
-        }
-        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-        .overlay(alignment: .leading) {
-            if time != nil {
-                RoundedRectangle(cornerRadius: 1)
-                    .fill(.white.opacity(0.52))
-                    .frame(width: 2)
-                    .padding(.vertical, 4)
-                    .offset(x: -10)
-                    .allowsHitTesting(false)
-            }
         }
     }
 }
@@ -576,6 +721,7 @@ struct FullLyricsBrowseFooter: View {
                 }
         }
         .buttonStyle(FullLyricsPressStyle())
+        .accessibilityIdentifier("fullLyrics.returnToCurrent")
     }
 }
 
@@ -600,7 +746,7 @@ private struct PlayerLyricsBackgroundView: View {
                         .frame(width: proxy.size.width, height: proxy.size.height)
                         .clipped()
                         .blur(radius: 34)
-                        .overlay(Color.black.opacity(0.38))
+                        .overlay(Color.black.opacity(0.75))
                 } else {
                     LinearGradient(
                         colors: [

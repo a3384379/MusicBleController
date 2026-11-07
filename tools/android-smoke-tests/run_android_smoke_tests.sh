@@ -161,6 +161,8 @@ if ! ADB_BIN="$(find_adb)"; then
 fi
 
 export ROOT_DIR OUT_DIR PACKAGE_NAME ADB_BIN
+# The device check runs in a child process, including when selected by CLI.
+export ANDROID_DEVICE_ID="${ANDROID_DEVICE_ID:-}"
 log "adb=$ADB_BIN"
 log "output=$OUT_DIR"
 
@@ -172,7 +174,11 @@ if "$SCRIPT_DIR/android_device_check.sh" >"$OUT_DIR/android_device_check_stdout.
 else
   detail="$(tail -20 "$OUT_DIR/android_device_check_stderr.log" | tr '\n' ' ' | sed 's/[[:space:]]\\+/ /g')"
   record_required "Device Check" "FAIL" "$(elapsed_ms "$start")" "${detail:-adb device check failed}"
-  python3 "$SCRIPT_DIR/generate_android_report.py" "$OUT_DIR" > "$OUT_DIR/report_path.txt"
+  if ! python3 "$SCRIPT_DIR/generate_android_report.py" "$OUT_DIR" > "$OUT_DIR/report_path.txt"; then
+    # If report generation exits nonzero after writing a report, preserve the
+    # JSON result before exiting this failed suite.
+    [[ -s "$OUT_DIR/report.json" ]] || exit 1
+  fi
   REPORT_JSON="$(sed -n '2p' "$OUT_DIR/report_path.txt")"
   if [[ "$JSON_OUTPUT" == true ]]; then
     python3 - "$REPORT_JSON" >&3 <<'PY'
@@ -286,7 +292,8 @@ else
 fi
 
 start="$(now_ms)"
-"$SCRIPT_DIR/ble_health_watchdog_test.sh" "$OUT_DIR/sony_logcat.log" \
+DEBUG_CONTROL_ENABLED="$DEBUG_CONTROL" \
+  "$SCRIPT_DIR/ble_health_watchdog_test.sh" "$OUT_DIR/sony_logcat.log" \
   >"$OUT_DIR/ble_health_watchdog_stdout.log" \
   2>"$OUT_DIR/ble_health_watchdog_stderr.log" || true
 ble_health_cost="$(elapsed_ms "$start")"

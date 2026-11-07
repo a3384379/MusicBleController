@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.util.Log
+import com.example.playeragent.service.BleRuntimePermissions
 import com.example.playeragent.service.PlayerAgentForegroundService
 
 class PlayerAgentDebugControlReceiver : BroadcastReceiver() {
@@ -21,11 +22,8 @@ class PlayerAgentDebugControlReceiver : BroadcastReceiver() {
                 )
             }
             ACTION_STOP_BLE_SERVICE -> {
-                forwardToService(
-                    context = context,
-                    serviceAction = PlayerAgentForegroundService.ACTION_STOP_SERVICE,
-                    logAction = "STOP_BLE_SERVICE"
-                )
+                val stopped = context.stopService(Intent(context, PlayerAgentForegroundService::class.java))
+                Log.i(TAG, "[DebugControl] completed action=STOP_BLE_SERVICE stopped=$stopped")
             }
             ACTION_RECOVER_BLE_STACK -> {
                 forwardToService(
@@ -57,6 +55,10 @@ class PlayerAgentDebugControlReceiver : BroadcastReceiver() {
         serviceAction: String?,
         logAction: String
     ) {
+        if (!BleRuntimePermissions.granted(context)) {
+            Log.w(TAG, "[DebugControl] skipped action=$logAction reason=permission_missing")
+            return
+        }
         val serviceIntent = Intent(context, PlayerAgentForegroundService::class.java).apply {
             action = serviceAction
         }
@@ -64,10 +66,15 @@ class PlayerAgentDebugControlReceiver : BroadcastReceiver() {
             TAG,
             "[DebugControl] forwarded to service action=${serviceAction ?: "DEFAULT_START"}"
         )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(serviceIntent)
-        } else {
-            context.startService(serviceIntent)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(serviceIntent)
+            } else {
+                context.startService(serviceIntent)
+            }
+        } catch (error: SecurityException) {
+            Log.w(TAG, "[DebugControl] failed action=$logAction reason=permission_denied", error)
+            return
         }
         Log.i(TAG, "[DebugControl] completed action=$logAction")
     }

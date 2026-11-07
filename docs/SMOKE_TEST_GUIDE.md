@@ -22,7 +22,8 @@
 - `android_build_install.sh`：构建 `:PlayerAgentApp:assembleDebug` 并安装 APK。
 - `android_collect_logs.sh`：采集 Sony logcat 和过滤日志。
 - `android_file_checks.sh`：检查 app external files、QRC cache、QQMusic public 目录。
-- `android_ble_optional_test.sh`：只基于 Sony logcat 判断 GATT/advertising 健康。
+- `android_ble_optional_test.sh`：默认通过 Debug Receiver 请求 START，再从 Sony logcat 判断 GATT/advertising 健康；禁用调试控制时只分析已有日志。
+- `ble_health_watchdog_test.sh`：默认请求 RECOVER，再分析健康状态；与 BLE optional 检查共用 `DEBUG_CONTROL_ENABLED` 开关。
 - `android_playback_diff_flow_test.sh`：只基于 Sony logcat 统计 PlaybackDiff snapshot/diff/push/skip 指标。
 - `android_current_word_flow_test.sh`：只基于 Sony logcat 统计轻量 `currentWord` push/skip/间隔指标。
 - `generate_android_report.py`：生成 Android `report.md` 和 `report.json`。
@@ -57,6 +58,7 @@
 - [android_collect_logs.sh](/Volumes/雷电/project/MusicBleController/tools/android-smoke-tests/android_collect_logs.sh)
 - [android_file_checks.sh](/Volumes/雷电/project/MusicBleController/tools/android-smoke-tests/android_file_checks.sh)
 - [android_ble_optional_test.sh](/Volumes/雷电/project/MusicBleController/tools/android-smoke-tests/android_ble_optional_test.sh)
+- [ble_health_watchdog_test.sh](/Volumes/雷电/project/MusicBleController/tools/android-smoke-tests/ble_health_watchdog_test.sh)
 - [android_playback_diff_flow_test.sh](/Volumes/雷电/project/MusicBleController/tools/android-smoke-tests/android_playback_diff_flow_test.sh)
 - [generate_android_report.py](/Volumes/雷电/project/MusicBleController/tools/android-smoke-tests/generate_android_report.py)
 
@@ -93,7 +95,7 @@
 4. 检查进程和 launch 后 FATAL/ANR。
 5. 采集 `logcat -d`，生成 `sony_logcat.log` 和 `sony_filtered.log`。
 6. 检查 `/sdcard/Android/data/com.example.playeragent/files`、QRC cache、ArtworkDiscovery、Logs、QQMusic public 目录。
-7. Optional BLE 只从 logcat 判断 GATT server / service add / advertising。
+7. 默认通过 Debug Receiver 请求 START/RECOVER，再从 logcat 判断 GATT server、service add、advertising 与健康状态；`--no-debug-control` 禁止这两处广播。
 8. Optional PlaybackDiff Flow 只从 logcat 统计 snapshotBuildCount、diffCount、pushCount、skipCount、skipRatio、trackChanged、wordChanged、positionJump。
 9. Optional CurrentWord Flow 只从 logcat 统计 `CurrentWordPush` push/skip/averageInterval/lastPushCost。
 10. 输出 `/tmp/music_ble_android_smoke/<timestamp>/report.md` 和 `report.json`。
@@ -269,7 +271,9 @@ xcodebuild \
 - PlaybackDiff Flow 在没有 iPhone subscriber 时返回 SKIPPED；有 subscriber 但样本不足时返回 WARN。真实连接并播放 2-3 分钟后，期望 `skipCount > pushCount`。
 - CurrentWord Flow 在没有 iPhone subscriber、旧 Sony build 或当前歌曲无逐字时间时返回 SKIPPED/WARN；真实连接并播放有逐字歌词的歌曲时，期望 `pushCount > 0`。
 - Optional FAIL 用于 FATAL/ANR 或 GATT/advertising 失败且没有 recovery success。
-- `--no-debug-control` 可关闭 Debug-only service control，回到只读 logcat 的旧行为。
+- `--no-debug-control` 同时关闭 BLE optional 与 health watchdog 的 START/RECOVER 广播、调试等待和日志刷新；这两项检查只分析已有日志。suite 的正常启动、日志采集和 full 模式构建安装仍会执行，App 自身的服务自动启动不受该参数关闭。
+- watchdog 报告记录 `debugControlEnabled/recoverCommandAttempted/recoverCommandRc/recoverCommandSkipReason`；未尝试时 rc 为 null，不能用广播 rc=0 冒充恢复成功。START 报告也区分收到、转发、权限拒绝，只有 GATT/advertising 证据才能证明 BLE 已运行。
+- 缺 BLE 权限时 Debug Receiver 拒绝冷启动动作；STOP 直接停止服务。服务自身捕获前台提升的权限异常，安全退出并拒绝继续执行命令。日志刷新不得抹掉已捕获的 FATAL/ANR。
 - release build 不包含 debug control receiver，`PlayerAgentForegroundService` 仍保持 `exported=false`。
 
 ## Cross-device 关键状态
@@ -278,6 +282,33 @@ xcodebuild \
 - `WARN`：Required 通过，但缺一台设备导致 suite `SKIPPED`，或 Optional 有 WARN。
 - `FAIL`：任一已运行 suite Required FAIL，显式指定的 suite 缺设备，或子脚本异常无报告。
 - 退出码：`0` 表示 PASS/WARN，`1` 表示 FAIL。
+
+## 缺权限调试恢复修复验证（2026-11-06 至 2026-11-07）
+
+基线 `1ae52b5`，分支 `codex/ble-recovery-permissions`。本次修复 Sony 服务启动权限保护和 Android smoke 参数遗漏，不改 BLE UUID、消息字段、数据库或 iOS 代码。
+
+| 检查 | 结果与边界 |
+|---|---|
+| Sony JVM | 148 项通过，无失败或跳过，包含 API 23/30/31/35 的权限组合 |
+| 无设备脚本测试 | 14 项通过，覆盖 START/RECOVER 开关透传、权限拒绝、未尝试状态和 FATAL 保留 |
+| Android 生命周期 | 2 项缺权限、1 项授权且无通知权限的实际测试全部通过，无 assumption skip；直接 FGS 拒绝后等待超过设备配置的 30000 ms 超时，无延迟崩溃或重启 |
+| 缺权限完整冒烟 | Required 8/8，Optional 1 PASS / 4 WARN / 2 SKIPPED / 0 FAIL；START 和 RECOVER 被拒绝，不再崩溃 |
+| 最终缺权限 quick | Required 8/8，watchdog 明确记录 `manual recover skipped: permission_missing` |
+| 禁用调试控制 quick | Required 8/8；无 START/RECOVER 调试广播，watchdog attempted=false、rc=null |
+| 权限完整的完整冒烟 | Required 8/8，Optional 4 PASS / 1 WARN / 2 SKIPPED / 0 FAIL；GATT、advertising 与手动恢复均有日志。WARN 为无 QQMusic 目录，SKIPPED 为无 iPhone 订阅者 |
+| 构建、lint、release 边界 | Debug 与 instrumentation APK 构建成功；lint 0 error / 30 个既有 warning；生成的 release manifest 不含 Debug Receiver，正式服务仍 exported=false |
+
+环境为专用 API 37 模拟器 `AuditMusicBle`、JDK 17；不代表 Sony 真机、旧版 Android 系统或 iPhone 端到端验收。未修改 Controller，未将旧的 Controller XML 记作本批重跑。iOS quick/full 不适用，未运行；已有 iOS 文案改动保持原样。
+
+中途一轮 quick 的启动检查为 FAIL（7/8）：权限切换后残留的系统 `GrantPermissionsActivity` 任务被 monkey 复用，目标进程未拉起，未观察到 FATAL/ANR。对专用模拟器的残留权限弹窗和目标 App 执行 force-stop 清理后，重新运行通过；原失败报告未删除，不计为通过轮次。
+
+完整清单位于本次工作机 `/tmp/musicble-ble-guard-20261106/verification.json`，包含原始失败、最终分组测试和各轮报告。该路径为临时证据，非长期归档。新权限 helper 仅对注入 SDK 判断中的内联权限名称局部说明 `InlinedApi` 误报；未屏蔽历史 lint 告警。
+
+## 本轮自用范围与多设备修复（2026-11-07）
+
+Android `--device` 现在向子脚本导出所选 serial，多台设备在线时仍只检查指定设备；设备检查失败时，`--json` 也输出报告位置与失败摘要，进程保持失败退出。相关无设备回归共 16 项通过，多设备环境下 Sony quick 为整体 PASS、Required 8/8，使用 `--no-debug-control`，未触发调试 START/RECOVER。
+
+本轮最终 iPhone full 与同构建 quick 均整体 PASS、Required 6/6。完整回归及证据边界见[优化进度](OPTIMIZATION_PROGRESS.md)和[CI 验证](CI_VALIDATION.md)。用户已取消真实两端性能采样、120 分钟长稳、双控制器和能耗对照；这些不属于当前 smoke 必选项，也没有记为通过。既有性能工具仅供以后主动手动使用。
 
 ## 不允许随便修改的点
 
@@ -294,7 +325,7 @@ xcodebuild \
 - Preferences FAIL：确认安装的是 DEBUG 包且支持 `--smoke-test-preferences`。
 - Log File FAIL：确认 App 启动过，且 `ios_ble.log` 有预期关键词。
 - AlbumArt Flow FAIL：查看 `album_art_flow.json` 的 `events` 和 `reason`。
-- Android Device Check FAIL：确认 `adb devices -l` 只有一台 `device`，且 Sony 已授权 USB 调试。
+- Android Device Check FAIL：确认 Sony 已授权 USB 调试；多台设备在线时使用 `--device <serial>` 或 `ANDROID_DEVICE_ID` 明确选择目标。
 - Android Build FAIL：看 `android_build_stderr.log`。
 - Android Launch FAIL：看 `launch_logcat.log`。
 - Android BLE Service WARN：可能只是未手动启动 PlayerAgent 前台服务。
@@ -311,6 +342,7 @@ xcodebuild \
 - 改 Sony Android 普通逻辑：跑 Android quick。
 - 改 Android build/manifest/service/permission/install：跑 Android full。
 - 改 Debug-only service control receiver：跑 Android full，并验证 release manifest 不包含 receiver。
+- 缺权限与恢复回归：运行 `BleServicePermissionTest` 的 denied/granted 分组；权限在 instrumentation 外设置，直接 FGS 失败测试需等待超过系统配置的前台提升超时。设备外脚本测试见 `tools/android-smoke-tests/tests/test_debug_control.py`。
 - 改 cross-device 总入口：跑 `./tools/smoke/run_all_smoke_tests.sh --quick --json`。
 - 跨端相关改动且两台设备都连接：优先跑 `./tools/smoke/run_all_smoke_tests.sh --quick --json`。
 - 验证 CurrentWord V2.3 实时效果：手动跑 `./tools/smoke/current_word_long_play_test.sh --duration 90 --json`，不要把它当作每次 quick smoke 的 Required。
