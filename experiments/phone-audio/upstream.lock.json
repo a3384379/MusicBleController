@@ -1,0 +1,37 @@
+{
+  "repository": "https://github.com/jqssun/android-airplay-server",
+  "tag": "v0.0.31",
+  "commit": "c8defdd70d7e6a04f4f1b71d353653682d594106",
+  "apk_url": "https://github.com/jqssun/android-airplay-server/releases/download/v0.0.31/app-release.apk",
+  "apk_sha256": "c5dce5c29ab52157bdaa406e485f9bfaab7d8d59c523d93622a33b253a28f410",
+  "native_libraries": {
+    "libairplay_native.so": "7ba7916a57d3a444ca9056ba55e8a526b1da1f70ae99205f4aa2ad597a03b09a",
+    "libc++_shared.so": "92ee8da641b969254cc8723f64aa115d36c8ffa87115e38bc9cb89e3eefee839",
+    "libcrypto.so": "4dac710631af83b6f995b0d85c212138d83086742e3946c01e049765351fc1f4",
+    "liboboe.so": "979d14353e7e95de1047fbe7321da6c07bc47e30ee2b2cb8b57a1a58ef026587"
+  },
+  "submodules": {
+    "app/src/main/cpp/third_party/UxPlay": "462153392f2e30937424922039ff9f0cda5e7b1a",
+    "app/src/main/cpp/third_party/ffmpeg": "38b88335f99e76ed89ff3c93f877fdefce736c13",
+    "app/src/main/cpp/third_party/libplist": "f41b1ea67045e0c09339974d83e389972d84f166",
+    "app/src/main/cpp/third_party/openssl-cmake": "4edd36a8dab5f85a8f92650b5bdf6e0cab13aab8"
+  },
+  "source_dependencies": {
+    "openssl": {
+      "version": "3.4.4",
+      "repository": "https://github.com/openssl/openssl",
+      "commit": "565bdcc41bbf89fcbaf962636469332689f0c9fd",
+      "archive_sha256": "54cc24d737d5ad91a574b2c444302a0c043b343654c579f251ece915f92960e1"
+    },
+    "oboe": {
+      "version": "1.9.3",
+      "repository": "https://github.com/google/oboe",
+      "commit": "b15f5e39c01a7ada306d959e5129620b145fb8b4",
+      "archive_sha256": "eb2a817017a554f664c5b6262ceef55756097a1e0b9536045de0f33b9868ef6e"
+    }
+  },
+  "native_toolchain": {
+    "ndk": "27.0.12077973",
+    "cmake": "3.22.1"
+  }
+}
